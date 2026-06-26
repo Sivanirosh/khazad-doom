@@ -61,8 +61,18 @@ pub fn worktree_add(
     let worktree = worktree_path.as_ref().to_string_lossy().to_string();
     run(
         repo_path,
-        &["worktree", "add", "-b", branch, &worktree, start_point],
+        &["worktree", "add", "-B", branch, &worktree, start_point],
     )?;
+    Ok(())
+}
+
+pub fn worktree_add_existing(
+    repo_path: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+    branch: &str,
+) -> Result<()> {
+    let worktree = worktree_path.as_ref().to_string_lossy().to_string();
+    run(repo_path, &["worktree", "add", worktree.as_str(), branch])?;
     Ok(())
 }
 

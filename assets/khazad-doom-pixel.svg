@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">Khazad-Doom pixel art: You shall not slope</title>
+  <desc id="desc">Pixel art parody of a bridge guard stopping a fiery slope daemon. The guard holds a JSON shield and says You shall not slope.</desc>
+
+  <!-- palette background -->
+  <rect width="960" height="540" fill="#080612"/>
+  <rect x="0" y="0" width="960" height="78" fill="#151126"/>
+  <rect x="0" y="78" width="86" height="54" fill="#151126"/>
+  <rect x="142" y="78" width="176" height="34" fill="#151126"/>
+  <rect x="392" y="78" width="138" height="62" fill="#151126"/>
+  <rect x="620" y="78" width="340" height="42" fill="#151126"/>
+  <rect x="32" y="104" width="34" height="96" fill="#201a36"/>
+  <rect x="238" y="96" width="38" height="84" fill="#201a36"/>
+  <rect x="454" y="118" width="42" height="74" fill="#201a36"/>
+  <rect x="756" y="94" width="42" height="102" fill="#201a36"/>
+  <rect x="864" y="92" width="34" height="76" fill="#201a36"/>
+
+  <!-- far cavern arches -->
+  <rect x="76" y="206" width="76" height="190" fill="#120f20"/>
+  <rect x="190" y="166" width="96" height="230" fill="#120f20"/>
+  <rect x="676" y="166" width="96" height="230" fill="#120f20"/>
+  <rect x="816" y="206" width="76" height="190" fill="#120f20"/>
+  <rect x="96" y="230" width="36" height="166" fill="#080612"/>
+  <rect x="214" y="196" width="48" height="200" fill="#080612"/>
+  <rect x="700" y="196" width="48" height="200" fill="#080612"/>
+  <rect x="836" y="230" width="36" height="166" fill="#080612"/>
+
+  <!-- lava and glow -->
+  <rect x="0" y="404" width="960" height="136" fill="#28100d"/>
+  <rect x="0" y="442" width="960" height="98" fill="#54170b"/>
+  <rect x="0" y="492" width="960" height="48" fill="#f97316"/>
+  <rect x="54" y="466" width="118" height="18" fill="#ffb000"/>
+  <rect x="218" y="500" width="164" height="18" fill="#ffd166"/>
+  <rect x="586" y="472" width="126" height="18" fill="#ffb000"/>
+  <rect x="758" y="506" width="136" height="16" fill="#ffd166"/>
+
+  <!-- the bridge -->
+  <rect x="86" y="368" width="788" height="28" fill="#7b7780"/>
+  <rect x="106" y="396" width="748" height="22" fill="#4a4651"/>
+  <rect x="128" y="350" width="92" height="18" fill="#98939c"/>
+  <rect x="248" y="350" width="112" height="18" fill="#98939c"/>
+  <rect x="392" y="350" width="86" height="18" fill="#98939c"/>
+  <rect x="512" y="350" width="98" height="18" fill="#98939c"/>
+  <rect x="646" y="350" width="106" height="18" fill="#98939c"/>
+  <rect x="784" y="350" width="62" height="18" fill="#98939c"/>
+  <rect x="160" y="396" width="20" height="24" fill="#2f2b36"/>
+  <rect x="328" y="396" width="20" height="24" fill="#2f2b36"/>
+  <rect x="548" y="396" width="20" height="24" fill="#2f2b36"/>
+  <rect x="734" y="396" width="20" height="24" fill="#2f2b36"/>
+
+  <!-- dangerous downhill slope coming from daemon side -->
+  <polygon points="542,332 874,252 874,306 542,386" fill="#b45309"/>
+  <polygon points="568,342 838,278 838,300 568,364" fill="#f59e0b"/>
+  <rect x="710" y="286" width="104" height="30" fill="#111827"/>
+  <text x="724" y="307" font-family="monospace" font-size="18" font-weight="700" fill="#ffd166">SLOPE</text>
+
+  <!-- JSON guard / wizard -->
+  <rect x="262" y="252" width="48" height="28" fill="#f1e7d0"/>
+  <rect x="246" y="224" width="80" height="28" fill="#d7dae6"/>
+  <rect x="258" y="202" width="56" height="22" fill="#c6cad8"/>
+  <rect x="272" y="184" width="28" height="18" fill="#f8f1dd"/>
+  <rect x="254" y="280" width="64" height="76" fill="#dfe3ee"/>
+  <rect x="238" y="304" width="18" height="54" fill="#b9bfcc"/>
+  <rect x="318" y="300" width="18" height="58" fill="#b9bfcc"/>
+  <rect x="258" y="356" width="20" height="38" fill="#717584"/>
+  <rect x="294" y="356" width="20" height="38" fill="#717584"/>
+  <rect x="268" y="252" width="8" height="8" fill="#111827"/>
+  <rect x="298" y="252" width="8" height="8" fill="#111827"/>
+  <rect x="280" y="266" width="16" height="6" fill="#111827"/>
+
+  <!-- JSON shield -->
+  <rect x="184" y="274" width="60" height="60" fill="#111827"/>
+  <rect x="192" y="282" width="44" height="44" fill="#f8f1dd"/>
+  <text x="198" y="313" font-family="monospace" font-size="26" font-weight="700" fill="#111827">{}</text>
+  <rect x="174" y="334" width="78" height="20" fill="#111827"/>
+  <text x="184" y="349" font-family="monospace" font-size="13" font-weight="700" fill="#36d399">SCHEMA</text>
+
+  <!-- gate staff -->
+  <rect x="344" y="214" width="10" height="150" fill="#8b5a2b"/>
+  <rect x="332" y="198" width="34" height="20" fill="#ffd166"/>
+  <rect x="338" y="202" width="8" height="12" fill="#111827"/>
+  <rect x="352" y="202" width="8" height="12" fill="#111827"/>
+  <rect x="332" y="178" width="34" height="18" fill="#36d399"/>
+  <text x="339" y="193" font-family="monospace" font-size="14" font-weight="700" fill="#111827">CI</text>
+
+  <!-- speech bubble -->
+  <rect x="92" y="92" width="420" height="92" fill="#f8f1dd"/>
+  <rect x="108" y="184" width="42" height="18" fill="#f8f1dd"/>
+  <rect x="128" y="202" width="20" height="20" fill="#f8f1dd"/>
+  <text x="118" y="132" font-family="monospace" font-size="30" font-weight="700" fill="#111827">YOU SHALL NOT</text>
+  <text x="188" y="170" font-family="monospace" font-size="34" font-weight="700" fill="#c2410c">SLOPE!</text>
+
+  <!-- fiery slope daemon -->
+  <rect x="628" y="198" width="154" height="140" fill="#2a0a0a"/>
+  <rect x="654" y="164" width="104" height="52" fill="#401010"/>
+  <rect x="678" y="138" width="58" height="28" fill="#5a1515"/>
+  <rect x="636" y="142" width="42" height="24" fill="#ff6b10"/>
+  <rect x="736" y="142" width="42" height="24" fill="#ff6b10"/>
+  <rect x="616" y="116" width="28" height="28" fill="#ffb000"/>
+  <rect x="770" y="116" width="28" height="28" fill="#ffb000"/>
+  <rect x="678" y="182" width="18" height="18" fill="#ffd166"/>
+  <rect x="720" y="182" width="18" height="18" fill="#ffd166"/>
+  <rect x="692" y="214" width="30" height="10" fill="#ff6b10"/>
+  <rect x="604" y="238" width="32" height="92" fill="#401010"/>
+  <rect x="782" y="238" width="32" height="92" fill="#401010"/>
+  <rect x="638" y="338" width="48" height="56" fill="#2a0a0a"/>
+  <rect x="724" y="338" width="48" height="56" fill="#2a0a0a"/>
+  <rect x="626" y="392" width="76" height="18" fill="#180707"/>
+  <rect x="716" y="392" width="76" height="18" fill="#180707"/>
+
+  <!-- daemon wings -->
+  <rect x="536" y="212" width="60" height="38" fill="#1c0911"/>
+  <rect x="500" y="250" width="96" height="36" fill="#1c0911"/>
+  <rect x="470" y="286" width="126" height="28" fill="#1c0911"/>
+  <rect x="814" y="212" width="60" height="38" fill="#1c0911"/>
+  <rect x="814" y="250" width="96" height="36" fill="#1c0911"/>
+  <rect x="814" y="286" width="126" height="28" fill="#1c0911"/>
+
+  <!-- sloppy cargo on the slope -->
+  <rect x="820" y="216" width="96" height="30" fill="#f59e0b"/>
+  <text x="830" y="237" font-family="monospace" font-size="15" font-weight="700" fill="#111827">scope++</text>
+  <rect x="810" y="252" width="112" height="30" fill="#f97316"/>
+  <text x="820" y="273" font-family="monospace" font-size="15" font-weight="700" fill="#111827">dirty diff</text>
+  <rect x="824" y="288" width="88" height="30" fill="#ef4444"/>
+  <text x="836" y="309" font-family="monospace" font-size="15" font-weight="700" fill="#111827">vibes</text>
+
+  <!-- sparks -->
+  <rect x="452" y="196" width="12" height="12" fill="#ffb000"/>
+  <rect x="520" y="160" width="8" height="8" fill="#ffd166"/>
+  <rect x="862" y="164" width="12" height="12" fill="#ff6b10"/>
+  <rect x="898" y="204" width="8" height="8" fill="#ffd166"/>
+  <rect x="430" y="334" width="10" height="10" fill="#ff6b10"/>
+  <rect x="534" y="360" width="8" height="8" fill="#ffd166"/>
+  <rect x="594" y="148" width="8" height="8" fill="#ffd166"/>
+
+  <!-- bottom plaque -->
+  <rect x="304" y="456" width="352" height="42" fill="#111827"/>
+  <rect x="312" y="464" width="336" height="26" fill="#1f2937"/>
+  <text x="336" y="484" font-family="monospace" font-size="18" font-weight="700" fill="#e5e7eb">JSON GATE BEFORE THE BRIDGE</text>
+</svg>

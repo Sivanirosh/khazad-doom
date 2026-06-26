@@ -1,9 +1,12 @@
 use crate::agent::RunnerSpec;
 use crate::daemon::{Client, Server};
-use crate::domain::{BranchHandoff, RunDetails, RunInspection, RunStatus, SliceValidationReport};
+use crate::domain::{
+    BranchHandoff, RunDetails, RunInspection, RunStatus, SliceValidationReport, SliceWriteResult,
+};
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
-    InspectRunParams, ListSlicesResult, SlicesParams, StartRunParams, StartRunResult, StatusParams,
+    InspectRunParams, ListSlicesResult, ResumeRunParams, SliceImportGithubParams, SliceNewParams,
+    SlicesParams, StartRunParams, StartRunResult, StatusParams,
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
@@ -44,6 +47,22 @@ enum CommandArgs {
         /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or pi.
         #[arg(long, default_value = "")]
         agent: String,
+        /// Run independent slice workers concurrently, then merge serially.
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Resume an interrupted/failed/cancelled run from its durable checkpoint.
+    Resume {
+        #[arg(long)]
+        run: String,
+        /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or pi.
+        #[arg(long, default_value = "")]
+        agent: String,
+        /// Run independent slice workers concurrently, then merge serially.
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
         #[arg(long)]
         wait: bool,
     },
@@ -58,6 +77,12 @@ enum CommandArgs {
     Handoff {
         #[arg(long)]
         run: String,
+        /// Execute `git push -u origin <integration-branch>`.
+        #[arg(long)]
+        push: bool,
+        /// Execute `gh pr create` after the branch is available remotely.
+        #[arg(long)]
+        create_pr: bool,
     },
     /// Inspect run artifacts and daemon log tail.
     Inspect {
@@ -95,6 +120,38 @@ enum SlicesCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Generate a new JSON Issue Slice template.
+    New {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        goal: String,
+        #[arg(long, default_value = "")]
+        github_issue: String,
+        #[arg(long = "acceptance")]
+        acceptance: Vec<String>,
+        #[arg(long = "verify")]
+        verify: Vec<String>,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Import a GitHub issue into a JSON Issue Slice using `gh issue view`.
+    ImportGithub {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        issue: String,
+        #[arg(long, default_value = "")]
+        id: String,
+        #[arg(long = "verify")]
+        verify: Vec<String>,
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,10 +174,21 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             slices,
             all,
             agent,
+            parallel,
             wait,
-        } => run_start(paths, repo, slices, all, agent, wait),
+        } => run_start(paths, repo, slices, all, agent, parallel, wait),
+        CommandArgs::Resume {
+            run,
+            agent,
+            parallel,
+            wait,
+        } => run_resume(paths, run, agent, parallel, wait),
         CommandArgs::Cancel { run, reason } => run_cancel(paths, run, reason),
-        CommandArgs::Handoff { run } => run_handoff(paths, run),
+        CommandArgs::Handoff {
+            run,
+            push,
+            create_pr,
+        } => run_handoff(paths, run, push, create_pr),
         CommandArgs::Inspect { run, log_tail } => run_inspect(paths, run, log_tail),
         CommandArgs::Status { run, events_limit } => run_status(paths, run, events_limit),
         CommandArgs::Slices { command } => run_slices(paths, command),
@@ -147,6 +215,7 @@ fn run_start(
     slices: Vec<String>,
     all: bool,
     agent: String,
+    parallel: usize,
     wait: bool,
 ) -> Result<()> {
     let runner = RunnerSpec::from_agent_and_env(&agent)?;
@@ -163,6 +232,33 @@ fn run_start(
             agent: runner.kind,
             pi_bin: runner.pi_bin,
             pi_args: runner.pi_args,
+            parallelism: parallel,
+        },
+    )?;
+    if !wait {
+        return print_json(&result);
+    }
+    wait_run(&client, &result.run_id)
+}
+
+fn run_resume(
+    paths: Paths,
+    run_id: String,
+    agent: String,
+    parallel: usize,
+    wait: bool,
+) -> Result<()> {
+    let runner = RunnerSpec::from_agent_and_env(&agent)?;
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths);
+    let result: StartRunResult = client.call(
+        "resumeRun",
+        &ResumeRunParams {
+            run_id,
+            agent: runner.kind,
+            pi_bin: runner.pi_bin,
+            pi_args: runner.pi_args,
+            parallelism: parallel,
         },
     )?;
     if !wait {
@@ -177,9 +273,16 @@ fn run_cancel(paths: Paths, run_id: String, reason: String) -> Result<()> {
     print_json(&result)
 }
 
-fn run_handoff(paths: Paths, run_id: String) -> Result<()> {
+fn run_handoff(paths: Paths, run_id: String, push: bool, create_pr: bool) -> Result<()> {
     let client = Client::new(paths);
-    let handoff: BranchHandoff = client.call("handoffRun", &HandoffParams { run_id })?;
+    let handoff: BranchHandoff = client.call(
+        "handoffRun",
+        &HandoffParams {
+            run_id,
+            push,
+            create_pr,
+        },
+    )?;
     print_json(&handoff)
 }
 
@@ -250,6 +353,56 @@ fn run_slices(paths: Paths, command: SlicesCommand) -> Result<()> {
             } else {
                 bail!("slice validation failed")
             }
+        }
+        SlicesCommand::New {
+            repo,
+            id,
+            title,
+            goal,
+            github_issue,
+            acceptance,
+            verify,
+            overwrite,
+        } => {
+            ensure_daemon(&paths)?;
+            let client = Client::new(paths);
+            let repo = resolve_repo_path(repo)?;
+            let result: SliceWriteResult = client.call(
+                "createSlice",
+                &SliceNewParams {
+                    repo_path: repo.to_string_lossy().to_string(),
+                    id,
+                    title,
+                    goal,
+                    github_issue,
+                    acceptance,
+                    verify,
+                    overwrite,
+                },
+            )?;
+            print_json(&result)
+        }
+        SlicesCommand::ImportGithub {
+            repo,
+            issue,
+            id,
+            verify,
+            overwrite,
+        } => {
+            ensure_daemon(&paths)?;
+            let client = Client::new(paths);
+            let repo = resolve_repo_path(repo)?;
+            let result: SliceWriteResult = client.call(
+                "importGithubIssue",
+                &SliceImportGithubParams {
+                    repo_path: repo.to_string_lossy().to_string(),
+                    issue,
+                    id,
+                    verify,
+                    overwrite,
+                },
+            )?;
+            print_json(&result)
         }
     }
 }

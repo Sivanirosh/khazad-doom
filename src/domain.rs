@@ -18,6 +18,8 @@ pub struct Slice {
     pub must_ask_if: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub verify_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +343,19 @@ pub struct BranchHandoff {
     pub pr_command: String,
     pub pr_title: String,
     pub pr_body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<HandoffActionResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffActionResult {
+    pub action: String,
+    pub command: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +376,28 @@ pub struct RunInspection {
     pub log_tail: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceWriteResult {
+    pub slice: Slice,
+    pub path: String,
+    pub written: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunCheckpoint {
+    pub run_id: String,
+    pub integration_branch: String,
+    pub base_sha: String,
+    pub current_sha: String,
+    pub completed_slices: Vec<String>,
+    pub remaining_slices: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }

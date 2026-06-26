@@ -3,8 +3,8 @@ use crate::agent::{CancellationToken, Job, Runner, RunnerSpec, runner_from_spec}
 use crate::artifact;
 use crate::domain::{
     BranchHandoff, CheckResult, Finding, GateCommandResult, GateResult, Handoff,
-    ImplementationSummary, RepairResult, Run, RunInspection, RunStatus, Slice, SliceRun,
-    SliceStatus, SliceValidationReport, WorkerResult,
+    HandoffActionResult, ImplementationSummary, RepairResult, Run, RunCheckpoint, RunInspection,
+    RunStatus, Slice, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -12,8 +12,9 @@ use crate::state::{Repo, Store as StateStore};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rand::RngCore;
+use serde::Deserialize;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -25,9 +26,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAX_REPAIR_ATTEMPTS: usize = 3;
+pub const DEFAULT_VERIFY_TIMEOUT_SECONDS: u64 = 600;
+static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 pub struct Manager {
@@ -45,6 +48,43 @@ pub struct StartOptions {
     pub agent: String,
     pub pi_bin: String,
     pub pi_args: Vec<String>,
+    pub parallelism: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SliceDraft {
+    pub repo_path: PathBuf,
+    pub id: String,
+    pub title: String,
+    pub goal: String,
+    pub github_issue: String,
+    pub acceptance: Vec<String>,
+    pub verify: Vec<String>,
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GithubImportOptions {
+    pub repo_path: PathBuf,
+    pub issue: String,
+    pub id: String,
+    pub verify: Vec<String>,
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeOptions {
+    pub run_id: String,
+    pub agent: String,
+    pub pi_bin: String,
+    pub pi_args: Vec<String>,
+    pub parallelism: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntegrationMode {
+    Fresh,
+    Existing,
 }
 
 impl Manager {
@@ -100,6 +140,57 @@ impl Manager {
         artifact::Store::new(root).validate_slices_report()
     }
 
+    pub fn create_slice(&self, draft: SliceDraft) -> Result<SliceWriteResult> {
+        let repo = self.init_repo(&draft.repo_path)?;
+        let slice = Slice {
+            id: draft.id,
+            title: draft.title,
+            goal: draft.goal,
+            github_issue: draft.github_issue,
+            depends_on: Vec::new(),
+            areas: Vec::new(),
+            acceptance: if draft.acceptance.is_empty() {
+                vec!["Acceptance criteria are satisfied.".to_string()]
+            } else {
+                draft.acceptance
+            },
+            must_ask_if: vec![
+                "Acceptance criteria conflict or require product intent not present in this slice."
+                    .to_string(),
+            ],
+            verify: draft.verify,
+            verify_timeout_seconds: 0,
+        };
+        artifact::Store::new(&repo.path).write_slice(&slice, draft.overwrite)
+    }
+
+    pub fn import_github_issue(&self, opts: GithubImportOptions) -> Result<SliceWriteResult> {
+        let repo = self.init_repo(&opts.repo_path)?;
+        let issue = fetch_github_issue(&opts.issue)?;
+        let id = if opts.id.trim().is_empty() {
+            slug_slice_id(&issue.title)
+        } else {
+            opts.id
+        };
+        let slice = Slice {
+            id,
+            title: issue.title.clone(),
+            goal: first_meaningful_paragraph(&issue.body).unwrap_or_else(|| issue.title.clone()),
+            github_issue: issue.url,
+            depends_on: Vec::new(),
+            areas: Vec::new(),
+            acceptance: acceptance_from_issue_body(&issue.body),
+            must_ask_if: vec![
+                "The GitHub issue discussion conflicts with this JSON slice.".to_string(),
+                "Implementing the issue requires product intent not present in this slice."
+                    .to_string(),
+            ],
+            verify: opts.verify,
+            verify_timeout_seconds: 0,
+        };
+        artifact::Store::new(&repo.path).write_slice(&slice, opts.overwrite)
+    }
+
     pub fn start_run(&self, opts: StartOptions) -> Result<Run> {
         let repo = self.init_repo(&opts.repo_path)?;
         let store = artifact::Store::new(&repo.path);
@@ -121,6 +212,7 @@ impl Manager {
             .map(|slice| slice.id.clone())
             .collect();
         let runner = self.runner_for_options(&opts)?;
+        let parallelism = opts.parallelism.max(1);
         let base_branch = gitutil::current_branch(&repo.path).unwrap_or_default();
         let base_sha = gitutil::head_sha(&repo.path)?;
         let run_id = new_run_id();
@@ -165,7 +257,15 @@ impl Manager {
                 active: manager.active.clone(),
                 run_id: bg_run.id.clone(),
             };
-            manager.execute_run(bg_run, selected_slices, cancel, runner);
+            manager.execute_run(
+                bg_run,
+                selected_slices.clone(),
+                selected_slices,
+                cancel,
+                runner,
+                parallelism,
+                IntegrationMode::Fresh,
+            );
         });
         Ok(run)
     }
@@ -194,6 +294,93 @@ impl Manager {
                 .record_event(run_id, "run_cancelled", &json!({ "reason": reason }))?;
         }
         Ok(active)
+    }
+
+    pub fn resume_run(&self, opts: ResumeOptions) -> Result<Run> {
+        let run = self
+            .state
+            .get_run(&opts.run_id)?
+            .ok_or_else(|| anyhow!("run {:?} not found", opts.run_id))?;
+        if !matches!(
+            run.status,
+            RunStatus::Interrupted | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            bail!(
+                "run {:?} is {}; resume requires interrupted, failed, or cancelled",
+                run.id,
+                run.status
+            );
+        }
+        let store = artifact::Store::new(&run.repo_path);
+        let _last_checkpoint = store.read_checkpoint(&run.id).ok();
+        let all_slices = store.load_slices()?;
+        let requested: Vec<String> = run
+            .selected_slice_id
+            .split(',')
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        let selected_slices = artifact::topological_order(&all_slices, &requested)?;
+        let slice_runs = self.state.get_slice_runs(&run.id)?;
+        let merged: BTreeSet<_> = slice_runs
+            .iter()
+            .filter(|slice_run| slice_run.status == SliceStatus::Merged)
+            .map(|slice_run| slice_run.slice_id.clone())
+            .collect();
+        let remaining: Vec<_> = selected_slices
+            .iter()
+            .filter(|slice| !merged.contains(&slice.id))
+            .cloned()
+            .collect();
+        for slice in &remaining {
+            self.state.upsert_slice_run(&SliceRun {
+                run_id: run.id.clone(),
+                slice_id: slice.id.clone(),
+                status: SliceStatus::Pending,
+                branch: String::new(),
+                commit_sha: String::new(),
+                attempts: 0,
+                last_error: String::new(),
+            })?;
+        }
+        self.state.update_run(&run.id, RunStatus::Running, "")?;
+        self.state.record_event(
+            &run.id,
+            "run_resumed",
+            &json!({ "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>() }),
+        )?;
+        let runner = if let Some(runner) = &self.runner_override {
+            runner.clone()
+        } else {
+            runner_from_spec(RunnerSpec::from_parts(
+                &opts.agent,
+                opts.pi_bin,
+                opts.pi_args,
+            )?)
+        };
+        let cancel = CancellationToken::new();
+        self.active.register(run.id.clone(), cancel.clone());
+        let manager = self.clone();
+        let bg_run = run.clone();
+        let parallelism = opts.parallelism.max(1);
+        thread::spawn(move || {
+            let _guard = ActiveRunGuard {
+                active: manager.active.clone(),
+                run_id: bg_run.id.clone(),
+            };
+            manager.execute_run(
+                bg_run,
+                remaining,
+                selected_slices,
+                cancel,
+                runner,
+                parallelism,
+                IntegrationMode::Existing,
+            );
+        });
+        self.state
+            .get_run(&run.id)?
+            .ok_or_else(|| anyhow!("run {:?} not found after resume", run.id))
     }
 
     pub fn recover_interrupted_runs(&self) -> Result<usize> {
@@ -228,7 +415,12 @@ impl Manager {
         Ok(runs.len())
     }
 
-    pub fn branch_handoff(&self, run_id: &str) -> Result<BranchHandoff> {
+    pub fn branch_handoff(
+        &self,
+        run_id: &str,
+        push: bool,
+        create_pr: bool,
+    ) -> Result<BranchHandoff> {
         let run = self
             .state
             .get_run(run_id)?
@@ -281,6 +473,36 @@ impl Manager {
             sh_quote(&pr_title),
             sh_quote(&final_report_path.to_string_lossy())
         );
+        let mut actions = Vec::new();
+        if push {
+            actions.push(run_handoff_command(
+                "push",
+                &run.repo_path,
+                &["push", "-u", "origin", &run.integration_branch],
+                &push_command,
+            )?);
+        }
+        if create_pr {
+            let body = final_report_path.to_string_lossy().to_string();
+            actions.push(run_external_command(
+                "create_pr",
+                &run.repo_path,
+                "gh",
+                &[
+                    "pr",
+                    "create",
+                    "--base",
+                    &run.base_branch,
+                    "--head",
+                    &run.integration_branch,
+                    "--title",
+                    &pr_title,
+                    "--body-file",
+                    &body,
+                ],
+                &pr_command,
+            )?);
+        }
         Ok(BranchHandoff {
             run_id: run.id,
             repo_path: run.repo_path,
@@ -296,6 +518,7 @@ impl Manager {
             pr_command,
             pr_title,
             pr_body,
+            actions,
         })
     }
 
@@ -315,14 +538,26 @@ impl Manager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_run(
         &self,
         run: Run,
-        slices: Vec<Slice>,
+        worker_slices: Vec<Slice>,
+        gate_slices: Vec<Slice>,
         cancel: CancellationToken,
         runner: Arc<dyn Runner>,
+        parallelism: usize,
+        integration_mode: IntegrationMode,
     ) {
-        let outcome = self.run_slices(&run, &slices, &cancel, runner);
+        let outcome = self.run_slices(
+            &run,
+            &worker_slices,
+            &gate_slices,
+            &cancel,
+            runner,
+            parallelism,
+            integration_mode,
+        );
         match self.cleanup_run_worktrees(&run) {
             Ok(()) => {
                 let _ = self.state.record_event(
@@ -366,12 +601,16 @@ impl Manager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_slices(
         &self,
         run: &Run,
-        slices: &[Slice],
+        worker_slices: &[Slice],
+        gate_slices: &[Slice],
         cancel: &CancellationToken,
         runner: Arc<dyn Runner>,
+        parallelism: usize,
+        integration_mode: IntegrationMode,
     ) -> Result<ImplementationSummary> {
         check_cancelled(cancel)?;
         let store = artifact::Store::new(&run.repo_path);
@@ -381,67 +620,87 @@ impl Manager {
         std::fs::create_dir_all(&root_worktree)
             .with_context(|| format!("create {}", root_worktree.display()))?;
 
-        gitutil::worktree_add(
-            &run.repo_path,
-            &integration_worktree,
-            &run.integration_branch,
-            &run.base_sha,
-        )
-        .context("create integration worktree")?;
+        match integration_mode {
+            IntegrationMode::Fresh => gitutil::worktree_add(
+                &run.repo_path,
+                &integration_worktree,
+                &run.integration_branch,
+                &run.base_sha,
+            )
+            .context("create integration worktree")?,
+            IntegrationMode::Existing => gitutil::worktree_add_existing(
+                &run.repo_path,
+                &integration_worktree,
+                &run.integration_branch,
+            )
+            .context("create existing integration worktree")?,
+        }
 
         let mut completed_slices = Vec::new();
         let mut checks = Vec::new();
         let mut dependency_summary = BTreeMap::new();
-
-        for slice in slices {
+        let mut completed_ids: BTreeSet<_> = self
+            .state
+            .get_slice_runs(&run.id)?
+            .into_iter()
+            .filter(|slice_run| slice_run.status == SliceStatus::Merged)
+            .map(|slice_run| slice_run.slice_id)
+            .collect();
+        for layer in artifact::dependency_layers(worker_slices)? {
             check_cancelled(cancel)?;
             let slice_base_sha = gitutil::head_sha(&integration_worktree)?;
-            let worker = self.run_slice_worker(
+            let outcomes = self.run_worker_layer(
                 run,
-                slice,
+                &layer,
                 &root_worktree,
                 &integration_worktree,
                 &slice_base_sha,
                 &dependency_summary,
                 cancel,
                 runner.clone(),
+                parallelism,
             )?;
-            gitutil::merge(
-                &integration_worktree,
-                &worker.branch,
-                &format!("khazad(slice:{}): merge {}", slice.id, slice.title),
-            )
-            .context("merge worker branch")?;
-            self.state.upsert_slice_run(&SliceRun {
-                run_id: run.id.clone(),
-                slice_id: slice.id.clone(),
-                status: SliceStatus::Merged,
-                branch: worker.branch,
-                commit_sha: worker.result.commit_sha.clone(),
-                attempts: worker.attempts,
-                last_error: String::new(),
-            })?;
-            self.state.record_event(
-                &run.id,
-                "slice_merged",
-                &json!({ "slice_id": slice.id, "commit_sha": worker.result.commit_sha }),
-            )?;
-            dependency_summary.insert(slice.id.clone(), worker.result.summary.clone());
-            checks.extend(worker.checks);
-            completed_slices.push(worker.result);
+            for worker in outcomes {
+                let slice = worker.slice.clone();
+                gitutil::merge(
+                    &integration_worktree,
+                    &worker.branch,
+                    &format!("khazad(slice:{}): merge {}", slice.id, slice.title),
+                )
+                .context("merge worker branch")?;
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: slice.id.clone(),
+                    status: SliceStatus::Merged,
+                    branch: worker.branch,
+                    commit_sha: worker.result.commit_sha.clone(),
+                    attempts: worker.attempts,
+                    last_error: String::new(),
+                })?;
+                self.state.record_event(
+                    &run.id,
+                    "slice_merged",
+                    &json!({ "slice_id": slice.id, "commit_sha": worker.result.commit_sha }),
+                )?;
+                dependency_summary.insert(slice.id.clone(), worker.result.summary.clone());
+                completed_ids.insert(slice.id.clone());
+                checks.extend(worker.checks);
+                completed_slices.push(worker.result);
+                self.write_checkpoint(run, gate_slices, &completed_ids, &integration_worktree)?;
+            }
         }
 
         check_cancelled(cancel)?;
         let repair = self.integration_repair(
             run,
-            slices,
+            gate_slices,
             &integration_worktree,
             &checks,
             cancel,
             runner.clone(),
         )?;
         check_cancelled(cancel)?;
-        let gate = self.integration_gate(slices, &integration_worktree, cancel)?;
+        let gate = self.integration_gate(gate_slices, &integration_worktree, cancel)?;
         let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         let summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -476,6 +735,103 @@ impl Manager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_worker_layer(
+        &self,
+        run: &Run,
+        layer: &[Slice],
+        root_worktree: &Path,
+        integration_worktree: &Path,
+        slice_base_sha: &str,
+        dependency_summary: &BTreeMap<String, String>,
+        cancel: &CancellationToken,
+        runner: Arc<dyn Runner>,
+        parallelism: usize,
+    ) -> Result<Vec<SliceWorkerOutcome>> {
+        if parallelism <= 1 || layer.len() <= 1 {
+            let mut outcomes = Vec::new();
+            for slice in layer {
+                outcomes.push(self.run_slice_worker(
+                    run,
+                    slice,
+                    root_worktree,
+                    integration_worktree,
+                    slice_base_sha,
+                    dependency_summary,
+                    cancel,
+                    runner.clone(),
+                )?);
+            }
+            return Ok(outcomes);
+        }
+
+        let mut queue: VecDeque<_> = layer.iter().cloned().collect();
+        let mut outcomes = Vec::new();
+        while !queue.is_empty() {
+            let batch: Vec<_> = (0..parallelism).filter_map(|_| queue.pop_front()).collect();
+            let mut handles = Vec::new();
+            for slice in batch {
+                let manager = self.clone();
+                let run = run.clone();
+                let root_worktree = root_worktree.to_path_buf();
+                let integration_worktree = integration_worktree.to_path_buf();
+                let slice_base_sha = slice_base_sha.to_string();
+                let dependency_summary = dependency_summary.clone();
+                let cancel = cancel.clone();
+                let runner = runner.clone();
+                handles.push(thread::spawn(move || {
+                    manager.run_slice_worker(
+                        &run,
+                        &slice,
+                        &root_worktree,
+                        &integration_worktree,
+                        &slice_base_sha,
+                        &dependency_summary,
+                        &cancel,
+                        runner,
+                    )
+                }));
+            }
+            for handle in handles {
+                outcomes.push(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow!("slice worker thread panicked"))??,
+                );
+            }
+        }
+        outcomes.sort_by(|a, b| a.slice.id.cmp(&b.slice.id));
+        Ok(outcomes)
+    }
+
+    fn write_checkpoint(
+        &self,
+        run: &Run,
+        all_slices: &[Slice],
+        completed_ids: &BTreeSet<String>,
+        integration_worktree: &Path,
+    ) -> Result<()> {
+        let current_sha = gitutil::head_sha(integration_worktree).unwrap_or_default();
+        let remaining_slices = all_slices
+            .iter()
+            .filter(|slice| !completed_ids.contains(&slice.id))
+            .map(|slice| slice.id.clone())
+            .collect();
+        let checkpoint = RunCheckpoint {
+            run_id: run.id.clone(),
+            integration_branch: run.integration_branch.clone(),
+            base_sha: run.base_sha.clone(),
+            current_sha,
+            completed_slices: completed_ids.iter().cloned().collect(),
+            remaining_slices,
+            updated_at: Utc::now(),
+        };
+        artifact::Store::new(&run.repo_path).write_checkpoint(&checkpoint)?;
+        self.state
+            .record_event(&run.id, "checkpoint_written", &checkpoint)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_slice_worker(
         &self,
         run: &Run,
@@ -490,13 +846,18 @@ impl Manager {
         let store = artifact::Store::new(&run.repo_path);
         let worker_worktree = root_worktree.join(&slice.id);
         let worker_branch = format!("khazad/{}/{}", run.id, slice.id);
-        gitutil::worktree_add(
-            &run.repo_path,
-            &worker_worktree,
-            &worker_branch,
-            &run.integration_branch,
-        )
-        .context("create worker worktree")?;
+        {
+            let _git_lock = WORKTREE_ADD_LOCK
+                .lock()
+                .expect("worktree add mutex poisoned");
+            gitutil::worktree_add(
+                &run.repo_path,
+                &worker_worktree,
+                &worker_branch,
+                slice_base_sha,
+            )
+            .context("create worker worktree")?;
+        }
 
         self.state.upsert_slice_run(&SliceRun {
             run_id: run.id.clone(),
@@ -598,6 +959,7 @@ impl Manager {
                     last_error: String::new(),
                 })?;
                 return Ok(SliceWorkerOutcome {
+                    slice: slice.clone(),
                     result: worker_result,
                     checks: all_checks,
                     branch: worker_branch,
@@ -727,25 +1089,27 @@ impl Manager {
             }
             check_cancelled(cancel)?;
             check.tests_run.push(command.clone());
-            let output = match run_shell_command(worker_worktree, command, cancel) {
-                Ok(output) => output,
-                Err(err) => {
-                    if cancel.is_cancelled() {
-                        return Err(CancelledError::new("run cancelled").into());
+            let output =
+                match run_shell_command(worker_worktree, command, cancel, verify_timeout(slice)) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        if cancel.is_cancelled() {
+                            return Err(CancelledError::new("run cancelled").into());
+                        }
+                        check.status = "failed".to_string();
+                        check.summary =
+                            format!("verify command failed or timed out: {command}: {err}");
+                        check.findings.push(Finding {
+                            id: String::new(),
+                            severity: "error".to_string(),
+                            action: "auto-fix".to_string(),
+                            file: String::new(),
+                            line: 0,
+                            description: check.summary.clone(),
+                        });
+                        return Ok(check);
                     }
-                    check.status = "failed".to_string();
-                    check.summary = format!("verify command failed to start: {command}: {err}");
-                    check.findings.push(Finding {
-                        id: String::new(),
-                        severity: "error".to_string(),
-                        action: "auto-fix".to_string(),
-                        file: String::new(),
-                        line: 0,
-                        description: check.summary.clone(),
-                    });
-                    return Ok(check);
-                }
-            };
+                };
             if !output.status.success() {
                 let combined = format!(
                     "{}{}",
@@ -869,13 +1233,17 @@ impl Manager {
         integration_worktree: &Path,
         cancel: &CancellationToken,
     ) -> Result<GateResult> {
-        let mut commands = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut commands: BTreeMap<String, Duration> = BTreeMap::new();
         for slice in slices {
             for command in &slice.verify {
-                if !command.trim().is_empty() && seen.insert(command.clone()) {
-                    commands.push(command.clone());
+                if command.trim().is_empty() {
+                    continue;
                 }
+                let timeout = verify_timeout(slice);
+                commands
+                    .entry(command.clone())
+                    .and_modify(|existing| *existing = (*existing).max(timeout))
+                    .or_insert(timeout);
             }
         }
         if commands.is_empty() {
@@ -889,9 +1257,9 @@ impl Manager {
 
         let mut results = Vec::new();
         let mut findings = Vec::new();
-        for command in commands {
+        for (command, timeout) in commands {
             check_cancelled(cancel)?;
-            let output = run_shell_command(integration_worktree, &command, cancel);
+            let output = run_shell_command(integration_worktree, &command, cancel, timeout);
             match output {
                 Ok(output) => {
                     let combined = format!(
@@ -932,7 +1300,7 @@ impl Manager {
                         file: String::new(),
                         line: 0,
                         description: format!(
-                            "integration gate command failed to start: {command}: {err}"
+                            "integration gate command failed to start or timed out: {command}: {err}"
                         ),
                     });
                     results.push(GateCommandResult {
@@ -983,6 +1351,7 @@ impl Manager {
 }
 
 struct SliceWorkerOutcome {
+    slice: Slice,
     result: WorkerResult,
     checks: Vec<CheckResult>,
     branch: String,
@@ -994,6 +1363,146 @@ fn sh_quote(value: &str) -> String {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssue {
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    url: String,
+}
+
+fn fetch_github_issue(issue: &str) -> Result<GithubIssue> {
+    let output = Command::new("gh")
+        .args(["issue", "view", issue, "--json", "title,body,url"])
+        .output()
+        .with_context(|| "run gh issue view")?;
+    if !output.status.success() {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        bail!("gh issue view failed: {}", combined.trim());
+    }
+    let mut parsed: GithubIssue = serde_json::from_slice(&output.stdout)
+        .with_context(|| "parse gh issue view JSON output")?;
+    if parsed.url.trim().is_empty() {
+        parsed.url = issue.to_string();
+    }
+    Ok(parsed)
+}
+
+fn slug_slice_id(title: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "slice-imported-issue".to_string()
+    } else if slug.starts_with("slice-") {
+        slug
+    } else {
+        format!("slice-{slug}")
+    }
+}
+
+fn first_meaningful_paragraph(body: &str) -> Option<String> {
+    body.split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .filter(|paragraph| !paragraph.starts_with('#'))
+        .filter(|paragraph| !paragraph.starts_with("- ["))
+        .map(|paragraph| {
+            paragraph
+                .lines()
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .find(|paragraph| !paragraph.is_empty())
+}
+
+fn acceptance_from_issue_body(body: &str) -> Vec<String> {
+    let criteria: Vec<_> = body
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            for prefix in ["- [ ]", "- [x]", "- [X]", "* [ ]", "* [x]", "* [X]"] {
+                if let Some(rest) = line.strip_prefix(prefix) {
+                    let criterion = rest.trim();
+                    if !criterion.is_empty() {
+                        return Some(criterion.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    if criteria.is_empty() {
+        vec!["Issue acceptance criteria are satisfied.".to_string()]
+    } else {
+        criteria
+    }
+}
+
+fn run_handoff_command(
+    action: &str,
+    cwd: &str,
+    args: &[&str],
+    display_command: &str,
+) -> Result<HandoffActionResult> {
+    run_external_command(action, cwd, "git", args, display_command)
+}
+
+fn run_external_command(
+    action: &str,
+    cwd: &str,
+    program: &str,
+    args: &[&str],
+    display_command: &str,
+) -> Result<HandoffActionResult> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("run handoff action {action}"))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        bail!("handoff action {action} failed: {}", combined.trim());
+    }
+    Ok(HandoffActionResult {
+        action: action.to_string(),
+        command: display_command.to_string(),
+        status: "passed".to_string(),
+        exit_code: output.status.code(),
+        output: combined.trim().to_string(),
+    })
+}
+
+fn verify_timeout(slice: &Slice) -> Duration {
+    let seconds = if slice.verify_timeout_seconds == 0 {
+        DEFAULT_VERIFY_TIMEOUT_SECONDS
+    } else {
+        slice.verify_timeout_seconds
+    };
+    Duration::from_secs(seconds)
 }
 
 fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
@@ -1012,7 +1521,12 @@ fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
     Ok(lines[keep_from..].to_vec())
 }
 
-fn run_shell_command(cwd: &Path, command: &str, cancel: &CancellationToken) -> Result<Output> {
+fn run_shell_command(
+    cwd: &Path,
+    command: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<Output> {
     let mut process = Command::new("sh");
     process
         .arg("-c")
@@ -1032,10 +1546,16 @@ fn run_shell_command(cwd: &Path, command: &str, cancel: &CancellationToken) -> R
         });
     }
     let mut child = process.spawn()?;
+    let started_at = Instant::now();
     loop {
         if cancel.is_cancelled() {
             terminate_process_group(&mut child);
             return Err(CancelledError::new("run cancelled").into());
+        }
+        if started_at.elapsed() >= timeout {
+            terminate_process_group(&mut child);
+            let _ = child.wait();
+            bail!("command timed out after {} seconds", timeout.as_secs());
         }
         if child.try_wait()?.is_some() {
             return Ok(child.wait_with_output()?);
@@ -1247,6 +1767,7 @@ mod tests {
             acceptance: vec!["done".to_string()],
             must_ask_if: Vec::new(),
             verify: Vec::new(),
+            verify_timeout_seconds: 0,
         }
     }
 
@@ -1280,6 +1801,17 @@ mod tests {
     }
 
     #[test]
+    fn shell_command_timeout_returns_promptly() -> Result<()> {
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let err = run_shell_command(Path::new("."), "sleep 30", &cancel, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[test]
     fn shell_command_cancellation_returns_promptly() -> Result<()> {
         let cancel = CancellationToken::new();
         let thread_cancel = cancel.clone();
@@ -1288,7 +1820,8 @@ mod tests {
             thread_cancel.cancel();
         });
         let started = Instant::now();
-        let err = run_shell_command(Path::new("."), "sleep 30", &cancel).unwrap_err();
+        let err = run_shell_command(Path::new("."), "sleep 30", &cancel, Duration::from_secs(30))
+            .unwrap_err();
         assert!(err.to_string().contains("run cancelled"));
         assert!(started.elapsed() < Duration::from_secs(5));
         Ok(())
@@ -1350,6 +1883,50 @@ mod tests {
     }
 
     #[test]
+    fn fake_runner_parallelizes_independent_slices() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        let mut second = slice("slice-002");
+        second.verify = vec!["test -f slice-002.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
+        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slices"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: Vec::new(),
+            all: true,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 2,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert_eq!(slice_runs.len(), 2);
+        assert!(
+            slice_runs
+                .iter()
+                .all(|slice_run| slice_run.status == SliceStatus::Merged)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -1379,6 +1956,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            parallelism: 1,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -1422,7 +2000,7 @@ mod tests {
                 .repo_worktree_dir(&completed.repo_id, &run.id)
                 .exists()
         );
-        let handoff = manager.branch_handoff(&run.id)?;
+        let handoff = manager.branch_handoff(&run.id, false, false)?;
         assert_eq!(handoff.integration_branch, completed.integration_branch);
         assert!(handoff.push_command.contains(&completed.integration_branch));
         assert!(handoff.pr_command.contains("gh pr create"));

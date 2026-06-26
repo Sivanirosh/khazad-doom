@@ -45,6 +45,21 @@ pub struct StartRunParams {
     pub pi_bin: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pi_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parallelism: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeRunParams {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pi_bin: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pi_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parallelism: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,8 +97,40 @@ pub struct SlicesParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceNewParams {
+    pub repo_path: String,
+    pub id: String,
+    pub title: String,
+    pub goal: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub github_issue: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceImportGithubParams {
+    pub repo_path: String,
+    pub issue: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffParams {
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub push: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_pr: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

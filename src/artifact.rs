@@ -1,6 +1,6 @@
 use crate::domain::{
-    ArtifactEntry, Handoff, ImplementationSummary, Slice, SliceSummary, SliceValidationIssue,
-    SliceValidationReport,
+    ArtifactEntry, Handoff, ImplementationSummary, RunCheckpoint, Slice, SliceSummary,
+    SliceValidationIssue, SliceValidationReport, SliceWriteResult,
 };
 use crate::gitutil;
 use anyhow::{Context, Result, bail};
@@ -186,6 +186,35 @@ impl Store {
         self.output_dir(run_id).join(name)
     }
 
+    pub fn slice_path(&self, slice_id: &str) -> PathBuf {
+        self.slices_dir().join(format!("{slice_id}.json"))
+    }
+
+    pub fn write_slice(&self, slice: &Slice, overwrite: bool) -> Result<SliceWriteResult> {
+        validate_slice(slice)?;
+        self.ensure_layout()?;
+        let path = self.slice_path(&slice.id);
+        if path.exists() && !overwrite {
+            bail!("slice {:?} already exists at {}", slice.id, path.display());
+        }
+        write_json(&path, slice)?;
+        Ok(SliceWriteResult {
+            slice: slice.clone(),
+            path: path.to_string_lossy().to_string(),
+            written: true,
+        })
+    }
+
+    pub fn write_checkpoint(&self, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
+        let path = self.output_path(&checkpoint.run_id, "checkpoint.json");
+        write_json(&path, checkpoint)?;
+        Ok(path)
+    }
+
+    pub fn read_checkpoint(&self, run_id: &str) -> Result<RunCheckpoint> {
+        read_json(self.output_path(run_id, "checkpoint.json"))
+    }
+
     pub fn write_implementation_summary(&self, summary: &ImplementationSummary) -> Result<PathBuf> {
         let path = self
             .reports_dir()
@@ -239,6 +268,9 @@ pub fn validate_slice(slice: &Slice) -> Result<()> {
     if slice.acceptance.is_empty() {
         bail!("acceptance must contain at least one criterion");
     }
+    if slice.verify_timeout_seconds > 86_400 {
+        bail!("verify_timeout_seconds must be <= 86400");
+    }
     for dep in &slice.depends_on {
         if !is_safe_slice_id(dep) {
             bail!("dependency id {dep:?} is not path/ref safe");
@@ -284,14 +316,7 @@ pub fn topological_order(slices: &[Slice], requested: &[String]) -> Result<Vec<S
         .iter()
         .map(|slice| (slice.id.as_str(), slice))
         .collect();
-    let mut wanted = BTreeSet::new();
-    if requested.is_empty() {
-        wanted.extend(slices.iter().map(|slice| slice.id.clone()));
-    } else {
-        for id in requested {
-            collect_with_dependencies(id, &by_id, &mut wanted)?;
-        }
-    }
+    let wanted = wanted_slice_ids(slices, requested, &by_id)?;
 
     let mut ordered = Vec::new();
     let mut visiting = HashSet::new();
@@ -307,6 +332,58 @@ pub fn topological_order(slices: &[Slice], requested: &[String]) -> Result<Vec<S
         )?;
     }
     Ok(ordered.into_iter().cloned().collect())
+}
+
+pub fn dependency_layers(slices: &[Slice]) -> Result<Vec<Vec<Slice>>> {
+    let mut pending: BTreeMap<String, Slice> = slices
+        .iter()
+        .map(|slice| (slice.id.clone(), slice.clone()))
+        .collect();
+    let selected: BTreeSet<_> = pending.keys().cloned().collect();
+    let mut completed = BTreeSet::new();
+    let mut layers = Vec::new();
+    while !pending.is_empty() {
+        let ready_ids: Vec<_> = pending
+            .values()
+            .filter(|slice| {
+                slice
+                    .depends_on
+                    .iter()
+                    .filter(|dep| selected.contains(*dep))
+                    .all(|dep| completed.contains(dep))
+            })
+            .map(|slice| slice.id.clone())
+            .collect();
+        if ready_ids.is_empty() {
+            bail!("slice dependency cycle or missing dependency in selected set");
+        }
+        let mut layer = Vec::new();
+        for id in ready_ids {
+            if let Some(slice) = pending.remove(&id) {
+                completed.insert(id);
+                layer.push(slice);
+            }
+        }
+        layer.sort_by(|a, b| a.id.cmp(&b.id));
+        layers.push(layer);
+    }
+    Ok(layers)
+}
+
+fn wanted_slice_ids<'a>(
+    slices: &[Slice],
+    requested: &[String],
+    by_id: &BTreeMap<&'a str, &'a Slice>,
+) -> Result<BTreeSet<String>> {
+    let mut wanted = BTreeSet::new();
+    if requested.is_empty() {
+        wanted.extend(slices.iter().map(|slice| slice.id.clone()));
+    } else {
+        for id in requested {
+            collect_with_dependencies(id, by_id, &mut wanted)?;
+        }
+    }
+    Ok(wanted)
 }
 
 fn collect_with_dependencies<'a>(
@@ -526,7 +603,7 @@ fn issue_for_path(path: &Path, slice_id: &str, message: String) -> SliceValidati
 
 #[cfg(test)]
 mod tests {
-    use super::{Slice, topological_order, validate_slice, validate_slice_set};
+    use super::{Slice, dependency_layers, topological_order, validate_slice, validate_slice_set};
 
     fn valid_slice(id: &str) -> Slice {
         Slice {
@@ -539,6 +616,7 @@ mod tests {
             acceptance: vec!["done".to_string()],
             must_ask_if: Vec::new(),
             verify: Vec::new(),
+            verify_timeout_seconds: 0,
         }
     }
 
@@ -577,5 +655,19 @@ mod tests {
         let ordered = topological_order(&[second, first], &["slice-002".to_string()]).unwrap();
         let ids: Vec<_> = ordered.iter().map(|slice| slice.id.as_str()).collect();
         assert_eq!(ids, ["slice-001", "slice-002"]);
+    }
+
+    #[test]
+    fn dependency_layers_group_independent_slices() {
+        let first = valid_slice("slice-001");
+        let second = valid_slice("slice-002");
+        let mut third = valid_slice("slice-003");
+        third.depends_on = vec!["slice-001".to_string(), "slice-002".to_string()];
+        let layers = dependency_layers(&[third, second, first]).unwrap();
+        let ids: Vec<Vec<_>> = layers
+            .iter()
+            .map(|layer| layer.iter().map(|slice| slice.id.as_str()).collect())
+            .collect();
+        assert_eq!(ids, vec![vec!["slice-001", "slice-002"], vec!["slice-003"]]);
     }
 }

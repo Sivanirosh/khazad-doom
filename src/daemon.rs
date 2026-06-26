@@ -1,12 +1,13 @@
-use crate::domain::{BranchHandoff, Run, RunDetails, RunInspection};
+use crate::domain::{BranchHandoff, Run, RunDetails, RunInspection, SliceWriteResult};
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
-    InspectRunParams, ListSlicesResult, Request, Response, SlicesParams, StartRunParams,
-    StartRunResult, StatusParams,
+    InspectRunParams, ListSlicesResult, Request, Response, ResumeRunParams,
+    SliceImportGithubParams, SliceNewParams, SlicesParams, StartRunParams, StartRunResult,
+    StatusParams,
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
-use crate::workflow::{Manager, StartOptions};
+use crate::workflow::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -191,6 +192,7 @@ impl Server {
                     agent: params.agent,
                     pi_bin: params.pi_bin,
                     pi_args: params.pi_args,
+                    parallelism: params.parallelism,
                 })?;
                 Ok(HandleOutcome::result(StartRunResult { run_id: run.id })?)
             }
@@ -224,6 +226,17 @@ impl Server {
                     active,
                 })?)
             }
+            "resumeRun" => {
+                let params: ResumeRunParams = decode_params(raw)?;
+                let run = self.manager.resume_run(ResumeOptions {
+                    run_id: params.run_id,
+                    agent: params.agent,
+                    pi_bin: params.pi_bin,
+                    pi_args: params.pi_args,
+                    parallelism: params.parallelism,
+                })?;
+                Ok(HandleOutcome::result(StartRunResult { run_id: run.id })?)
+            }
             "listSlices" => {
                 let params: SlicesParams = decode_params(raw)?;
                 let report = self
@@ -234,9 +247,37 @@ impl Server {
                     issues: report.issues,
                 })?)
             }
+            "createSlice" => {
+                let params: SliceNewParams = decode_params(raw)?;
+                let result: SliceWriteResult = self.manager.create_slice(SliceDraft {
+                    repo_path: PathBuf::from(params.repo_path),
+                    id: params.id,
+                    title: params.title,
+                    goal: params.goal,
+                    github_issue: params.github_issue,
+                    acceptance: params.acceptance,
+                    verify: params.verify,
+                    overwrite: params.overwrite,
+                })?;
+                Ok(HandleOutcome::result(result)?)
+            }
+            "importGithubIssue" => {
+                let params: SliceImportGithubParams = decode_params(raw)?;
+                let result: SliceWriteResult =
+                    self.manager.import_github_issue(GithubImportOptions {
+                        repo_path: PathBuf::from(params.repo_path),
+                        issue: params.issue,
+                        id: params.id,
+                        verify: params.verify,
+                        overwrite: params.overwrite,
+                    })?;
+                Ok(HandleOutcome::result(result)?)
+            }
             "handoffRun" => {
                 let params: HandoffParams = decode_params(raw)?;
-                let handoff: BranchHandoff = self.manager.branch_handoff(&params.run_id)?;
+                let handoff: BranchHandoff =
+                    self.manager
+                        .branch_handoff(&params.run_id, params.push, params.create_pr)?;
                 Ok(HandleOutcome::result(handoff)?)
             }
             "inspectRun" => {
