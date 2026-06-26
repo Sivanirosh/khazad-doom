@@ -24,6 +24,30 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Serialize)]
+struct RunStartOutput {
+    pub run_id: String,
+    pub repo_path: String,
+    pub monitor_command: String,
+    pub run_monitor_command: String,
+}
+
+impl RunStartOutput {
+    fn new(run_id: String, repo_path: String) -> Self {
+        let monitor_command = format!(
+            "khazad-doom monitor --repo {} --latest",
+            shell_quote_arg(&repo_path)
+        );
+        let run_monitor_command = format!("khazad-doom monitor --run {}", shell_quote_arg(&run_id));
+        Self {
+            run_id,
+            repo_path,
+            monitor_command,
+            run_monitor_command,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "khazad-doom", about = "Khazad-Doom — You shall not slop.")]
 struct Cli {
@@ -303,12 +327,13 @@ fn run_start(
     };
     let runner = RunnerSpec::from_agent_and_env(&effective_agent)?;
     let parallel = effective_cli_parallelism(parallel, config.parallelism);
+    let repo_path = repo.to_string_lossy().to_string();
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
     let result: StartRunResult = client.call(
         "startRun",
         &StartRunParams {
-            repo_path: repo.to_string_lossy().to_string(),
+            repo_path: repo_path.clone(),
             slice_id: String::new(),
             slice_ids: slices,
             all,
@@ -318,10 +343,11 @@ fn run_start(
             parallelism: parallel,
         },
     )?;
+    let output = RunStartOutput::new(result.run_id, repo_path);
     if !wait {
-        return print_json(&result);
+        return print_json(&output);
     }
-    wait_run(&client, &result.run_id)
+    wait_run(&client, &output.run_id)
 }
 
 fn run_resume(
@@ -1139,6 +1165,30 @@ fn wait_run(client: &Client, run_id: &str) -> Result<()> {
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn shell_quote_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'/'
+                | b'.'
+                | b'_'
+                | b'-'
+                | b':'
+                | b','
+                | b'='
+        )
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn effective_cli_parallelism(requested: usize, configured: usize) -> usize {

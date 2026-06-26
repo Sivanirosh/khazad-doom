@@ -77,16 +77,18 @@ khazad-doom slices new \
   --goal "Add bounded retries for transient job failures" \
   --verify "cargo test"
 khazad-doom slices validate
+
+# Optional live dashboard in another terminal from this repo:
+khazad-doom monitor --repo . --latest
+
 khazad-doom run --slice slice-001
-khazad-doom watch --run <run-id>
 khazad-doom handoff --run <run-id>
 ```
 
-For a deterministic smoke test that does not invoke Pi:
+For a deterministic smoke test that does not invoke Pi, keep the same dashboard open and run:
 
 ```bash
 khazad-doom run --agent fake --all
-khazad-doom watch --run <run-id>
 ```
 
 ## Issue Slices
@@ -129,10 +131,24 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Structured output | Worker and repair results must be machine-readable JSON. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
-| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `watch`, and Pi adapters. |
+| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `monitor`, `watch`, and optional Pi adapters. |
 | Durable checkpoints | `resume` continues remaining work from recorded state instead of pretending nothing happened. |
 | Conflict artifacts | Merge conflicts become structured blocked reports, not half-merged chaos. |
 | Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
+
+## Live progress
+
+The recommended harness-neutral live progress path is an always-on monitor:
+
+```bash
+khazad-doom monitor --repo . --latest
+```
+
+`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while any harness starts daemon-owned runs normally. Khazad-Doom does not auto-open external windows by default.
+
+Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so a harness can display those commands directly instead of guessing how to launch user-visible progress.
+
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. A Pi extension can be an optional adapter over the same daemon state, but it is not required and does not own core workflow state.
 
 ## Commands
 
@@ -151,7 +167,9 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |
 | `khazad-doom status --run <id> --follow` | Follow compact live progress until the run reaches a terminal state. |
-| `khazad-doom watch --run <id>` | Same live monitor as `status --follow`; intended for long daemon-owned runs. |
+| `khazad-doom monitor --repo . --latest` | Open the dashboard TUI for the latest active run in this repo. |
+| `khazad-doom monitor --run <id>` | Open the dashboard TUI for one specific run. |
+| `khazad-doom watch --run <id>` | Plain text fallback for one specific run. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
 | `khazad-doom handoff --run <id>` | Print push/PR handoff JSON for a completed run. |
