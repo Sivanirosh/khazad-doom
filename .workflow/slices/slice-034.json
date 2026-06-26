@@ -1,0 +1,26 @@
+{
+  "id": "slice-034",
+  "title": "Harness-neutral terminal monitor",
+  "goal": "Add a robust khazad-doom monitor command that renders an attachable terminal dashboard for either a specific run or the latest active run in a repo.",
+  "depends_on": [
+    "slice-033"
+  ],
+  "areas": [
+    "src/cli.rs",
+    "src/ipc.rs",
+    "src/daemon.rs",
+    "src/state.rs",
+    "tests/daemon_integration.rs"
+  ],
+  "acceptance": [
+    "khazad-doom monitor --repo . --latest waits for runs, auto-attaches to the newest active run, keeps showing terminal summaries, and continues waiting for future runs until Ctrl-C.",
+    "khazad-doom monitor --run <run-id> follows a specific run and exits successfully only when that run completes; failed/blocked/cancelled/interrupted statuses return an error.",
+    "The dashboard is stable and compact, showing run id/status, phase, slice, command, elapsed time, message, recent events, and bounded output tail without cancelling runs on monitor exit.",
+    "A non-looping --once mode exists for tests/scripts and renders the same monitor snapshot once.",
+    "watch/status --follow remain available as simple text fallback commands."
+  ],
+  "must_ask_if": [
+    "The implementation would attempt to auto-open OS windows, tmux panes, or external terminals."
+  ],
+  "verify_profile": "quick"
+}

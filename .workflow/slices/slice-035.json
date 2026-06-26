@@ -1,0 +1,24 @@
+{
+  "id": "slice-035",
+  "title": "Document always-on monitor UX",
+  "goal": "Update Khazad-Doom docs and skill instructions around the simple always-on monitor path: users start monitor --latest wherever they want, while any harness starts daemon-owned runs normally.",
+  "depends_on": [
+    "slice-034"
+  ],
+  "areas": [
+    "README.md",
+    "skills/khazad-doom/SKILL.md",
+    "src/cli.rs"
+  ],
+  "acceptance": [
+    "README explains TUI as terminal user interface and recommends khazad-doom monitor --repo . --latest as the harness-neutral live progress path.",
+    "README distinguishes watch as plain fallback, monitor as dashboard, and Pi extension as an optional adapter, not core workflow state.",
+    "The skill tells Pi to recommend or use monitor --latest for user-visible progress and not to rely on blocking --wait for real Pi runs.",
+    "khazad-doom run JSON includes enough information for any harness to present the monitor command without guessing environment-specific launch behavior.",
+    "Docs explicitly say Khazad-Doom does not auto-open external windows by default."
+  ],
+  "must_ask_if": [
+    "The implementation would make Pi-specific UI required for normal monitoring."
+  ],
+  "verify_profile": "quick"
+}
