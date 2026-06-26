@@ -1,13 +1,17 @@
-use super::{REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, integration_repair_prompt, worker_prompt};
+use super::gate::{IntegrationGateRequest, SliceVerificationRequest, WorkflowGate};
+use super::{
+    CancelledError, REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, check_cancelled,
+    integration_repair_prompt, worker_prompt,
+};
 use crate::agent::{
     CancellationToken, Job, Runner, RunnerEvent, RunnerEventSink, RunnerSpec, runner_from_spec,
 };
 use crate::artifact;
 use crate::domain::{
-    BranchHandoff, CheckResult, Finding, GateCommandResult, GateResult, Handoff,
-    HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
-    RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceRun, SliceStatus,
-    SliceValidationReport, SliceWriteResult, VerifyCommand, WorkerResult, WorkflowConfig,
+    BranchHandoff, CheckResult, Finding, Handoff, HandoffActionResult, HandoffDiagnostics,
+    ImplementationSummary, MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection,
+    RunStatus, Slice, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
+    WorkflowConfig,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -21,9 +25,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -32,10 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const MAX_REPAIR_ATTEMPTS: usize = 3;
-pub const DEFAULT_VERIFY_TIMEOUT_SECONDS: u64 = 600;
-const PROGRESS_OUTPUT_TAIL_BYTES: usize = 4_000;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
-type ShellProgress = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct Manager {
@@ -174,22 +174,6 @@ impl Manager {
         self.progress_reporter(run_id).mark(&ProgressScope::new(
             phase, slice_id, attempt, command, message,
         ));
-    }
-
-    fn shell_progress_sink(
-        &self,
-        run_id: &str,
-        phase: &str,
-        slice_id: &str,
-        attempt: usize,
-        command: &str,
-        message: &str,
-    ) -> ShellProgress {
-        let reporter = self.progress_reporter(run_id);
-        let scope = ProgressScope::new(phase, slice_id, attempt, command, message);
-        Arc::new(move |output_tail| {
-            reporter.update_output_tail(&scope, &output_tail);
-        })
     }
 
     fn worker_event_sink(&self, context: &WorkerAttemptContext) -> RunnerEventSink {
@@ -992,8 +976,14 @@ impl Manager {
             "",
             "running integration gate commands",
         );
-        let gate =
-            self.integration_gate(run, gate_slices, &integration_worktree, cancel, &config)?;
+        let gate = WorkflowGate::new(self.progress_reporter(&run.id)).run_integration_gate(
+            IntegrationGateRequest {
+                slices: gate_slices,
+                integration_worktree: &integration_worktree,
+                config: &config,
+            },
+            cancel,
+        )?;
         let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         let summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -1414,80 +1404,22 @@ impl Manager {
             return Ok(check);
         }
 
-        for command in effective_verify_commands(ctx.slice, ctx.config)? {
-            if command.command.trim().is_empty() {
-                continue;
-            }
-            check_cancelled(cancel)?;
-            check.tests_run.push(command.command.clone());
-            let cwd = verify_command_cwd(ctx.worker_worktree, &command)?;
-            self.mark_progress(
-                ctx.run_id,
-                "worker_verify",
-                &ctx.slice.id,
-                ctx.attempt,
-                &command.command,
-                "running slice verification command",
-            );
-            let progress = self.shell_progress_sink(
-                ctx.run_id,
-                "worker_verify",
-                &ctx.slice.id,
-                ctx.attempt,
-                &command.command,
-                "running slice verification command",
-            );
-            let output = match run_shell_command(
-                &cwd,
-                &command.command,
+        let verification = WorkflowGate::new(self.progress_reporter(ctx.run_id))
+            .verify_slice_commands(
+                SliceVerificationRequest {
+                    slice: ctx.slice,
+                    worker_worktree: ctx.worker_worktree,
+                    attempt: ctx.attempt,
+                    config: ctx.config,
+                },
                 cancel,
-                verify_command_timeout(ctx.slice, &command, ctx.config),
-                &command.env,
-                Some(progress),
-            ) {
-                Ok(output) => output,
-                Err(err) => {
-                    if cancel.is_cancelled() {
-                        return Err(CancelledError::new("run cancelled").into());
-                    }
-                    check.status = "failed".to_string();
-                    check.summary = format!(
-                        "verify command failed or timed out: {}: {err}",
-                        command.command
-                    );
-                    check.findings.push(Finding {
-                        id: String::new(),
-                        severity: "error".to_string(),
-                        action: "auto-fix".to_string(),
-                        file: String::new(),
-                        line: 0,
-                        description: check.summary.clone(),
-                    });
-                    return Ok(check);
-                }
-            };
-            if !output.status.success() {
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                check.status = "failed".to_string();
-                check.summary = format!(
-                    "verify command failed: {}\n{}",
-                    command.command,
-                    combined.trim()
-                );
-                check.findings.push(Finding {
-                    id: String::new(),
-                    severity: "error".to_string(),
-                    action: "auto-fix".to_string(),
-                    file: String::new(),
-                    line: 0,
-                    description: check.summary.clone(),
-                });
-                return Ok(check);
-            }
+            )?;
+        check.tests_run = verification.tests_run;
+        if let Some(failure) = verification.failure {
+            check.status = "failed".to_string();
+            check.summary = failure.summary;
+            check.findings.push(failure.finding);
+            return Ok(check);
         }
         Ok(check)
     }
@@ -1594,135 +1526,6 @@ impl Manager {
             MAX_REPAIR_ATTEMPTS,
             last_error
         ))
-    }
-
-    fn integration_gate(
-        &self,
-        run: &Run,
-        slices: &[Slice],
-        integration_worktree: &Path,
-        cancel: &CancellationToken,
-        config: &WorkflowConfig,
-    ) -> Result<GateResult> {
-        let mut commands: BTreeMap<String, VerifyCommand> = BTreeMap::new();
-        for slice in slices {
-            for command in effective_verify_commands(slice, config)? {
-                if command.command.trim().is_empty() {
-                    continue;
-                }
-                let key = verify_command_key(&command);
-                commands
-                    .entry(key)
-                    .and_modify(|existing| {
-                        if command.timeout_seconds > existing.timeout_seconds {
-                            existing.timeout_seconds = command.timeout_seconds;
-                        }
-                    })
-                    .or_insert(command);
-            }
-        }
-        if commands.is_empty() {
-            return Ok(GateResult {
-                status: "passed".to_string(),
-                summary: "no integration gate commands configured".to_string(),
-                commands: Vec::new(),
-                findings: Vec::new(),
-            });
-        }
-
-        let mut results = Vec::new();
-        let mut findings = Vec::new();
-        for (_, command) in commands {
-            check_cancelled(cancel)?;
-            let cwd = verify_command_cwd(integration_worktree, &command)?;
-            self.mark_progress(
-                &run.id,
-                "integration_gate",
-                "",
-                0,
-                &command.command,
-                "running integration gate command",
-            );
-            let progress = self.shell_progress_sink(
-                &run.id,
-                "integration_gate",
-                "",
-                0,
-                &command.command,
-                "running integration gate command",
-            );
-            let output = run_shell_command(
-                &cwd,
-                &command.command,
-                cancel,
-                verify_command_timeout_for_command(&command, config),
-                &command.env,
-                Some(progress),
-            );
-            match output {
-                Ok(output) => {
-                    let combined = format!(
-                        "{}{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    let status = if output.status.success() {
-                        "passed"
-                    } else {
-                        "failed"
-                    };
-                    if !output.status.success() {
-                        findings.push(Finding {
-                            id: String::new(),
-                            severity: "error".to_string(),
-                            action: "auto-fix".to_string(),
-                            file: String::new(),
-                            line: 0,
-                            description: format!("integration gate failed: {}", command.command),
-                        });
-                    }
-                    results.push(GateCommandResult {
-                        command: command.command,
-                        status: status.to_string(),
-                        exit_code: output.status.code(),
-                        output: combined.trim().to_string(),
-                    });
-                }
-                Err(err) => {
-                    if cancel.is_cancelled() {
-                        return Err(CancelledError::new("run cancelled").into());
-                    }
-                    findings.push(Finding {
-                        id: String::new(),
-                        severity: "error".to_string(),
-                        action: "auto-fix".to_string(),
-                        file: String::new(),
-                        line: 0,
-                        description: format!(
-                            "integration gate command failed to start or timed out: {}: {err}",
-                            command.command
-                        ),
-                    });
-                    results.push(GateCommandResult {
-                        command: command.command,
-                        status: "failed".to_string(),
-                        exit_code: None,
-                        output: err.to_string(),
-                    });
-                }
-            }
-        }
-        let failed = results.iter().any(|result| result.status != "passed");
-        Ok(GateResult {
-            status: if failed { "failed" } else { "passed" }.to_string(),
-            summary: if failed {
-                "one or more integration gate commands failed".to_string()
-            } else {
-                "integration gate passed".to_string()
-            },
-            commands: results,
-            findings,
-        })
     }
 
     fn write_merge_conflict_report(
@@ -2032,79 +1835,6 @@ fn effective_parallelism(requested: usize, config: &WorkflowConfig) -> usize {
     }
 }
 
-fn effective_verify_commands(slice: &Slice, config: &WorkflowConfig) -> Result<Vec<VerifyCommand>> {
-    let mut commands = Vec::new();
-    if !slice.verify_profile.trim().is_empty() {
-        let profile = config
-            .verify_profiles
-            .get(&slice.verify_profile)
-            .ok_or_else(|| {
-                anyhow!(
-                    "slice {} references missing verify_profile {:?}",
-                    slice.id,
-                    slice.verify_profile
-                )
-            })?;
-        commands.extend(profile.commands.clone());
-    }
-    commands.extend(slice.verify.iter().cloned().map(|command| VerifyCommand {
-        command,
-        timeout_seconds: slice.verify_timeout_seconds,
-        cwd: String::new(),
-        env: BTreeMap::new(),
-    }));
-    Ok(commands)
-}
-
-fn verify_command_timeout(
-    slice: &Slice,
-    command: &VerifyCommand,
-    config: &WorkflowConfig,
-) -> Duration {
-    if command.timeout_seconds > 0 {
-        Duration::from_secs(command.timeout_seconds)
-    } else if slice.verify_timeout_seconds > 0 {
-        Duration::from_secs(slice.verify_timeout_seconds)
-    } else {
-        verify_command_timeout_for_command(command, config)
-    }
-}
-
-fn verify_command_timeout_for_command(
-    command: &VerifyCommand,
-    config: &WorkflowConfig,
-) -> Duration {
-    let seconds = if command.timeout_seconds > 0 {
-        command.timeout_seconds
-    } else if config.verify_timeout_seconds > 0 {
-        config.verify_timeout_seconds
-    } else {
-        DEFAULT_VERIFY_TIMEOUT_SECONDS
-    };
-    Duration::from_secs(seconds)
-}
-
-fn verify_command_cwd(root: &Path, command: &VerifyCommand) -> Result<PathBuf> {
-    if command.cwd.trim().is_empty() || command.cwd.trim() == "." {
-        return Ok(root.to_path_buf());
-    }
-    let cwd = Path::new(&command.cwd);
-    if cwd.is_absolute() || command.cwd.contains("..") {
-        bail!("verify command cwd must be repo-relative and may not contain '..'");
-    }
-    Ok(root.join(cwd))
-}
-
-fn verify_command_key(command: &VerifyCommand) -> String {
-    let env = command
-        .env
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(";");
-    format!("{}\0{}\0{}", command.cwd, env, command.command)
-}
-
 fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
     if line_count == 0 || !path.exists() {
         return Ok(Vec::new());
@@ -2119,195 +1849,6 @@ fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
     let lines: Vec<_> = text.lines().map(str::to_string).collect();
     let keep_from = lines.len().saturating_sub(line_count);
     Ok(lines[keep_from..].to_vec())
-}
-
-fn run_shell_command(
-    cwd: &Path,
-    command: &str,
-    cancel: &CancellationToken,
-    timeout: Duration,
-    env: &BTreeMap<String, String>,
-    progress: Option<ShellProgress>,
-) -> Result<Output> {
-    let mut process = Command::new("sh");
-    process
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .envs(env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Create a process group for the shell and its children so cancellation can
-    // kill a hanging verify/gate command instead of only killing the shell.
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-    let mut child = process.spawn()?;
-    let stdout = child.stdout.take().context("command stdout")?;
-    let stderr = child.stderr.take().context("command stderr")?;
-    let monitor = ShellCommandMonitor::spawn(stdout, stderr, progress);
-
-    let started_at = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    let status = loop {
-        if cancel.is_cancelled() {
-            terminate_process_group(&mut child);
-            let _ = monitor.finish();
-            return Err(CancelledError::new("run cancelled").into());
-        }
-        if !timeout.is_zero() && started_at.elapsed() >= timeout {
-            terminate_process_group(&mut child);
-            let _ = monitor.finish();
-            bail!("command timed out after {} seconds", timeout.as_secs());
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
-            monitor.emit_progress();
-            last_heartbeat = Instant::now();
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-    let (stdout, stderr) = monitor.finish();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-struct ShellCommandMonitor {
-    stdout_buf: Arc<Mutex<Vec<u8>>>,
-    stderr_buf: Arc<Mutex<Vec<u8>>>,
-    combined_tail: Arc<Mutex<Vec<u8>>>,
-    progress: Option<ShellProgress>,
-    stdout_thread: thread::JoinHandle<()>,
-    stderr_thread: thread::JoinHandle<()>,
-}
-
-impl ShellCommandMonitor {
-    fn spawn(
-        stdout: impl Read + Send + 'static,
-        stderr: impl Read + Send + 'static,
-        progress: Option<ShellProgress>,
-    ) -> Self {
-        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-        let combined_tail = Arc::new(Mutex::new(Vec::new()));
-        let stdout_thread = spawn_output_reader(
-            stdout,
-            stdout_buf.clone(),
-            combined_tail.clone(),
-            progress.clone(),
-        );
-        let stderr_thread = spawn_output_reader(
-            stderr,
-            stderr_buf.clone(),
-            combined_tail.clone(),
-            progress.clone(),
-        );
-        Self {
-            stdout_buf,
-            stderr_buf,
-            combined_tail,
-            progress,
-            stdout_thread,
-            stderr_thread,
-        }
-    }
-
-    fn emit_progress(&self) {
-        if let Some(progress) = &self.progress {
-            progress(tail_text(&self.combined_tail));
-        }
-    }
-
-    fn finish(self) -> (Vec<u8>, Vec<u8>) {
-        let Self {
-            stdout_buf,
-            stderr_buf,
-            stdout_thread,
-            stderr_thread,
-            ..
-        } = self;
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
-        (
-            stdout_buf.lock().expect("stdout mutex poisoned").clone(),
-            stderr_buf.lock().expect("stderr mutex poisoned").clone(),
-        )
-    }
-}
-
-fn spawn_output_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    stream_buf: Arc<Mutex<Vec<u8>>>,
-    combined_tail: Arc<Mutex<Vec<u8>>>,
-    progress: Option<ShellProgress>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut buf = [0_u8; 4096];
-        let mut last_emit = Instant::now() - Duration::from_secs(1);
-        loop {
-            let read = match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => break,
-            };
-            stream_buf
-                .lock()
-                .expect("stream mutex poisoned")
-                .extend_from_slice(&buf[..read]);
-            let output_tail = {
-                let mut combined = combined_tail.lock().expect("combined mutex poisoned");
-                combined.extend_from_slice(&buf[..read]);
-                if combined.len() > PROGRESS_OUTPUT_TAIL_BYTES {
-                    let remove = combined.len() - PROGRESS_OUTPUT_TAIL_BYTES;
-                    combined.drain(0..remove);
-                }
-                String::from_utf8_lossy(&combined).to_string()
-            };
-            if let Some(progress) = &progress
-                && last_emit.elapsed() >= Duration::from_millis(500)
-            {
-                progress(output_tail);
-                last_emit = Instant::now();
-            }
-        }
-        if let Some(progress) = &progress {
-            progress(tail_text(&combined_tail));
-        }
-    })
-}
-
-fn tail_text(combined_tail: &Arc<Mutex<Vec<u8>>>) -> String {
-    String::from_utf8_lossy(&combined_tail.lock().expect("combined mutex poisoned")).to_string()
-}
-
-fn terminate_process_group(child: &mut std::process::Child) {
-    let pgid = -(child.id() as i32);
-    unsafe {
-        let _ = libc::kill(pgid, libc::SIGTERM);
-    }
-    for _ in 0..10 {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    // Always escalate to the whole process group. The shell may exit after
-    // SIGTERM while a descendant in the same process group ignores it.
-    unsafe {
-        let _ = libc::kill(pgid, libc::SIGKILL);
-    }
-    let _ = child.wait();
 }
 
 #[derive(Default)]
@@ -2393,14 +1934,6 @@ fn validate_repair_result(result: &RepairResult) -> Result<()> {
     Ok(())
 }
 
-fn check_cancelled(cancel: &CancellationToken) -> Result<()> {
-    if cancel.is_cancelled() {
-        Err(CancelledError::new("run cancelled").into())
-    } else {
-        Ok(())
-    }
-}
-
 fn new_run_id() -> String {
     let mut bytes = [0_u8; 4];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -2420,27 +1953,6 @@ fn classify_run_failure(err: &anyhow::Error) -> RunStatus {
         RunStatus::Failed
     }
 }
-
-#[derive(Debug)]
-struct CancelledError {
-    reason: String,
-}
-
-impl CancelledError {
-    fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-        }
-    }
-}
-
-impl fmt::Display for CancelledError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.reason)
-    }
-}
-
-impl Error for CancelledError {}
 
 #[derive(Debug)]
 struct BlockedError {
@@ -2463,10 +1975,7 @@ impl Error for BlockedError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Manager, PROGRESS_OUTPUT_TAIL_BYTES, ShellProgress, StartOptions, run_shell_command,
-        validate_repair_result, validate_worker_result,
-    };
+    use super::{Manager, StartOptions, validate_repair_result, validate_worker_result};
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
@@ -2482,7 +1991,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2529,91 +2038,6 @@ mod tests {
             ..RepairResult::default()
         };
         assert!(validate_repair_result(&repair).is_err());
-    }
-
-    #[test]
-    fn shell_command_timeout_returns_promptly() -> Result<()> {
-        let cancel = CancellationToken::new();
-        let started = Instant::now();
-        let err = run_shell_command(
-            Path::new("."),
-            "sleep 30",
-            &cancel,
-            Duration::from_secs(1),
-            &BTreeMap::new(),
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        Ok(())
-    }
-
-    #[test]
-    fn shell_command_cancellation_returns_promptly() -> Result<()> {
-        let cancel = CancellationToken::new();
-        let thread_cancel = cancel.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            thread_cancel.cancel();
-        });
-        let started = Instant::now();
-        let err = run_shell_command(
-            Path::new("."),
-            "sleep 30",
-            &cancel,
-            Duration::from_secs(30),
-            &BTreeMap::new(),
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("run cancelled"));
-        assert!(started.elapsed() < Duration::from_secs(5));
-        Ok(())
-    }
-
-    #[test]
-    fn shell_command_progress_is_bounded_and_preserves_streams() -> Result<()> {
-        let cancel = CancellationToken::new();
-        let tails = Arc::new(Mutex::new(Vec::new()));
-        let observed_tails = tails.clone();
-        let progress: ShellProgress = Arc::new(move |tail| {
-            observed_tails
-                .lock()
-                .expect("progress tails mutex poisoned")
-                .push(tail);
-        });
-
-        let output = run_shell_command(
-            Path::new("."),
-            "printf '%05000d' 0 | tr '0' 'o'; printf 'err-line\\n' >&2",
-            &cancel,
-            Duration::from_secs(5),
-            &BTreeMap::new(),
-            Some(progress),
-        )?;
-
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 5000);
-        assert_eq!(String::from_utf8_lossy(&output.stderr), "err-line\n");
-        let tails = tails.lock().expect("progress tails mutex poisoned");
-        assert!(
-            !tails.is_empty(),
-            "progress sink should receive output tails"
-        );
-        assert!(
-            tails
-                .iter()
-                .all(|tail| tail.len() <= PROGRESS_OUTPUT_TAIL_BYTES),
-            "progress tails should stay bounded: {tails:#?}"
-        );
-        assert!(
-            tails
-                .iter()
-                .any(|tail| tail.contains("err-line") || tail.contains('o')),
-            "progress should include streamed stdout or stderr: {tails:#?}"
-        );
-        Ok(())
     }
 
     #[test]
