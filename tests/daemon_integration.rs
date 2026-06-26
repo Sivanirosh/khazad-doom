@@ -332,6 +332,115 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
 }
 
 #[test]
+fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo_a = tempfile::tempdir()?;
+    let repo_b = tempfile::tempdir()?;
+    let empty_repo = tempfile::tempdir()?;
+    init_git_repo(repo_a.path())?;
+    init_git_repo(repo_b.path())?;
+    init_git_repo(empty_repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(
+        &bin,
+        home.path(),
+        &["init", "--repo", path(empty_repo.path())],
+    )?;
+    let empty = kd_ok(
+        &bin,
+        home.path(),
+        &["status", "--repo", path(empty_repo.path()), "--latest"],
+    )?;
+    assert!(json_stdout(&empty)?.is_null());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo_a.path())])?;
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo_b.path())])?;
+    write_slice(
+        repo_a.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Long active slice A",
+            "goal": "Keep repo A active long enough for latest lookup.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["printf 'latest-a\\n'; sleep 6; test -f slice-001.txt"]
+        }),
+    )?;
+    write_slice(
+        repo_b.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Long active slice B",
+            "goal": "Keep repo B active long enough for latest lookup.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["printf 'latest-b\\n'; sleep 6; test -f slice-001.txt"]
+        }),
+    )?;
+    git(repo_a.path(), &["add", ".workflow"])?;
+    git(repo_a.path(), &["commit", "-m", "add long slice a"])?;
+    git(repo_b.path(), &["add", ".workflow"])?;
+    git(repo_b.path(), &["commit", "-m", "add long slice b"])?;
+
+    let started_a = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo_a.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_a = json_stdout(&started_a)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let latest_a = wait_for_latest_run(&bin, home.path(), repo_a.path(), &run_a)?;
+    assert_eq!(latest_a["run"]["repo_path"], path(repo_a.path()));
+    assert_eq!(latest_a["run"]["status"], "running");
+    assert!(latest_a["progress"].is_object());
+    assert!(!latest_a["slice_runs"].as_array().unwrap().is_empty());
+    assert!(!latest_a["events"].as_array().unwrap().is_empty());
+
+    let started_b = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo_b.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_b = json_stdout(&started_b)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let latest_b = wait_for_latest_run(&bin, home.path(), repo_b.path(), &run_b)?;
+    assert_eq!(latest_b["run"]["repo_path"], path(repo_b.path()));
+
+    let scoped_a = wait_for_latest_run(&bin, home.path(), repo_a.path(), &run_a)?;
+    assert_eq!(scoped_a["run"]["id"], run_a);
+
+    wait_for_status(&bin, home.path(), &run_a, "completed")?;
+    wait_for_status(&bin, home.path(), &run_b, "completed")?;
+    let no_active = kd_ok(
+        &bin,
+        home.path(),
+        &["status", "--repo", path(repo_a.path()), "--latest"],
+    )?;
+    assert!(json_stdout(&no_active)?.is_null());
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn interrupted_run_resumes_without_duplicate_merges_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -477,6 +586,22 @@ fn wait_for_status(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestR
             panic!("run reached terminal non-success state: {value:#}");
         }
         assert!(Instant::now() < deadline, "timed out waiting for {wanted}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_latest_run(bin: &Path, home: &Path, repo: &Path, run_id: &str) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--repo", path(repo), "--latest"])?;
+        let value = json_stdout(&output)?;
+        if value["run"]["id"].as_str() == Some(run_id) {
+            return Ok(value);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for latest active run {run_id}: {value:#}"
+        );
         thread::sleep(Duration::from_millis(100));
     }
 }

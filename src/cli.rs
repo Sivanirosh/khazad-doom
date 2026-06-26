@@ -100,6 +100,12 @@ enum CommandArgs {
     Status {
         #[arg(long, default_value = "")]
         run: String,
+        /// Repository path used with --latest. Defaults to the current directory for latest lookup.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Return the latest active run details for a repository, or null if none exists.
+        #[arg(long)]
+        latest: bool,
         #[arg(long, default_value_t = 50)]
         events_limit: usize,
         /// Follow a run with compact human-readable progress until it reaches a terminal state.
@@ -221,10 +227,12 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
         CommandArgs::Inspect { run, log_tail } => run_inspect(paths, run, log_tail),
         CommandArgs::Status {
             run,
+            repo,
+            latest,
             events_limit,
             follow,
             interval_ms,
-        } => run_status(paths, run, events_limit, follow, interval_ms),
+        } => run_status(paths, run, repo, latest, events_limit, follow, interval_ms),
         CommandArgs::Watch { run, interval_ms } => run_watch(paths, run, interval_ms),
         CommandArgs::Slices { command } => run_slices(paths, command),
         CommandArgs::Daemon { command } => run_daemon(paths, command),
@@ -371,6 +379,8 @@ fn run_inspect(paths: Paths, run_id: String, log_tail_lines: usize) -> Result<()
 fn run_status(
     paths: Paths,
     run_id: String,
+    repo: Option<PathBuf>,
+    latest: bool,
     events_limit: usize,
     follow: bool,
     interval_ms: u64,
@@ -379,26 +389,48 @@ fn run_status(
         if run_id.is_empty() {
             bail!("status --follow requires --run <run-id>");
         }
+        if latest {
+            bail!("status --follow cannot be combined with --latest");
+        }
         return run_watch(paths, run_id, interval_ms);
     }
     let client = Client::new(paths);
     if !run_id.is_empty() {
+        if latest {
+            bail!("status --latest cannot be combined with --run <run-id>");
+        }
         let details: RunDetails = client.call(
             "status",
             &StatusParams {
                 run_id,
-                limit: 0,
                 events_limit,
+                ..StatusParams::default()
             },
         )?;
         return print_json(&details);
     }
+    if latest {
+        let repo = resolve_repo_path(repo.unwrap_or_else(|| PathBuf::from(".")))?;
+        let details: Option<RunDetails> = client.call(
+            "status",
+            &StatusParams {
+                repo_path: repo.to_string_lossy().to_string(),
+                latest: true,
+                active_only: true,
+                events_limit,
+                ..StatusParams::default()
+            },
+        )?;
+        return print_json(&details);
+    }
+    if repo.is_some() {
+        bail!("status --repo requires --latest");
+    }
     let out: serde_json::Value = client.call(
         "status",
         &StatusParams {
-            run_id: String::new(),
             limit: 10,
-            events_limit: 0,
+            ..StatusParams::default()
         },
     )?;
     println!("{}", serde_json::to_string(&out)?);
@@ -413,8 +445,8 @@ fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
             "status",
             &StatusParams {
                 run_id: run_id.clone(),
-                limit: 0,
                 events_limit: 5,
+                ..StatusParams::default()
             },
         )?;
         print_watch_snapshot(&details);
@@ -672,8 +704,8 @@ fn wait_run(client: &Client, run_id: &str) -> Result<()> {
             "status",
             &StatusParams {
                 run_id: run_id.to_string(),
-                limit: 0,
                 events_limit: 50,
+                ..StatusParams::default()
             },
         )?;
         print_json(&details)?;

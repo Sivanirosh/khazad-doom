@@ -473,13 +473,48 @@ impl Store {
         self.update_run(run_id, RunStatus::Interrupted, reason)
     }
 
+    pub fn latest_run_for_repo(&self, repo_path: &str, active_only: bool) -> Result<Option<Run>> {
+        let conn = self.conn()?;
+        let sql = if active_only {
+            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                      selected_slice_id, error, started_at, updated_at
+               FROM runs
+               WHERE repo_path=?1 AND status IN (?2, ?3)
+               ORDER BY started_at DESC, id DESC
+               LIMIT 1"#
+        } else {
+            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                      selected_slice_id, error, started_at, updated_at
+               FROM runs
+               WHERE repo_path=?1
+               ORDER BY started_at DESC, id DESC
+               LIMIT 1"#
+        };
+        let row = if active_only {
+            conn.query_row(
+                sql,
+                params![
+                    repo_path,
+                    RunStatus::Pending.as_str(),
+                    RunStatus::Running.as_str()
+                ],
+                run_tuple_from_row,
+            )
+            .optional()?
+        } else {
+            conn.query_row(sql, params![repo_path], run_tuple_from_row)
+                .optional()?
+        };
+        row.map(run_from_tuple).transpose()
+    }
+
     pub fn latest_runs(&self, limit: usize) -> Result<Vec<Run>> {
         let conn = self.conn()?;
         let limit = if limit == 0 { 10 } else { limit };
         let mut stmt = conn.prepare(
             r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
                       selected_slice_id, error, started_at, updated_at
-               FROM runs ORDER BY started_at DESC LIMIT ?1"#,
+               FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit as i64], run_tuple_from_row)?;
         let mut runs = Vec::new();
@@ -653,4 +688,81 @@ fn parse_time(field: &str, value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("parse {field}: {value:?}"))?
         .with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    fn run(id: &str, repo_path: &str, status: RunStatus, started_at: DateTime<Utc>) -> Run {
+        Run {
+            id: id.to_string(),
+            repo_id: format!("repo-{repo_path}"),
+            repo_path: repo_path.to_string(),
+            status,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: format!("khazad/{id}/integration"),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at,
+            updated_at: started_at,
+        }
+    }
+
+    #[test]
+    fn latest_run_for_repo_is_deterministic_and_active_scoped() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        let repo_a = "/tmp/repo-a";
+        let repo_b = "/tmp/repo-b";
+        let repo_tie = "/tmp/repo-tie";
+
+        store.insert_run(&run("run-active-a", repo_a, RunStatus::Running, now))?;
+        store.insert_run(&run(
+            "run-active-b",
+            repo_a,
+            RunStatus::Pending,
+            now + ChronoDuration::seconds(1),
+        ))?;
+        store.insert_run(&run(
+            "run-completed-newer",
+            repo_a,
+            RunStatus::Completed,
+            now + ChronoDuration::seconds(2),
+        ))?;
+        store.insert_run(&run(
+            "run-other-repo",
+            repo_b,
+            RunStatus::Running,
+            now + ChronoDuration::seconds(3),
+        ))?;
+        store.insert_run(&run("run-tie-a", repo_tie, RunStatus::Running, now))?;
+        store.insert_run(&run("run-tie-b", repo_tie, RunStatus::Running, now))?;
+
+        let active = store
+            .latest_run_for_repo(repo_a, true)?
+            .expect("active run for repo_a");
+        assert_eq!(active.id, "run-active-b");
+
+        let latest = store
+            .latest_run_for_repo(repo_a, false)?
+            .expect("latest run for repo_a");
+        assert_eq!(latest.id, "run-completed-newer");
+
+        let scoped = store
+            .latest_run_for_repo(repo_b, true)?
+            .expect("active run for repo_b");
+        assert_eq!(scoped.id, "run-other-repo");
+
+        let tied = store
+            .latest_run_for_repo(repo_tie, true)?
+            .expect("tie-broken active run");
+        assert_eq!(tied.id, "run-tie-b");
+
+        assert!(store.latest_run_for_repo("/tmp/missing", true)?.is_none());
+        Ok(())
+    }
 }

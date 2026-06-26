@@ -49,11 +49,17 @@ impl Client {
         if line.trim().is_empty() {
             bail!("daemon returned an empty response");
         }
-        let response: Response = serde_json::from_str(&line)?;
-        if let Some(error) = response.error {
-            bail!(error);
+        let response: serde_json::Value = serde_json::from_str(&line)?;
+        if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            if let Some(error) = error.as_str() {
+                bail!(error.to_string());
+            }
+            bail!(error.to_string());
         }
-        let result = response.result.context("daemon response missing result")?;
+        let result = response
+            .get("result")
+            .cloned()
+            .context("daemon response missing result")?;
         Ok(serde_json::from_value(result)?)
     }
 
@@ -61,9 +67,8 @@ impl Client {
         let _: serde_json::Value = self.call(
             "status",
             &StatusParams {
-                run_id: String::new(),
                 limit: 1,
-                events_limit: 0,
+                ..StatusParams::default()
             },
         )?;
         Ok(())
@@ -169,6 +174,16 @@ impl Server {
         Ok(shutdown)
     }
 
+    fn run_details(&self, run: Run, events_limit: usize) -> Result<RunDetails> {
+        let run_id = run.id.clone();
+        Ok(RunDetails {
+            slice_runs: self.store.get_slice_runs(&run_id)?,
+            progress: self.store.get_progress(&run_id)?,
+            events: self.store.get_events(&run_id, events_limit)?,
+            run,
+        })
+    }
+
     fn handle(&self, method: &str, raw: Option<serde_json::Value>) -> Result<HandleOutcome> {
         match method {
             "initRepo" => {
@@ -206,12 +221,17 @@ impl Server {
                         .store
                         .get_run(&params.run_id)?
                         .ok_or_else(|| anyhow!("run {:?} not found", params.run_id))?;
-                    let details = RunDetails {
-                        slice_runs: self.store.get_slice_runs(&params.run_id)?,
-                        progress: self.store.get_progress(&params.run_id)?,
-                        events: self.store.get_events(&params.run_id, params.events_limit)?,
-                        run,
-                    };
+                    let details = self.run_details(run, params.events_limit)?;
+                    Ok(HandleOutcome::result(details)?)
+                } else if params.latest {
+                    if params.repo_path.trim().is_empty() {
+                        bail!("status latest requires repo_path");
+                    }
+                    let details = self
+                        .store
+                        .latest_run_for_repo(&params.repo_path, params.active_only)?
+                        .map(|run| self.run_details(run, params.events_limit))
+                        .transpose()?;
                     Ok(HandleOutcome::result(details)?)
                 } else {
                     let runs = self.store.latest_runs(params.limit)?;
