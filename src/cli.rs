@@ -2,8 +2,8 @@ use crate::agent::RunnerSpec;
 use crate::artifact;
 use crate::daemon::{Client, Server};
 use crate::domain::{
-    BranchHandoff, Event, RunDetails, RunEconomics, RunInspection, RunStatus, SliceStatus,
-    SliceValidationReport, SliceWriteResult, WorkerAttemptProgress,
+    BranchHandoff, Event, RunDetails, RunEconomics, RunIncident, RunInspection, RunStatus,
+    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerAttemptProgress,
 };
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
@@ -132,6 +132,9 @@ enum CommandArgs {
         /// Return the latest active run details for a repository, or null if none exists.
         #[arg(long)]
         latest: bool,
+        /// With --latest, fall back to the latest terminal run when no active run exists.
+        #[arg(long)]
+        include_terminal: bool,
         #[arg(long, default_value_t = 50)]
         events_limit: usize,
         /// Follow a run with compact human-readable progress until it reaches a terminal state.
@@ -276,10 +279,22 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             run,
             repo,
             latest,
+            include_terminal,
             events_limit,
             follow,
             interval_ms,
-        } => run_status(paths, run, repo, latest, events_limit, follow, interval_ms),
+        } => run_status(
+            paths,
+            RunStatusOptions {
+                run_id: run,
+                repo,
+                latest,
+                include_terminal,
+                events_limit,
+                follow,
+                interval_ms,
+            },
+        ),
         CommandArgs::Monitor {
             run,
             repo,
@@ -433,54 +448,56 @@ fn run_inspect(paths: Paths, run_id: String, log_tail_lines: usize) -> Result<()
     print_json(&inspection)
 }
 
-fn run_status(
-    paths: Paths,
+struct RunStatusOptions {
     run_id: String,
     repo: Option<PathBuf>,
     latest: bool,
+    include_terminal: bool,
     events_limit: usize,
     follow: bool,
     interval_ms: u64,
-) -> Result<()> {
-    if follow {
-        if run_id.is_empty() {
+}
+
+fn run_status(paths: Paths, opts: RunStatusOptions) -> Result<()> {
+    if opts.follow {
+        if opts.run_id.is_empty() {
             bail!("status --follow requires --run <run-id>");
         }
-        if latest {
+        if opts.latest {
             bail!("status --follow cannot be combined with --latest");
         }
-        return run_watch(paths, run_id, interval_ms);
+        return run_watch(paths, opts.run_id, opts.interval_ms);
     }
     let client = Client::new(paths);
-    if !run_id.is_empty() {
-        if latest {
+    if opts.include_terminal && !opts.latest {
+        bail!("status --include-terminal requires --latest");
+    }
+    if !opts.run_id.is_empty() {
+        if opts.latest {
             bail!("status --latest cannot be combined with --run <run-id>");
         }
         let details: RunDetails = client.call(
             "status",
             &StatusParams {
-                run_id,
-                events_limit,
+                run_id: opts.run_id,
+                events_limit: opts.events_limit,
                 ..StatusParams::default()
             },
         )?;
         return print_json(&details);
     }
-    if latest {
-        let repo = resolve_repo_path(repo.unwrap_or_else(|| PathBuf::from(".")))?;
-        let details: Option<RunDetails> = client.call(
-            "status",
-            &StatusParams {
-                repo_path: repo.to_string_lossy().to_string(),
-                latest: true,
-                active_only: true,
-                events_limit,
-                ..StatusParams::default()
-            },
-        )?;
+    if opts.latest {
+        let repo = resolve_repo_path(opts.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+        let repo_path = repo.to_string_lossy().to_string();
+        let active = fetch_latest_run(&client, &repo_path, opts.events_limit, true)?;
+        let details = if opts.include_terminal && active.is_none() {
+            fetch_latest_run(&client, &repo_path, opts.events_limit, false)?
+        } else {
+            active
+        };
         return print_json(&details);
     }
-    if repo.is_some() {
+    if opts.repo.is_some() {
         bail!("status --repo requires --latest");
     }
     let out: serde_json::Value = client.call(
@@ -573,11 +590,15 @@ fn monitor_latest(
         let details = if let Some(run_id) = attached_run_id.clone() {
             Some(fetch_run_details(client, &run_id, events_limit)?)
         } else {
-            let latest = fetch_latest_active_run(client, &repo_path, events_limit)?;
-            if let Some(details) = &latest {
+            let active = fetch_latest_run(client, &repo_path, events_limit, true)?;
+            if let Some(details) = &active {
                 attached_run_id = Some(details.run.id.clone());
             }
-            latest
+            if active.is_some() {
+                active
+            } else {
+                fetch_latest_run(client, &repo_path, events_limit, false)?
+            }
         };
         render_monitor_snapshot(
             details.as_ref(),
@@ -614,17 +635,18 @@ fn fetch_run_details(client: &Client, run_id: &str, events_limit: usize) -> Resu
     )
 }
 
-fn fetch_latest_active_run(
+fn fetch_latest_run(
     client: &Client,
     repo_path: &str,
     events_limit: usize,
+    active_only: bool,
 ) -> Result<Option<RunDetails>> {
     client.call(
         "status",
         &StatusParams {
             repo_path: repo_path.to_string(),
             latest: true,
-            active_only: true,
+            active_only,
             events_limit,
             ..StatusParams::default()
         },
@@ -888,6 +910,12 @@ fn print_watch_snapshot(details: &RunDetails) {
     if let Some(economics) = &details.economics {
         print_economics(economics);
     }
+    if !details.incidents.is_empty() {
+        println!("Incidents: {}", details.incidents.len());
+        for incident in details.incidents.iter().rev().take(3).rev() {
+            println!("  - {}: {}", incident.kind, incident.message);
+        }
+    }
     println!();
 }
 
@@ -985,6 +1013,7 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
     if let Some(economics) = &details.economics {
         render_economics(out, economics)?;
     }
+    render_incidents(out, &details.incidents)?;
     writeln!(out, "Recent events:")?;
     render_event_tail(out, &details.events)?;
     writeln!(out, "Output tail:")?;
@@ -994,6 +1023,23 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
             .map(|progress| progress.output_tail.as_str())
             .unwrap_or_default(),
     )?;
+    Ok(())
+}
+
+fn render_incidents(out: &mut impl Write, incidents: &[RunIncident]) -> Result<()> {
+    if incidents.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "Incidents:")?;
+    for incident in incidents.iter().rev().take(8).rev() {
+        writeln!(
+            out,
+            "  - [{}] {}: {}",
+            incident.severity,
+            incident.kind,
+            truncate_display(&incident.message, MONITOR_LINE_WIDTH)
+        )?;
+    }
     Ok(())
 }
 

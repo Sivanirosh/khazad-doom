@@ -135,6 +135,96 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
 }
 
 #[test]
+fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Untracked workflow slice",
+            "goal": "Create fake output while workflow metadata is untracked.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["test -f slice-001.txt"]
+        }),
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let status = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let incidents = status["incidents"].as_array().expect("incidents array");
+    assert!(incidents.iter().any(|incident| {
+        incident["kind"].as_str() == Some("slice_close_skipped")
+            && incident["severity"].as_str() == Some("warning")
+    }));
+    let monitor = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--run",
+            &run_id,
+            "--once",
+            "--interval-ms",
+            "100",
+        ],
+    )?;
+    let monitor = String::from_utf8(monitor.stdout)?;
+    assert!(monitor.contains("Incidents"));
+    assert!(monitor.contains("slice_close_skipped"));
+    let latest_status = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "status",
+            "--repo",
+            path(repo.path()),
+            "--latest",
+            "--include-terminal",
+        ],
+    )?;
+    assert_eq!(json_stdout(&latest_status)?["run"]["id"], run_id);
+    let latest_monitor = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--repo",
+            path(repo.path()),
+            "--latest",
+            "--once",
+            "--interval-ms",
+            "100",
+        ],
+    )?;
+    let latest_monitor = String::from_utf8(latest_monitor.stdout)?;
+    assert!(latest_monitor.contains(&format!("Run: {run_id}")));
+    assert!(latest_monitor.contains("Status: completed"));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn schema_import_and_handoff_v2_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;

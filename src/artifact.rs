@@ -247,18 +247,37 @@ impl Store {
         })
     }
 
-    pub fn close_slices(&self, slice_ids: &[String], run_id: &str, closed_at: &str) -> Result<()> {
+    pub fn close_slices_if_present(
+        &self,
+        slice_ids: &[String],
+        run_id: &str,
+        closed_at: &str,
+    ) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
         for slice_id in slice_ids {
             let path = self.slice_path(slice_id);
-            let mut slice: Slice = read_json(&path)
-                .with_context(|| format!("read slice {} for closing", path.display()))?;
-            slice.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
-            slice.closed_by_run = run_id.to_string();
-            slice.closed_at = closed_at.to_string();
-            validate_slice(&slice)?;
-            write_json(&path, &slice)
-                .with_context(|| format!("write closed slice {}", path.display()))?;
+            if !path.exists() {
+                warnings.push(format!(
+                    "slice metadata for {slice_id} was not present at {}; closure skipped",
+                    path.display()
+                ));
+                continue;
+            }
+            self.close_slice_file(slice_id, run_id, closed_at)?;
         }
+        Ok(warnings)
+    }
+
+    fn close_slice_file(&self, slice_id: &str, run_id: &str, closed_at: &str) -> Result<()> {
+        let path = self.slice_path(slice_id);
+        let mut slice: Slice = read_json(&path)
+            .with_context(|| format!("read slice {} for closing", path.display()))?;
+        slice.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        slice.closed_by_run = run_id.to_string();
+        slice.closed_at = closed_at.to_string();
+        validate_slice(&slice)?;
+        write_json(&path, &slice)
+            .with_context(|| format!("write closed slice {}", path.display()))?;
         Ok(())
     }
 

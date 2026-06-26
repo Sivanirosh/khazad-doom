@@ -47,11 +47,13 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 - Verification and gate timeouts are per-command hang protection. They are not global workflow timeouts and must not be reused to cap total run lifetime.
 - Gate failures are reported with command evidence and must be repaired or surfaced as blocked/failed before handoff.
 - Status/watch/monitor snapshots and final reports include runtime economics: agent calls, daemon-owned command executions, cache hit/miss counts, repair policy/attempts, phase durations, duplicate-command telemetry, and SLA violations.
+- Completed runs may still have incidents. Resume events, prior run errors, cleanup issues, integration repairs, and non-fatal lifecycle warnings must remain visible as run incidents instead of being hidden by a final `completed` status.
 
 ## Progress, status, and monitor state
 
 - The daemon/state store is the source of truth for run status, slice states, events, and live progress snapshots.
 - `status`, `watch`, `monitor`, and optional Pi adapters render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
+- `monitor --latest` and `/khazad-monitor --latest` must not make terminal runs disappear. When no active run exists, they keep the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
 

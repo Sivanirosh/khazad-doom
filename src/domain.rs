@@ -542,11 +542,22 @@ pub struct WorkerAttemptProgress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunIncident {
+    pub severity: String,
+    pub kind: String,
+    pub message: String,
+    pub event_id: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
     pub slice_runs: Vec<SliceRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<RunProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incidents: Vec<RunIncident>,
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economics: Option<RunEconomics>,

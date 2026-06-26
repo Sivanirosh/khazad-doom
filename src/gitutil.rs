@@ -83,6 +83,11 @@ pub fn worktree_remove(repo_path: impl AsRef<Path>, worktree_path: impl AsRef<Pa
     Ok(())
 }
 
+pub fn worktree_prune(repo_path: impl AsRef<Path>) -> Result<()> {
+    run(repo_path, &["worktree", "prune"])?;
+    Ok(())
+}
+
 pub fn merge(worktree_path: impl AsRef<Path>, branch: &str, message: &str) -> Result<()> {
     run(worktree_path, &["merge", "--no-ff", branch, "-m", message])?;
     Ok(())

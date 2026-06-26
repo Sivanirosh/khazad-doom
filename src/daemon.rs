@@ -1,7 +1,7 @@
 use crate::artifact;
 use crate::domain::{
-    BranchHandoff, ImplementationSummary, Run, RunDetails, RunEconomics, RunInspection,
-    RunProgress, SliceRun, SliceStatus, SliceWriteResult,
+    BranchHandoff, Event, ImplementationSummary, Run, RunDetails, RunEconomics, RunIncident,
+    RunInspection, RunProgress, SliceRun, SliceStatus, SliceWriteResult,
 };
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
@@ -186,9 +186,11 @@ impl Server {
             annotate_parallel_progress(progress, &slice_runs);
         }
         let economics = read_run_economics(&run).ok();
+        let incidents = run_incidents_from_events(&self.store.get_incident_events(&run_id)?);
         Ok(RunDetails {
             slice_runs,
             progress,
+            incidents,
             events: self.store.get_events(&run_id, events_limit)?,
             economics,
             run,
@@ -344,6 +346,67 @@ impl Server {
             _ => bail!("unknown method {method:?}"),
         }
     }
+}
+
+fn run_incidents_from_events(events: &[Event]) -> Vec<RunIncident> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let payload = &event.payload;
+            let (severity, kind, message) = match event.typ.as_str() {
+                "run_incident" => (
+                    payload_text(payload, "severity", "warning"),
+                    payload_text(payload, "kind", "run_incident"),
+                    payload_text(payload, "message", "incident recorded"),
+                ),
+                "run_error" => (
+                    "error".to_string(),
+                    "run_error".to_string(),
+                    payload_text(payload, "error", "run failed"),
+                ),
+                "run_resumed" => (
+                    "warning".to_string(),
+                    "run_resumed".to_string(),
+                    "run resumed after a terminal/interrupted state".to_string(),
+                ),
+                "worktree_cleanup_error" | "daemon_recovery_cleanup_error" => (
+                    "warning".to_string(),
+                    event.typ.clone(),
+                    payload_text(payload, "error", "worktree cleanup reported an error"),
+                ),
+                "integration_repair_completed" => (
+                    "warning".to_string(),
+                    "integration_repair_completed".to_string(),
+                    [
+                        payload_text(payload, "status", ""),
+                        payload_text(payload, "summary", "integration repair completed"),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                ),
+                _ => return None,
+            };
+            Some(RunIncident {
+                severity,
+                kind,
+                message,
+                event_id: event.id,
+                created_at: event.created_at,
+            })
+        })
+        .collect()
+}
+
+fn payload_text(payload: &serde_json::Value, field: &str, fallback: &str) -> String {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn read_run_economics(run: &Run) -> Result<RunEconomics> {

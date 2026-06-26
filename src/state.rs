@@ -526,6 +526,30 @@ impl Store {
         Ok(events)
     }
 
+    pub fn get_incident_events(&self, run_id: &str) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT id, run_id, type, payload_json, created_at
+               FROM events
+               WHERE run_id=?1
+                 AND type IN (
+                   'run_incident',
+                   'run_error',
+                   'run_resumed',
+                   'worktree_cleanup_error',
+                   'daemon_recovery_cleanup_error',
+                   'integration_repair_completed'
+                 )
+               ORDER BY id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![run_id], event_tuple_from_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(event_from_tuple(row?)?);
+        }
+        Ok(events)
+    }
+
     pub fn cancel_running_runs(&self, reason: &str) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(

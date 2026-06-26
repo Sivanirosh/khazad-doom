@@ -549,6 +549,7 @@ impl Manager {
         self.ensure_repo_run_available(&run.repo_id, Some(&run.id))?;
         let store = artifact::Store::new(&run.repo_path);
         let _last_checkpoint = store.read_checkpoint(&run.id).ok();
+        self.prepare_resume_worktrees(&run)?;
         let all_slices = store.load_slices()?;
         let requested: Vec<String> = run
             .selected_slice_id
@@ -837,7 +838,7 @@ impl Manager {
             }
             Err(err) => {
                 let status = classify_run_failure(err);
-                let message = err.to_string();
+                let message = format!("{err:#}");
                 if status == RunStatus::Cancelled {
                     let _ = self.state.cancel_active_slice_runs(&run.id, &message);
                     self.mark_progress(&run.id, "cancelled", "", 0, "", &message);
@@ -1090,11 +1091,22 @@ impl Manager {
                 .iter()
                 .map(|slice| slice.slice_id.clone())
                 .collect();
-            integration_store.close_slices(
+            let close_warnings = integration_store.close_slices_if_present(
                 &completed_slice_ids,
                 &run.id,
                 &Utc::now().to_rfc3339(),
             )?;
+            for warning in close_warnings {
+                self.state.record_event(
+                    &run.id,
+                    "run_incident",
+                    &json!({
+                        "severity": "warning",
+                        "kind": "slice_close_skipped",
+                        "message": warning,
+                    }),
+                )?;
+            }
         }
         let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         let summary = ImplementationSummary {
@@ -1959,6 +1971,30 @@ impl Manager {
         Ok(report)
     }
 
+    fn prepare_resume_worktrees(&self, run: &Run) -> Result<()> {
+        let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
+        if !root.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&root).with_context(|| {
+            format!(
+                "remove stale run worktree dir before resume {}",
+                root.display()
+            )
+        })?;
+        let _ = gitutil::worktree_prune(&run.repo_path);
+        self.state.record_event(
+            &run.id,
+            "run_incident",
+            &json!({
+                "severity": "warning",
+                "kind": "stale_worktree_removed_before_resume",
+                "message": format!("removed stale run worktree directory before resume: {}", root.display()),
+            }),
+        )?;
+        Ok(())
+    }
+
     fn cleanup_run_worktrees(&self, run: &Run) -> Result<()> {
         let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
         if !root.exists() {
@@ -1976,6 +2012,7 @@ impl Manager {
             }
         }
         let _ = std::fs::remove_dir_all(&root);
+        let _ = gitutil::worktree_prune(&run.repo_path);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2890,6 +2927,110 @@ mod tests {
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_removes_stale_integration_worktree_before_recreating() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-stale-resume".to_string();
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let integration_branch = format!("khazad/{run_id}/integration");
+        gitutil::run(repo.path(), &["branch", &integration_branch, &base_sha])?;
+        let now = Utc::now();
+        state.insert_run(&Run {
+            id: run_id.clone(),
+            repo_id: repo_id.clone(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Failed,
+            base_branch: "master".to_string(),
+            base_sha,
+            integration_branch,
+            selected_slice_id: "slice-001".to_string(),
+            error: "previous failure".to_string(),
+            started_at: now,
+            updated_at: now,
+        })?;
+        let stale_integration = paths
+            .repo_worktree_dir(&repo_id, &run_id)
+            .join("integration");
+        fs::create_dir_all(&stale_integration)?;
+        fs::write(stale_integration.join("stale.txt"), "stale")?;
+
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        manager.resume_run(super::ResumeOptions {
+            run_id: run_id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let completed = wait_for_run(&state, &run_id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let events = state.get_events(&run_id, 100)?;
+        assert!(events.iter().any(|event| event.typ == "run_resumed"));
+        assert!(
+            !completed
+                .error
+                .contains("create existing integration worktree")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_workflow_slices_do_not_fail_successful_finalization() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: Vec::new(),
+            all: true,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.completed_slices.len(), 1);
+        let events = state.get_events(&run.id, 100)?;
+        assert!(events.iter().any(|event| {
+            event.typ == "run_incident"
+                && event.payload["kind"].as_str() == Some("slice_close_skipped")
+        }));
         Ok(())
     }
 

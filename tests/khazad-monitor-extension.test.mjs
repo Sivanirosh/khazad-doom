@@ -100,6 +100,121 @@ function noisyDetails() {
 	};
 }
 
+function duplicateProneDetails() {
+	const details = noisyDetails();
+	details.run.id = 'kd-20260626-211646-8af9eacc';
+	details.run.selected_slice_id = 'KF-CHECK-VALIDATOR-01,KF-DASHBOARD-01,KF-DEMO-CURSUS-01,KF-HINT-LADDER-01,KF-PATTERN-TAGS-01';
+	details.slice_runs = [
+		{ slice_id: 'KF-CHECK-VALIDATOR-01', status: 'running' },
+		{ slice_id: 'KF-DASHBOARD-01', status: 'pending' },
+		{ slice_id: 'KF-DEMO-CURSUS-01', status: 'pending' },
+		{ slice_id: 'KF-HINT-LADDER-01', status: 'pending' },
+		{ slice_id: 'KF-PATTERN-TAGS-01', status: 'pending' },
+	];
+	details.progress.slice_id = 'KF-CHECK-VALIDATOR-01';
+	details.progress.command = 'pi';
+	details.progress.message = 'slice worker is running';
+	details.events = [
+		{
+			id: 1,
+			created_at: '2026-06-26T21:16:46Z',
+			type: 'run_started',
+			payload: {
+				selected_slices: details.run.selected_slice_id.split(','),
+			},
+		},
+		{ id: 2, created_at: '2026-06-26T21:16:46Z', type: 'progress', payload: { phase: 'started', message: 'run accepted by daemon' } },
+		{ id: 3, created_at: '2026-06-26T21:16:46Z', type: 'progress', payload: { phase: 'integration_setup', message: 'creating integration worktree' } },
+		{ id: 4, created_at: '2026-06-26T21:16:47Z', type: 'slice_started', payload: { slice_id: 'KF-CHECK-VALIDATOR-01' } },
+		{ id: 5, created_at: '2026-06-26T21:16:47Z', type: 'progress', payload: { phase: 'worker_started', slice_id: 'KF-CHECK-VALIDATOR-01', message: 'slice worker started' } },
+		{ id: 6, created_at: '2026-06-26T21:16:47Z', type: 'progress', payload: { phase: 'worker_running', slice_id: 'KF-CHECK-VALIDATOR-01', attempt: 1, command: 'pi', message: 'slice worker is running' } },
+	];
+	return details;
+}
+
+function sectionCount(lines, label) {
+	const pattern = new RegExp(`│\\s+${label}\\s`);
+	return lines.filter((line) => pattern.test(line) && !line.includes('└')).length;
+}
+
+test('khazad monitor overlay collapses duplicate historical sections into activity', () => {
+	const { overlay } = makeOverlay(40);
+	overlay.state.details = duplicateProneDetails();
+
+	const lines = overlay.render(120);
+	const text = lines.join('\n');
+
+	assert.equal(sectionCount(lines, 'Todos'), 1);
+	assert.equal(sectionCount(lines, 'Run'), 1);
+	assert.equal(sectionCount(lines, 'Worker'), 1);
+	assert.equal(sectionCount(lines, 'Activity'), 1);
+	assert.match(text, /Activity.*recent/);
+	assert.match(text, /Run \(started\): 5 selected slices/);
+	assert.doesNotMatch(text, /Worker \(KF-CHECK-VALIDATOR-01 • attempt 1\): slice KF-CHECK-VALIDATOR-01/);
+});
+
+test('latest overlay keeps the last terminal run visible when no active run remains', async () => {
+	const completed = duplicateProneDetails();
+	completed.run.status = 'completed';
+	completed.progress = {
+		phase: 'completed',
+		message: 'run completed; handoff artifacts are ready',
+		updated_at: '2026-06-26T21:57:02Z',
+	};
+	let call = 0;
+	let argsSeen = [];
+	const overlay = new KhazadMonitorOverlay({
+		pi: {
+			exec: async (_bin, args) => {
+				call += 1;
+				argsSeen = args;
+				return { code: 0, stdout: call === 1 ? JSON.stringify(completed) : 'null', stderr: '' };
+			},
+		},
+		config: {
+			mode: 'latest',
+			repo: '/tmp/repo',
+			intervalMs: 1000,
+			eventsLimit: 50,
+			bin: 'khazad-doom',
+		},
+		theme: plainTheme(),
+		tui: { terminal: { rows: 30 } },
+		done: () => {},
+		requestRender: () => {},
+	});
+
+	await overlay.poll();
+	assert.equal(overlay.state.details.run.id, completed.run.id);
+	await overlay.poll();
+
+	assert.equal(overlay.state.details.run.id, completed.run.id);
+	assert.equal(overlay.state.details.run.status, 'completed');
+	assert.equal(overlay.state.waitingRepo, undefined);
+	assert.ok(argsSeen.includes('--include-terminal'));
+});
+
+test('khazad monitor overlay escalates completed runs with incidents', () => {
+	const { overlay } = makeOverlay(40);
+	const details = duplicateProneDetails();
+	details.run.status = 'completed';
+	details.events.push(
+		{ id: 7, created_at: '2026-06-26T21:50:34Z', type: 'run_error', payload: { error: 'read slice for closing' } },
+		{ id: 8, created_at: '2026-06-26T21:53:11Z', type: 'run_resumed', payload: {} },
+		{ id: 9, created_at: '2026-06-26T21:53:41Z', type: 'integration_repair_completed', payload: { status: 'fixed', summary: 'stabilized flaky smoke' } },
+		{ id: 10, created_at: '2026-06-26T21:56:47Z', type: 'run_incident', payload: { severity: 'warning', kind: 'slice_close_skipped', message: 'slice metadata missing' } },
+	);
+	overlay.state.details = details;
+
+	const text = overlay.render(120).join('\n');
+
+	assert.match(text, /Incidents/);
+	assert.match(text, /run_error: read slice for closing/);
+	assert.match(text, /run_resumed/);
+	assert.match(text, /integration_repair_completed: fixed stabilized flaky smoke/);
+	assert.match(text, /slice_close_skipped: slice metadata missing/);
+});
+
 test('khazad monitor overlay caps tall feeds and keeps a visible scrollbar/footer', () => {
 	const rows = 20;
 	const maxOverlayRows = Math.min(Math.floor((rows * 86) / 100), rows - 2);

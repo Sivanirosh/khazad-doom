@@ -1,6 +1,6 @@
 {
   "agent": "pi",
-  "parallelism": 1,
+  "parallelism": 3,
   "verify_timeout_seconds": 600,
   "worker_attempt_timeout_seconds": 0,
   "worker_no_output_warning_seconds": 900,

@@ -142,7 +142,7 @@ The recommended harness-neutral live progress path is an always-on monitor:
 khazad-doom monitor --repo . --latest
 ```
 
-`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while any harness starts daemon-owned runs normally. Khazad-Doom does not auto-open external windows by default.
+`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while any harness starts daemon-owned runs normally. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. Khazad-Doom does not auto-open external windows by default.
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so a harness can display those commands directly instead of guessing how to launch user-visible progress.
 
@@ -165,6 +165,8 @@ Hint: wait, inspect, or cancel
 ```
 
 A quiet worker is not considered failed by default. Khazad-Doom reports that the daemon is still supervising the process, shows when stdout/stderr/JSON events last arrived, and leaves the wait/inspect/cancel decision explicit unless a repo config opts into a worker-attempt timeout. The status JSON includes `progress.parallel_layer: true` and `progress.parallel_slices` while a parallel worker layer is active.
+
+Runs also expose an `incidents` array in status JSON and monitor output. A final `completed` status does not hide prior run errors, resumes, cleanup warnings, integration repair, or non-fatal lifecycle warnings; those are escalated as completed-with-incidents signals for release triage.
 
 ### Optional Pi adapter
 
@@ -215,6 +217,7 @@ To install only the skill without the optional extension, use Pi package filters
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |
 | `khazad-doom status --run <id> --follow` | Follow compact live progress until the run reaches a terminal state. |
+| `khazad-doom status --repo . --latest --include-terminal` | Return the latest active run, or latest terminal run when none is active. |
 | `khazad-doom monitor --repo . --latest` | Open the dashboard TUI for the latest active run in this repo. |
 | `khazad-doom monitor --run <id>` | Open the dashboard TUI for one specific run. |
 | `khazad-doom watch --run <id>` | Plain text fallback for one specific run. |

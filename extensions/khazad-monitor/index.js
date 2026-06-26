@@ -172,6 +172,13 @@ class KhazadMonitorOverlay {
 			}
 			const stdout = String(result.stdout || '').trim();
 			const details = stdout ? JSON.parse(stdout) : null;
+			const previousDetails = this.state.details;
+			const keepLastTerminal = this.config.mode === 'latest'
+				&& !details
+				&& previousDetails
+				&& previousDetails.run
+				&& isTerminalStatus(previousDetails.run.status);
+			const visibleDetails = details || (keepLastTerminal ? previousDetails : null);
 			if (this.config.mode === 'latest' && details && details.run && !this.attachedRunId) {
 				this.attachedRunId = details.run.id;
 			}
@@ -180,8 +187,8 @@ class KhazadMonitorOverlay {
 			}
 			this.state = {
 				loading: false,
-				details: details || undefined,
-				waitingRepo: this.config.mode === 'latest' && !details ? this.config.repo : undefined,
+				details: visibleDetails || undefined,
+				waitingRepo: this.config.mode === 'latest' && !visibleDetails ? this.config.repo : undefined,
 				error: '',
 				lastUpdated: new Date(),
 				lastCommand: commandToText(command),
@@ -461,7 +468,7 @@ function statusCommandFor(config, attachedRunId) {
 	}
 	return {
 		bin: config.bin,
-		args: ['status', '--repo', config.repo, '--latest', '--events-limit', String(config.eventsLimit)],
+		args: ['status', '--repo', config.repo, '--latest', '--include-terminal', '--events-limit', String(config.eventsLimit)],
 	};
 }
 
@@ -558,15 +565,18 @@ function runDetailsLines(details, theme, rememberedEvents) {
 		}
 	}
 
+	const incidents = incidentLines(details, theme);
+	if (incidents.length) {
+		lines.push('', sectionHeading(theme, 'Incidents', `(${incidents.length})`), ...incidents);
+	}
+
 	const feedBlocks = buildFeedBlocks(details, rememberedEvents && rememberedEvents.length ? rememberedEvents : details.events || []);
-	const visibleBlocks = feedBlocks.filter((block) => !current || block.key !== current.key).slice(-FEED_BLOCK_LIMIT);
-	if (visibleBlocks.length) {
-		lines.push('');
-		for (const block of visibleBlocks) {
-			lines.push(...renderFeedBlock(block, theme));
-			lines.push('');
-		}
-		if (lines[lines.length - 1] === '') lines.pop();
+	const visibleBlocks = feedBlocks
+		.filter((block) => !current || (block.key !== current.key && block.semanticKey !== current.semanticKey))
+		.slice(-FEED_BLOCK_LIMIT);
+	const activity = feedBlocksToActivityLines(visibleBlocks, theme);
+	if (activity.length) {
+		lines.push('', sectionHeading(theme, 'Activity', `(${activity.length} recent)`), ...activity);
 	}
 
 	const outputTail = details.progress && details.progress.output_tail ? details.progress.output_tail : '';
@@ -647,6 +657,7 @@ function currentProgressBlock(details) {
 	const phase = valueOrDash(progress.phase || (details.run && details.run.status));
 	const block = {
 		key: `current:${phase}:${progress.slice_id || ''}`,
+		semanticKey: progressSemanticKey(progress),
 		label: phaseLabel(phase),
 		meta: '(now)',
 		lines: [],
@@ -676,9 +687,9 @@ function eventToBlock(event, details) {
 		const selected = Array.isArray(payload.selected_slices) ? payload.selected_slices : selectedSliceItems(details).map((item) => item.slice_id);
 		return {
 			key: `event:${eventKey(event)}`,
-			label: 'Todos',
-			meta: `(${selected.length} ${selected.length === 1 ? 'item' : 'items'})`,
-			lines: selected.slice(0, MAX_TODO_ITEMS).map((sliceId) => ({ raw: `☐ ${sliceId}` })),
+			label: 'Run',
+			meta: '(started)',
+			lines: [{ text: `${selected.length} selected ${selected.length === 1 ? 'slice' : 'slices'}`, role: 'dim' }],
 		};
 	}
 	if (type === 'slice_started') {
@@ -774,7 +785,11 @@ function commandProgressBlock(progress, details, options = {}) {
 	lines.push({ text: `${scope}${elapsed}` });
 	if (progress.message) lines.push({ text: progress.message, role: progressRole(phase) });
 	if (options.current && progress.updated_at) lines.push({ text: `updated ${ageLabel(progress.updated_at)}`, role: 'dim' });
-	return { key: progressKey(progress, options.event), label, meta: metaParts.length ? `(${metaParts.join(' • ')})` : '', lines };
+	return { key: progressKey(progress, options.event), semanticKey: progressSemanticKey(progress), label, meta: metaParts.length ? `(${metaParts.join(' • ')})` : '', lines };
+}
+
+function progressSemanticKey(progress) {
+	return [progress.phase || '', progress.slice_id || '', progress.attempt || '', progress.command || '', progress.message || ''].join('\0');
 }
 
 function workerBlock(worker, progress, details, options = {}) {
@@ -785,6 +800,7 @@ function workerBlock(worker, progress, details, options = {}) {
 	if (options.current) meta.push('now');
 	return {
 		key: progressKey(progress || {}, options.event),
+		semanticKey: progressSemanticKey(progress || {}),
 		label: 'Worker',
 		meta: meta.length ? `(${meta.join(' • ')})` : '',
 		lines: [
@@ -801,6 +817,49 @@ function workerBlock(worker, progress, details, options = {}) {
 function genericEventBlock(type, payload, event) {
 	const summary = eventSummary({ payload });
 	return summary ? { key: `event:${eventKey(event)}`, label: eventLabel(type), lines: [{ text: summary, role: type === 'error' || type === 'blocked' ? 'error' : 'dim' }] } : undefined;
+}
+
+function incidentLines(details, theme) {
+	const incidents = (details.events || [])
+		.map(incidentSummary)
+		.filter(Boolean)
+		.slice(-8);
+	return incidents.map((incident) => treeLine(theme, truncatePlain(incident, 180), 'warning'));
+}
+
+function incidentSummary(event) {
+	const type = event && event.type ? String(event.type) : '';
+	const payload = (event && event.payload) || {};
+	if (type === 'run_error') return `run_error: ${valueOrDash(payload.error || payload.message)}`;
+	if (type === 'run_resumed') return 'run_resumed';
+	if (type === 'worktree_cleanup_error' || type === 'daemon_recovery_cleanup_error') return `${type}: ${valueOrDash(payload.error || payload.message)}`;
+	if (type === 'integration_repair_completed') return `integration_repair_completed: ${[payload.status, payload.summary].filter(Boolean).join(' ') || '-'}`;
+	if (type === 'run_incident') return `${valueOrDash(payload.kind || type)}: ${valueOrDash(payload.message || payload.error)}`;
+	return '';
+}
+
+function feedBlocksToActivityLines(blocks, theme) {
+	return blocks.map((block) => {
+		const heading = [block.label, block.meta].filter(Boolean).join(' ');
+		const summary = feedBlockSummary(block);
+		const text = summary ? `${heading}: ${summary}` : heading;
+		return treeLine(theme, truncatePlain(text, 180), feedBlockRole(block));
+	});
+}
+
+function feedBlockSummary(block) {
+	return (block.lines || [])
+		.map((line) => {
+			if (line.raw !== undefined) return stripAnsi(String(line.raw)).trim();
+			return stripAnsi(String(line.text || '')).trim();
+		})
+		.filter(Boolean)
+		.join(' • ');
+}
+
+function feedBlockRole(block) {
+	const line = (block.lines || []).find((candidate) => candidate && candidate.role);
+	return line ? line.role : 'dim';
 }
 
 function renderFeedBlock(block, theme) {
