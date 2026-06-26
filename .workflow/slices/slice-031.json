@@ -1,0 +1,32 @@
+{
+  "id": "slice-031",
+  "title": "Pre-release codebase audit",
+  "goal": "Audit the Khazad-Doom Rust codebase before v0.1.0 for AI slop coding, dirty/broken/dead/redundant code, unclear scope, and shallow modules. Keep scope limited to committed repository code and release workflow assets; either fix low-risk issues or document blockers in docs/release-audit.md.",
+  "github_issue": "",
+  "depends_on": [],
+  "areas": [
+    "src",
+    "tests",
+    "scripts",
+    "workflow",
+    "docs"
+  ],
+  "acceptance": [
+    "docs/release-audit.md exists and records audited scope, findings, fixes made, remaining risks, and release recommendation.",
+    "The audit explicitly checks module depth using the project vocabulary: module, interface, seam, depth, leverage, and locality.",
+    "Any dirty, broken, dead, redundant, or AI-slop code found inside the defined scope is either removed/fixed or listed as a justified remaining risk.",
+    "No public CLI, daemon IPC, JSON Issue Slice, or runner contract changes are made unless they are documented as required and verified.",
+    "The final worktree is clean, committed, and passes the full verification profile."
+  ],
+  "must_ask_if": [
+    "The audit suggests changing public CLI behavior, daemon IPC shape, JSON worker result schema, or existing slice semantics.",
+    "A cleanup requires a broad architectural rewrite rather than a local behavior-preserving change.",
+    "A suspected issue cannot be proven with code reading or tests.",
+    "The requested scope needs to expand beyond committed Khazad-Doom repository code and release workflow assets."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "test -f docs/release-audit.md"
+  ],
+  "verify_timeout_seconds": 600
+}
