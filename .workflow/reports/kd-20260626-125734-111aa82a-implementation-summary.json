@@ -1,0 +1,260 @@
+{
+  "run_id": "kd-20260626-125734-111aa82a",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260626-125734-111aa82a/integration",
+  "base_sha": "66051beaa5e5208cc2d71188744879d3911ece76",
+  "final_sha": "338630d3b26d24ceaf011d641e8c6bcf7bd5db99",
+  "completed_slices": [
+    {
+      "slice_id": "slice-033",
+      "status": "complete",
+      "summary": "Implemented latest active run lookup scoped by repository path, exposed it through daemon status as optional RunDetails, and added CLI support for khazad-doom status --repo <path> --latest returning null when no active run matches.",
+      "commit_sha": "4fd30d1d560b0dd91291627c7b54bbaa5f9e2019",
+      "commit_message": "Add latest active run status lookup",
+      "changed_files": [
+        "src/state.rs",
+        "src/ipc.rs",
+        "src/daemon.rs",
+        "src/cli.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "Added StatusParams fields: repo_path, latest, active_only",
+        "Added Store::latest_run_for_repo(repo_path, active_only)",
+        "Added CLI flags: khazad-doom status --repo <path> --latest"
+      ],
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check"
+      ],
+      "acceptance_status": [
+        "State latest-run query is deterministic, repo-scoped, and supports active-only pending/running filtering.",
+        "Daemon status latest lookup returns the existing RunDetails shape with progress and events when a run matches.",
+        "CLI status --repo <path> --latest prints RunDetails JSON or null when no active run matches.",
+        "Existing status --run and daemon-wide status paths remain covered by integration tests.",
+        "Added unit/integration coverage for latest active selection, repo scoping, and empty-result behavior."
+      ],
+      "assumptions": [
+        "CLI --latest is monitor-oriented and therefore uses active-only lookup; daemon IPC can request non-active latest by setting active_only=false."
+      ]
+    },
+    {
+      "slice_id": "slice-034",
+      "status": "complete",
+      "summary": "Added a harness-neutral `monitor` command with run-specific follow mode, latest-active repo mode, compact dashboard rendering, and `--once` snapshots. Updated event retrieval to return recent events and added integration coverage.",
+      "commit_sha": "7eede0efb0458161f55f8ebd4c23c21c2140492c",
+      "commit_message": "khazad(slice-034): add terminal monitor",
+      "changed_files": [
+        "src/cli.rs",
+        "src/state.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "khazad-doom monitor --run <run-id> [--once] [--interval-ms <ms>] [--events-limit <n>]",
+        "khazad-doom monitor --repo <path> --latest [--once] [--interval-ms <ms>] [--events-limit <n>]",
+        "Run status events now return the latest bounded events in chronological order"
+      ],
+      "tests_run": [
+        "cargo check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings"
+      ],
+      "acceptance_status": [
+        "Implemented latest repo monitor wait/attach loop with waiting snapshots and future-run continuation.",
+        "Implemented specific run monitor follow mode with success only on completed and errors for failed/blocked/cancelled/interrupted.",
+        "Dashboard shows run id/status, phase, slice, command, elapsed, message, recent events, and bounded output tail.",
+        "Implemented --once snapshot mode.",
+        "Preserved watch and status --follow fallback commands."
+      ],
+      "assumptions": [
+        "Harness-neutral means terminal/stdout rendering only; no OS windows, tmux panes, or external terminals were opened."
+      ]
+    },
+    {
+      "slice_id": "slice-035",
+      "status": "complete",
+      "summary": "Documented the always-on monitor UX, updated the Khazad-Doom skill to prefer monitor --latest over blocking --wait for Pi runs, and extended khazad-doom run CLI JSON with repo and monitor commands.",
+      "commit_sha": "ef7ceb3bab01edb8a3357e1f566998a2355240f0",
+      "commit_message": "Document always-on monitor UX",
+      "changed_files": [
+        "README.md",
+        "skills/khazad-doom/SKILL.md",
+        "src/cli.rs"
+      ],
+      "public_interfaces_changed": [
+        "khazad-doom run JSON now includes repo_path, monitor_command, and run_monitor_command"
+      ],
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "manual smoke: target/debug/khazad-doom run --repo <temp-repo> --agent fake --all JSON monitor fields"
+      ],
+      "acceptance_status": [
+        "README explains TUI as terminal user interface and recommends khazad-doom monitor --repo . --latest.",
+        "README distinguishes watch as plain fallback, monitor as dashboard, and Pi extension as optional adapter, not core workflow state.",
+        "Skill recommends monitor --latest / emitted monitor_command and warns not to rely on blocking --wait for real Pi runs.",
+        "khazad-doom run JSON includes repo_path, monitor_command, and run_monitor_command.",
+        "Docs explicitly say Khazad-Doom does not auto-open external windows by default."
+      ],
+      "assumptions": [
+        "Interpreted khazad-doom run JSON as the CLI output for khazad-doom run."
+      ]
+    },
+    {
+      "slice_id": "slice-036",
+      "status": "complete",
+      "summary": "Added a Pi package manifest and optional /khazad-monitor Pi TUI overlay extension that polls khazad-doom status JSON, renders run/progress/events/output tail, degrades cleanly outside TUI, and documents installation/use.",
+      "commit_sha": "b5d45130f7d054de8919ea1fa6e0c15fcbcb2bef",
+      "commit_message": "Add optional Pi monitor adapter",
+      "changed_files": [
+        "package.json",
+        "extensions/khazad-monitor/index.js",
+        "README.md",
+        "skills/khazad-doom/SKILL.md"
+      ],
+      "public_interfaces_changed": [
+        "Pi package manifest declares skills and extensions",
+        "New Pi slash command: /khazad-monitor"
+      ],
+      "tests_run": [
+        "node --check extensions/khazad-monitor/index.js",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh"
+      ],
+      "acceptance_status": [
+        "complete: package.json declares the existing skill and optional khazad-monitor extension without changing global settings.",
+        "complete: /khazad-monitor supports latest and run-id modes and renders status JSON fields in a Pi TUI overlay.",
+        "complete: q and Esc close only the overlay; no cancel command is issued.",
+        "complete: non-TUI and unavailable-khazad cases show fallback commands or overlay errors without stack traces.",
+        "complete: extension syntax check passes and README/skill docs explain optional installation and use."
+      ],
+      "assumptions": [
+        "The khazad-doom binary is available on PATH or via KHAZAD_DOOM_BIN for the extension.",
+        "Users explicitly install or enable the Pi package; this slice does not modify user Pi settings."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "slice-033",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test"
+      ],
+      "attempt": 1,
+      "worker_head": "4fd30d1d560b0dd91291627c7b54bbaa5f9e2019",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-034",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test"
+      ],
+      "attempt": 1,
+      "worker_head": "7eede0efb0458161f55f8ebd4c23c21c2140492c",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-035",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test"
+      ],
+      "attempt": 1,
+      "worker_head": "ef7ceb3bab01edb8a3357e1f566998a2355240f0",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-036",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "node --check extensions/khazad-monitor/index.js"
+      ],
+      "attempt": 1,
+      "worker_head": "b5d45130f7d054de8919ea1fa6e0c15fcbcb2bef",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "fixed",
+    "summary": "Normalized CLI repo path handling to the git repository root so run JSON monitor commands and status/monitor --latest work when invoked from subdirectories. Added regression coverage and left the worktree clean.",
+    "commit_sha": "338630d3b26d24ceaf011d641e8c6bcf7bd5db99",
+    "changed_files": [
+      "src/cli.rs",
+      "tests/daemon_integration.rs"
+    ],
+    "tests_run": [
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --test daemon_integration status_latest_returns_active_run_for_repo_or_null -- --nocapture",
+      "manual subdir monitor smoke using target/debug/khazad-doom with temp HOME/repo",
+      "node --check extensions/khazad-monitor/index.js",
+      "bash -n scripts/install.sh scripts/package.sh",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+      "git diff --check"
+    ],
+    "findings": [
+      {
+        "id": "repo-path-normalization",
+        "severity": "error",
+        "action": "auto-fix",
+        "file": "src/cli.rs",
+        "line": 1204,
+        "description": "run --repo <subdir> emitted a monitor_command scoped to the subdirectory while the daemon stored runs under the git root, causing status/monitor --repo <subdir> --latest to return null. The CLI now normalizes repo paths to the git root."
+      }
+    ]
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s"
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 19 tests\ntest agent::tests::extracts_embedded_json_object ... ok\ntest agent::tests::parses_explicit_runner_specs ... ok\ntest artifact::tests::accepts_safe_slice_id ... ok\ntest artifact::tests::dependency_layers_group_independent_slices ... ok\ntest artifact::tests::rejects_path_or_ref_unsafe_slice_ids ... ok\ntest artifact::tests::reports_missing_dependencies ... ok\ntest artifact::tests::topological_order_includes_requested_dependencies_first ... ok\ntest workflow::manager::tests::rejects_unknown_worker_and_repair_statuses ... ok\ntest workflow::manager::tests::rejects_worker_result_for_wrong_slice ... ok\ntest workflow::manager::tests::shell_command_progress_is_bounded_and_preserves_streams ... ok\ntest workflow::manager::tests::shell_command_cancellation_returns_promptly ... ok\ntest state::tests::latest_run_for_repo_is_deterministic_and_active_scoped ... ok\ntest workflow::manager::tests::recovery_marks_stale_running_runs_interrupted ... ok\ntest workflow::manager::tests::merge_conflicts_are_structured_blocked_artifacts ... ok\ntest workflow::manager::tests::shell_command_timeout_returns_promptly ... ok\ntest workflow::manager::tests::repo_config_verify_profile_runs_with_env_and_cwd ... ok\ntest workflow::manager::tests::fake_runner_parallelizes_independent_slices ... ok\ntest workflow::manager::tests::fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees ... ok\ntest workflow::manager::tests::active_repo_run_blocks_second_run ... ok\n\ntest result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.05s\n\n\nrunning 6 tests\ntest monitor_specific_run_returns_error_for_failed_terminal_status ... ok\ntest schema_import_and_handoff_v2_black_box ... ok\ntest interrupted_run_resumes_without_duplicate_merges_black_box ... ok\ntest daemon_fake_run_handoff_and_inspect_black_box ... ok\ntest status_and_watch_expose_live_progress_for_long_verification ... ok\ntest status_latest_returns_active_run_for_repo_or_null ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.28s\n\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s\n     Running unittests src/main.rs (target/debug/deps/khazad_doom-5a3ff85b4912457c)\n     Running tests/daemon_integration.rs (target/debug/deps/daemon_integration-060352e879623867)"
+      },
+      {
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "node --check extensions/khazad-monitor/index.js",
+        "status": "passed",
+        "exit_code": 0
+      }
+    ]
+  },
+  "created_at": "2026-06-26T13:45:47.949135877Z"
+}
