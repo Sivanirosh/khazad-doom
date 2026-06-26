@@ -444,6 +444,140 @@ fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> Test
 }
 
 #[test]
+fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let marker = tempfile::tempdir()?;
+    let fake_pi = write_parallel_fail_fake_pi(fake_bin.path())?;
+    let marker_string = path(marker.path()).to_string();
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_PARALLEL_MARKER", marker_string.as_str())],
+        &["init", "--repo", path(repo.path())],
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Failing parallel slice",
+            "goal": "Fail while a sibling worker is still active.",
+            "acceptance": ["parallel layer failure is recorded"]
+        }),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-002",
+            "title": "Long parallel sibling",
+            "goal": "Stay active until the layer cancellation reaches this worker.",
+            "acceptance": ["parallel sibling receives cancellation"],
+            "verify": ["test -f slice-002.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add parallel failure slices"],
+    )?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[
+            ("KHAZAD_PI_BIN", fake_pi_string.as_str()),
+            ("KHAZAD_PARALLEL_MARKER", marker_string.as_str()),
+        ],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--all",
+            "--parallel",
+            "2",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let live = wait_for_parallel_progress(&bin, home.path(), &run_id, &["slice-001", "slice-002"])?;
+    assert_eq!(live["progress"]["parallel_layer"], true);
+    assert_eq!(
+        live["progress"]["parallel_slices"],
+        json!(["slice-001", "slice-002"])
+    );
+    let monitored = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--run",
+            &run_id,
+            "--once",
+            "--interval-ms",
+            "100",
+        ],
+    )?;
+    let monitored = String::from_utf8(monitored.stdout)?;
+    assert!(monitored.contains("parallel_worker_layer"));
+    assert!(monitored.contains("Parallel layer: slice-001, slice-002"));
+
+    let failed = wait_for_terminal_status(&bin, home.path(), &run_id, "failed")?;
+    assert!(
+        failed["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("parallel worker layer failed"),
+        "run error should summarize the parallel layer: {failed:#}"
+    );
+    assert!(marker.path().join("slice-002.terminated").exists());
+
+    let slice_runs = failed["slice_runs"].as_array().expect("slice_runs");
+    let slice_status = |slice_id: &str| {
+        slice_runs
+            .iter()
+            .find(|slice_run| slice_run["slice_id"].as_str() == Some(slice_id))
+            .and_then(|slice_run| slice_run["status"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(slice_status("slice-001"), "failed");
+    assert_eq!(slice_status("slice-002"), "cancelled");
+
+    let failed_event = failed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"].as_str() == Some("parallel_layer_failed"))
+        .expect("parallel layer failure event");
+    let outcomes = failed_event["payload"]["outcomes"]
+        .as_array()
+        .expect("parallel outcomes");
+    assert_eq!(outcomes[0]["slice_id"], "slice-001");
+    assert_eq!(outcomes[0]["status"], "failed");
+    assert_eq!(outcomes[1]["slice_id"], "slice-002");
+    assert_eq!(outcomes[1]["status"], "cancelled");
+
+    let branch = failed["run"]["integration_branch"].as_str().unwrap();
+    let subjects = git(repo.path(), &["log", "--format=%s", branch])?;
+    assert!(!subjects.contains("khazad(slice:slice-001): merge"));
+    assert!(!subjects.contains("khazad(slice:slice-002): merge"));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -797,6 +931,62 @@ fn wait_for_status(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestR
     }
 }
 
+fn wait_for_terminal_status(
+    bin: &Path,
+    home: &Path,
+    run_id: &str,
+    wanted: &str,
+) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&output)?;
+        let status = value["run"]["status"].as_str();
+        if status == Some(wanted) {
+            return Ok(value);
+        }
+        if matches!(
+            status,
+            Some("completed" | "failed" | "blocked" | "cancelled" | "interrupted")
+        ) {
+            panic!("run reached unexpected terminal state while waiting for {wanted}: {value:#}");
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {wanted}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_parallel_progress(
+    bin: &Path,
+    home: &Path,
+    run_id: &str,
+    expected: &[&str],
+) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&output)?;
+        let parallel_slices = value["progress"]["parallel_slices"]
+            .as_array()
+            .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if parallel_slices == expected {
+            return Ok(value);
+        }
+        if matches!(
+            value["run"]["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled" | "interrupted" | "completed")
+        ) {
+            panic!("run reached terminal state before parallel progress was visible: {value:#}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for parallel progress {expected:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn wait_for_latest_run(bin: &Path, home: &Path, repo: &Path, run_id: &str) -> TestResult<Value> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -944,6 +1134,73 @@ JSON
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms)?;
     Ok(())
+}
+
+fn write_parallel_fail_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+def emit(result):
+    event = {
+        "type": "agent_end",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": json.dumps(result)}],
+            }
+        ],
+    }
+    print(json.dumps(event), flush=True)
+
+prompt = sys.stdin.read()
+handoff_path = ""
+lines = prompt.splitlines()
+for index, line in enumerate(lines):
+    if line.strip() == "Read this handoff JSON first:" and index + 1 < len(lines):
+        handoff_path = lines[index + 1].strip()
+        break
+if not handoff_path:
+    emit({"status": "no-op", "summary": "parallel fake pi: no repair needed"})
+    sys.exit(0)
+else:
+    with open(handoff_path, encoding="utf-8") as fh:
+        handoff = json.load(fh)
+    slice_id = handoff["slice"]["id"]
+    marker_dir = Path(os.environ["KHAZAD_PARALLEL_MARKER"])
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / f"{slice_id}.started").write_text("started\n", encoding="utf-8")
+
+    if slice_id == "slice-001":
+        time.sleep(2)
+        emit({
+            "slice_id": slice_id,
+            "status": "failed",
+            "summary": "intentional parallel worker failure",
+        })
+        sys.exit(0)
+
+    def terminate(signum, frame):
+        (marker_dir / f"{slice_id}.terminated").write_text("terminated\n", encoding="utf-8")
+        sys.exit(143)
+
+    signal.signal(signal.SIGTERM, terminate)
+    while True:
+        time.sleep(0.1)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
 }
 
 fn write_quiet_fake_pi(dir: &Path) -> TestResult<PathBuf> {

@@ -845,9 +845,12 @@ fn print_watch_snapshot(details: &RunDetails) {
             .signed_duration_since(progress.phase_started_at)
             .to_std()
             .unwrap_or_default();
-        println!("Phase: {}", progress.phase);
+        println!("Phase: {}", progress_phase_label(progress));
         if !progress.slice_id.is_empty() {
             println!("Slice: {}", progress.slice_id);
+        }
+        if !progress.parallel_slices.is_empty() {
+            println!("Parallel layer: {}", progress.parallel_slices.join(", "));
         }
         if !progress.command.is_empty() {
             println!("Command: {}", progress.command);
@@ -932,9 +935,9 @@ fn render_waiting_monitor(out: &mut impl Write, repo: &str) -> Result<()> {
 fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> {
     let progress = details.progress.as_ref();
     let phase = match progress {
-        Some(progress) if !progress.phase.trim().is_empty() => progress.phase.as_str(),
-        _ if is_terminal_status(details.run.status) => details.run.status.as_str(),
-        _ => "unknown",
+        Some(progress) if !progress.phase.trim().is_empty() => progress_phase_label(progress),
+        _ if is_terminal_status(details.run.status) => details.run.status.as_str().to_string(),
+        _ => "unknown".to_string(),
     };
     let command = progress
         .map(|progress| progress.command.as_str())
@@ -956,6 +959,15 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
     writeln!(out, "Status: {}", details.run.status)?;
     writeln!(out, "Phase: {phase}")?;
     writeln!(out, "Slice: {}", monitor_slice_label(details))?;
+    if let Some(progress) = progress
+        && !progress.parallel_slices.is_empty()
+    {
+        writeln!(
+            out,
+            "Parallel layer: {}",
+            progress.parallel_slices.join(", ")
+        )?;
+    }
     writeln!(out, "Command: {}", display_or_dash(command))?;
     writeln!(out, "Elapsed: {}", format_duration(elapsed))?;
     writeln!(out, "Updated: {updated}")?;
@@ -977,6 +989,14 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
             .unwrap_or_default(),
     )?;
     Ok(())
+}
+
+fn progress_phase_label(progress: &crate::domain::RunProgress) -> String {
+    if progress.parallel_layer && progress.phase != "parallel_worker_layer" {
+        format!("parallel_worker_layer ({})", progress.phase)
+    } else {
+        progress.phase.clone()
+    }
 }
 
 fn render_worker_attempt(out: &mut impl Write, worker: &WorkerAttemptProgress) -> Result<()> {
@@ -1179,6 +1199,12 @@ fn monitor_message(details: &RunDetails) -> String {
 }
 
 fn monitor_slice_label(details: &RunDetails) -> String {
+    if let Some(progress) = &details.progress
+        && progress.parallel_layer
+        && !progress.parallel_slices.is_empty()
+    {
+        return format!("parallel layer: {}", progress.parallel_slices.join(", "));
+    }
     if let Some(progress) = &details.progress
         && !progress.slice_id.trim().is_empty()
     {

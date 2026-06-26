@@ -30,6 +30,7 @@ use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1091,19 +1092,85 @@ impl Manager {
         let mut outcomes = Vec::new();
         while !queue.is_empty() {
             let batch: Vec<_> = (0..parallelism).filter_map(|_| queue.pop_front()).collect();
-            let mut handles = Vec::new();
-            for slice in batch {
-                let manager = self.clone();
-                let run = run.clone();
-                let root_worktree = root_worktree.to_path_buf();
-                let integration_worktree = integration_worktree.to_path_buf();
-                let slice_base_sha = slice_base_sha.to_string();
-                let dependency_summary = dependency_summary.clone();
-                let cancel = cancel.clone();
-                let runner = runner.clone();
-                let config = config.clone();
-                handles.push(thread::spawn(move || {
-                    manager.run_slice_worker(
+            let mut batch_outcomes = self.run_parallel_worker_batch(
+                run,
+                &batch,
+                root_worktree,
+                integration_worktree,
+                slice_base_sha,
+                dependency_summary,
+                cancel,
+                runner.clone(),
+                config,
+            )?;
+            outcomes.append(&mut batch_outcomes);
+        }
+        outcomes.sort_by(|a, b| a.slice.id.cmp(&b.slice.id));
+        Ok(outcomes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_parallel_worker_batch(
+        &self,
+        run: &Run,
+        batch: &[Slice],
+        root_worktree: &Path,
+        integration_worktree: &Path,
+        slice_base_sha: &str,
+        dependency_summary: &BTreeMap<String, String>,
+        cancel: &CancellationToken,
+        runner: Arc<dyn Runner>,
+        config: &WorkflowConfig,
+    ) -> Result<Vec<SliceWorkerOutcome>> {
+        let batch_ids: Vec<_> = batch.iter().map(|slice| slice.id.clone()).collect();
+        let batch_label = batch_ids.join(",");
+        self.mark_progress(
+            &run.id,
+            "parallel_worker_layer",
+            &batch_label,
+            0,
+            runner.name(),
+            &format!("parallel worker layer running: {}", batch_ids.join(", ")),
+        );
+        self.state.record_event(
+            &run.id,
+            "parallel_layer_started",
+            &json!({ "slices": batch_ids }),
+        )?;
+
+        let batch_cancel = CancellationToken::new();
+        let batch_done = Arc::new(AtomicBool::new(false));
+        let parent_cancel = cancel.clone();
+        let bridge_cancel = batch_cancel.clone();
+        let bridge_done = batch_done.clone();
+        let cancel_bridge = thread::spawn(move || {
+            while !bridge_done.load(Ordering::SeqCst) {
+                if parent_cancel.is_cancelled() {
+                    bridge_cancel.cancel();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        for slice in batch.iter().cloned() {
+            let slice_id = slice.id.clone();
+            let manager = self.clone();
+            let run = run.clone();
+            let root_worktree = root_worktree.to_path_buf();
+            let integration_worktree = integration_worktree.to_path_buf();
+            let slice_base_sha = slice_base_sha.to_string();
+            let dependency_summary = dependency_summary.clone();
+            let cancel = batch_cancel.clone();
+            let runner = runner.clone();
+            let config = config.clone();
+            let tx = tx.clone();
+            handles.push(ParallelWorkerHandle {
+                slice_id: slice_id.clone(),
+                handle: thread::spawn(move || {
+                    let result = manager.run_slice_worker(
                         &run,
                         &slice,
                         &root_worktree,
@@ -1113,18 +1180,155 @@ impl Manager {
                         &cancel,
                         runner,
                         &config,
-                    )
-                }));
-            }
-            for handle in handles {
-                outcomes.push(
-                    handle
-                        .join()
-                        .map_err(|_| anyhow!("slice worker thread panicked"))??,
-                );
+                    );
+                    let _ = tx.send(ParallelWorkerResult { slice_id, result });
+                }),
+            });
+        }
+        drop(tx);
+
+        let mut results: BTreeMap<String, Result<SliceWorkerOutcome>> = BTreeMap::new();
+        while results.len() < handles.len() {
+            match rx.recv() {
+                Ok(result) => {
+                    if result.result.is_err() {
+                        batch_cancel.cancel();
+                    }
+                    results.insert(result.slice_id, result.result);
+                }
+                Err(_) => break,
             }
         }
-        outcomes.sort_by(|a, b| a.slice.id.cmp(&b.slice.id));
+
+        batch_done.store(true, Ordering::SeqCst);
+        let _ = cancel_bridge.join();
+
+        for worker in handles {
+            let panicked = worker.handle.join().is_err();
+            if panicked {
+                results
+                    .entry(worker.slice_id)
+                    .or_insert_with(|| Err(anyhow!("slice worker thread panicked")));
+            }
+        }
+        for slice_id in &batch_ids {
+            results.entry(slice_id.clone()).or_insert_with(|| {
+                Err(anyhow!(
+                    "slice worker thread ended without reporting result"
+                ))
+            });
+        }
+
+        if results.values().any(Result::is_err) {
+            let parent_cancelled = cancel.is_cancelled();
+            let outcomes =
+                self.record_parallel_layer_outcomes(run, &batch_ids, &results, parent_cancelled)?;
+            let summary = parallel_layer_failure_summary(&outcomes);
+            self.state.record_event(
+                &run.id,
+                "parallel_layer_failed",
+                &json!({ "slices": batch_ids, "outcomes": outcomes, "summary": summary }),
+            )?;
+            if parent_cancelled || parallel_results_all_cancelled(&results) {
+                return Err(CancelledError::new("run cancelled").into());
+            }
+            if parallel_results_any_blocked(&results) {
+                return Err(BlockedError::new(summary).into());
+            }
+            bail!(summary);
+        }
+
+        let outcomes = parallel_layer_success_outcomes(&results);
+        self.state.record_event(
+            &run.id,
+            "parallel_layer_completed",
+            &json!({ "slices": batch_ids, "outcomes": outcomes }),
+        )?;
+        results.into_values().collect()
+    }
+
+    fn record_parallel_layer_outcomes(
+        &self,
+        run: &Run,
+        batch_ids: &[String],
+        results: &BTreeMap<String, Result<SliceWorkerOutcome>>,
+        parent_cancelled: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        for (slice_id, result) in results {
+            if let Err(err) = result
+                && err.downcast_ref::<CancelledError>().is_some()
+                && !parent_cancelled
+            {
+                self.state.update_slice_status(
+                    &run.id,
+                    slice_id,
+                    SliceStatus::Cancelled,
+                    "cancelled after sibling failure in parallel worker layer",
+                )?;
+            }
+        }
+
+        let existing_slice_runs = self.state.get_slice_runs(&run.id)?;
+        let existing_ids: BTreeSet<_> = existing_slice_runs
+            .iter()
+            .map(|slice_run| slice_run.slice_id.clone())
+            .collect();
+        for slice_id in batch_ids {
+            if existing_ids.contains(slice_id) {
+                continue;
+            }
+            if let Some(result) = results.get(slice_id) {
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: slice_id.clone(),
+                    status: parallel_result_slice_status(result),
+                    branch: format!("khazad/{}/{}", run.id, slice_id),
+                    commit_sha: result
+                        .as_ref()
+                        .map(|outcome| outcome.result.commit_sha.clone())
+                        .unwrap_or_default(),
+                    attempts: result.as_ref().map(|outcome| outcome.attempts).unwrap_or(0),
+                    last_error: if result.is_err() {
+                        parallel_result_summary(result)
+                    } else {
+                        String::new()
+                    },
+                })?;
+            }
+        }
+
+        let slice_runs: BTreeMap<_, _> = self
+            .state
+            .get_slice_runs(&run.id)?
+            .into_iter()
+            .map(|slice_run| (slice_run.slice_id.clone(), slice_run))
+            .collect();
+        let mut outcomes = Vec::new();
+        for slice_id in batch_ids {
+            let mut status = results
+                .get(slice_id)
+                .map(parallel_result_status)
+                .unwrap_or("failed")
+                .to_string();
+            let mut summary = results
+                .get(slice_id)
+                .map(parallel_result_summary)
+                .unwrap_or_else(|| "worker did not report a result".to_string());
+            let mut attempts = 0;
+            if let Some(slice_run) = slice_runs.get(slice_id) {
+                status = slice_run.status.as_str().to_string();
+                attempts = slice_run.attempts;
+                if !slice_run.last_error.trim().is_empty() {
+                    summary = slice_run.last_error.clone();
+                }
+            }
+            outcomes.push(json!({
+                "slice_id": slice_id,
+                "status": status,
+                "attempts": attempts,
+                "summary": &summary,
+            }));
+        }
         Ok(outcomes)
     }
 
@@ -1636,6 +1840,16 @@ struct SliceWorkerOutcome {
     attempts: usize,
 }
 
+struct ParallelWorkerHandle {
+    slice_id: String,
+    handle: thread::JoinHandle<()>,
+}
+
+struct ParallelWorkerResult {
+    slice_id: String,
+    result: Result<SliceWorkerOutcome>,
+}
+
 struct LightweightCheckContext<'a> {
     run_id: &'a str,
     slice: &'a Slice,
@@ -1643,6 +1857,99 @@ struct LightweightCheckContext<'a> {
     base_sha: &'a str,
     attempt: usize,
     config: &'a WorkflowConfig,
+}
+
+fn parallel_layer_success_outcomes(
+    results: &BTreeMap<String, Result<SliceWorkerOutcome>>,
+) -> Vec<serde_json::Value> {
+    results
+        .iter()
+        .map(|(slice_id, result)| {
+            let outcome = result.as_ref().expect("successful parallel worker result");
+            json!({
+                "slice_id": slice_id,
+                "status": "ready_to_merge",
+                "attempts": outcome.attempts,
+                "summary": &outcome.result.summary,
+            })
+        })
+        .collect()
+}
+
+fn parallel_layer_failure_summary(outcomes: &[serde_json::Value]) -> String {
+    let non_ready = outcomes
+        .iter()
+        .filter(|outcome| {
+            !matches!(
+                outcome.get("status").and_then(serde_json::Value::as_str),
+                Some("ready_to_merge")
+            )
+        })
+        .count();
+    let details = outcomes
+        .iter()
+        .map(|outcome| {
+            let slice_id = outcome
+                .get("slice_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let status = outcome
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let summary = outcome
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if summary.trim().is_empty() {
+                format!("{slice_id}={status}")
+            } else {
+                format!("{slice_id}={status} ({summary})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "parallel worker layer failed with {non_ready} non-ready slice(s) out of {}: {details}",
+        outcomes.len()
+    )
+}
+
+fn parallel_result_status(result: &Result<SliceWorkerOutcome>) -> &'static str {
+    match result {
+        Ok(_) => "ready_to_merge",
+        Err(err) if err.downcast_ref::<CancelledError>().is_some() => "cancelled",
+        Err(err) if err.downcast_ref::<BlockedError>().is_some() => "blocked",
+        Err(_) => "failed",
+    }
+}
+
+fn parallel_result_summary(result: &Result<SliceWorkerOutcome>) -> String {
+    match result {
+        Ok(outcome) => outcome.result.summary.clone(),
+        Err(err) => err.to_string(),
+    }
+}
+
+fn parallel_result_slice_status(result: &Result<SliceWorkerOutcome>) -> SliceStatus {
+    match result {
+        Ok(_) => SliceStatus::ReadyToMerge,
+        Err(err) if err.downcast_ref::<CancelledError>().is_some() => SliceStatus::Cancelled,
+        Err(err) if err.downcast_ref::<BlockedError>().is_some() => SliceStatus::Blocked,
+        Err(_) => SliceStatus::Failed,
+    }
+}
+
+fn parallel_results_any_blocked(results: &BTreeMap<String, Result<SliceWorkerOutcome>>) -> bool {
+    results
+        .values()
+        .any(|result| matches!(result, Err(err) if err.downcast_ref::<BlockedError>().is_some()))
+}
+
+fn parallel_results_all_cancelled(results: &BTreeMap<String, Result<SliceWorkerOutcome>>) -> bool {
+    results
+        .values()
+        .all(|result| matches!(result, Err(err) if err.downcast_ref::<CancelledError>().is_some()))
 }
 
 fn sh_quote(value: &str) -> String {

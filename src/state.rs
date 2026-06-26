@@ -403,6 +403,8 @@ impl Store {
             phase_started_at: parse_time("phase_started_at", &phase_started_at)?,
             updated_at: now,
             worker: None,
+            parallel_layer: false,
+            parallel_slices: Vec::new(),
         })
     }
 
@@ -859,6 +861,8 @@ fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
         phase_started_at: parse_time("phase_started_at", &phase_started_at)?,
         updated_at: parse_time("updated_at", &updated_at)?,
         worker,
+        parallel_layer: false,
+        parallel_slices: Vec::new(),
     })
 }
 

@@ -17,6 +17,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 - Each worker attempt runs one open slice in a daemon-managed isolated worktree. Parallel workers must not share a checkout.
 - A completed worker must return valid JSON, commit intended changes, and leave its worktree clean before the daemon may integrate the slice.
 - Independent slices may execute concurrently, but integration into the run branch is serial.
+- A parallel dependency layer is integration-atomic: Khazad-Doom joins every spawned worker in the active batch/layer and records deterministic per-slice outcomes before deciding whether the layer may merge. No successful worker from a layer is merged after a sibling fails or blocks.
 - After each successful integration merge, Khazad-Doom records a checkpoint before advancing, so `resume` can continue from recorded state instead of replaying completed merges.
 - Merge conflicts, `ask-user` findings, invalid worker output, dirty worktrees, and verification failures become structured blocked/failed artifacts rather than silent best-effort integration.
 - If integrated work needs repair, repair occurs before the integration gate is treated as passed; repair does not bypass or weaken the gate.
@@ -26,6 +27,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 
 - Attempt history is append-only evidence. Retries add attempts and preserve previous output/failure context.
 - Worker execution is at-least-once, not exactly-once. A timed-out, cancelled, or retried attempt may have produced files or commits in its isolated worktree.
+- Parallel worker cancellation is graceful-first. If a run cancellation or sibling layer failure happens while a parallel batch is active, Khazad-Doom propagates cancellation to active workers and still joins every worker thread before the layer returns.
 - Process liveness and output activity are distinct. `Supervisor: alive` means the daemon still observes the child process, not that semantic progress is guaranteed.
 - Quiet-worker warnings are advisory. Missing output alone is not terminal unless an explicit timeout/policy makes it terminal.
 - `worker_attempt_timeout_seconds: 0` means no fatal worker-attempt timeout. Any nonzero worker-attempt timeout is an explicit repo/operator policy and applies to an attempt, not to the whole run lifetime.
@@ -48,6 +50,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 - The daemon/state store is the source of truth for run status, slice states, events, and live progress snapshots.
 - `status`, `watch`, `monitor`, and optional Pi adapters render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
+- When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
 
 ## Artifacts, handoffs, and remotes
 

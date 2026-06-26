@@ -118,6 +118,7 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Bounded work | Each worker receives exactly one slice and its declared context. |
 | Dependency order | Requested open slices include open dependencies, skip closed dependencies, and reject cycles. |
 | Worktree isolation | Parallel workers cannot trample the same checkout. |
+| Parallel layer safety | Every spawned worker in a parallel batch is joined and recorded before success/failure; integration starts only after the whole layer succeeds. |
 | Structured output | Worker and repair results must be machine-readable JSON. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
@@ -146,9 +147,12 @@ Run the command above from the repo checkout; from elsewhere, use the absolute `
 
 Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. A Pi extension can be an optional adapter over the same daemon state, but it is not required and does not own core workflow state.
 
-During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity:
+During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
 
 ```text
+Phase: parallel_worker_layer (worker_running)
+Slice: parallel layer: slice-001, slice-002
+Parallel layer: slice-001, slice-002
 Supervisor: alive, observed child 8s ago
 Worker process: running pid=12345
 Worker runtime: 22m14s
@@ -159,7 +163,7 @@ Warning: worker is quiet for 15m00s; this may be normal; no timeout configured
 Hint: wait, inspect, or cancel
 ```
 
-A quiet worker is not considered failed by default. Khazad-Doom reports that the daemon is still supervising the process, shows when stdout/stderr/JSON events last arrived, and leaves the wait/inspect/cancel decision explicit unless a repo config opts into a worker-attempt timeout.
+A quiet worker is not considered failed by default. Khazad-Doom reports that the daemon is still supervising the process, shows when stdout/stderr/JSON events last arrived, and leaves the wait/inspect/cancel decision explicit unless a repo config opts into a worker-attempt timeout. The status JSON includes `progress.parallel_layer: true` and `progress.parallel_slices` while a parallel worker layer is active.
 
 ### Optional Pi adapter
 
@@ -205,7 +209,7 @@ To install only the skill without the optional extension, use Pi package filters
 | `khazad-doom slices list` | Print compact slice summaries. |
 | `khazad-doom slices schema --write` | Write the JSON Schema for editor and CI validation. |
 | `khazad-doom run --slice <id>` | Run one open slice plus open dependencies; closed dependencies are treated as satisfied. |
-| `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently. |
+| `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently, then integrate only after the whole parallel layer succeeds. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |

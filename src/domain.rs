@@ -378,6 +378,10 @@ pub struct RunProgress {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerAttemptProgress>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_layer: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parallel_slices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

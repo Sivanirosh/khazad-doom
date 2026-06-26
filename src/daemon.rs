@@ -1,4 +1,7 @@
-use crate::domain::{BranchHandoff, Run, RunDetails, RunInspection, SliceWriteResult};
+use crate::domain::{
+    BranchHandoff, Run, RunDetails, RunInspection, RunProgress, SliceRun, SliceStatus,
+    SliceWriteResult,
+};
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
     InspectRunParams, ListSlicesResult, Request, Response, ResumeRunParams,
@@ -176,9 +179,14 @@ impl Server {
 
     fn run_details(&self, run: Run, events_limit: usize) -> Result<RunDetails> {
         let run_id = run.id.clone();
+        let slice_runs = self.store.get_slice_runs(&run_id)?;
+        let mut progress = self.store.get_progress(&run_id)?;
+        if let Some(progress) = progress.as_mut() {
+            annotate_parallel_progress(progress, &slice_runs);
+        }
         Ok(RunDetails {
-            slice_runs: self.store.get_slice_runs(&run_id)?,
-            progress: self.store.get_progress(&run_id)?,
+            slice_runs,
+            progress,
             events: self.store.get_events(&run_id, events_limit)?,
             run,
         })
@@ -333,6 +341,43 @@ impl Server {
             _ => bail!("unknown method {method:?}"),
         }
     }
+}
+
+fn annotate_parallel_progress(progress: &mut RunProgress, slice_runs: &[SliceRun]) {
+    if progress.phase == "parallel_worker_layer" && !progress.slice_id.trim().is_empty() {
+        progress.parallel_layer = true;
+        progress.parallel_slices = progress
+            .slice_id
+            .split(',')
+            .map(str::trim)
+            .filter(|slice_id| !slice_id.is_empty())
+            .map(str::to_string)
+            .collect();
+        return;
+    }
+    if !is_worker_layer_phase(&progress.phase) {
+        return;
+    }
+    let active: Vec<_> = slice_runs
+        .iter()
+        .filter(|slice_run| is_parallel_layer_slice_status(slice_run.status))
+        .map(|slice_run| slice_run.slice_id.clone())
+        .collect();
+    if active.len() > 1 {
+        progress.parallel_layer = true;
+        progress.parallel_slices = active;
+    }
+}
+
+fn is_worker_layer_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "worker_started" | "worker_running" | "worker_verify" | "ready_to_merge"
+    )
+}
+
+fn is_parallel_layer_slice_status(status: SliceStatus) -> bool {
+    !matches!(status, SliceStatus::Pending | SliceStatus::Merged)
 }
 
 struct HandleOutcome {
