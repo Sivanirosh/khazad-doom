@@ -1,0 +1,14 @@
+# Build outputs
+/bin/
+/dist/
+/target/
+/khazad-doom
+*.test
+
+# Runtime state for dogfooding this repo
+.workflow/runs/
+.workflow/worktrees/
+
+# Local editor/system
+.DS_Store
+.env

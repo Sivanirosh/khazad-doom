@@ -1,0 +1,405 @@
+use crate::domain::{Event, Run, RunStatus, SliceRun, SliceStatus};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Repo {
+    pub id: String,
+    pub path: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Store {
+    path: PathBuf,
+}
+
+impl Store {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create state directory {}", parent.display()))?;
+        }
+        let store = Self { path };
+        store.init()?;
+        Ok(store)
+    }
+
+    fn conn(&self) -> Result<Connection> {
+        let conn = Connection::open(&self.path)
+            .with_context(|| format!("open sqlite state {}", self.path.display()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        Ok(conn)
+    }
+
+    fn init(&self) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS repos (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runs (
+                id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                base_branch TEXT NOT NULL,
+                base_sha TEXT NOT NULL,
+                integration_branch TEXT NOT NULL,
+                selected_slice_id TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS slice_runs (
+                run_id TEXT NOT NULL,
+                slice_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                branch TEXT NOT NULL DEFAULT '',
+                commit_sha TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (run_id, slice_id)
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_repo(&self, repo: &Repo) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"INSERT INTO repos (id, path, created_at) VALUES (?1, ?2, ?3)
+               ON CONFLICT(id) DO UPDATE SET path=excluded.path"#,
+            params![&repo.id, &repo.path, repo.created_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_run(&self, run: &Run) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"INSERT INTO runs
+               (id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                selected_slice_id, error, started_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            params![
+                &run.id,
+                &run.repo_id,
+                &run.repo_path,
+                run.status.as_str(),
+                &run.base_branch,
+                &run.base_sha,
+                &run.integration_branch,
+                &run.selected_slice_id,
+                &run.error,
+                run.started_at.to_rfc3339(),
+                run.updated_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_run(&self, run_id: &str, status: RunStatus, error: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE runs SET status=?1, error=?2, updated_at=?3 WHERE id=?4",
+            params![status.as_str(), error, Utc::now().to_rfc3339(), run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_slice_run(&self, slice_run: &SliceRun) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"INSERT INTO slice_runs (run_id, slice_id, status, branch, commit_sha, attempts, last_error)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               ON CONFLICT(run_id, slice_id) DO UPDATE SET
+                 status=excluded.status,
+                 branch=excluded.branch,
+                 commit_sha=excluded.commit_sha,
+                 attempts=excluded.attempts,
+                 last_error=excluded.last_error"#,
+            params![
+                &slice_run.run_id,
+                &slice_run.slice_id,
+                slice_run.status.as_str(),
+                &slice_run.branch,
+                &slice_run.commit_sha,
+                slice_run.attempts as i64,
+                &slice_run.last_error
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_slice_status(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+        status: SliceStatus,
+        last_error: &str,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE slice_runs SET status=?1, last_error=?2 WHERE run_id=?3 AND slice_id=?4",
+            params![status.as_str(), last_error, run_id, slice_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_active_slice_runs(&self, run_id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"UPDATE slice_runs SET status=?1, last_error=?2
+               WHERE run_id=?3 AND status IN ('pending', 'running', 'repair_needed')"#,
+            params![SliceStatus::Cancelled.as_str(), reason, run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn interrupt_active_slice_runs(&self, run_id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"UPDATE slice_runs SET status=?1, last_error=?2
+               WHERE run_id=?3 AND status IN ('pending', 'running', 'repair_needed', 'ready_to_merge')"#,
+            params![SliceStatus::Interrupted.as_str(), reason, run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_event<T: Serialize>(&self, run_id: &str, typ: &str, payload: &T) -> Result<()> {
+        let payload_json = serde_json::to_string(payload)?;
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, typ, payload_json, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_run(&self, id: &str) -> Result<Option<Run>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                          selected_slice_id, error, started_at, updated_at
+                   FROM runs WHERE id=?1"#,
+                params![id],
+                run_tuple_from_row,
+            )
+            .optional()?;
+        row.map(run_from_tuple).transpose()
+    }
+
+    pub fn get_slice_runs(&self, run_id: &str) -> Result<Vec<SliceRun>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id, slice_id, status, branch, commit_sha, attempts, last_error
+               FROM slice_runs WHERE run_id=?1 ORDER BY slice_id"#,
+        )?;
+        let rows = stmt.query_map(params![run_id], slice_run_tuple_from_row)?;
+        let mut slice_runs = Vec::new();
+        for row in rows {
+            slice_runs.push(slice_run_from_tuple(row?)?);
+        }
+        Ok(slice_runs)
+    }
+
+    pub fn get_events(&self, run_id: &str, limit: usize) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let limit = if limit == 0 { 50 } else { limit };
+        let mut stmt = conn.prepare(
+            r#"SELECT id, run_id, type, payload_json, created_at
+               FROM events WHERE run_id=?1 ORDER BY id ASC LIMIT ?2"#,
+        )?;
+        let rows = stmt.query_map(params![run_id, limit as i64], event_tuple_from_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(event_from_tuple(row?)?);
+        }
+        Ok(events)
+    }
+
+    pub fn cancel_running_runs(&self, reason: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE runs SET status=?1, error=?2, updated_at=?3 WHERE status IN (?4, ?5)",
+            params![
+                RunStatus::Cancelled.as_str(),
+                reason,
+                Utc::now().to_rfc3339(),
+                RunStatus::Running.as_str(),
+                RunStatus::Pending.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_runs(&self) -> Result<Vec<Run>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                      selected_slice_id, error, started_at, updated_at
+               FROM runs WHERE status IN (?1, ?2) ORDER BY started_at ASC"#,
+        )?;
+        let rows = stmt.query_map(
+            params![RunStatus::Pending.as_str(), RunStatus::Running.as_str()],
+            run_tuple_from_row,
+        )?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(run_from_tuple(row?)?);
+        }
+        Ok(runs)
+    }
+
+    pub fn mark_run_interrupted(&self, run_id: &str, reason: &str) -> Result<()> {
+        self.update_run(run_id, RunStatus::Interrupted, reason)
+    }
+
+    pub fn latest_runs(&self, limit: usize) -> Result<Vec<Run>> {
+        let conn = self.conn()?;
+        let limit = if limit == 0 { 10 } else { limit };
+        let mut stmt = conn.prepare(
+            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                      selected_slice_id, error, started_at, updated_at
+               FROM runs ORDER BY started_at DESC LIMIT ?1"#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], run_tuple_from_row)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(run_from_tuple(row?)?);
+        }
+        Ok(runs)
+    }
+}
+
+type RunTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+type SliceRunTuple = (String, String, String, String, String, i64, String);
+type EventTuple = (i64, String, String, String, String);
+
+fn run_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn slice_run_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SliceRunTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn event_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn run_from_tuple(row: RunTuple) -> Result<Run> {
+    let (
+        id,
+        repo_id,
+        repo_path,
+        status,
+        base_branch,
+        base_sha,
+        integration_branch,
+        selected_slice_id,
+        error,
+        started_at,
+        updated_at,
+    ) = row;
+    Ok(Run {
+        id,
+        repo_id,
+        repo_path,
+        status: RunStatus::parse(&status)?,
+        base_branch,
+        base_sha,
+        integration_branch,
+        selected_slice_id,
+        error,
+        started_at: parse_time("started_at", &started_at)?,
+        updated_at: parse_time("updated_at", &updated_at)?,
+    })
+}
+
+fn slice_run_from_tuple(row: SliceRunTuple) -> Result<SliceRun> {
+    let (run_id, slice_id, status, branch, commit_sha, attempts, last_error) = row;
+    Ok(SliceRun {
+        run_id,
+        slice_id,
+        status: SliceStatus::parse(&status)?,
+        branch,
+        commit_sha,
+        attempts: attempts as usize,
+        last_error,
+    })
+}
+
+fn event_from_tuple(row: EventTuple) -> Result<Event> {
+    let (id, run_id, typ, payload_json, created_at) = row;
+    Ok(Event {
+        id,
+        run_id,
+        typ,
+        payload: serde_json::from_str(&payload_json)
+            .with_context(|| format!("parse event payload {payload_json:?}"))?,
+        created_at: parse_time("created_at", &created_at)?,
+    })
+}
+
+fn parse_time(field: &str, value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("parse {field}: {value:?}"))?
+        .with_timezone(&Utc))
+}

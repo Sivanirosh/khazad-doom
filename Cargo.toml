@@ -1,0 +1,21 @@
+[package]
+name = "khazad-doom"
+version = "0.1.0"
+edition = "2024"
+description = "Local agentic workflow daemon for JSON Issue Slices"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+libc = "0.2"
+rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
