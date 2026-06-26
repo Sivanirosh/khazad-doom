@@ -1,0 +1,134 @@
+{
+  "run_id": "kd-20260626-102840-44c20dda",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260626-102840-44c20dda/integration",
+  "base_sha": "827295e2170123faabe3fd724366d93b689d2393",
+  "final_sha": "5a761938e48d019bb739f864944179e108aa2b2c",
+  "completed_slices": [
+    {
+      "slice_id": "slice-031",
+      "status": "complete",
+      "summary": "Completed the pre-release audit and documented scope, module depth, findings, fixes, remaining risks, and release recommendation in docs/release-audit.md. No public contracts or code behavior were changed.",
+      "commit_sha": "260900e919650606f15eaea20e23731598042dd8",
+      "commit_message": "docs: add v0.1.0 release audit",
+      "changed_files": [
+        "docs/release-audit.md"
+      ],
+      "tests_run": [
+        "KHAZAD_HOME=<temp> cargo run --quiet -- slices validate --repo .",
+        "scripts/package.sh",
+        "test -f docs/release-audit.md",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh"
+      ],
+      "acceptance_status": [
+        "docs/release-audit.md exists and records audited scope, findings, fixes made, remaining risks, and release recommendation.",
+        "Audit explicitly checks module depth using module, interface, seam, depth, leverage, and locality vocabulary.",
+        "Dirty, broken, dead, redundant, and AI-slop review is recorded; remaining risks are justified.",
+        "No public CLI, daemon IPC, JSON Issue Slice, or runner contract changes were made.",
+        "Full verification profile passed; changes were committed and the tracked worktree is clean."
+      ],
+      "findings": [
+        {
+          "id": "AUD-001",
+          "severity": "info",
+          "action": "auto-fix",
+          "file": "docs/release-audit.md",
+          "line": 1,
+          "description": "No committed release audit existed before this slice; added the required audit document."
+        },
+        {
+          "id": "AUD-002",
+          "severity": "info",
+          "action": "no-op",
+          "file": "src/workflow/manager.rs",
+          "line": 1,
+          "description": "workflow::Manager is large but remains a deep module with a small external interface; post-release private refactoring is non-blocking."
+        },
+        {
+          "id": "AUD-003",
+          "severity": "info",
+          "action": "no-op",
+          "description": "Full verification and slice validation passed; no release-blocking broken, dirty, redundant, dead, or AI-slop code was found."
+        }
+      ],
+      "assumptions": [
+        "The requested workflow scope includes .workflow assets and .github release workflow assets.",
+        "Ignored build/runtime outputs such as target/ and dist/ are outside the committed-code audit scope."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "slice-031",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "test -f docs/release-audit.md"
+      ],
+      "attempt": 1,
+      "worker_head": "260900e919650606f15eaea20e23731598042dd8",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "no-op",
+    "summary": "Integration repair pass found no cross-slice or verification breakage; no files changed and worktree remained clean.",
+    "tests_run": [
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+      "bash -n scripts/install.sh scripts/package.sh",
+      "test -f docs/release-audit.md",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo run -- slices validate --repo ."
+    ],
+    "findings": [
+      {
+        "severity": "info",
+        "action": "no-op",
+        "description": "Already-merged integration branch passed the quick repair verification pass with no integration repair needed."
+      }
+    ]
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 17 tests\ntest artifact::tests::accepts_safe_slice_id ... ok\ntest agent::tests::extracts_embedded_json_object ... ok\ntest agent::tests::parses_explicit_runner_specs ... ok\ntest artifact::tests::dependency_layers_group_independent_slices ... ok\ntest artifact::tests::rejects_path_or_ref_unsafe_slice_ids ... ok\ntest artifact::tests::reports_missing_dependencies ... ok\ntest artifact::tests::topological_order_includes_requested_dependencies_first ... ok\ntest workflow::manager::tests::rejects_unknown_worker_and_repair_statuses ... ok\ntest workflow::manager::tests::rejects_worker_result_for_wrong_slice ... ok\ntest workflow::manager::tests::shell_command_cancellation_returns_promptly ... ok\ntest workflow::manager::tests::recovery_marks_stale_running_runs_interrupted ... ok\ntest workflow::manager::tests::merge_conflicts_are_structured_blocked_artifacts ... ok\ntest workflow::manager::tests::repo_config_verify_profile_runs_with_env_and_cwd ... ok\ntest workflow::manager::tests::fake_runner_parallelizes_independent_slices ... ok\ntest workflow::manager::tests::shell_command_timeout_returns_promptly ... ok\ntest workflow::manager::tests::fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees ... ok\ntest workflow::manager::tests::active_repo_run_blocks_second_run ... ok\n\ntest result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.46s\n\n\nrunning 3 tests\ntest schema_import_and_handoff_v2_black_box ... ok\ntest interrupted_run_resumes_without_duplicate_merges_black_box ... ok\ntest daemon_fake_run_handoff_and_inspect_black_box ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s\n\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s\n     Running unittests src/main.rs (target/debug/deps/khazad_doom-5a3ff85b4912457c)\n     Running tests/daemon_integration.rs (target/debug/deps/daemon_integration-060352e879623867)"
+      },
+      {
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "test -f docs/release-audit.md",
+        "status": "passed",
+        "exit_code": 0
+      }
+    ]
+  },
+  "created_at": "2026-06-26T10:34:46.206231360Z"
+}
