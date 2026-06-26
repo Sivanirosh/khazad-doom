@@ -1,10 +1,11 @@
 use crate::domain::{
     ArtifactEntry, Handoff, ImplementationSummary, RunCheckpoint, Slice, SliceSummary,
-    SliceValidationIssue, SliceValidationReport, SliceWriteResult,
+    SliceValidationIssue, SliceValidationReport, SliceWriteResult, WorkflowConfig,
 };
 use crate::gitutil;
 use anyhow::{Context, Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,9 +30,12 @@ impl Store {
             self.plans_dir(),
             self.reports_dir(),
             self.runs_dir(),
+            self.schema_dir(),
         ] {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
+        self.ensure_default_config()?;
+        self.write_slice_schema()?;
         ensure_gitignore(&self.repo_path)
     }
 
@@ -53,6 +57,18 @@ impl Store {
 
     pub fn runs_dir(&self) -> PathBuf {
         self.workflow_dir().join("runs")
+    }
+
+    pub fn schema_dir(&self) -> PathBuf {
+        self.workflow_dir().join("schema")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.workflow_dir().join("khazad.json")
+    }
+
+    pub fn slice_schema_path(&self) -> PathBuf {
+        self.schema_dir().join("slice.schema.json")
     }
 
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
@@ -190,12 +206,38 @@ impl Store {
         self.slices_dir().join(format!("{slice_id}.json"))
     }
 
+    pub fn read_config(&self) -> Result<WorkflowConfig> {
+        let path = self.config_path();
+        if !path.exists() {
+            return Ok(WorkflowConfig::default());
+        }
+        read_json(path)
+    }
+
+    pub fn ensure_default_config(&self) -> Result<()> {
+        let path = self.config_path();
+        if !path.exists() {
+            write_json(path, &WorkflowConfig::default())?;
+        }
+        Ok(())
+    }
+
+    pub fn write_slice_schema(&self) -> Result<PathBuf> {
+        let path = self.slice_schema_path();
+        write_json(&path, &slice_schema())?;
+        Ok(path)
+    }
+
     pub fn write_slice(&self, slice: &Slice, overwrite: bool) -> Result<SliceWriteResult> {
         validate_slice(slice)?;
         self.ensure_layout()?;
         let path = self.slice_path(&slice.id);
         if path.exists() && !overwrite {
-            bail!("slice {:?} already exists at {}", slice.id, path.display());
+            bail!(
+                "slice {:?} already exists at {}; use --overwrite or choose a different --id",
+                slice.id,
+                path.display()
+            );
         }
         write_json(&path, slice)?;
         Ok(SliceWriteResult {
@@ -248,6 +290,30 @@ impl Store {
         entries.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
         Ok(entries)
     }
+}
+
+pub fn slice_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://khazad-doom.local/slice.schema.json",
+        "title": "Khazad-Doom JSON Issue Slice",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "goal", "acceptance"],
+        "properties": {
+            "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+            "title": { "type": "string", "minLength": 1 },
+            "goal": { "type": "string", "minLength": 1 },
+            "github_issue": { "type": "string" },
+            "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "areas": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "acceptance": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "must_ask_if": { "type": "array", "items": { "type": "string" } },
+            "verify_profile": { "type": "string" },
+            "verify": { "type": "array", "items": { "type": "string" } },
+            "verify_timeout_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 }
+        }
+    })
 }
 
 pub fn validate_slice(slice: &Slice) -> Result<()> {
@@ -615,6 +681,7 @@ mod tests {
             areas: Vec::new(),
             acceptance: vec!["done".to_string()],
             must_ask_if: Vec::new(),
+            verify_profile: String::new(),
             verify: Vec::new(),
             verify_timeout_seconds: 0,
         }

@@ -1,0 +1,24 @@
+{
+  "id": "slice-022",
+  "title": "Repo config file",
+  "goal": "Add .workflow/khazad.json defaults for agent, parallelism, verification timeout, base branch, handoff behavior, and verification profiles.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-021"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "Repositories can define Khazad-Doom defaults in .workflow/khazad.json.",
+    "Run startup applies configured agent, parallelism, verify timeout, and base branch defaults.",
+    "Handoff defaults are read without surprising users when --dry-run is used."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

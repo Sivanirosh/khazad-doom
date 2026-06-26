@@ -1,0 +1,24 @@
+{
+  "id": "slice-023",
+  "title": "Resume e2e hardening",
+  "goal": "Harden resume with a black-box interrupted-run scenario that resumes remaining slices without duplicate merges.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-022"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "A daemon integration test interrupts a run after a checkpoint.",
+    "resume --run continues remaining slices from the integration branch.",
+    "Previously merged slices are not merged a second time."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

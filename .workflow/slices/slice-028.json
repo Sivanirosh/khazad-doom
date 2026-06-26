@@ -1,0 +1,24 @@
+{
+  "id": "slice-028",
+  "title": "Repo/run locking",
+  "goal": "Prevent unsafe concurrent runs against the same repository and branch namespace.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-027"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "Starting a second active run for a repo fails with a clear error.",
+    "Resuming the same run is allowed when no other run is active.",
+    "The lock is based on daemon state and survives CLI process boundaries."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

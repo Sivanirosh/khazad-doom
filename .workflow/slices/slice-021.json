@@ -1,0 +1,22 @@
+{
+  "id": "slice-021",
+  "title": "Dogfood slice set",
+  "goal": "Commit real .workflow/slices/slice-021..030.json so Khazad-Doom can run its own roadmap.",
+  "github_issue": "",
+  "depends_on": [],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    ".workflow/slices/slice-021.json through slice-030.json exist.",
+    "The dogfood slices validate with khazad-doom slices validate.",
+    "Each slice has clear acceptance criteria and verification policy."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

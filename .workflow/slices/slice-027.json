@@ -1,0 +1,24 @@
+{
+  "id": "slice-027",
+  "title": "Handoff v2",
+  "goal": "Add --dry-run, diagnostics, and stronger handoff action behavior for push/PR execution.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-026"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "handoff --dry-run suppresses configured push/PR defaults.",
+    "Handoff JSON includes origin and gh diagnostics.",
+    "Tests exercise --push --create-pr with a fake gh executable."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

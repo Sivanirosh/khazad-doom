@@ -122,6 +122,8 @@ pub struct SliceImportGithubParams {
     pub verify: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub overwrite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +133,8 @@ pub struct HandoffParams {
     pub push: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub create_pr: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

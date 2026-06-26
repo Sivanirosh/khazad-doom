@@ -1,0 +1,71 @@
+{
+  "$id": "https://khazad-doom.local/slice.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acceptance": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "areas": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "depends_on": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "github_issue": {
+      "type": "string"
+    },
+    "goal": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "type": "string"
+    },
+    "must_ask_if": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "title": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "verify": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "verify_profile": {
+      "type": "string"
+    },
+    "verify_timeout_seconds": {
+      "maximum": 86400,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "goal",
+    "acceptance"
+  ],
+  "title": "Khazad-Doom JSON Issue Slice",
+  "type": "object"
+}

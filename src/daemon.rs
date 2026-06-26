@@ -270,14 +270,18 @@ impl Server {
                         id: params.id,
                         verify: params.verify,
                         overwrite: params.overwrite,
+                        dry_run: params.dry_run,
                     })?;
                 Ok(HandleOutcome::result(result)?)
             }
             "handoffRun" => {
                 let params: HandoffParams = decode_params(raw)?;
-                let handoff: BranchHandoff =
-                    self.manager
-                        .branch_handoff(&params.run_id, params.push, params.create_pr)?;
+                let handoff: BranchHandoff = self.manager.branch_handoff(
+                    &params.run_id,
+                    params.push,
+                    params.create_pr,
+                    params.dry_run,
+                )?;
                 Ok(HandleOutcome::result(handoff)?)
             }
             "inspectRun" => {

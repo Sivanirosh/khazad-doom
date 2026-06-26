@@ -1,0 +1,24 @@
+{
+  "id": "slice-026",
+  "title": "GitHub import v2",
+  "goal": "Improve GitHub issue import with URL parsing, checklist extraction, labels/metadata, --dry-run, and collision guidance.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-025"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "GitHub issue URLs are converted to gh issue view --repo arguments.",
+    "Checklist items become acceptance criteria and labels become areas.",
+    "--dry-run returns the generated slice without writing it."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

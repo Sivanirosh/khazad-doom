@@ -1,7 +1,7 @@
 ---
 name: khazad-doom
 description: Drive the Khazad-Doom workflow daemon: initialize repo workflow contracts, run JSON Issue Slices through isolated Pi/fake workers, inspect status/artifacts, create handoffs, and report blockers.
-argument-hint: "[init|slices|run|status|cancel|handoff|inspect] [options]"
+argument-hint: "[init|slices|run|resume|status|cancel|handoff|inspect] [options]"
 ---
 
 # Khazad-Doom
@@ -22,11 +22,14 @@ Common commands:
 khazad-doom init
 khazad-doom slices validate
 khazad-doom slices list
+khazad-doom slices schema --write
 khazad-doom run --slice <slice-id> --wait
-khazad-doom run --all --wait
+khazad-doom run --all --parallel <n> --wait
 khazad-doom run --agent fake --all --wait
+khazad-doom resume --run <run-id>
 khazad-doom status --run <run-id>
 khazad-doom handoff --run <run-id>
+khazad-doom handoff --run <run-id> --dry-run
 khazad-doom inspect --run <run-id>
 khazad-doom cancel --run <run-id>
 khazad-doom daemon status
@@ -35,13 +38,16 @@ khazad-doom daemon status
 ## Protocol
 
 - JSON Issue Slices in `.workflow/slices/*.json` are the machine source of truth.
+- `.workflow/khazad.json` carries repo defaults and verification profiles.
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
 - Worker output is JSON-only.
 - Worker commits are required before merge.
-- Multiple slices run serially in dependency order; requested slice dependencies are included automatically.
+- Multiple slices run in dependency order; independent slices can run in parallel, then merge serially.
 - `--agent fake` is deterministic and only for local tests/dogfooding.
 - Interrupted daemon runs are marked `interrupted` on next startup; lost workers are not silently resumed.
+- Merge conflicts are structured blocked artifacts; do not paper over them.
 - Runtime artifacts under `.workflow/runs/` are gitignored.
+- Handoff prints by default; push/PR creation require explicit flags or config, and `--dry-run` suppresses configured actions.
 - The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, status, handoff JSON, and artifact inspection.
 
 If a run blocks with an `ask-user` finding, relay the blocker to the user with exact details and ask for a decision before resuming.

@@ -87,6 +87,7 @@ An Issue Slice is the smallest unit of work Khazad-Doom will hand to an agent. I
     "Auth/session behavior changes.",
     "Acceptance criteria conflict."
   ],
+  "verify_profile": "quick",
   "verify": ["cargo test"],
   "verify_timeout_seconds": 600
 }
@@ -103,8 +104,11 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 - **Verification** — slice `verify` commands run before merge and again through the integration gate.
 - **Dependency order** — requested slices automatically include their dependencies.
 - **Parallel workers** — independent slices can run concurrently, then merge serially.
-- **Timeout policy** — slice verification commands have bounded runtime.
+- **Repo/run locking** — one active run per repository prevents branch/worktree collisions.
+- **Config defaults** — `.workflow/khazad.json` can set agent, parallelism, base branch, handoff, and verification profiles.
+- **Timeout policy** — slice and profile verification commands have bounded runtime.
 - **Durable checkpoints** — completed merges write checkpoints; `resume` continues remaining work explicitly.
+- **Conflict artifacts** — merge conflicts become structured blocked reports instead of half-merged chaos.
 - **No surprise PRs** — handoff prints commands by default and only pushes/creates PRs with explicit flags.
 
 ## Install
@@ -135,6 +139,7 @@ Inside a git repository:
 khazad-doom init
 khazad-doom slices new --id slice-001 --title "Add retry policy" --goal "Add bounded retries" --verify "cargo test"
 khazad-doom slices validate
+khazad-doom slices schema --write
 khazad-doom run --slice slice-001 --wait
 khazad-doom status --run <run-id>
 khazad-doom handoff --run <run-id>
@@ -155,6 +160,8 @@ khazad-doom run --agent fake --all --wait
 | `khazad-doom slices list` | Print compact slice summaries. |
 | `khazad-doom slices new ...` | Generate a JSON Issue Slice template. |
 | `khazad-doom slices import-github --issue <url>` | Import a GitHub issue via `gh issue view`. |
+| `khazad-doom slices import-github --issue <url> --dry-run` | Preview generated slice JSON without writing. |
+| `khazad-doom slices schema --write` | Print/write the JSON Schema for slice files. |
 | `khazad-doom run --slice <id>` | Run one slice plus its dependencies. |
 | `khazad-doom run --all --parallel <n>` | Run all slices; independent workers may run concurrently. |
 | `khazad-doom resume --run <id>` | Continue an interrupted/failed/cancelled run from checkpoint. |
@@ -162,6 +169,7 @@ khazad-doom run --agent fake --all --wait
 | `khazad-doom status --run <id>` | Show one run, slice states, and events. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
 | `khazad-doom handoff --run <id>` | Print push/PR handoff JSON for a completed run. |
+| `khazad-doom handoff --run <id> --dry-run` | Suppress configured push/PR defaults and print diagnostics only. |
 | `khazad-doom handoff --run <id> --push --create-pr` | Explicitly push and open a PR with `gh`. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom daemon start` | Start the local daemon. |
@@ -180,11 +188,36 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 
 `fake` is deliberately boring: it commits predictable fixture files and returns valid worker JSON. Use it for daemon tests, demos, and dogfooding the workflow itself.
 
+## Repository config
+
+`khazad-doom init` creates `.workflow/khazad.json`. Commit it when you want shared defaults:
+
+```json
+{
+  "agent": "pi",
+  "parallelism": 1,
+  "verify_timeout_seconds": 600,
+  "handoff": { "push": false, "create_pr": false },
+  "verify_profiles": {
+    "quick": {
+      "commands": [
+        { "command": "cargo fmt --check", "timeout_seconds": 120 },
+        { "command": "cargo test", "timeout_seconds": 240 }
+      ]
+    }
+  }
+}
+```
+
+A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts.
+
 ## Files and state
 
 | Path | Purpose |
 |---|---|
+| `.workflow/khazad.json` | Shared repo defaults and verification profiles. |
 | `.workflow/slices/*.json` | Durable machine-readable Issue Slices. |
+| `.workflow/schema/slice.schema.json` | JSON Schema for editor/CI validation. |
 | `.workflow/plans/` | Optional planning artifacts. |
 | `.workflow/reports/` | Reports committed to integration branches. |
 | `.workflow/runs/` | Transient handoffs and raw outputs; gitignored. |
@@ -205,7 +238,7 @@ If the daemon starts and finds active runs from a previous process, it marks the
 - suggested `git push` command
 - suggested `gh pr create` command
 
-By default it does not push and does not open a PR. Add `--push --create-pr` when you want Khazad-Doom to run those commands explicitly.
+By default it does not push and does not open a PR. Add `--push --create-pr` when you want Khazad-Doom to run those commands explicitly. Use `--dry-run` to inspect commands and diagnostics even if repo config enables default handoff actions.
 
 ## Development
 
@@ -221,6 +254,8 @@ Run the daemon path through the fake runner:
 ```bash
 cargo test --test daemon_integration
 ```
+
+Create a release by pushing a `v*` tag. CI builds the package tarball, writes `SHA256SUMS`, and attaches both to the GitHub release.
 
 ## FAQ
 

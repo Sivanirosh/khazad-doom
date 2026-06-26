@@ -1,0 +1,43 @@
+{
+  "agent": "pi",
+  "parallelism": 1,
+  "verify_timeout_seconds": 600,
+  "handoff": {
+    "push": false,
+    "create_pr": false
+  },
+  "verify_profiles": {
+    "quick": {
+      "commands": [
+        {
+          "command": "cargo fmt --check",
+          "timeout_seconds": 120
+        },
+        {
+          "command": "cargo test",
+          "timeout_seconds": 240
+        }
+      ]
+    },
+    "full": {
+      "commands": [
+        {
+          "command": "cargo fmt --check",
+          "timeout_seconds": 120
+        },
+        {
+          "command": "cargo test",
+          "timeout_seconds": 240
+        },
+        {
+          "command": "cargo clippy --all-targets --all-features -- -D warnings",
+          "timeout_seconds": 240
+        },
+        {
+          "command": "bash -n scripts/install.sh scripts/package.sh",
+          "timeout_seconds": 60
+        }
+      ]
+    }
+  }
+}

@@ -1,4 +1,6 @@
 use serde_json::{Value, json};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -121,6 +123,216 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn schema_import_and_handoff_v2_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let remote = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let gh_log = home.path().join("fake-gh.log");
+    write_fake_gh(fake_bin.path())?;
+    let path_env = prepend_path(fake_bin.path());
+    let gh_log_string = path(&gh_log).to_string();
+    let env = [
+        ("PATH", path_env.as_str()),
+        ("FAKE_GH_LOG", gh_log_string.as_str()),
+    ];
+
+    init_git_repo(repo.path())?;
+    git(remote.path(), &["init", "--bare"])?;
+    git(
+        repo.path(),
+        &["remote", "add", "origin", path(remote.path())],
+    )?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok_with_env(
+        &bin,
+        home.path(),
+        &env,
+        &["init", "--repo", path(repo.path())],
+    )?;
+    let schema = kd_ok(
+        &bin,
+        home.path(),
+        &["slices", "schema", "--repo", path(repo.path()), "--write"],
+    )?;
+    assert_eq!(
+        json_stdout(&schema)?["title"],
+        "Khazad-Doom JSON Issue Slice"
+    );
+    assert!(
+        repo.path()
+            .join(".workflow/schema/slice.schema.json")
+            .exists()
+    );
+
+    let imported = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &env,
+        &[
+            "slices",
+            "import-github",
+            "--repo",
+            path(repo.path()),
+            "--issue",
+            "https://github.com/acme/widgets/issues/42",
+            "--dry-run",
+        ],
+    )?;
+    let imported = json_stdout(&imported)?;
+    assert_eq!(imported["written"], false);
+    assert_eq!(imported["slice"]["areas"][0], "backend");
+    assert!(imported["slice"]["acceptance"].as_array().unwrap().len() >= 2);
+    assert!(fs::read_to_string(&gh_log)?.contains("--repo acme/widgets"));
+
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Fake handoff slice",
+            "goal": "Create fake output.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["test -f slice-001.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add workflow"])?;
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+
+    let handoff = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &env,
+        &["handoff", "--run", &run_id, "--push", "--create-pr"],
+    )?;
+    let handoff = json_stdout(&handoff)?;
+    assert_eq!(handoff["diagnostics"]["gh_available"], true);
+    assert!(
+        handoff["diagnostics"]["origin_url"]
+            .as_str()
+            .unwrap()
+            .contains(path(remote.path()))
+    );
+    let actions = handoff["actions"].as_array().expect("actions");
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().all(|action| action["status"] == "passed"));
+    assert!(fs::read_to_string(&gh_log)?.contains("pr create"));
+
+    let dry = kd_ok(
+        &bin,
+        home.path(),
+        &["handoff", "--run", &run_id, "--dry-run"],
+    )?;
+    let dry = json_stdout(&dry)?;
+    assert_eq!(dry["dry_run"], true);
+    assert!(
+        dry["actions"]
+            .as_array()
+            .is_none_or(|actions| actions.is_empty())
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn interrupted_run_resumes_without_duplicate_merges_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let hold = home.path().join("hold-second-slice");
+    fs::write(&hold, "hold\n")?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "First resumable slice",
+            "goal": "Create first fake output.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["test -f slice-001.txt"]
+        }),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-002",
+            "title": "Second resumable slice",
+            "goal": "Create second fake output after restart.",
+            "depends_on": ["slice-001"],
+            "acceptance": ["slice-002.txt exists"],
+            "verify": [format!("test -f slice-002.txt && if test -f '{}'; then sleep 30; fi", path(&hold))]
+        }),
+    )?;
+    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add resumable slices"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_event(&bin, home.path(), &run_id, "checkpoint_written")?;
+    kill_daemon(home.path())?;
+    fs::remove_file(&hold)?;
+
+    kd_ok(&bin, home.path(), &["daemon", "start"])?;
+    let interrupted = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
+    assert_eq!(json_stdout(&interrupted)?["run"]["status"], "interrupted");
+    kd_ok(
+        &bin,
+        home.path(),
+        &["resume", "--run", &run_id, "--agent", "fake"],
+    )?;
+    let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let branch = completed["run"]["integration_branch"].as_str().unwrap();
+    let subjects = git(repo.path(), &["log", "--format=%s", branch])?;
+    assert_eq!(
+        subjects.matches("khazad(slice:slice-001): merge").count(),
+        1
+    );
+    assert_eq!(
+        subjects.matches("khazad(slice:slice-002): merge").count(),
+        1
+    );
+
+    guard.stop();
+    Ok(())
+}
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_khazad-doom"))
 }
@@ -146,6 +358,33 @@ impl Drop for DaemonGuard {
     }
 }
 
+fn wait_for_event(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&output)?;
+        if value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"].as_str() == Some(wanted))
+        {
+            return Ok(value);
+        }
+        if matches!(
+            value["run"]["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled" | "interrupted" | "completed")
+        ) {
+            panic!("run reached terminal state before event {wanted}: {value:#}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for event {wanted}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn wait_for_status(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestResult<Value> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -163,6 +402,52 @@ fn wait_for_status(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestR
         assert!(Instant::now() < deadline, "timed out waiting for {wanted}");
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn kill_daemon(home: &Path) -> TestResult {
+    let pid = fs::read_to_string(home.join("daemon.pid"))?
+        .trim()
+        .to_string();
+    let output = Command::new("kill").arg("-TERM").arg(pid).output()?;
+    if !output.status.success() {
+        panic!(
+            "kill daemon failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    thread::sleep(Duration::from_millis(300));
+    Ok(())
+}
+
+fn write_fake_gh(dir: &Path) -> TestResult {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("gh");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "gh fake 0.0"
+  exit 0
+fi
+if [ -n "${FAKE_GH_LOG:-}" ]; then
+  echo "$*" >> "$FAKE_GH_LOG"
+fi
+cat <<'JSON'
+{"title":"Add Better Import","body":"Intro paragraph.\n\n- [ ] Do the thing\n- [x] Keep proof","url":"https://github.com/acme/widgets/issues/42","labels":[{"name":"backend"},{"name":"workflow"}]}
+JSON
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(())
+}
+
+fn prepend_path(dir: &Path) -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{current}", path(dir))
 }
 
 fn write_slice(repo: &Path, value: Value) -> TestResult {

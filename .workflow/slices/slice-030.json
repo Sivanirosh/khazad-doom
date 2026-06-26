@@ -1,0 +1,24 @@
+{
+  "id": "slice-030",
+  "title": "Release automation",
+  "goal": "Add tag-triggered GitHub release automation with packaged tarballs and checksums.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-029"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "CI publishes releases for v* tags only.",
+    "Release artifacts include packaged tarballs from scripts/package.sh.",
+    "SHA256SUMS is generated and attached to the release."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

@@ -268,6 +268,36 @@ impl Store {
         Ok(runs)
     }
 
+    pub fn active_run_for_repo(
+        &self,
+        repo_id: &str,
+        allowed_run_id: Option<&str>,
+    ) -> Result<Option<Run>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                      selected_slice_id, error, started_at, updated_at
+               FROM runs
+               WHERE repo_id=?1 AND status IN (?2, ?3)
+               ORDER BY started_at ASC"#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                repo_id,
+                RunStatus::Pending.as_str(),
+                RunStatus::Running.as_str()
+            ],
+            run_tuple_from_row,
+        )?;
+        for row in rows {
+            let run = run_from_tuple(row?)?;
+            if Some(run.id.as_str()) != allowed_run_id {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn mark_run_interrupted(&self, run_id: &str, reason: &str) -> Result<()> {
         self.update_run(run_id, RunStatus::Interrupted, reason)
     }

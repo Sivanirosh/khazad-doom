@@ -1,4 +1,5 @@
 use crate::agent::RunnerSpec;
+use crate::artifact;
 use crate::daemon::{Client, Server};
 use crate::domain::{
     BranchHandoff, RunDetails, RunInspection, RunStatus, SliceValidationReport, SliceWriteResult,
@@ -83,6 +84,9 @@ enum CommandArgs {
         /// Execute `gh pr create` after the branch is available remotely.
         #[arg(long)]
         create_pr: bool,
+        /// Print handoff only; suppress configured push/PR defaults.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect run artifacts and daemon log tail.
     Inspect {
@@ -151,6 +155,15 @@ enum SlicesCommand {
         verify: Vec<String>,
         #[arg(long)]
         overwrite: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print or write the JSON Schema for Issue Slices.
+    Schema {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        write: bool,
     },
 }
 
@@ -188,7 +201,8 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             run,
             push,
             create_pr,
-        } => run_handoff(paths, run, push, create_pr),
+            dry_run,
+        } => run_handoff(paths, run, push, create_pr, dry_run),
         CommandArgs::Inspect { run, log_tail } => run_inspect(paths, run, log_tail),
         CommandArgs::Status { run, events_limit } => run_status(paths, run, events_limit),
         CommandArgs::Slices { command } => run_slices(paths, command),
@@ -218,10 +232,19 @@ fn run_start(
     parallel: usize,
     wait: bool,
 ) -> Result<()> {
-    let runner = RunnerSpec::from_agent_and_env(&agent)?;
+    let repo = resolve_repo_path(repo)?;
+    let config = artifact::Store::new(&repo)
+        .read_config()
+        .unwrap_or_default();
+    let effective_agent = if agent.trim().is_empty() && std::env::var("KHAZAD_AGENT").is_err() {
+        config.agent.clone()
+    } else {
+        agent
+    };
+    let runner = RunnerSpec::from_agent_and_env(&effective_agent)?;
+    let parallel = effective_cli_parallelism(parallel, config.parallelism);
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
-    let repo = resolve_repo_path(repo)?;
     let result: StartRunResult = client.call(
         "startRun",
         &StartRunParams {
@@ -248,16 +271,35 @@ fn run_resume(
     parallel: usize,
     wait: bool,
 ) -> Result<()> {
-    let runner = RunnerSpec::from_agent_and_env(&agent)?;
+    let runner = if agent.trim().is_empty() && std::env::var("KHAZAD_AGENT").is_err() {
+        None
+    } else {
+        Some(RunnerSpec::from_agent_and_env(&agent)?)
+    };
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
     let result: StartRunResult = client.call(
         "resumeRun",
         &ResumeRunParams {
             run_id,
-            agent: runner.kind,
-            pi_bin: runner.pi_bin,
-            pi_args: runner.pi_args,
+            agent: runner
+                .as_ref()
+                .map(|runner| runner.kind.clone())
+                .unwrap_or_default(),
+            pi_bin: runner
+                .as_ref()
+                .map(|runner| runner.pi_bin.clone())
+                .unwrap_or_else(|| std::env::var("KHAZAD_PI_BIN").unwrap_or_default()),
+            pi_args: runner
+                .as_ref()
+                .map(|runner| runner.pi_args.clone())
+                .unwrap_or_else(|| {
+                    std::env::var("KHAZAD_PI_ARGS")
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect()
+                }),
             parallelism: parallel,
         },
     )?;
@@ -273,7 +315,13 @@ fn run_cancel(paths: Paths, run_id: String, reason: String) -> Result<()> {
     print_json(&result)
 }
 
-fn run_handoff(paths: Paths, run_id: String, push: bool, create_pr: bool) -> Result<()> {
+fn run_handoff(
+    paths: Paths,
+    run_id: String,
+    push: bool,
+    create_pr: bool,
+    dry_run: bool,
+) -> Result<()> {
     let client = Client::new(paths);
     let handoff: BranchHandoff = client.call(
         "handoffRun",
@@ -281,6 +329,7 @@ fn run_handoff(paths: Paths, run_id: String, push: bool, create_pr: bool) -> Res
             run_id,
             push,
             create_pr,
+            dry_run,
         },
     )?;
     print_json(&handoff)
@@ -388,6 +437,7 @@ fn run_slices(paths: Paths, command: SlicesCommand) -> Result<()> {
             id,
             verify,
             overwrite,
+            dry_run,
         } => {
             ensure_daemon(&paths)?;
             let client = Client::new(paths);
@@ -400,16 +450,25 @@ fn run_slices(paths: Paths, command: SlicesCommand) -> Result<()> {
                     id,
                     verify,
                     overwrite,
+                    dry_run,
                 },
             )?;
             print_json(&result)
+        }
+        SlicesCommand::Schema { repo, write } => {
+            let schema = artifact::slice_schema();
+            if write {
+                let repo = resolve_repo_path(repo)?;
+                artifact::Store::new(repo).write_slice_schema()?;
+            }
+            print_json(&schema)
         }
     }
 }
 
 fn run_daemon(paths: Paths, command: DaemonCommand) -> Result<()> {
     match command {
-        DaemonCommand::Start => start_daemon(&paths),
+        DaemonCommand::Start => start_daemon(&paths, true),
         DaemonCommand::Stop => {
             let client = Client::new(paths);
             let result: serde_json::Value = client.call("shutdown", &serde_json::json!({}))?;
@@ -430,13 +489,15 @@ fn ensure_daemon(paths: &Paths) -> Result<()> {
     if client.ping().is_ok() {
         return Ok(());
     }
-    start_daemon(paths)
+    start_daemon(paths, false)
 }
 
-fn start_daemon(paths: &Paths) -> Result<()> {
+fn start_daemon(paths: &Paths, announce: bool) -> Result<()> {
     let client = Client::new(paths.clone());
     if client.ping().is_ok() {
-        println!("daemon already running");
+        if announce {
+            println!("daemon already running");
+        }
         return Ok(());
     }
     paths.ensure()?;
@@ -458,7 +519,9 @@ fn start_daemon(paths: &Paths) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if client.ping().is_ok() {
-            println!("daemon started pid={}", child.id());
+            if announce {
+                println!("daemon started pid={}", child.id());
+            }
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
@@ -513,6 +576,16 @@ fn wait_run(client: &Client, run_id: &str) -> Result<()> {
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn effective_cli_parallelism(requested: usize, configured: usize) -> usize {
+    if requested > 1 {
+        requested
+    } else if configured > 0 {
+        configured
+    } else {
+        requested.max(1)
+    }
 }
 
 fn resolve_repo_path(repo: PathBuf) -> Result<PathBuf> {

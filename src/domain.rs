@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,10 +17,76 @@ pub struct Slice {
     pub acceptance: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_ask_if: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verify_profile: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub verify_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub parallelism: usize,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub verify_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_branch: String,
+    #[serde(default, skip_serializing_if = "HandoffDefaults::is_empty")]
+    pub handoff: HandoffDefaults,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verify_profiles: BTreeMap<String, VerifyProfile>,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            agent: "pi".to_string(),
+            parallelism: 1,
+            verify_timeout_seconds: 600,
+            base_branch: String::new(),
+            handoff: HandoffDefaults::default(),
+            verify_profiles: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandoffDefaults {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub push: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_pr: bool,
+}
+
+impl HandoffDefaults {
+    pub fn is_empty(&self) -> bool {
+        !self.push && !self.create_pr
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifyProfile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<VerifyCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerifyCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,8 +410,21 @@ pub struct BranchHandoff {
     pub pr_command: String,
     pub pr_title: String,
     pub pr_body: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dry_run: bool,
+    pub diagnostics: HandoffDiagnostics,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<HandoffActionResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct HandoffDiagnostics {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gh_version: String,
+    pub gh_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,10 +474,31 @@ pub struct RunCheckpoint {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeConflictReport {
+    pub run_id: String,
+    pub slice_id: String,
+    pub branch: String,
+    pub status: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
 fn is_zero(value: &i64) -> bool {
     *value == 0
 }
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

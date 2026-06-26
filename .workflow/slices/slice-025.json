@@ -1,0 +1,24 @@
+{
+  "id": "slice-025",
+  "title": "Slice JSON schema export",
+  "goal": "Add khazad-doom slices schema and a committed JSON Schema for editor validation.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-024"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "slices schema prints the Issue Slice JSON Schema.",
+    "slices schema --write writes .workflow/schema/slice.schema.json.",
+    "The schema includes verify_profile and verify_timeout_seconds."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

@@ -1,0 +1,24 @@
+{
+  "id": "slice-024",
+  "title": "Merge conflict handling",
+  "goal": "Turn worker merge conflicts into structured blocked artifacts instead of rough errors.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-023"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    "Merge conflicts write a .merge-conflict.json artifact.",
+    "The affected slice is marked blocked with conflicted file details.",
+    "The integration worktree aborts the failed merge before cleanup."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

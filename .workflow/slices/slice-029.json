@@ -1,0 +1,24 @@
+{
+  "id": "slice-029",
+  "title": "Verification profiles",
+  "goal": "Support named verification profiles like quick/full with per-command timeout, env, and cwd.",
+  "github_issue": "",
+  "depends_on": [
+    "slice-028"
+  ],
+  "areas": [
+    "khazad-doom",
+    "workflow"
+  ],
+  "acceptance": [
+    ".workflow/khazad.json can define named verify_profiles.",
+    "Slices can reference verify_profile in addition to inline verify commands.",
+    "Verification commands support timeout_seconds, env, and repo-relative cwd."
+  ],
+  "must_ask_if": [
+    "The slice requires changing the JSON-only worker result contract incompatibly.",
+    "The implementation would remove existing CLI/daemon commands.",
+    "Acceptance criteria conflict with the Khazad-Doom rule: You shall not slop."
+  ],
+  "verify_profile": "full"
+}

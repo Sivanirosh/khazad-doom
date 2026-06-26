@@ -88,6 +88,21 @@ pub fn merge(worktree_path: impl AsRef<Path>, branch: &str, message: &str) -> Re
     Ok(())
 }
 
+pub fn merge_abort(worktree_path: impl AsRef<Path>) -> Result<()> {
+    run(worktree_path, &["merge", "--abort"])?;
+    Ok(())
+}
+
+pub fn conflicted_files(worktree_path: impl AsRef<Path>) -> Result<Vec<String>> {
+    let output = run(worktree_path, &["diff", "--name-only", "--diff-filter=U"])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 pub fn commit_all(dir: impl AsRef<Path>, message: &str) -> Result<()> {
     if status_porcelain(dir.as_ref())?.trim().is_empty() {
         return Ok(());
