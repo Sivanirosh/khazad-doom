@@ -1,0 +1,23 @@
+{
+  "id": "slice-032",
+  "title": "Deepen live progress implementation",
+  "goal": "Refactor live progress and shell command monitoring into a small internal interface or helper so long-running run observability stays product-quality while preserving behavior.",
+  "depends_on": [],
+  "areas": [
+    "src/workflow/manager.rs",
+    "src/state.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs"
+  ],
+  "acceptance": [
+    "Live progress update logic is centralized behind a small internal interface or helper so workflow phases do not manually duplicate low-level state/event persistence details.",
+    "Shell command output streaming remains bounded, cancellation-safe, and preserves stdout/stderr for command results.",
+    "khazad-doom status --run still includes the progress snapshot and khazad-doom watch --run still renders compact human-readable progress.",
+    "No hidden global workflow timeout is introduced; verification/gate command timeouts remain explicit per-command guardrails.",
+    "Existing tests pass, and at least one integration or unit test continues to cover live progress during long verification."
+  ],
+  "must_ask_if": [
+    "The refactor requires changing public CLI flags, JSON status shape, workflow slice schema, or timeout semantics."
+  ],
+  "verify_profile": "full"
+}
