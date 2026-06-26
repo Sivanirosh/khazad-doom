@@ -36,6 +36,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 ## Verification and gates
 
 - Slice `verify` commands and configured verification profile commands are gates for completion/integration; they must run with their declared repo-relative context and environment.
+- The workflow manager owns lifecycle ordering, retries, repair decisions, checkpointing, and state transitions; the workflow gate/shell seam owns only command resolution/execution details and returns typed check/gate results.
 - Verification and gate timeouts are per-command hang protection. They are not global workflow timeouts and must not be reused to cap total run lifetime.
 - Gate failures are reported with command evidence and must be repaired or surfaced as blocked/failed before handoff.
 
