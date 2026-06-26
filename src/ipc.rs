@@ -71,6 +71,12 @@ pub struct StartRunResult {
 pub struct StatusParams {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub latest: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active_only: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub limit: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
