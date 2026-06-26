@@ -1,0 +1,97 @@
+{
+  "run_id": "kd-20260626-121011-06ed0834",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260626-121011-06ed0834/integration",
+  "base_sha": "3a7b4454ed35abb64f9ca962d42e3fda125e8c7f",
+  "final_sha": "190f3a9278c1efe7371b191c6f376cbaa4bd99e5",
+  "completed_slices": [
+    {
+      "slice_id": "slice-032",
+      "status": "complete",
+      "summary": "Centralized run progress persistence behind ProgressReporter/ProgressScope and refactored shell command streaming into ShellCommandMonitor while preserving status/watch behavior, bounded progress tails, cancellation handling, and stdout/stderr results.",
+      "commit_sha": "2b2f812cb62293e8ba2913643b1bffb92b49073c",
+      "commit_message": "Refactor live progress monitoring",
+      "changed_files": [
+        "src/state.rs",
+        "src/workflow/manager.rs"
+      ],
+      "tests_run": [
+        "cargo fmt --check",
+        "cargo test",
+        "cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "git diff --check"
+      ],
+      "acceptance_status": [
+        "complete: Live progress state/event persistence is centralized in ProgressReporter/ProgressScope.",
+        "complete: Shell command monitoring is centralized in ShellCommandMonitor; progress tail remains bounded and stdout/stderr are preserved.",
+        "complete: status --run and watch --run public behavior/schema unchanged; existing integration coverage passes.",
+        "complete: No global workflow timeout added; per-command timeout guardrails unchanged.",
+        "complete: Existing tests pass; live progress during long verification remains covered by integration test and shell streaming has added unit coverage."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "slice-032",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh"
+      ],
+      "attempt": 1,
+      "worker_head": "2b2f812cb62293e8ba2913643b1bffb92b49073c",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "no-op",
+    "summary": "Integration repair pass completed; no cross-slice or verification breakage found, and the worktree is clean.",
+    "tests_run": [
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+      "bash -n scripts/install.sh scripts/package.sh"
+    ],
+    "findings": [
+      {
+        "severity": "info",
+        "action": "no-op",
+        "description": "No integration repair was required."
+      }
+    ]
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s"
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 18 tests\ntest artifact::tests::accepts_safe_slice_id ... ok\ntest agent::tests::parses_explicit_runner_specs ... ok\ntest agent::tests::extracts_embedded_json_object ... ok\ntest artifact::tests::dependency_layers_group_independent_slices ... ok\ntest artifact::tests::rejects_path_or_ref_unsafe_slice_ids ... ok\ntest artifact::tests::reports_missing_dependencies ... ok\ntest artifact::tests::topological_order_includes_requested_dependencies_first ... ok\ntest workflow::manager::tests::rejects_worker_result_for_wrong_slice ... ok\ntest workflow::manager::tests::rejects_unknown_worker_and_repair_statuses ... ok\ntest workflow::manager::tests::shell_command_progress_is_bounded_and_preserves_streams ... ok\ntest workflow::manager::tests::shell_command_cancellation_returns_promptly ... ok\ntest workflow::manager::tests::recovery_marks_stale_running_runs_interrupted ... ok\ntest workflow::manager::tests::shell_command_timeout_returns_promptly ... ok\ntest workflow::manager::tests::merge_conflicts_are_structured_blocked_artifacts ... ok\ntest workflow::manager::tests::repo_config_verify_profile_runs_with_env_and_cwd ... ok\ntest workflow::manager::tests::fake_runner_parallelizes_independent_slices ... ok\ntest workflow::manager::tests::fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees ... ok\ntest workflow::manager::tests::active_repo_run_blocks_second_run ... ok\n\ntest result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.90s\n\n\nrunning 4 tests\ntest schema_import_and_handoff_v2_black_box ... ok\ntest interrupted_run_resumes_without_duplicate_merges_black_box ... ok\ntest daemon_fake_run_handoff_and_inspect_black_box ... ok\ntest status_and_watch_expose_live_progress_for_long_verification ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.27s\n\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s\n     Running unittests src/main.rs (target/debug/deps/khazad_doom-5a3ff85b4912457c)\n     Running tests/daemon_integration.rs (target/debug/deps/daemon_integration-060352e879623867)"
+      },
+      {
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "status": "passed",
+        "exit_code": 0
+      }
+    ]
+  },
+  "created_at": "2026-06-26T12:16:43.506870Z"
+}
