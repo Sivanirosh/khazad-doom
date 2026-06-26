@@ -481,6 +481,8 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
     )?;
     git(repo_a.path(), &["add", ".workflow"])?;
     git(repo_a.path(), &["commit", "-m", "add long slice a"])?;
+    let repo_a_subdir = repo_a.path().join("nested");
+    fs::create_dir_all(&repo_a_subdir)?;
     git(repo_b.path(), &["add", ".workflow"])?;
     git(repo_b.path(), &["commit", "-m", "add long slice b"])?;
 
@@ -490,18 +492,26 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
         &[
             "run",
             "--repo",
-            path(repo_a.path()),
+            path(&repo_a_subdir),
             "--agent",
             "fake",
             "--all",
         ],
     )?;
-    let run_a = json_stdout(&started_a)?["run_id"]
-        .as_str()
-        .expect("run_id")
-        .to_string();
+    let started_a = json_stdout(&started_a)?;
+    let run_a = started_a["run_id"].as_str().expect("run_id").to_string();
+    assert_eq!(started_a["repo_path"], path(repo_a.path()));
+    assert_eq!(
+        started_a["monitor_command"],
+        format!(
+            "khazad-doom monitor --repo {} --latest",
+            path(repo_a.path())
+        )
+    );
     let latest_a = wait_for_latest_run(&bin, home.path(), repo_a.path(), &run_a)?;
     assert_eq!(latest_a["run"]["repo_path"], path(repo_a.path()));
+    let latest_a_from_subdir = wait_for_latest_run(&bin, home.path(), &repo_a_subdir, &run_a)?;
+    assert_eq!(latest_a_from_subdir["run"]["id"], run_a);
     assert_eq!(latest_a["run"]["status"], "running");
     assert!(latest_a["progress"].is_object());
     assert!(!latest_a["slice_runs"].as_array().unwrap().is_empty());

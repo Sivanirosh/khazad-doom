@@ -1202,6 +1202,9 @@ fn effective_cli_parallelism(requested: usize, configured: usize) -> usize {
 }
 
 fn resolve_repo_path(repo: PathBuf) -> Result<PathBuf> {
-    repo.canonicalize()
-        .with_context(|| format!("resolve repository path {}", repo.display()))
+    let canonical = repo
+        .canonicalize()
+        .with_context(|| format!("resolve repository path {}", repo.display()))?;
+    crate::gitutil::repo_root(&canonical)
+        .with_context(|| format!("resolve git repository root for {}", canonical.display()))
 }
