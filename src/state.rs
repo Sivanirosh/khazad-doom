@@ -17,6 +17,78 @@ pub struct Store {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProgressScope {
+    phase: String,
+    slice_id: String,
+    attempt: usize,
+    command: String,
+    message: String,
+}
+
+impl ProgressScope {
+    pub(crate) fn new(
+        phase: impl Into<String>,
+        slice_id: impl Into<String>,
+        attempt: usize,
+        command: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase: phase.into(),
+            slice_id: slice_id.into(),
+            attempt,
+            command: command.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProgressReporter {
+    store: Store,
+    run_id: String,
+}
+
+impl ProgressReporter {
+    pub(crate) fn new(store: Store, run_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            run_id: run_id.into(),
+        }
+    }
+
+    pub(crate) fn mark(&self, scope: &ProgressScope) {
+        let _ = self.persist(scope, "", true);
+    }
+
+    pub(crate) fn update_output_tail(&self, scope: &ProgressScope, output_tail: &str) {
+        let _ = self.persist(scope, output_tail, false);
+    }
+
+    fn persist(
+        &self,
+        scope: &ProgressScope,
+        output_tail: &str,
+        record_event: bool,
+    ) -> Result<RunProgress> {
+        let progress = self.store.update_progress(
+            &self.run_id,
+            &scope.phase,
+            &scope.slice_id,
+            scope.attempt,
+            &scope.command,
+            &scope.message,
+            output_tail,
+        )?;
+        if record_event {
+            self.store
+                .record_event(&self.run_id, "progress", &progress)?;
+        }
+        Ok(progress)
+    }
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
