@@ -31,6 +31,9 @@ khazad-doom status --run <run-id>
 khazad-doom status --run <run-id> --follow
 khazad-doom monitor --repo . --latest
 khazad-doom monitor --run <run-id>
+# Optional Pi package adapter, when installed/enabled in Pi TUI:
+/khazad-monitor --latest
+/khazad-monitor --run <run-id>
 khazad-doom watch --run <run-id>
 khazad-doom handoff --run <run-id>
 khazad-doom handoff --run <run-id> --dry-run
@@ -57,6 +60,8 @@ khazad-doom daemon status
 - Do not use blocking `--wait` as the primary Pi UX for real `pi` runs. Start the run without `--wait`, capture the JSON (`run_id`, `repo_path`, `monitor_command`, `run_monitor_command`), and recommend or use `khazad-doom monitor --repo . --latest` / the emitted `monitor_command` for user-visible progress.
 - Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable.
 - Khazad-Doom does not auto-open external windows by default; a Pi extension is an optional adapter over daemon state, not core workflow state.
+- If the optional Pi package extension is installed, `/khazad-monitor --latest` or `/khazad-monitor --run <run-id>` may open a Pi TUI overlay over the same `status` JSON. Closing it with `q` or `Esc` only detaches the overlay; never treat it as run cancellation.
+- Do not require the Pi extension for non-Pi harnesses or core monitoring; keep `khazad-doom monitor --repo . --latest` as the harness-neutral path and `watch`/`status` as fallbacks.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 
 If a run blocks with an `ask-user` finding, relay the blocker to the user with exact details and ask for a decision before resuming.

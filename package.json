@@ -1,0 +1,24 @@
+{
+  "name": "khazad-doom",
+  "version": "0.1.0",
+  "description": "Local agentic workflow daemon for JSON Issue Slices",
+  "license": "MIT",
+  "type": "commonjs",
+  "keywords": [
+    "pi-package",
+    "khazad-doom",
+    "agentic-workflow",
+    "pi-extension"
+  ],
+  "scripts": {
+    "check:extension": "node --check extensions/khazad-monitor/index.js"
+  },
+  "pi": {
+    "skills": [
+      "./skills"
+    ],
+    "extensions": [
+      "./extensions/khazad-monitor"
+    ]
+  }
+}
