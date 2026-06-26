@@ -270,7 +270,7 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
             "title": "Long verification slice",
             "goal": "Create fake output and run a visibly long verification command.",
             "acceptance": ["slice-001.txt exists"],
-            "verify": ["printf 'started-progress\\n'; sleep 2; printf 'finished-progress\\n'; test -f slice-001.txt"]
+            "verify": ["printf 'started-progress\\n'; sleep 4; printf 'finished-progress\\n'; test -f slice-001.txt"]
         }),
     )?;
     git(repo.path(), &["add", ".workflow"])?;
@@ -306,7 +306,7 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
     assert_eq!(live["progress"]["slice_id"], "slice-001");
     assert_eq!(
         live["progress"]["command"],
-        "printf 'started-progress\\n'; sleep 2; printf 'finished-progress\\n'; test -f slice-001.txt"
+        "printf 'started-progress\\n'; sleep 4; printf 'finished-progress\\n'; test -f slice-001.txt"
     );
     assert!(
         live["progress"]["output_tail"]
@@ -316,7 +316,41 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
         "progress should include streamed command output: {live:#}"
     );
 
+    let monitored_once = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--run",
+            &run_id,
+            "--once",
+            "--interval-ms",
+            "100",
+        ],
+    )?;
+    let monitored_once = String::from_utf8(monitored_once.stdout)?;
+    assert!(monitored_once.contains("Khazad-Doom Monitor"));
+    assert!(monitored_once.contains(&format!("Run: {run_id}")));
+    assert!(monitored_once.contains("Status:"));
+    assert!(monitored_once.contains("Phase:"));
+    assert!(monitored_once.contains("Slice: slice-001"));
+    assert!(monitored_once.contains("Command:"));
+    assert!(monitored_once.contains("Elapsed:"));
+    assert!(monitored_once.contains("Message:"));
+    assert!(monitored_once.contains("Recent events:"));
+    assert!(monitored_once.contains("Output tail:"));
+    assert!(monitored_once.contains("started-progress"));
+
     wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let monitored_completed = kd_ok(
+        &bin,
+        home.path(),
+        &["monitor", "--run", &run_id, "--interval-ms", "100"],
+    )?;
+    let monitored_completed = String::from_utf8(monitored_completed.stdout)?;
+    assert!(monitored_completed.contains(&format!("Run: {run_id}")));
+    assert!(monitored_completed.contains("Status: completed"));
+
     let watched = kd_ok(
         &bin,
         home.path(),
@@ -326,6 +360,60 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
     assert!(watched.contains(&format!("Run: {run_id}")));
     assert!(watched.contains("Status: completed"));
     assert!(watched.contains("Phase: completed"));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Failing monitor slice",
+            "goal": "Fail verification so monitor reports a terminal error.",
+            "acceptance": ["monitor sees failed run"],
+            "verify": ["printf 'monitor-fail\\n'; false"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add failing monitor slice"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let monitored = kd(
+        &bin,
+        home.path(),
+        &["monitor", "--run", &run_id, "--interval-ms", "100"],
+    )?;
+    assert!(!monitored.status.success());
+    let stdout = String::from_utf8_lossy(&monitored.stdout);
+    let stderr = String::from_utf8_lossy(&monitored.stderr);
+    assert!(stdout.contains(&format!("Run: {run_id}")));
+    assert!(stdout.contains("Status: failed"));
+    assert!(stderr.contains("run ended with status failed"));
 
     guard.stop();
     Ok(())
@@ -354,6 +442,20 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
         &["status", "--repo", path(empty_repo.path()), "--latest"],
     )?;
     assert!(json_stdout(&empty)?.is_null());
+    let empty_monitor = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--repo",
+            path(empty_repo.path()),
+            "--latest",
+            "--once",
+        ],
+    )?;
+    let empty_monitor = String::from_utf8(empty_monitor.stdout)?;
+    assert!(empty_monitor.contains("Status: waiting"));
+    assert!(empty_monitor.contains("waiting for latest active run"));
 
     kd_ok(&bin, home.path(), &["init", "--repo", path(repo_a.path())])?;
     kd_ok(&bin, home.path(), &["init", "--repo", path(repo_b.path())])?;
@@ -404,6 +506,23 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
     assert!(latest_a["progress"].is_object());
     assert!(!latest_a["slice_runs"].as_array().unwrap().is_empty());
     assert!(!latest_a["events"].as_array().unwrap().is_empty());
+    let latest_monitor = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--repo",
+            path(repo_a.path()),
+            "--latest",
+            "--once",
+        ],
+    )?;
+    let latest_monitor = String::from_utf8(latest_monitor.stdout)?;
+    assert!(latest_monitor.contains("Khazad-Doom Monitor"));
+    assert!(latest_monitor.contains(&format!("Run: {run_a}")));
+    assert!(latest_monitor.contains("Status: running"));
+    assert!(latest_monitor.contains("Recent events:"));
+    assert!(latest_monitor.contains("Output tail:"));
 
     let started_b = kd_ok(
         &bin,

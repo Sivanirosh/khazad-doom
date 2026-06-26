@@ -2,7 +2,8 @@ use crate::agent::RunnerSpec;
 use crate::artifact;
 use crate::daemon::{Client, Server};
 use crate::domain::{
-    BranchHandoff, RunDetails, RunInspection, RunStatus, SliceValidationReport, SliceWriteResult,
+    BranchHandoff, Event, RunDetails, RunInspection, RunStatus, SliceStatus, SliceValidationReport,
+    SliceWriteResult,
 };
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
@@ -17,6 +18,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -113,6 +115,27 @@ enum CommandArgs {
         follow: bool,
         /// Poll interval for --follow, in milliseconds.
         #[arg(long, default_value_t = 2000)]
+        interval_ms: u64,
+    },
+    /// Monitor a run or latest active repo run with a compact terminal dashboard.
+    Monitor {
+        /// Specific run id to follow.
+        #[arg(long, default_value = "")]
+        run: String,
+        /// Repository path used with --latest. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Attach to the latest active run for the repository and wait for future runs.
+        #[arg(long)]
+        latest: bool,
+        /// Render one dashboard snapshot and exit.
+        #[arg(long)]
+        once: bool,
+        /// Number of events to fetch before displaying the compact recent event tail.
+        #[arg(long, default_value_t = 20)]
+        events_limit: usize,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
     /// Watch a run with compact human-readable progress until it reaches a terminal state.
@@ -233,6 +256,14 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             follow,
             interval_ms,
         } => run_status(paths, run, repo, latest, events_limit, follow, interval_ms),
+        CommandArgs::Monitor {
+            run,
+            repo,
+            latest,
+            once,
+            events_limit,
+            interval_ms,
+        } => run_monitor(paths, run, repo, latest, once, events_limit, interval_ms),
         CommandArgs::Watch { run, interval_ms } => run_watch(paths, run, interval_ms),
         CommandArgs::Slices { command } => run_slices(paths, command),
         CommandArgs::Daemon { command } => run_daemon(paths, command),
@@ -437,6 +468,152 @@ fn run_status(
     Ok(())
 }
 
+fn run_monitor(
+    paths: Paths,
+    run_id: String,
+    repo: Option<PathBuf>,
+    latest: bool,
+    once: bool,
+    events_limit: usize,
+    interval_ms: u64,
+) -> Result<()> {
+    if !run_id.is_empty() && latest {
+        bail!("monitor --latest cannot be combined with --run <run-id>");
+    }
+    if run_id.is_empty() && !latest {
+        bail!("monitor requires --run <run-id> or --latest");
+    }
+    if !run_id.is_empty() && repo.is_some() {
+        bail!("monitor --repo can only be used with --latest");
+    }
+
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths);
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let clear_screen = stdout_is_terminal();
+    if !run_id.is_empty() {
+        return monitor_run(&client, run_id, once, events_limit, interval, clear_screen);
+    }
+
+    let repo = resolve_repo_path(repo.unwrap_or_else(|| PathBuf::from(".")))?;
+    monitor_latest(
+        &client,
+        repo.to_string_lossy().to_string(),
+        once,
+        events_limit,
+        interval,
+        clear_screen,
+    )
+}
+
+fn monitor_run(
+    client: &Client,
+    run_id: String,
+    once: bool,
+    events_limit: usize,
+    interval: Duration,
+    clear_screen: bool,
+) -> Result<()> {
+    let mut first = true;
+    loop {
+        let details = fetch_run_details(client, &run_id, events_limit)?;
+        render_monitor_snapshot(Some(&details), None, clear_screen, !clear_screen && !first)?;
+        first = false;
+        if once {
+            return monitor_once_result(&details);
+        }
+        match details.run.status {
+            RunStatus::Completed => return Ok(()),
+            RunStatus::Failed
+            | RunStatus::Blocked
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted => return terminal_run_error(&details),
+            _ => thread::sleep(interval),
+        }
+    }
+}
+
+fn monitor_latest(
+    client: &Client,
+    repo_path: String,
+    once: bool,
+    events_limit: usize,
+    interval: Duration,
+    clear_screen: bool,
+) -> Result<()> {
+    let mut attached_run_id: Option<String> = None;
+    let mut first = true;
+    loop {
+        let details = if let Some(run_id) = attached_run_id.clone() {
+            Some(fetch_run_details(client, &run_id, events_limit)?)
+        } else {
+            let latest = fetch_latest_active_run(client, &repo_path, events_limit)?;
+            if let Some(details) = &latest {
+                attached_run_id = Some(details.run.id.clone());
+            }
+            latest
+        };
+        render_monitor_snapshot(
+            details.as_ref(),
+            Some(&repo_path),
+            clear_screen,
+            !clear_screen && !first,
+        )?;
+        first = false;
+
+        if once {
+            if let Some(details) = &details {
+                return monitor_once_result(details);
+            }
+            return Ok(());
+        }
+        if details
+            .as_ref()
+            .is_some_and(|details| is_terminal_status(details.run.status))
+        {
+            attached_run_id = None;
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn fetch_run_details(client: &Client, run_id: &str, events_limit: usize) -> Result<RunDetails> {
+    client.call(
+        "status",
+        &StatusParams {
+            run_id: run_id.to_string(),
+            events_limit,
+            ..StatusParams::default()
+        },
+    )
+}
+
+fn fetch_latest_active_run(
+    client: &Client,
+    repo_path: &str,
+    events_limit: usize,
+) -> Result<Option<RunDetails>> {
+    client.call(
+        "status",
+        &StatusParams {
+            repo_path: repo_path.to_string(),
+            latest: true,
+            active_only: true,
+            events_limit,
+            ..StatusParams::default()
+        },
+    )
+}
+
+fn monitor_once_result(details: &RunDetails) -> Result<()> {
+    match details.run.status {
+        RunStatus::Failed | RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => {
+            terminal_run_error(details)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
     let client = Client::new(paths);
     let interval = Duration::from_millis(interval_ms.max(100));
@@ -455,13 +632,7 @@ fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
             RunStatus::Failed
             | RunStatus::Blocked
             | RunStatus::Cancelled
-            | RunStatus::Interrupted => {
-                bail!(
-                    "run ended with status {}: {}",
-                    details.run.status,
-                    details.run.error
-                );
-            }
+            | RunStatus::Interrupted => return terminal_run_error(&details),
             _ => thread::sleep(interval),
         }
     }
@@ -684,6 +855,251 @@ fn print_watch_snapshot(details: &RunDetails) {
     println!();
 }
 
+const MONITOR_EVENT_LINES: usize = 5;
+const MONITOR_OUTPUT_LINES: usize = 12;
+const MONITOR_LINE_WIDTH: usize = 180;
+
+fn render_monitor_snapshot(
+    details: Option<&RunDetails>,
+    waiting_repo: Option<&str>,
+    clear_screen: bool,
+    separator: bool,
+) -> Result<()> {
+    let mut out = io::stdout();
+    if clear_screen {
+        write!(out, "\x1b[2J\x1b[H")?;
+    } else if separator {
+        writeln!(out, "---")?;
+    }
+
+    writeln!(out, "Khazad-Doom Monitor")?;
+    match details {
+        Some(details) => render_run_monitor(&mut out, details)?,
+        None => render_waiting_monitor(&mut out, waiting_repo.unwrap_or("-"))?,
+    }
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
+}
+
+fn render_waiting_monitor(out: &mut impl Write, repo: &str) -> Result<()> {
+    writeln!(out, "Run: -")?;
+    writeln!(out, "Repo: {repo}")?;
+    writeln!(out, "Status: waiting")?;
+    writeln!(out, "Phase: waiting")?;
+    writeln!(out, "Slice: -")?;
+    writeln!(out, "Command: -")?;
+    writeln!(out, "Elapsed: 0s")?;
+    writeln!(out, "Updated: -")?;
+    writeln!(out, "Message: waiting for latest active run")?;
+    writeln!(out, "Recent events:")?;
+    writeln!(out, "  -")?;
+    writeln!(out, "Output tail:")?;
+    writeln!(out, "  -")?;
+    Ok(())
+}
+
+fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    let progress = details.progress.as_ref();
+    let phase = match progress {
+        Some(progress) if !progress.phase.trim().is_empty() => progress.phase.as_str(),
+        _ if is_terminal_status(details.run.status) => details.run.status.as_str(),
+        _ => "unknown",
+    };
+    let command = progress
+        .map(|progress| progress.command.as_str())
+        .unwrap_or_default();
+    let message = monitor_message(details);
+    let elapsed_start = progress
+        .map(|progress| progress.phase_started_at)
+        .unwrap_or(details.run.started_at);
+    let elapsed = Utc::now()
+        .signed_duration_since(elapsed_start)
+        .to_std()
+        .unwrap_or_default();
+    let updated = progress
+        .map(|progress| progress.updated_at.to_rfc3339())
+        .unwrap_or_else(|| details.run.updated_at.to_rfc3339());
+
+    writeln!(out, "Run: {}", details.run.id)?;
+    writeln!(out, "Repo: {}", details.run.repo_path)?;
+    writeln!(out, "Status: {}", details.run.status)?;
+    writeln!(out, "Phase: {phase}")?;
+    writeln!(out, "Slice: {}", monitor_slice_label(details))?;
+    writeln!(out, "Command: {}", display_or_dash(command))?;
+    writeln!(out, "Elapsed: {}", format_duration(elapsed))?;
+    writeln!(out, "Updated: {updated}")?;
+    writeln!(
+        out,
+        "Message: {}",
+        truncate_display(&message, MONITOR_LINE_WIDTH)
+    )?;
+    writeln!(out, "Recent events:")?;
+    render_event_tail(out, &details.events)?;
+    writeln!(out, "Output tail:")?;
+    render_output_tail(
+        out,
+        progress
+            .map(|progress| progress.output_tail.as_str())
+            .unwrap_or_default(),
+    )?;
+    Ok(())
+}
+
+fn render_event_tail(out: &mut impl Write, events: &[Event]) -> Result<()> {
+    if events.is_empty() {
+        writeln!(out, "  -")?;
+        return Ok(());
+    }
+    let recent = events
+        .iter()
+        .rev()
+        .take(MONITOR_EVENT_LINES)
+        .collect::<Vec<_>>();
+    for event in recent.into_iter().rev() {
+        let summary = event_summary(event);
+        if summary.is_empty() {
+            writeln!(
+                out,
+                "  {} {}",
+                event.created_at.format("%H:%M:%S"),
+                event.typ
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  {} {} {}",
+                event.created_at.format("%H:%M:%S"),
+                event.typ,
+                summary
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn render_output_tail(out: &mut impl Write, output_tail: &str) -> Result<()> {
+    let trimmed = output_tail.trim_end();
+    if trimmed.is_empty() {
+        writeln!(out, "  -")?;
+        return Ok(());
+    }
+    let lines = trimmed
+        .lines()
+        .rev()
+        .take(MONITOR_OUTPUT_LINES)
+        .collect::<Vec<_>>();
+    for line in lines.into_iter().rev() {
+        writeln!(out, "  {}", truncate_display(line, MONITOR_LINE_WIDTH))?;
+    }
+    Ok(())
+}
+
+fn event_summary(event: &Event) -> String {
+    let Some(map) = event.payload.as_object() else {
+        return truncate_display(&event.payload.to_string(), 120);
+    };
+    let mut parts = Vec::new();
+    for key in [
+        "slice_id", "phase", "status", "message", "summary", "error", "command",
+    ] {
+        let Some(value) = map.get(key) else {
+            continue;
+        };
+        let text = value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string());
+        if !text.trim().is_empty() {
+            parts.push(format!("{key}={}", truncate_display(&text, 80)));
+        }
+    }
+    if parts.is_empty() {
+        truncate_display(&event.payload.to_string(), 120)
+    } else {
+        truncate_display(&parts.join(" "), 160)
+    }
+}
+
+fn monitor_message(details: &RunDetails) -> String {
+    if let Some(progress) = &details.progress
+        && !progress.message.trim().is_empty()
+    {
+        return progress.message.clone();
+    }
+    if !details.run.error.trim().is_empty() {
+        return details.run.error.clone();
+    }
+    format!("run is {}", details.run.status)
+}
+
+fn monitor_slice_label(details: &RunDetails) -> String {
+    if let Some(progress) = &details.progress
+        && !progress.slice_id.trim().is_empty()
+    {
+        return progress.slice_id.clone();
+    }
+    for status in [
+        SliceStatus::Running,
+        SliceStatus::RepairNeeded,
+        SliceStatus::ReadyToMerge,
+        SliceStatus::Pending,
+    ] {
+        if let Some(slice_run) = details
+            .slice_runs
+            .iter()
+            .find(|slice_run| slice_run.status == status)
+        {
+            return format!("{} ({})", slice_run.slice_id, slice_run.status);
+        }
+    }
+    if details.slice_runs.len() == 1 {
+        let slice_run = &details.slice_runs[0];
+        return format!("{} ({})", slice_run.slice_id, slice_run.status);
+    }
+    display_or_dash(&details.run.selected_slice_id).to_string()
+}
+
+fn display_or_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
+}
+
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn is_terminal_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Blocked
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted
+    )
+}
+
+fn terminal_run_error(details: &RunDetails) -> Result<()> {
+    if details.run.error.trim().is_empty() {
+        bail!("run ended with status {}", details.run.status);
+    }
+    bail!(
+        "run ended with status {}: {}",
+        details.run.status,
+        details.run.error
+    )
+}
+
+fn stdout_is_terminal() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     let hours = seconds / 3600;
@@ -714,13 +1130,7 @@ fn wait_run(client: &Client, run_id: &str) -> Result<()> {
             RunStatus::Failed
             | RunStatus::Blocked
             | RunStatus::Cancelled
-            | RunStatus::Interrupted => {
-                bail!(
-                    "run ended with status {}: {}",
-                    details.run.status,
-                    details.run.error
-                );
-            }
+            | RunStatus::Interrupted => return terminal_run_error(&details),
             _ => thread::sleep(Duration::from_secs(2)),
         }
     }

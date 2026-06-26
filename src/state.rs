@@ -396,13 +396,14 @@ impl Store {
         let limit = if limit == 0 { 50 } else { limit };
         let mut stmt = conn.prepare(
             r#"SELECT id, run_id, type, payload_json, created_at
-               FROM events WHERE run_id=?1 ORDER BY id ASC LIMIT ?2"#,
+               FROM events WHERE run_id=?1 ORDER BY id DESC LIMIT ?2"#,
         )?;
         let rows = stmt.query_map(params![run_id, limit as i64], event_tuple_from_row)?;
         let mut events = Vec::new();
         for row in rows {
             events.push(event_from_tuple(row?)?);
         }
+        events.reverse();
         Ok(events)
     }
 
