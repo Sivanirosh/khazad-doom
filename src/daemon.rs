@@ -208,6 +208,7 @@ impl Server {
                         .ok_or_else(|| anyhow!("run {:?} not found", params.run_id))?;
                     let details = RunDetails {
                         slice_runs: self.store.get_slice_runs(&params.run_id)?,
+                        progress: self.store.get_progress(&params.run_id)?,
                         events: self.store.get_events(&params.run_id, params.events_limit)?,
                         run,
                     };

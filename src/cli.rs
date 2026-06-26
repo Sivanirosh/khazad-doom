@@ -12,6 +12,7 @@ use crate::ipc::{
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::ffi::OsString;
@@ -101,6 +102,20 @@ enum CommandArgs {
         run: String,
         #[arg(long, default_value_t = 50)]
         events_limit: usize,
+        /// Follow a run with compact human-readable progress until it reaches a terminal state.
+        #[arg(long)]
+        follow: bool,
+        /// Poll interval for --follow, in milliseconds.
+        #[arg(long, default_value_t = 2000)]
+        interval_ms: u64,
+    },
+    /// Watch a run with compact human-readable progress until it reaches a terminal state.
+    Watch {
+        #[arg(long)]
+        run: String,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 2000)]
+        interval_ms: u64,
     },
     /// Inspect repo-local JSON Issue Slices.
     Slices {
@@ -204,7 +219,13 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             dry_run,
         } => run_handoff(paths, run, push, create_pr, dry_run),
         CommandArgs::Inspect { run, log_tail } => run_inspect(paths, run, log_tail),
-        CommandArgs::Status { run, events_limit } => run_status(paths, run, events_limit),
+        CommandArgs::Status {
+            run,
+            events_limit,
+            follow,
+            interval_ms,
+        } => run_status(paths, run, events_limit, follow, interval_ms),
+        CommandArgs::Watch { run, interval_ms } => run_watch(paths, run, interval_ms),
         CommandArgs::Slices { command } => run_slices(paths, command),
         CommandArgs::Daemon { command } => run_daemon(paths, command),
     }
@@ -347,7 +368,19 @@ fn run_inspect(paths: Paths, run_id: String, log_tail_lines: usize) -> Result<()
     print_json(&inspection)
 }
 
-fn run_status(paths: Paths, run_id: String, events_limit: usize) -> Result<()> {
+fn run_status(
+    paths: Paths,
+    run_id: String,
+    events_limit: usize,
+    follow: bool,
+    interval_ms: u64,
+) -> Result<()> {
+    if follow {
+        if run_id.is_empty() {
+            bail!("status --follow requires --run <run-id>");
+        }
+        return run_watch(paths, run_id, interval_ms);
+    }
     let client = Client::new(paths);
     if !run_id.is_empty() {
         let details: RunDetails = client.call(
@@ -370,6 +403,36 @@ fn run_status(paths: Paths, run_id: String, events_limit: usize) -> Result<()> {
     )?;
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
+}
+
+fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
+    let client = Client::new(paths);
+    let interval = Duration::from_millis(interval_ms.max(100));
+    loop {
+        let details: RunDetails = client.call(
+            "status",
+            &StatusParams {
+                run_id: run_id.clone(),
+                limit: 0,
+                events_limit: 5,
+            },
+        )?;
+        print_watch_snapshot(&details);
+        match details.run.status {
+            RunStatus::Completed => return Ok(()),
+            RunStatus::Failed
+            | RunStatus::Blocked
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted => {
+                bail!(
+                    "run ended with status {}: {}",
+                    details.run.status,
+                    details.run.error
+                );
+            }
+            _ => thread::sleep(interval),
+        }
+    }
 }
 
 fn run_slices(paths: Paths, command: SlicesCommand) -> Result<()> {
@@ -543,6 +606,64 @@ fn serve_daemon(paths: Paths) -> Result<()> {
     let state = StateStore::open(paths.db_file())?;
     let server = Server::new(paths, state);
     server.serve()
+}
+
+fn print_watch_snapshot(details: &RunDetails) {
+    println!("Run: {}", details.run.id);
+    println!("Status: {}", details.run.status);
+    if let Some(progress) = &details.progress {
+        let elapsed = Utc::now()
+            .signed_duration_since(progress.phase_started_at)
+            .to_std()
+            .unwrap_or_default();
+        println!("Phase: {}", progress.phase);
+        if !progress.slice_id.is_empty() {
+            println!("Slice: {}", progress.slice_id);
+        }
+        if !progress.command.is_empty() {
+            println!("Command: {}", progress.command);
+        }
+        println!("Elapsed: {}", format_duration(elapsed));
+        println!("Updated: {}", progress.updated_at);
+        println!("Message: {}", progress.message);
+        if !progress.output_tail.trim().is_empty() {
+            println!("Last output:");
+            for line in progress
+                .output_tail
+                .trim_end()
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                println!("  {line}");
+            }
+        }
+    } else {
+        let elapsed = Utc::now()
+            .signed_duration_since(details.run.started_at)
+            .to_std()
+            .unwrap_or_default();
+        println!("Phase: unknown");
+        println!("Elapsed: {}", format_duration(elapsed));
+    }
+    println!();
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn wait_run(client: &Client, run_id: &str) -> Result<()> {

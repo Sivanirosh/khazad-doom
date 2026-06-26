@@ -1,7 +1,7 @@
 ---
 name: khazad-doom
-description: Drive the Khazad-Doom workflow daemon: initialize repo workflow contracts, run JSON Issue Slices through isolated Pi/fake workers, inspect status/artifacts, create handoffs, and report blockers.
-argument-hint: "[init|slices|run|resume|status|cancel|handoff|inspect] [options]"
+description: "Drive the Khazad-Doom workflow daemon: initialize repo workflow contracts, run JSON Issue Slices through isolated Pi/fake workers, inspect status/artifacts, create handoffs, and report blockers."
+argument-hint: "[init|slices|run|resume|status|watch|cancel|handoff|inspect] [options]"
 ---
 
 # Khazad-Doom
@@ -23,11 +23,13 @@ khazad-doom init
 khazad-doom slices validate
 khazad-doom slices list
 khazad-doom slices schema --write
-khazad-doom run --slice <slice-id> --wait
-khazad-doom run --all --parallel <n> --wait
-khazad-doom run --agent fake --all --wait
+khazad-doom run --slice <slice-id>
+khazad-doom run --all --parallel <n>
+khazad-doom run --agent fake --all
 khazad-doom resume --run <run-id>
 khazad-doom status --run <run-id>
+khazad-doom status --run <run-id> --follow
+khazad-doom watch --run <run-id>
 khazad-doom handoff --run <run-id>
 khazad-doom handoff --run <run-id> --dry-run
 khazad-doom inspect --run <run-id>
@@ -48,6 +50,9 @@ khazad-doom daemon status
 - Merge conflicts are structured blocked artifacts; do not paper over them.
 - Runtime artifacts under `.workflow/runs/` are gitignored.
 - Handoff prints by default; push/PR creation require explicit flags or config, and `--dry-run` suppresses configured actions.
-- The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, status, handoff JSON, and artifact inspection.
+- The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status, handoff JSON, and artifact inspection.
+- Runs are daemon-owned durable sessions. A Pi tool call must start/control/observe a run, never define its lifetime.
+- Do not use `--wait` as the primary Pi UX for real `pi` runs. Start the run, capture `run_id`, and automatically attach a live monitor with `khazad-doom watch --run <run-id>` or repeated short `status --run` checks when the harness requires nonblocking control.
+- Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 
 If a run blocks with an `ask-user` finding, relay the blocker to the user with exact details and ask for a decision before resuming.

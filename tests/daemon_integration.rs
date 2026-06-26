@@ -255,6 +255,83 @@ fn schema_import_and_handoff_v2_black_box() -> TestResult {
 }
 
 #[test]
+fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Long verification slice",
+            "goal": "Create fake output and run a visibly long verification command.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["printf 'started-progress\\n'; sleep 2; printf 'finished-progress\\n'; test -f slice-001.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add long verification slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let live = wait_for_progress_output(
+        &bin,
+        home.path(),
+        &run_id,
+        "worker_verify",
+        "started-progress",
+    )?;
+    assert_eq!(live["progress"]["slice_id"], "slice-001");
+    assert_eq!(
+        live["progress"]["command"],
+        "printf 'started-progress\\n'; sleep 2; printf 'finished-progress\\n'; test -f slice-001.txt"
+    );
+    assert!(
+        live["progress"]["output_tail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("started-progress"),
+        "progress should include streamed command output: {live:#}"
+    );
+
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let watched = kd_ok(
+        &bin,
+        home.path(),
+        &["watch", "--run", &run_id, "--interval-ms", "100"],
+    )?;
+    let watched = String::from_utf8(watched.stdout)?;
+    assert!(watched.contains(&format!("Run: {run_id}")));
+    assert!(watched.contains("Status: completed"));
+    assert!(watched.contains("Phase: completed"));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn interrupted_run_resumes_without_duplicate_merges_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -400,6 +477,41 @@ fn wait_for_status(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestR
             panic!("run reached terminal non-success state: {value:#}");
         }
         assert!(Instant::now() < deadline, "timed out waiting for {wanted}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_progress_output(
+    bin: &Path,
+    home: &Path,
+    run_id: &str,
+    wanted_phase: &str,
+    wanted_output: &str,
+) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&output)?;
+        if value["progress"]["phase"].as_str() == Some(wanted_phase)
+            && value["progress"]["output_tail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(wanted_output)
+        {
+            return Ok(value);
+        }
+        if matches!(
+            value["run"]["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled" | "interrupted" | "completed")
+        ) {
+            panic!(
+                "run reached terminal state before progress phase {wanted_phase} with output {wanted_output}: {value:#}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for progress phase {wanted_phase} with output {wanted_output}"
+        );
         thread::sleep(Duration::from_millis(100));
     }
 }

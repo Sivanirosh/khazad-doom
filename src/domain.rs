@@ -344,9 +344,28 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunProgress {
+    pub run_id: String,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slice_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_tail: String,
+    pub phase_started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
     pub slice_runs: Vec<SliceRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<RunProgress>,
     pub events: Vec<Event>,
 }
 

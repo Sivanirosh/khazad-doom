@@ -77,14 +77,16 @@ khazad-doom slices new \
   --goal "Add bounded retries for transient job failures" \
   --verify "cargo test"
 khazad-doom slices validate
-khazad-doom run --slice slice-001 --wait
+khazad-doom run --slice slice-001
+khazad-doom watch --run <run-id>
 khazad-doom handoff --run <run-id>
 ```
 
 For a deterministic smoke test that does not invoke Pi:
 
 ```bash
-khazad-doom run --agent fake --all --wait
+khazad-doom run --agent fake --all
+khazad-doom watch --run <run-id>
 ```
 
 ## Issue Slices
@@ -127,6 +129,7 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Structured output | Worker and repair results must be machine-readable JSON. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
+| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `watch`, and Pi adapters. |
 | Durable checkpoints | `resume` continues remaining work from recorded state instead of pretending nothing happened. |
 | Conflict artifacts | Merge conflicts become structured blocked reports, not half-merged chaos. |
 | Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
@@ -146,7 +149,9 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | `khazad-doom run --all --parallel <n>` | Run all slices; independent workers may run concurrently. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
-| `khazad-doom status --run <id>` | Show one run, slice states, and events. |
+| `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |
+| `khazad-doom status --run <id> --follow` | Follow compact live progress until the run reaches a terminal state. |
+| `khazad-doom watch --run <id>` | Same live monitor as `status --follow`; intended for long daemon-owned runs. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
 | `khazad-doom handoff --run <id>` | Print push/PR handoff JSON for a completed run. |
@@ -191,6 +196,8 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 
 A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts.
 
+Khazad-Doom does not use a hidden global workflow timeout. Runs are daemon-owned and may outlive the CLI or Pi tool call that started them. Timeouts are explicit guardrails for individual verification/gate commands so hung shell commands do not stall a run forever.
+
 ## Files and state
 
 | Path | Purpose |
@@ -202,7 +209,7 @@ A slice can reference `"verify_profile": "quick"` and still add inline `verify` 
 | `.workflow/reports/` | Reports committed to integration branches. |
 | `.workflow/runs/` | Transient handoffs and raw outputs; gitignored. |
 | `~/.khazad-doom/socket` | Daemon IPC socket. |
-| `~/.khazad-doom/state.sqlite` | Run, slice, and event state. |
+| `~/.khazad-doom/state.sqlite` | Run, slice, event, and live progress state. |
 | `~/.khazad-doom/worktrees/` | Daemon-managed temporary worktrees. |
 
 If the daemon starts and finds active runs from a previous process, it marks them `interrupted`, records recovery events, and cleans daemon worktrees where possible. `khazad-doom resume --run <id>` is explicit: it reuses the integration branch and checkpoint state for remaining slices.

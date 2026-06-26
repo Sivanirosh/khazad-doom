@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 pub const MAX_REPAIR_ATTEMPTS: usize = 3;
 pub const DEFAULT_VERIFY_TIMEOUT_SECONDS: u64 = 600;
+const PROGRESS_OUTPUT_TAIL_BYTES: usize = 4_000;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
+type ShellProgress = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct Manager {
@@ -111,6 +113,59 @@ impl Manager {
 
     pub fn active_run_count(&self) -> usize {
         self.active.count()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mark_progress(
+        &self,
+        run_id: &str,
+        phase: &str,
+        slice_id: &str,
+        attempt: usize,
+        command: &str,
+        message: &str,
+        output_tail: &str,
+    ) {
+        if let Ok(progress) = self.state.update_progress(
+            run_id,
+            phase,
+            slice_id,
+            attempt,
+            command,
+            message,
+            output_tail,
+        ) {
+            let _ = self.state.record_event(run_id, "progress", &progress);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shell_progress_sink(
+        &self,
+        run_id: &str,
+        phase: &str,
+        slice_id: &str,
+        attempt: usize,
+        command: &str,
+        message: &str,
+    ) -> ShellProgress {
+        let state = self.state.clone();
+        let run_id = run_id.to_string();
+        let phase = phase.to_string();
+        let slice_id = slice_id.to_string();
+        let command = command.to_string();
+        let message = message.to_string();
+        Arc::new(move |output_tail| {
+            let _ = state.update_progress(
+                &run_id,
+                &phase,
+                &slice_id,
+                attempt,
+                &command,
+                &message,
+                &output_tail,
+            );
+        })
     }
 
     fn ensure_repo_run_available(&self, repo_id: &str, allowed_run_id: Option<&str>) -> Result<()> {
@@ -302,6 +357,7 @@ impl Manager {
             "run_started",
             &json!({ "run": run, "selected_slices": selected_ids, "agent": runner.name() }),
         )?;
+        self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon", "");
 
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
@@ -405,6 +461,7 @@ impl Manager {
             "run_resumed",
             &json!({ "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>() }),
         )?;
+        self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon", "");
         let config = store.read_config()?;
         let runner = if let Some(runner) = &self.runner_override {
             runner.clone()
@@ -641,6 +698,15 @@ impl Manager {
         }
         match &outcome {
             Ok(_) => {
+                self.mark_progress(
+                    &run.id,
+                    "completed",
+                    "",
+                    0,
+                    "",
+                    "run completed; handoff artifacts are ready",
+                    "",
+                );
                 let _ =
                     self.state
                         .record_event(&run.id, "run_completed", &json!({ "run_id": run.id }));
@@ -651,12 +717,19 @@ impl Manager {
                 let message = err.to_string();
                 if status == RunStatus::Cancelled {
                     let _ = self.state.cancel_active_slice_runs(&run.id, &message);
+                    self.mark_progress(&run.id, "cancelled", "", 0, "", &message, "");
                     let _ = self.state.record_event(
                         &run.id,
                         "run_cancelled",
                         &json!({ "reason": message }),
                     );
                 } else {
+                    let phase = if status == RunStatus::Blocked {
+                        "blocked"
+                    } else {
+                        "failed"
+                    };
+                    self.mark_progress(&run.id, phase, "", 0, "", &message, "");
                     let _ =
                         self.state
                             .record_event(&run.id, "run_error", &json!({ "error": message }));
@@ -686,6 +759,15 @@ impl Manager {
         std::fs::create_dir_all(&root_worktree)
             .with_context(|| format!("create {}", root_worktree.display()))?;
 
+        self.mark_progress(
+            &run.id,
+            "integration_setup",
+            "",
+            0,
+            "",
+            "creating integration worktree",
+            "",
+        );
         match integration_mode {
             IntegrationMode::Fresh => gitutil::worktree_add(
                 &run.repo_path,
@@ -729,6 +811,15 @@ impl Manager {
             )?;
             for worker in outcomes {
                 let slice = worker.slice.clone();
+                self.mark_progress(
+                    &run.id,
+                    "merging",
+                    &slice.id,
+                    worker.attempts,
+                    "git merge",
+                    "merging slice branch into integration branch",
+                    "",
+                );
                 if let Err(err) = gitutil::merge(
                     &integration_worktree,
                     &worker.branch,
@@ -773,6 +864,15 @@ impl Manager {
         }
 
         check_cancelled(cancel)?;
+        self.mark_progress(
+            &run.id,
+            "integration_repair",
+            "",
+            0,
+            "",
+            "checking whether integration repair is needed",
+            "",
+        );
         let repair = self.integration_repair(
             run,
             gate_slices,
@@ -782,7 +882,17 @@ impl Manager {
             runner.clone(),
         )?;
         check_cancelled(cancel)?;
-        let gate = self.integration_gate(gate_slices, &integration_worktree, cancel, &config)?;
+        self.mark_progress(
+            &run.id,
+            "integration_gate",
+            "",
+            0,
+            "",
+            "running integration gate commands",
+            "",
+        );
+        let gate =
+            self.integration_gate(run, gate_slices, &integration_worktree, cancel, &config)?;
         let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         let summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -957,6 +1067,15 @@ impl Manager {
         })?;
         self.state
             .record_event(&run.id, "slice_started", &json!({ "slice_id": slice.id }))?;
+        self.mark_progress(
+            &run.id,
+            "worker_started",
+            &slice.id,
+            0,
+            "",
+            "slice worker started",
+            "",
+        );
 
         let mut all_checks = Vec::new();
         let mut last_failure = String::new();
@@ -980,6 +1099,15 @@ impl Manager {
             };
             let handoff_path = store.write_handoff(&run.id, &handoff)?;
             let prompt = worker_prompt(&handoff_path.to_string_lossy(), &handoff, &last_failure);
+            self.mark_progress(
+                &run.id,
+                "worker_running",
+                &slice.id,
+                attempt,
+                runner.name(),
+                "slice worker is running",
+                "",
+            );
             let result = match runner.run(
                 Job {
                     kind: "slice-worker".to_string(),
@@ -1022,12 +1150,15 @@ impl Manager {
             artifact::write_json(&output_path, &worker_result)?;
 
             let check = self.lightweight_check(
-                slice,
-                &worker_worktree,
-                slice_base_sha,
-                attempt,
+                LightweightCheckContext {
+                    run_id: &run.id,
+                    slice,
+                    worker_worktree: &worker_worktree,
+                    base_sha: slice_base_sha,
+                    attempt,
+                    config,
+                },
                 cancel,
-                config,
             )?;
             artifact::write_json(
                 store.output_path(
@@ -1042,6 +1173,15 @@ impl Manager {
                 if worker_result.commit_sha.is_empty() {
                     worker_result.commit_sha = check.worker_head.clone();
                 }
+                self.mark_progress(
+                    &run.id,
+                    "ready_to_merge",
+                    &slice.id,
+                    attempt,
+                    "",
+                    "slice passed worker checks and is ready to merge",
+                    "",
+                );
                 self.state.upsert_slice_run(&SliceRun {
                     run_id: run.id.clone(),
                     slice_id: slice.id.clone(),
@@ -1110,26 +1250,22 @@ impl Manager {
 
     fn lightweight_check(
         &self,
-        slice: &Slice,
-        worker_worktree: &Path,
-        base_sha: &str,
-        attempt: usize,
+        ctx: LightweightCheckContext<'_>,
         cancel: &CancellationToken,
-        config: &WorkflowConfig,
     ) -> Result<CheckResult> {
         let mut check = CheckResult {
-            slice_id: slice.id.clone(),
+            slice_id: ctx.slice.id.clone(),
             status: "passed".to_string(),
             summary: "lightweight checks passed".to_string(),
             tests_run: Vec::new(),
             findings: Vec::new(),
-            attempt,
+            attempt: ctx.attempt,
             worker_head: String::new(),
             worktree_ok: true,
             commit_found: true,
         };
 
-        let status = match gitutil::status_porcelain(worker_worktree) {
+        let status = match gitutil::status_porcelain(ctx.worker_worktree) {
             Ok(status) => status,
             Err(err) => {
                 check.status = "failed".to_string();
@@ -1153,7 +1289,7 @@ impl Manager {
             return Ok(check);
         }
 
-        let head = match gitutil::head_sha(worker_worktree) {
+        let head = match gitutil::head_sha(ctx.worker_worktree) {
             Ok(head) => head,
             Err(err) => {
                 check.status = "failed".to_string();
@@ -1162,7 +1298,7 @@ impl Manager {
             }
         };
         check.worker_head = head.clone();
-        if head == base_sha {
+        if head == ctx.base_sha {
             check.commit_found = false;
             check.status = "failed".to_string();
             check.summary = "worker did not create a slice commit".to_string();
@@ -1177,19 +1313,37 @@ impl Manager {
             return Ok(check);
         }
 
-        for command in effective_verify_commands(slice, config)? {
+        for command in effective_verify_commands(ctx.slice, ctx.config)? {
             if command.command.trim().is_empty() {
                 continue;
             }
             check_cancelled(cancel)?;
             check.tests_run.push(command.command.clone());
-            let cwd = verify_command_cwd(worker_worktree, &command)?;
+            let cwd = verify_command_cwd(ctx.worker_worktree, &command)?;
+            self.mark_progress(
+                ctx.run_id,
+                "worker_verify",
+                &ctx.slice.id,
+                ctx.attempt,
+                &command.command,
+                "running slice verification command",
+                "",
+            );
+            let progress = self.shell_progress_sink(
+                ctx.run_id,
+                "worker_verify",
+                &ctx.slice.id,
+                ctx.attempt,
+                &command.command,
+                "running slice verification command",
+            );
             let output = match run_shell_command(
                 &cwd,
                 &command.command,
                 cancel,
-                verify_command_timeout(slice, &command, config),
+                verify_command_timeout(ctx.slice, &command, ctx.config),
                 &command.env,
+                Some(progress),
             ) {
                 Ok(output) => output,
                 Err(err) => {
@@ -1250,8 +1404,17 @@ impl Manager {
         let check_summary =
             serde_json::to_string_pretty(checks).unwrap_or_else(|_| "[]".to_string());
         let mut last_error = String::new();
-        for _attempt in 1..=MAX_REPAIR_ATTEMPTS {
+        for attempt in 1..=MAX_REPAIR_ATTEMPTS {
             check_cancelled(cancel)?;
+            self.mark_progress(
+                &run.id,
+                "integration_repair",
+                "",
+                attempt,
+                runner.name(),
+                "integration repair worker is running",
+                "",
+            );
             let prompt = integration_repair_prompt(
                 &run.id,
                 &integration_worktree.to_string_lossy(),
@@ -1335,6 +1498,7 @@ impl Manager {
 
     fn integration_gate(
         &self,
+        run: &Run,
         slices: &[Slice],
         integration_worktree: &Path,
         cancel: &CancellationToken,
@@ -1371,12 +1535,30 @@ impl Manager {
         for (_, command) in commands {
             check_cancelled(cancel)?;
             let cwd = verify_command_cwd(integration_worktree, &command)?;
+            self.mark_progress(
+                &run.id,
+                "integration_gate",
+                "",
+                0,
+                &command.command,
+                "running integration gate command",
+                "",
+            );
+            let progress = self.shell_progress_sink(
+                &run.id,
+                "integration_gate",
+                "",
+                0,
+                &command.command,
+                "running integration gate command",
+            );
             let output = run_shell_command(
                 &cwd,
                 &command.command,
                 cancel,
                 verify_command_timeout_for_command(&command, config),
                 &command.env,
+                Some(progress),
             );
             match output {
                 Ok(output) => {
@@ -1512,6 +1694,15 @@ struct SliceWorkerOutcome {
     checks: Vec<CheckResult>,
     branch: String,
     attempts: usize,
+}
+
+struct LightweightCheckContext<'a> {
+    run_id: &'a str,
+    slice: &'a Slice,
+    worker_worktree: &'a Path,
+    base_sha: &'a str,
+    attempt: usize,
+    config: &'a WorkflowConfig,
 }
 
 fn sh_quote(value: &str) -> String {
@@ -1837,6 +2028,7 @@ fn run_shell_command(
     cancel: &CancellationToken,
     timeout: Duration,
     env: &BTreeMap<String, String>,
+    progress: Option<ShellProgress>,
 ) -> Result<Output> {
     let mut process = Command::new("sh");
     process
@@ -1858,22 +2050,102 @@ fn run_shell_command(
         });
     }
     let mut child = process.spawn()?;
+    let stdout = child.stdout.take().context("command stdout")?;
+    let stderr = child.stderr.take().context("command stderr")?;
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let combined_tail = Arc::new(Mutex::new(Vec::new()));
+    let stdout_thread = spawn_output_reader(
+        stdout,
+        stdout_buf.clone(),
+        combined_tail.clone(),
+        progress.clone(),
+    );
+    let stderr_thread = spawn_output_reader(
+        stderr,
+        stderr_buf.clone(),
+        combined_tail.clone(),
+        progress.clone(),
+    );
+
     let started_at = Instant::now();
-    loop {
+    let mut last_heartbeat = Instant::now();
+    let status = loop {
         if cancel.is_cancelled() {
             terminate_process_group(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             return Err(CancelledError::new("run cancelled").into());
         }
-        if started_at.elapsed() >= timeout {
+        if !timeout.is_zero() && started_at.elapsed() >= timeout {
             terminate_process_group(&mut child);
-            let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             bail!("command timed out after {} seconds", timeout.as_secs());
         }
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+            if let Some(progress) = &progress {
+                progress(tail_text(&combined_tail));
+            }
+            last_heartbeat = Instant::now();
         }
         thread::sleep(Duration::from_millis(100));
-    }
+    };
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    Ok(Output {
+        status,
+        stdout: stdout_buf.lock().expect("stdout mutex poisoned").clone(),
+        stderr: stderr_buf.lock().expect("stderr mutex poisoned").clone(),
+    })
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    stream_buf: Arc<Mutex<Vec<u8>>>,
+    combined_tail: Arc<Mutex<Vec<u8>>>,
+    progress: Option<ShellProgress>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        loop {
+            let read = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            stream_buf
+                .lock()
+                .expect("stream mutex poisoned")
+                .extend_from_slice(&buf[..read]);
+            let output_tail = {
+                let mut combined = combined_tail.lock().expect("combined mutex poisoned");
+                combined.extend_from_slice(&buf[..read]);
+                if combined.len() > PROGRESS_OUTPUT_TAIL_BYTES {
+                    let remove = combined.len() - PROGRESS_OUTPUT_TAIL_BYTES;
+                    combined.drain(0..remove);
+                }
+                String::from_utf8_lossy(&combined).to_string()
+            };
+            if let Some(progress) = &progress
+                && last_emit.elapsed() >= Duration::from_millis(500)
+            {
+                progress(output_tail);
+                last_emit = Instant::now();
+            }
+        }
+        if let Some(progress) = &progress {
+            progress(tail_text(&combined_tail));
+        }
+    })
+}
+
+fn tail_text(combined_tail: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(&combined_tail.lock().expect("combined mutex poisoned")).to_string()
 }
 
 fn terminate_process_group(child: &mut std::process::Child) {
@@ -2125,6 +2397,7 @@ mod tests {
             &cancel,
             Duration::from_secs(1),
             &BTreeMap::new(),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("timed out"));
@@ -2147,6 +2420,7 @@ mod tests {
             &cancel,
             Duration::from_secs(30),
             &BTreeMap::new(),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("run cancelled"));

@@ -1,4 +1,4 @@
-use crate::domain::{Event, Run, RunStatus, SliceRun, SliceStatus};
+use crate::domain::{Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -74,6 +74,17 @@ impl Store {
                 type TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_progress (
+                run_id TEXT PRIMARY KEY,
+                phase TEXT NOT NULL,
+                slice_id TEXT NOT NULL DEFAULT '',
+                attempt INTEGER NOT NULL DEFAULT 0,
+                command TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                output_tail TEXT NOT NULL DEFAULT '',
+                phase_started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             "#,
         )?;
@@ -190,6 +201,94 @@ impl Store {
             params![run_id, typ, payload_json, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_progress(
+        &self,
+        run_id: &str,
+        phase: &str,
+        slice_id: &str,
+        attempt: usize,
+        command: &str,
+        message: &str,
+        output_tail: &str,
+    ) -> Result<RunProgress> {
+        let conn = self.conn()?;
+        let previous: Option<(String, String, i64, String, String)> = conn
+            .query_row(
+                "SELECT phase, slice_id, attempt, command, phase_started_at FROM run_progress WHERE run_id=?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        let same_phase = previous.as_ref().is_some_and(
+            |(old_phase, old_slice_id, old_attempt, old_command, _)| {
+                old_phase == phase
+                    && old_slice_id == slice_id
+                    && *old_attempt == attempt as i64
+                    && old_command == command
+            },
+        );
+        let now = Utc::now();
+        let phase_started_at = if same_phase {
+            previous
+                .as_ref()
+                .map(|(_, _, _, _, started)| started.clone())
+                .unwrap_or_else(|| now.to_rfc3339())
+        } else {
+            now.to_rfc3339()
+        };
+        conn.execute(
+            r#"INSERT INTO run_progress
+               (run_id, phase, slice_id, attempt, command, message, output_tail, phase_started_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               ON CONFLICT(run_id) DO UPDATE SET
+                 phase=excluded.phase,
+                 slice_id=excluded.slice_id,
+                 attempt=excluded.attempt,
+                 command=excluded.command,
+                 message=excluded.message,
+                 output_tail=excluded.output_tail,
+                 phase_started_at=excluded.phase_started_at,
+                 updated_at=excluded.updated_at"#,
+            params![
+                run_id,
+                phase,
+                slice_id,
+                attempt as i64,
+                command,
+                message,
+                output_tail,
+                phase_started_at,
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(RunProgress {
+            run_id: run_id.to_string(),
+            phase: phase.to_string(),
+            slice_id: slice_id.to_string(),
+            attempt,
+            command: command.to_string(),
+            message: message.to_string(),
+            output_tail: output_tail.to_string(),
+            phase_started_at: parse_time("phase_started_at", &phase_started_at)?,
+            updated_at: now,
+        })
+    }
+
+    pub fn get_progress(&self, run_id: &str) -> Result<Option<RunProgress>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                r#"SELECT run_id, phase, slice_id, attempt, command, message, output_tail,
+                          phase_started_at, updated_at
+                   FROM run_progress WHERE run_id=?1"#,
+                params![run_id],
+                run_progress_tuple_from_row,
+            )
+            .optional()?;
+        row.map(run_progress_from_tuple).transpose()
     }
 
     pub fn get_run(&self, id: &str) -> Result<Option<Run>> {
@@ -335,6 +434,17 @@ type RunTuple = (
 
 type SliceRunTuple = (String, String, String, String, String, i64, String);
 type EventTuple = (i64, String, String, String, String);
+type RunProgressTuple = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 fn run_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunTuple> {
     Ok((
@@ -371,6 +481,20 @@ fn event_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventTuple>
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+    ))
+}
+
+fn run_progress_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunProgressTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -425,6 +549,31 @@ fn event_from_tuple(row: EventTuple) -> Result<Event> {
         payload: serde_json::from_str(&payload_json)
             .with_context(|| format!("parse event payload {payload_json:?}"))?,
         created_at: parse_time("created_at", &created_at)?,
+    })
+}
+
+fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
+    let (
+        run_id,
+        phase,
+        slice_id,
+        attempt,
+        command,
+        message,
+        output_tail,
+        phase_started_at,
+        updated_at,
+    ) = row;
+    Ok(RunProgress {
+        run_id,
+        phase,
+        slice_id,
+        attempt: attempt as usize,
+        command,
+        message,
+        output_tail,
+        phase_started_at: parse_time("phase_started_at", &phase_started_at)?,
+        updated_at: parse_time("updated_at", &updated_at)?,
     })
 }
 
