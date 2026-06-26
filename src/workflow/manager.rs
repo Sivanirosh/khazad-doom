@@ -313,6 +313,9 @@ impl Manager {
             title: draft.title,
             goal: draft.goal,
             github_issue: draft.github_issue,
+            status: crate::domain::SLICE_STATUS_OPEN.to_string(),
+            closed_by_run: String::new(),
+            closed_at: String::new(),
             depends_on: Vec::new(),
             areas: Vec::new(),
             acceptance: if draft.acceptance.is_empty() {
@@ -344,6 +347,9 @@ impl Manager {
             title: issue.title.clone(),
             goal: first_meaningful_paragraph(&issue.body).unwrap_or_else(|| issue.title.clone()),
             github_issue: issue.url,
+            status: crate::domain::SLICE_STATUS_OPEN.to_string(),
+            closed_by_run: String::new(),
+            closed_at: String::new(),
             depends_on: Vec::new(),
             areas: issue
                 .labels
@@ -394,9 +400,25 @@ impl Manager {
         } else {
             opts.slice_ids.clone()
         };
-        let selected_slices = artifact::topological_order(&slices, &requested)?;
+        let requested_set: BTreeSet<_> = requested.iter().cloned().collect();
+        let planned_slices = artifact::topological_order(&slices, &requested)?;
+        let mut skipped_closed_slices = Vec::new();
+        let mut selected_slices = Vec::new();
+        for slice in planned_slices {
+            if slice.status == crate::domain::SLICE_STATUS_CLOSED {
+                if requested_set.contains(&slice.id) {
+                    bail!(
+                        "slice {:?} is closed; create a follow-up slice instead of rerunning historical work",
+                        slice.id
+                    );
+                }
+                skipped_closed_slices.push(slice.id.clone());
+                continue;
+            }
+            selected_slices.push(slice);
+        }
         if selected_slices.is_empty() {
-            bail!("no slices selected");
+            bail!("no open slices selected");
         }
         let selected_ids: Vec<_> = selected_slices
             .iter()
@@ -444,7 +466,12 @@ impl Manager {
         self.state.record_event(
             &run.id,
             "run_started",
-            &json!({ "run": run, "selected_slices": selected_ids, "agent": runner.name() }),
+            &json!({
+                "run": run,
+                "selected_slices": selected_ids,
+                "skipped_closed_slices": skipped_closed_slices,
+                "agent": runner.name()
+            }),
         )?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
 
@@ -984,6 +1011,18 @@ impl Manager {
             },
             cancel,
         )?;
+        let integration_store = artifact::Store::new(&integration_worktree);
+        if gate.status == "passed" {
+            let completed_slice_ids: Vec<_> = completed_slices
+                .iter()
+                .map(|slice| slice.slice_id.clone())
+                .collect();
+            integration_store.close_slices(
+                &completed_slice_ids,
+                &run.id,
+                &Utc::now().to_rfc3339(),
+            )?;
+        }
         let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         let summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -998,7 +1037,6 @@ impl Manager {
             created_at: Utc::now(),
         };
 
-        let integration_store = artifact::Store::new(&integration_worktree);
         integration_store
             .write_implementation_summary(&summary)
             .context("write implementation summary")?;
@@ -2001,6 +2039,9 @@ mod tests {
             title: format!("Title {id}"),
             goal: "Goal".to_string(),
             github_issue: String::new(),
+            status: crate::domain::SLICE_STATUS_OPEN.to_string(),
+            closed_by_run: String::new(),
+            closed_at: String::new(),
             depends_on: Vec::new(),
             areas: Vec::new(),
             acceptance: vec!["done".to_string()],
@@ -2208,6 +2249,18 @@ mod tests {
                 ),
             ],
         )?;
+        let closed_slice = gitutil::run(
+            repo.path(),
+            &[
+                "show",
+                &format!(
+                    "{}:.workflow/slices/slice-001.json",
+                    completed.integration_branch
+                ),
+            ],
+        )?;
+        assert!(closed_slice.contains("\"status\": \"closed\""));
+        assert!(closed_slice.contains(&format!("\"closed_by_run\": \"{}\"", run.id)));
         assert!(
             !paths
                 .repo_worktree_dir(&completed.repo_id, &run.id)
@@ -2227,6 +2280,99 @@ mod tests {
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
+        Ok(())
+    }
+
+    #[test]
+    fn closed_dependency_is_satisfied_and_not_rerun() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        first.closed_by_run = "kd-prior".to_string();
+        first.closed_at = Utc::now().to_rfc3339();
+        let mut second = slice("slice-002");
+        second.depends_on = vec!["slice-001".to_string()];
+        second.verify = vec!["test -f slice-002.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
+        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(
+            repo.path(),
+            &["commit", "-m", "add closed dependency and open slice"],
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-002".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(completed.selected_slice_id, "slice-002");
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert_eq!(slice_runs.len(), 1);
+        assert_eq!(slice_runs[0].slice_id, "slice-002");
+        assert_eq!(slice_runs[0].status, SliceStatus::Merged);
+        let events = state.get_events(&run.id, 20)?;
+        let started = events
+            .iter()
+            .find(|event| event.typ == "run_started")
+            .expect("run_started event");
+        assert_eq!(
+            started.payload["skipped_closed_slices"],
+            json!(["slice-001"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicitly_requested_closed_slice_is_rejected() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut closed = slice("slice-001");
+        closed.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        closed.closed_by_run = "kd-prior".to_string();
+        closed.closed_at = Utc::now().to_rfc3339();
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &closed)?;
+        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add closed slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state, Arc::new(FakeRunner));
+        let err = manager
+            .start_run(StartOptions {
+                repo_path: repo.path().to_path_buf(),
+                slice_ids: vec!["slice-001".to_string()],
+                all: false,
+                agent: "fake".to_string(),
+                pi_bin: String::new(),
+                pi_args: Vec::new(),
+                parallelism: 1,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("is closed"));
         Ok(())
     }
 

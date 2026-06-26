@@ -1,0 +1,31 @@
+{
+  "id": "slice-041",
+  "title": "Parallel scheduler hardening",
+  "goal": "Make parallel worker execution release-safe by collecting all worker outcomes deterministically, preserving artifacts, and making failure/cancellation behavior explicit before v0.1.0.",
+  "areas": [
+    "src/workflow/manager.rs",
+    "src/state.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "README.md"
+  ],
+  "acceptance": [
+    "Parallel worker batches always join every spawned worker thread before returning success or failure; no worker thread is dropped/detached because an earlier sibling failed.",
+    "If any worker in a parallel layer fails, Khazad-Doom records deterministic per-slice outcomes for all workers in that layer that reached a terminal result, then fails or blocks the run with a clear summary.",
+    "Cancellation during a parallel layer is graceful-first and propagates to all active workers before the layer returns.",
+    "Monitor/status output clearly identifies a parallel worker layer and the active slices in that layer while workers are running.",
+    "Tests cover at least one parallel layer where one worker fails while another succeeds or is still running, proving the daemon joins/records outcomes rather than abandoning handles.",
+    "No integration merges happen until the entire parallel layer has completed successfully; integration remains serial and deterministic."
+  ],
+  "must_ask_if": [
+    "The implementation would merge a successful worker from a layer after a sibling failed without an explicit policy decision.",
+    "The implementation would abandon or detach worker threads/processes after the first parallel failure.",
+    "The implementation would weaken worker attempt history or artifact preservation."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 120
+}

@@ -2,7 +2,9 @@
   "id": "slice-025",
   "title": "Slice JSON schema export",
   "goal": "Add khazad-doom slices schema and a committed JSON Schema for editor validation.",
-  "github_issue": "",
+  "status": "closed",
+  "closed_by_run": "legacy-pre-rust-rewrite",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-024"
   ],

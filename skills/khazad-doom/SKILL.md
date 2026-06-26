@@ -45,12 +45,14 @@ khazad-doom daemon status
 ## Protocol
 
 - JSON Issue Slices in `.workflow/slices/*.json` are the machine source of truth.
+- Slices have an issue-style lifecycle: new slices are open by default; successful daemon runs close completed slice JSON with `status: "closed"`, `closed_by_run`, and `closed_at`.
+- Do not rerun closed historical slices. Closed dependencies are treated as satisfied; explicitly requesting a closed slice should be rejected in favor of creating a follow-up slice.
 - `docs/workflow-invariants.md` records daemon workflow invariants that behavior-preserving refactors must keep stable.
 - `.workflow/khazad.json` carries repo defaults and verification profiles.
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
 - Worker output is JSON-only.
 - Worker commits are required before merge.
-- Multiple slices run in dependency order; independent slices can run in parallel, then merge serially.
+- Multiple open slices run in dependency order; independent open slices can run in parallel, then merge serially.
 - `--agent fake` is deterministic and only for local tests/dogfooding.
 - Interrupted daemon runs are marked `interrupted` on next startup; lost workers are not silently resumed.
 - Merge conflicts are structured blocked artifacts; do not paper over them.

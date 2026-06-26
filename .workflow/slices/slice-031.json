@@ -2,8 +2,9 @@
   "id": "slice-031",
   "title": "Pre-release codebase audit",
   "goal": "Audit the Khazad-Doom Rust codebase before v0.1.0 for AI slop coding, dirty/broken/dead/redundant code, unclear scope, and shallow modules. Keep scope limited to committed repository code and release workflow assets; either fix low-risk issues or document blockers in docs/release-audit.md.",
-  "github_issue": "",
-  "depends_on": [],
+  "status": "closed",
+  "closed_by_run": "kd-20260626-102840-44c20dda",
+  "closed_at": "2026-06-26T19:45:00Z",
   "areas": [
     "src",
     "tests",

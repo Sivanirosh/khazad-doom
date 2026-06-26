@@ -11,13 +11,16 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 
 ## Slice lifecycle and integration
 
-- JSON Issue Slices are the authoritative work contract. Dependencies run before dependents, cycles are invalid, and requested slices include required dependencies.
-- Each worker attempt runs one slice in a daemon-managed isolated worktree. Parallel workers must not share a checkout.
+- JSON Issue Slices are the authoritative work contract. Open slices represent runnable work; closed slices represent accepted historical work.
+- Requested open slices include open dependencies before dependents. Closed dependencies are treated as satisfied and must not launch historical workers again. Explicitly requesting a closed slice is rejected; create a follow-up slice for new work.
+- Cycles are invalid across the slice graph.
+- Each worker attempt runs one open slice in a daemon-managed isolated worktree. Parallel workers must not share a checkout.
 - A completed worker must return valid JSON, commit intended changes, and leave its worktree clean before the daemon may integrate the slice.
 - Independent slices may execute concurrently, but integration into the run branch is serial.
 - After each successful integration merge, Khazad-Doom records a checkpoint before advancing, so `resume` can continue from recorded state instead of replaying completed merges.
 - Merge conflicts, `ask-user` findings, invalid worker output, dirty worktrees, and verification failures become structured blocked/failed artifacts rather than silent best-effort integration.
 - If integrated work needs repair, repair occurs before the integration gate is treated as passed; repair does not bypass or weaken the gate.
+- After a run passes the integration gate, the daemon closes completed slice JSON in the integration branch with `status: "closed"`, `closed_by_run`, and `closed_at` before writing final reports.
 
 ## Worker attempt supervision
 

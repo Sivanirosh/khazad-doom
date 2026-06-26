@@ -2,7 +2,9 @@
   "id": "slice-032",
   "title": "Deepen live progress implementation",
   "goal": "Refactor live progress and shell command monitoring into a small internal interface or helper so long-running run observability stays product-quality while preserving behavior.",
-  "depends_on": [],
+  "status": "closed",
+  "closed_by_run": "kd-20260626-121011-06ed0834",
+  "closed_at": "2026-06-26T19:45:00Z",
   "areas": [
     "src/workflow/manager.rs",
     "src/state.rs",

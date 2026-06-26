@@ -2,7 +2,9 @@
   "id": "slice-028",
   "title": "Repo/run locking",
   "goal": "Prevent unsafe concurrent runs against the same repository and branch namespace.",
-  "github_issue": "",
+  "status": "closed",
+  "closed_by_run": "legacy-pre-rust-rewrite",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-027"
   ],

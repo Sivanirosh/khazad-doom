@@ -2,6 +2,9 @@
   "id": "slice-037",
   "title": "Worker attempt supervision",
   "goal": "Expose daemon-owned worker attempt supervision that distinguishes process liveness from worker output activity, warns on quiet workers without treating silence as failure by default, and keeps any fatal worker timeout explicit.",
+  "status": "closed",
+  "closed_by_run": "manual-2cfa8d0",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-036"
   ],

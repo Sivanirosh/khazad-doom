@@ -2,6 +2,9 @@
   "id": "slice-035",
   "title": "Document always-on monitor UX",
   "goal": "Update Khazad-Doom docs and skill instructions around the simple always-on monitor path: users start monitor --latest wherever they want, while any harness starts daemon-owned runs normally.",
+  "status": "closed",
+  "closed_by_run": "kd-20260626-125734-111aa82a",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-034"
   ],

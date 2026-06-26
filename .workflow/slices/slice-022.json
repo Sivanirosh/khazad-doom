@@ -2,7 +2,9 @@
   "id": "slice-022",
   "title": "Repo config file",
   "goal": "Add .workflow/khazad.json defaults for agent, parallelism, verification timeout, base branch, handoff behavior, and verification profiles.",
-  "github_issue": "",
+  "status": "closed",
+  "closed_by_run": "legacy-pre-rust-rewrite",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-021"
   ],

@@ -116,7 +116,7 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Guarantee | Why it matters |
 |---|---|
 | Bounded work | Each worker receives exactly one slice and its declared context. |
-| Dependency order | Requested slices automatically include dependencies and reject cycles. |
+| Dependency order | Requested open slices include open dependencies, skip closed dependencies, and reject cycles. |
 | Worktree isolation | Parallel workers cannot trample the same checkout. |
 | Structured output | Worker and repair results must be machine-readable JSON. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
@@ -127,6 +127,10 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
 
 Behavior-preserving refactor guardrails are collected in [`docs/workflow-invariants.md`](docs/workflow-invariants.md).
+
+## Slice lifecycle
+
+Slices use a small issue-style lifecycle. New slices are `open` by default. A successful daemon run closes completed slice JSON in the integration branch with `status: "closed"`, `closed_by_run`, and `closed_at`. Future runs skip closed dependencies instead of launching historical work again, and explicitly requesting a closed slice is rejected; create a follow-up slice for new work.
 
 ## Live progress
 
@@ -200,8 +204,8 @@ To install only the skill without the optional extension, use Pi package filters
 | `khazad-doom slices validate` | Validate slice JSON, IDs, dependencies, and cycles. |
 | `khazad-doom slices list` | Print compact slice summaries. |
 | `khazad-doom slices schema --write` | Write the JSON Schema for editor and CI validation. |
-| `khazad-doom run --slice <id>` | Run one slice plus its dependencies. |
-| `khazad-doom run --all --parallel <n>` | Run all slices; independent workers may run concurrently. |
+| `khazad-doom run --slice <id>` | Run one open slice plus open dependencies; closed dependencies are treated as satisfied. |
+| `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |

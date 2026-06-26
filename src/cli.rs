@@ -66,10 +66,10 @@ enum CommandArgs {
     Run {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// Slice id to run. Repeat to select multiple. Dependencies are included automatically.
+        /// Open slice id to run. Repeat to select multiple. Open dependencies are included automatically; closed dependencies are skipped.
         #[arg(long = "slice")]
         slices: Vec<String>,
-        /// Run all slices in dependency order. This is also the default when no --slice is given.
+        /// Run all open slices in dependency order. This is also the default when no --slice is given.
         #[arg(long)]
         all: bool,
         /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or pi.

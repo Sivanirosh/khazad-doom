@@ -2,8 +2,9 @@
   "id": "slice-021",
   "title": "Dogfood slice set",
   "goal": "Commit real .workflow/slices/slice-021..030.json so Khazad-Doom can run its own roadmap.",
-  "github_issue": "",
-  "depends_on": [],
+  "status": "closed",
+  "closed_by_run": "legacy-pre-rust-rewrite",
+  "closed_at": "2026-06-26T19:45:00Z",
   "areas": [
     "khazad-doom",
     "workflow"

@@ -2,6 +2,9 @@
   "id": "slice-039",
   "title": "Extract integration gate seam",
   "goal": "Perform the first behavior-preserving workflow manager seam extraction by moving integration gate and shell command execution responsibilities behind a compact, deep interface without broad mechanical splitting.",
+  "status": "closed",
+  "closed_by_run": "kd-20260626-184032-7f7bc767",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-038"
   ],

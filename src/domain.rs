@@ -10,6 +10,15 @@ pub struct Slice {
     pub goal: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub github_issue: String,
+    #[serde(
+        default = "default_slice_status",
+        skip_serializing_if = "is_open_status"
+    )]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub closed_by_run: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub closed_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -403,6 +412,8 @@ pub struct RunDetails {
 pub struct SliceSummary {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "is_open_status")]
+    pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -416,6 +427,7 @@ impl From<&Slice> for SliceSummary {
         Self {
             id: slice.id.clone(),
             title: slice.title.clone(),
+            status: slice.status.clone(),
             depends_on: slice.depends_on.clone(),
             areas: slice.areas.clone(),
             acceptance_count: slice.acceptance.len(),
@@ -534,6 +546,17 @@ pub struct MergeConflictReport {
     pub conflicted_files: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+}
+
+pub const SLICE_STATUS_OPEN: &str = "open";
+pub const SLICE_STATUS_CLOSED: &str = "closed";
+
+fn default_slice_status() -> String {
+    SLICE_STATUS_OPEN.to_string()
+}
+
+pub fn is_open_status(value: &str) -> bool {
+    value.is_empty() || value == SLICE_STATUS_OPEN
 }
 
 fn is_zero(value: &i64) -> bool {

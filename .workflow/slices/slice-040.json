@@ -1,0 +1,38 @@
+{
+  "id": "slice-040",
+  "title": "Slice lifecycle safety",
+  "goal": "Prevent accidental historical dependency reruns by giving JSON Issue Slices an explicit open/closed lifecycle and treating closed dependencies as already satisfied.",
+  "status": "closed",
+  "closed_by_run": "manual-root-cause-fix",
+  "closed_at": "2026-06-26T19:45:00Z",
+  "areas": [
+    "src/domain.rs",
+    "src/artifact.rs",
+    "src/workflow/manager.rs",
+    "src/cli.rs",
+    "README.md",
+    "docs/workflow-invariants.md",
+    "skills/khazad-doom/SKILL.md",
+    ".workflow/slices",
+    ".workflow/schema/slice.schema.json"
+  ],
+  "acceptance": [
+    "Slice JSON supports an issue-style lifecycle where omitted status means open and status=closed records accepted historical work.",
+    "Successful daemon runs close completed slice JSON with closed_by_run and closed_at before final reports are written.",
+    "run --slice skips closed dependencies instead of launching historical workers again.",
+    "run --slice rejects an explicitly requested closed slice and tells the operator to create a follow-up slice.",
+    "run --all selects only open slices.",
+    "Existing historical slices in this repository are marked closed so future release-polish work cannot accidentally rerun them.",
+    "Regression tests cover closed dependency skipping, explicit closed-slice rejection, and automatic closing after a successful run."
+  ],
+  "must_ask_if": [
+    "The implementation would rerun closed historical slices by default.",
+    "The implementation would silently reopen a closed slice.",
+    "The implementation would remove JSON Issue Slices as the machine source of truth."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 120
+}

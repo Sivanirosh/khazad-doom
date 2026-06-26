@@ -2,6 +2,9 @@
   "id": "slice-034",
   "title": "Harness-neutral terminal monitor",
   "goal": "Add a robust khazad-doom monitor command that renders an attachable terminal dashboard for either a specific run or the latest active run in a repo.",
+  "status": "closed",
+  "closed_by_run": "kd-20260626-125734-111aa82a",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-033"
   ],

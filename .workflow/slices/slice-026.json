@@ -2,7 +2,9 @@
   "id": "slice-026",
   "title": "GitHub import v2",
   "goal": "Improve GitHub issue import with URL parsing, checklist extraction, labels/metadata, --dry-run, and collision guidance.",
-  "github_issue": "",
+  "status": "closed",
+  "closed_by_run": "legacy-pre-rust-rewrite",
+  "closed_at": "2026-06-26T19:45:00Z",
   "depends_on": [
     "slice-025"
   ],

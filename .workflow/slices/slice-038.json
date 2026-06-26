@@ -2,6 +2,9 @@
   "id": "slice-038",
   "title": "Document workflow invariants",
   "goal": "Capture the daemon workflow invariants that must remain stable during v0.1.0 release-polish refactors, especially run lifetime, slice ordering, worker attempts, cancellation, progress, artifacts, and release gates.",
+  "status": "closed",
+  "closed_by_run": "kd-20260626-184032-7f7bc767",
+  "closed_at": "2026-06-26T19:45:00Z",
   "areas": [
     "docs/workflow-invariants.md",
     "README.md",

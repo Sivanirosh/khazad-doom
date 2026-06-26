@@ -247,6 +247,21 @@ impl Store {
         })
     }
 
+    pub fn close_slices(&self, slice_ids: &[String], run_id: &str, closed_at: &str) -> Result<()> {
+        for slice_id in slice_ids {
+            let path = self.slice_path(slice_id);
+            let mut slice: Slice = read_json(&path)
+                .with_context(|| format!("read slice {} for closing", path.display()))?;
+            slice.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+            slice.closed_by_run = run_id.to_string();
+            slice.closed_at = closed_at.to_string();
+            validate_slice(&slice)?;
+            write_json(&path, &slice)
+                .with_context(|| format!("write closed slice {}", path.display()))?;
+        }
+        Ok(())
+    }
+
     pub fn write_checkpoint(&self, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
         let path = self.output_path(&checkpoint.run_id, "checkpoint.json");
         write_json(&path, checkpoint)?;
@@ -305,6 +320,9 @@ pub fn slice_schema() -> Value {
             "title": { "type": "string", "minLength": 1 },
             "goal": { "type": "string", "minLength": 1 },
             "github_issue": { "type": "string" },
+            "status": { "type": "string", "enum": ["open", "closed"] },
+            "closed_by_run": { "type": "string" },
+            "closed_at": { "type": "string" },
             "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
             "areas": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
             "acceptance": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
@@ -333,6 +351,12 @@ pub fn validate_slice(slice: &Slice) -> Result<()> {
     }
     if slice.acceptance.is_empty() {
         bail!("acceptance must contain at least one criterion");
+    }
+    if !matches!(slice.status.as_str(), "open" | "closed") {
+        bail!("status must be either 'open' or 'closed'");
+    }
+    if slice.status == "open" && (!slice.closed_by_run.is_empty() || !slice.closed_at.is_empty()) {
+        bail!("open slices must not set closed_by_run or closed_at");
     }
     if slice.verify_timeout_seconds > 86_400 {
         bail!("verify_timeout_seconds must be <= 86400");
@@ -677,6 +701,9 @@ mod tests {
             title: "Title".to_string(),
             goal: "Goal".to_string(),
             github_issue: String::new(),
+            status: crate::domain::SLICE_STATUS_OPEN.to_string(),
+            closed_by_run: String::new(),
+            closed_at: String::new(),
             depends_on: Vec::new(),
             areas: Vec::new(),
             acceptance: vec!["done".to_string()],

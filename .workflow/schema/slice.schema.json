@@ -17,6 +17,12 @@
       "type": "array",
       "uniqueItems": true
     },
+    "closed_at": {
+      "type": "string"
+    },
+    "closed_by_run": {
+      "type": "string"
+    },
     "depends_on": {
       "items": {
         "type": "string"
@@ -40,6 +46,13 @@
         "type": "string"
       },
       "type": "array"
+    },
+    "status": {
+      "enum": [
+        "open",
+        "closed"
+      ],
+      "type": "string"
     },
     "title": {
       "minLength": 1,

@@ -2,6 +2,9 @@
   "id": "slice-033",
   "title": "Latest run lookup for monitors",
   "goal": "Expose a harness-neutral daemon/status lookup for the latest run in a repository so monitors can attach without knowing a run id.",
+  "status": "closed",
+  "closed_by_run": "kd-20260626-125734-111aa82a",
+  "closed_at": "2026-06-26T19:45:00Z",
   "areas": [
     "src/state.rs",
     "src/ipc.rs",
