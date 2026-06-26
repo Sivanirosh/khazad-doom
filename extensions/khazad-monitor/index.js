@@ -1,16 +1,18 @@
 'use strict';
 
 const DEFAULT_INTERVAL_MS = 1000;
-const DEFAULT_EVENTS_LIMIT = 8;
+const DEFAULT_EVENTS_LIMIT = 50;
 const STATUS_TIMEOUT_MS = 8000;
-const OUTPUT_TAIL_LINES = 10;
+const OUTPUT_TAIL_LINES = 4;
+const FEED_BLOCK_LIMIT = 7;
 const EVENT_TAIL_LINES = 6;
+const MAX_TODO_ITEMS = 8;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted']);
 
 function khazadMonitorExtension(pi) {
 	pi.registerCommand('khazad-monitor', {
 		description:
-			'Open an optional Khazad-Doom progress overlay. Usage: /khazad-monitor [--latest|--run <run-id>|<run-id>]',
+			'Open an optional Khazad-Doom activity-feed overlay. Usage: /khazad-monitor [--latest|--run <run-id>|<run-id>]',
 		getArgumentCompletions(prefix) {
 			const options = ['--latest', '--run ', '--repo ', '--events-limit ', '--interval-ms '];
 			const filtered = options.filter((option) => option.startsWith(prefix));
@@ -52,9 +54,9 @@ function khazadMonitorExtension(pi) {
 					{
 						overlay: true,
 						overlayOptions: {
-							width: '85%',
+							width: 96,
 							minWidth: 64,
-							maxHeight: '90%',
+							maxHeight: '86%',
 							anchor: 'center',
 							margin: 1,
 						},
@@ -85,6 +87,9 @@ class KhazadMonitorOverlay {
 		this.inFlight = false;
 		this.abortController = undefined;
 		this.attachedRunId = undefined;
+		this.feedRunId = undefined;
+		this.feedEvents = [];
+		this.feedEventKeys = new Set();
 		this.state = {
 			loading: true,
 			details: undefined,
@@ -143,6 +148,9 @@ class KhazadMonitorOverlay {
 			if (this.config.mode === 'latest' && details && details.run && !this.attachedRunId) {
 				this.attachedRunId = details.run.id;
 			}
+			if (details && details.run) {
+				this.rememberEvents(details.run.id, details.events || []);
+			}
 			this.state = {
 				loading: false,
 				details: details || undefined,
@@ -170,59 +178,63 @@ class KhazadMonitorOverlay {
 		}
 	}
 
-	render(width) {
-		const safeWidth = Math.max(2, width || 80);
-		const innerWidth = Math.max(1, safeWidth - 2);
-		const lines = [];
-		const border = (text) => this.theme.fg('border', text);
-		const row = (content = '') => {
-			const truncated = truncatePlain(content, innerWidth);
-			return border('│') + padRight(truncated, innerWidth) + border('│');
-		};
-
-		lines.push(border(`╭${'─'.repeat(innerWidth)}╮`));
-		lines.push(row(' Khazad-Doom Monitor'));
-		lines.push(row(' q/Esc closes this overlay only; daemon-owned runs keep running.'));
-		lines.push(row(' r refreshes now.'));
-		lines.push(border(`├${'─'.repeat(innerWidth)}┤`));
-
-		for (const line of this.snapshotLines()) {
-			lines.push(row(line));
+	rememberEvents(runId, events) {
+		if (!runId) return;
+		if (this.feedRunId !== runId) {
+			this.feedRunId = runId;
+			this.feedEvents = [];
+			this.feedEventKeys = new Set();
 		}
+		const ordered = [...(events || [])].sort(compareEvents);
+		for (const event of ordered) {
+			const key = eventKey(event);
+			if (this.feedEventKeys.has(key)) continue;
+			this.feedEventKeys.add(key);
+			this.feedEvents.push(event);
+		}
+		if (this.feedEvents.length > 200) {
+			this.feedEvents = this.feedEvents.slice(-200);
+			this.feedEventKeys = new Set(this.feedEvents.map(eventKey));
+		}
+	}
 
-		lines.push(border(`╰${'─'.repeat(innerWidth)}╯`));
+	render(width) {
+		const safeWidth = Math.max(28, width || 80);
+		const innerWidth = Math.max(1, safeWidth - 2);
+		const lines = [overlayTopBorder(this.theme, innerWidth, ' Khazad-Doom Monitor ')];
+		for (const line of this.snapshotLines()) {
+			lines.push(overlayLine(this.theme, line, innerWidth));
+		}
+		lines.push(overlayBottomBorder(this.theme, innerWidth));
 		return lines;
 	}
 
 	invalidate() {}
 
 	snapshotLines() {
+		const lines = [];
+
 		if (this.state.loading) {
-			return [
-				`Mode: ${modeLabel(this.config)}`,
-				`Status: loading`,
-				`Command: ${this.state.lastCommand}`,
-			];
+			lines.push(sectionHeading(this.theme, 'Run', 'loading'));
+			lines.push(treeLine(this.theme, `command ${this.state.lastCommand}`, 'dim'));
+			lines.push('', footerLine(this.theme, this.config, this.state.lastUpdated));
+			return lines;
 		}
 
-		const lines = [`Mode: ${modeLabel(this.config)}`];
 		if (this.state.error) {
-			lines.push('Status: unavailable');
-			lines.push(`Message: ${this.state.error}`);
-			lines.push(`Command: ${this.state.lastCommand}`);
+			lines.push(sectionHeading(this.theme, 'Monitor', 'unavailable'));
+			lines.push(treeLine(this.theme, this.state.error, 'error'));
+			lines.push(treeLine(this.theme, `command ${this.state.lastCommand}`, 'dim'));
 			lines.push('');
 		}
 
 		if (this.state.details) {
-			lines.push(...runDetailsLines(this.state.details));
+			lines.push(...runDetailsLines(this.state.details, this.theme, this.feedEvents));
 		} else if (!this.state.error || this.config.mode === 'latest') {
-			lines.push(...waitingLines(this.state.waitingRepo || this.config.repo));
+			lines.push(...waitingLines(this.state.waitingRepo || this.config.repo, this.theme));
 		}
 
-		if (this.state.lastUpdated) {
-			lines.push('');
-			lines.push(`Overlay updated: ${this.state.lastUpdated.toLocaleTimeString()}`);
-		}
+		lines.push('', footerLine(this.theme, this.config, this.state.lastUpdated));
 		return lines;
 	}
 }
@@ -474,55 +486,508 @@ function errorMessage(error) {
 	return error && error.message ? String(error.message) : String(error);
 }
 
-function runDetailsLines(details) {
-	const run = details.run || {};
-	const progress = details.progress || undefined;
-	const phase = progress && progress.phase ? progress.phase : isTerminalStatus(run.status) ? run.status : 'unknown';
-	const command = progress && progress.command ? progress.command : '-';
-	const message = monitorMessage(details);
-	const updated = progress && progress.updated_at ? progress.updated_at : run.updated_at || '-';
-	const elapsedStart = progress && progress.phase_started_at ? progress.phase_started_at : run.started_at;
-	const lines = [
-		`Run: ${valueOrDash(run.id)}`,
-		`Repo: ${valueOrDash(run.repo_path)}`,
-		`Status: ${valueOrDash(run.status)}`,
-		`Integration branch: ${valueOrDash(run.integration_branch)}`,
-		'',
-		'Progress:',
-		`  Phase: ${valueOrDash(phase)}`,
-		`  Slice: ${monitorSliceLabel(details)}`,
-		`  Attempt: ${progress && progress.attempt ? progress.attempt : '-'}`,
-		`  Command: ${valueOrDash(command)}`,
-		`  Elapsed: ${formatElapsed(elapsedStart)}`,
-		`  Updated: ${updated}`,
-		`  Message: ${valueOrDash(message)}`,
-		...workerLines(progress && progress.worker),
-		'',
-		'Recent events:',
-		...eventLines(details.events || []),
-		'',
-		'Output tail:',
-		...outputTailLines(progress && progress.output_tail ? progress.output_tail : ''),
-	];
+function runDetailsLines(details, theme, rememberedEvents) {
+	const lines = [];
+	const todos = todoLines(details, theme);
+	if (todos.length) {
+		lines.push(...todos);
+	}
+	lines.push('', ...runSummaryLines(details, theme));
+
+	const current = currentProgressBlock(details);
+	if (current) {
+		lines.push('', ...renderFeedBlock(current, theme));
+		const warning = currentWorkerWarning(details);
+		if (warning) {
+			lines.push('', ...renderFeedBlock({ label: 'Warn', lines: [{ text: warning, role: 'warning' }, { text: 'wait, inspect, or cancel explicitly', role: 'dim' }] }, theme));
+		}
+	}
+
+	const feedBlocks = buildFeedBlocks(details, rememberedEvents && rememberedEvents.length ? rememberedEvents : details.events || []);
+	const visibleBlocks = feedBlocks.filter((block) => !current || block.key !== current.key).slice(-FEED_BLOCK_LIMIT);
+	if (visibleBlocks.length) {
+		lines.push('');
+		for (const block of visibleBlocks) {
+			lines.push(...renderFeedBlock(block, theme));
+			lines.push('');
+		}
+		if (lines[lines.length - 1] === '') lines.pop();
+	}
+
+	const outputTail = details.progress && details.progress.output_tail ? details.progress.output_tail : '';
+	if (String(outputTail || '').trim()) {
+		lines.push('', ...renderFeedBlock({ label: 'Tail', lines: outputTailBlockLines(outputTail) }, theme));
+	}
 	return lines;
 }
 
-function workerLines(worker) {
-	if (!worker) return [];
-	const lines = [
-		`  Supervisor: ${supervisorLabel(worker)}`,
-		`  Worker process: ${worker.pid ? `running pid=${worker.pid}` : 'running'}`,
-		`  Worker runtime: ${formatElapsed(worker.attempt_started_at)}`,
-		`  Last worker event: ${lastWorkerEventLabel(worker)}`,
-		`  Last semantic progress: ${worker.last_semantic_progress_at ? formatElapsed(worker.last_semantic_progress_at) : 'unknown'}`,
-		`  Timeout: ${workerTimeoutLabel(worker)}`,
-	];
-	const warning = workerQuietWarning(worker);
-	if (warning) {
-		lines.push(`  Warning: ${warning}`);
-		lines.push('  Hint: wait, inspect, or cancel');
+function runSummaryLines(details, theme) {
+	const run = details.run || {};
+	const progress = details.progress || undefined;
+	const phase = progress && progress.phase ? progress.phase : isTerminalStatus(run.status) ? run.status : 'unknown';
+	const elapsedStart = progress && progress.phase_started_at ? progress.phase_started_at : run.started_at;
+	const message = monitorMessage(details);
+	const lines = [sectionHeading(theme, 'Run', `${statusIcon(run.status)} ${valueOrDash(run.status)} • ${shortRunId(run.id)}`)];
+	lines.push(treeLine(theme, `phase ${valueOrDash(phase)} • elapsed ${formatElapsed(elapsedStart)}`));
+	lines.push(treeLine(theme, `repo ${shortPath(valueOrDash(run.repo_path))}`, 'dim'));
+	if (message) {
+		lines.push(treeLine(theme, message, statusRole(run.status)));
 	}
 	return lines;
+}
+
+function todoLines(details, theme) {
+	const items = selectedSliceItems(details);
+	const lines = [sectionHeading(theme, 'Todos', `(${items.length} ${items.length === 1 ? 'item' : 'items'})`)];
+	if (!items.length) {
+		lines.push(treeLine(theme, 'no selected slices recorded', 'dim'));
+		return lines;
+	}
+	for (const item of items.slice(0, MAX_TODO_ITEMS)) {
+		lines.push(todoLine(item, theme));
+	}
+	if (items.length > MAX_TODO_ITEMS) {
+		lines.push(fg(theme, 'dim', `  … ${items.length - MAX_TODO_ITEMS} more`));
+	}
+	return lines;
+}
+
+function selectedSliceItems(details) {
+	const sliceRuns = details.slice_runs || [];
+	if (sliceRuns.length) return sliceRuns;
+	const selected = valueOrDash(details.run && details.run.selected_slice_id);
+	if (selected === '-') return [];
+	return selected
+		.split(',')
+		.map((sliceId) => sliceId.trim())
+		.filter(Boolean)
+		.map((slice_id) => ({ slice_id, status: 'selected' }));
+}
+
+function todoLine(sliceRun, theme) {
+	const status = valueOrDash(sliceRun.status);
+	const role = statusRole(status);
+	const icon = fg(theme, role, sliceCheckbox(status));
+	let label = valueOrDash(sliceRun.slice_id);
+	if (isDoneSliceStatus(status)) label = strike(theme, label);
+	label = fg(theme, role, label);
+	const meta = [];
+	if (status !== '-') meta.push(status);
+	if (sliceRun.attempts) meta.push(`${sliceRun.attempts} ${Number(sliceRun.attempts) === 1 ? 'attempt' : 'attempts'}`);
+	if (sliceRun.commit_sha) meta.push(shortSha(sliceRun.commit_sha));
+	return `${icon} ${label}${meta.length ? fg(theme, 'dim', `  ${meta.join(' • ')}`) : ''}`;
+}
+
+function currentProgressBlock(details) {
+	const progress = details.progress || undefined;
+	const run = details.run || {};
+	if (!progress) return undefined;
+	if (isTerminalStatus(run.status) && isTerminalStatus(progress.phase)) return undefined;
+	if (progress.worker) {
+		return workerBlock(progress.worker, progress, details, { current: true });
+	}
+	if (progress.command) {
+		return commandProgressBlock(progress, details, { current: true });
+	}
+	const phase = valueOrDash(progress.phase || (details.run && details.run.status));
+	const block = {
+		key: `current:${phase}:${progress.slice_id || ''}`,
+		label: phaseLabel(phase),
+		meta: '(now)',
+		lines: [],
+	};
+	if (progress.slice_id) block.lines.push({ text: `slice ${progress.slice_id}` });
+	if (progress.message) block.lines.push({ text: progress.message, role: statusRole(details.run && details.run.status) });
+	if (progress.updated_at) block.lines.push({ text: `updated ${ageLabel(progress.updated_at)}`, role: 'dim' });
+	return block.lines.length ? block : undefined;
+}
+
+function currentWorkerWarning(details) {
+	const worker = details.progress && details.progress.worker;
+	return worker ? workerQuietWarning(worker) : '';
+}
+
+function buildFeedBlocks(details, events) {
+	return [...(events || [])]
+		.sort(compareEvents)
+		.map((event) => eventToBlock(event, details))
+		.filter(Boolean);
+}
+
+function eventToBlock(event, details) {
+	const type = valueOrDash(event && event.type);
+	const payload = event && event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload) ? event.payload : {};
+	if (type === 'run_started') {
+		const selected = Array.isArray(payload.selected_slices) ? payload.selected_slices : selectedSliceItems(details).map((item) => item.slice_id);
+		return {
+			key: `event:${eventKey(event)}`,
+			label: 'Todos',
+			meta: `(${selected.length} ${selected.length === 1 ? 'item' : 'items'})`,
+			lines: selected.slice(0, MAX_TODO_ITEMS).map((sliceId) => ({ raw: `☐ ${sliceId}` })),
+		};
+	}
+	if (type === 'slice_started') {
+		return {
+			key: `event:${eventKey(event)}`,
+			label: 'Worker',
+			meta: payload.slice_id ? `(${payload.slice_id})` : '',
+			lines: [{ text: 'slice worker started' }],
+		};
+	}
+	if (type === 'slice_merged') {
+		return {
+			key: `event:${eventKey(event)}`,
+			label: 'Todos',
+			meta: payload.slice_id ? `(${payload.slice_id})` : '',
+			lines: [{ raw: `☒ ${payload.slice_id || 'slice'}${payload.commit_sha ? fglessMeta(`merged • ${shortSha(payload.commit_sha)}`) : fglessMeta('merged')}` }],
+		};
+	}
+	if (type === 'integration_repair_completed') {
+		return {
+			key: `event:${eventKey(event)}`,
+			label: 'Repair',
+			meta: payload.status ? `(${payload.status})` : '',
+			lines: [{ text: payload.summary || 'integration repair completed', role: payload.status === 'failed' ? 'error' : 'dim' }],
+		};
+	}
+	if (type === 'implementation_summary') {
+		const gate = payload.integration_gate || {};
+		const completed = Array.isArray(payload.completed_slices) ? payload.completed_slices.length : undefined;
+		const lines = [];
+		if (completed !== undefined) lines.push({ text: `${completed} completed slice${completed === 1 ? '' : 's'}` });
+		if (gate.status || gate.summary) lines.push({ text: gate.summary || `integration gate ${gate.status}`, role: gate.status === 'passed' ? 'success' : statusRole(gate.status) });
+		if (payload.final_sha) lines.push({ text: `final ${shortSha(payload.final_sha)}`, role: 'dim' });
+		return { key: `event:${eventKey(event)}`, label: 'Summary', lines };
+	}
+	if (type === 'run_completed') {
+		return { key: `event:${eventKey(event)}`, label: 'Run', meta: '(completed)', lines: [{ text: 'handoff artifacts are ready', role: 'success' }] };
+	}
+	if (type === 'worktrees_cleaned') {
+		return { key: `event:${eventKey(event)}`, label: 'Cleanup', lines: [{ text: 'worker worktrees cleaned', role: 'dim' }] };
+	}
+	if (type === 'checkpoint_written') {
+		const completed = Array.isArray(payload.completed_slices) ? payload.completed_slices.length : 0;
+		const remaining = Array.isArray(payload.remaining_slices) ? payload.remaining_slices.length : 0;
+		return {
+			key: `event:${eventKey(event)}`,
+			label: 'State',
+			lines: [{ text: `checkpoint written • ${completed} done • ${remaining} remaining`, role: 'dim' }],
+		};
+	}
+	if (type === 'progress') {
+		return progressEventBlock(payload, details, event);
+	}
+	return genericEventBlock(type, payload, event);
+}
+
+function progressEventBlock(progress, details, event) {
+	const phase = valueOrDash(progress.phase);
+	if (phase === 'ready_to_merge') {
+		return {
+			key: progressKey(progress, event),
+			label: 'Todos',
+			meta: progress.slice_id ? `(${progress.slice_id})` : '',
+			lines: [{ raw: `◐ ${progress.slice_id || 'slice'}${fglessMeta('ready to merge')}` }],
+		};
+	}
+	if (phase === 'completed') {
+		return undefined;
+	}
+	if (progress.command) {
+		return commandProgressBlock(progress, details, { event });
+	}
+	const label = phaseLabel(phase);
+	const lines = [];
+	if (progress.slice_id) lines.push({ text: `slice ${progress.slice_id}` });
+	if (progress.message) lines.push({ text: progress.message, role: progressRole(phase) });
+	return lines.length ? { key: progressKey(progress, event), label, lines } : undefined;
+}
+
+function commandProgressBlock(progress, details, options = {}) {
+	const phase = valueOrDash(progress.phase);
+	const command = valueOrDash(progress.command);
+	const label = commandBlockLabel(phase, command);
+	const metaParts = [];
+	if (label === 'Worker' && progress.slice_id) metaParts.push(progress.slice_id);
+	if (label === 'Worker' && progress.attempt) metaParts.push(`attempt ${progress.attempt}`);
+	if (label !== 'Worker') metaParts.push(command === '-' ? phase : commandMeta(command));
+	if (options.current) metaParts.push('now');
+	const lines = [];
+	if (command !== '-' && !(label === 'Worker' && command === 'pi')) lines.push({ text: command, role: 'dim' });
+	const scope = progress.slice_id ? `slice ${progress.slice_id}` : phase.replace(/_/g, ' ');
+	const elapsed = progress.phase_started_at ? ` • elapsed ${formatElapsed(progress.phase_started_at)}` : '';
+	lines.push({ text: `${scope}${elapsed}` });
+	if (progress.message) lines.push({ text: progress.message, role: progressRole(phase) });
+	if (options.current && progress.updated_at) lines.push({ text: `updated ${ageLabel(progress.updated_at)}`, role: 'dim' });
+	return { key: progressKey(progress, options.event), label, meta: metaParts.length ? `(${metaParts.join(' • ')})` : '', lines };
+}
+
+function workerBlock(worker, progress, details, options = {}) {
+	const slice = progress && progress.slice_id ? progress.slice_id : monitorSliceLabel(details);
+	const meta = [];
+	if (slice !== '-') meta.push(slice);
+	if (progress && progress.attempt) meta.push(`attempt ${progress.attempt}`);
+	if (options.current) meta.push('now');
+	return {
+		key: progressKey(progress || {}, options.event),
+		label: 'Worker',
+		meta: meta.length ? `(${meta.join(' • ')})` : '',
+		lines: [
+			{ text: `Supervisor: ${supervisorLabel(worker)}` },
+			{ text: `Process: ${workerProcessLabel(worker)}` },
+			{ text: `Runtime: ${formatElapsed(worker.attempt_started_at)}` },
+			{ text: `Last worker event: ${lastWorkerEventLabel(worker)}` },
+			{ text: `Last semantic progress: ${worker.last_semantic_progress_at ? ageLabel(worker.last_semantic_progress_at) : 'unknown'}` },
+			{ text: `Timeout: ${workerTimeoutLabel(worker)}` },
+		],
+	};
+}
+
+function genericEventBlock(type, payload, event) {
+	const summary = eventSummary({ payload });
+	return summary ? { key: `event:${eventKey(event)}`, label: eventLabel(type), lines: [{ text: summary, role: type === 'error' || type === 'blocked' ? 'error' : 'dim' }] } : undefined;
+}
+
+function renderFeedBlock(block, theme) {
+	const lines = [sectionHeading(theme, block.label, block.meta || '')];
+	for (const line of block.lines || []) {
+		if (line.raw !== undefined) {
+			lines.push(styleRawTodoLine(String(line.raw), theme));
+		} else {
+			lines.push(treeLine(theme, line.text, line.role));
+		}
+	}
+	return lines;
+}
+
+function outputTailBlockLines(outputTail) {
+	const trimmed = String(outputTail || '').trimEnd();
+	if (!trimmed) return [{ text: '-', role: 'dim' }];
+	return trimmed
+		.split(/\r?\n/)
+		.slice(-OUTPUT_TAIL_LINES)
+		.map((line) => ({ text: truncatePlain(line, 160), role: 'dim' }));
+}
+
+function styleRawTodoLine(line, theme) {
+	const status = line.startsWith('☒') ? 'merged' : line.startsWith('◐') ? 'running' : line.startsWith('✗') ? 'failed' : 'pending';
+	const role = statusRole(status);
+	if (!line.includes('  ')) return fg(theme, role, line);
+	const [head, ...rest] = line.split('  ');
+	return `${fg(theme, role, head)}${fg(theme, 'dim', `  ${rest.join('  ')}`)}`;
+}
+
+function fglessMeta(text) {
+	return `  ${text}`;
+}
+
+function progressKey(progress, event) {
+	return event ? `event:${eventKey(event)}` : `current:${progress.phase || ''}:${progress.slice_id || ''}:${progress.command || ''}`;
+}
+
+function compareEvents(left, right) {
+	const leftId = Number(left && left.id);
+	const rightId = Number(right && right.id);
+	if (Number.isFinite(leftId) && Number.isFinite(rightId) && leftId !== rightId) return leftId - rightId;
+	const leftTime = Date.parse((left && left.created_at) || '');
+	const rightTime = Date.parse((right && right.created_at) || '');
+	if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+	return String(eventKey(left)).localeCompare(String(eventKey(right)));
+}
+
+function eventKey(event) {
+	if (!event) return 'missing';
+	if (event.id !== undefined && event.id !== null) return `id:${event.id}`;
+	return `${event.created_at || ''}:${event.type || ''}:${JSON.stringify(event.payload || {}).slice(0, 200)}`;
+}
+
+function footerLine(theme, config, updatedAt) {
+	const updated = updatedAt ? `updated ${updatedAt.toLocaleTimeString()}` : 'waiting';
+	const scope = config.mode === 'run' ? `run ${config.runId}` : `latest ${shortPath(config.repo)}`;
+	return fg(theme, 'dim', `q/Esc detach • r refresh • ${updated} • ${scope}`);
+}
+
+function phaseLabel(phase) {
+	const normalized = String(phase || '').toLowerCase();
+	if (normalized.startsWith('worker')) return normalized === 'worker_verify' ? 'Shell' : 'Worker';
+	if (normalized.includes('gate')) return 'Shell';
+	if (normalized.includes('merge')) return 'Merge';
+	if (normalized.includes('repair')) return 'Repair';
+	if (normalized === 'ready_to_merge') return 'Todos';
+	if (normalized === 'completed' || normalized === 'started' || normalized === 'integration_setup') return 'Run';
+	return titleCase(normalized.replace(/_/g, ' ') || 'Activity');
+}
+
+function commandBlockLabel(phase, command) {
+	const normalized = String(phase || '').toLowerCase();
+	const text = String(command || '').toLowerCase();
+	if (normalized === 'worker_running' || text === 'pi') return 'Worker';
+	if (normalized.includes('merge') || text.startsWith('git merge')) return 'Merge';
+	if (normalized.includes('repair')) return 'Repair';
+	return 'Shell';
+}
+
+function commandMeta(command) {
+	let text = String(command || '').trim();
+	text = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s*)+/, '');
+	if (text.startsWith('PATH=')) text = text.replace(/^PATH=(?:"[^"]*"|'[^']*'|\S+)\s*/, '');
+	return truncatePlain(text || command || '-', 34);
+}
+
+function progressRole(phase) {
+	const normalized = String(phase || '').toLowerCase();
+	if (normalized === 'completed' || normalized === 'ready_to_merge') return 'success';
+	if (normalized.includes('failed') || normalized.includes('blocked')) return 'error';
+	if (normalized.includes('repair')) return 'warning';
+	if (normalized.includes('worker') || normalized.includes('gate') || normalized.includes('merge')) return 'accent';
+	return 'dim';
+}
+
+function eventLabel(type) {
+	return titleCase(String(type || 'activity').replace(/_/g, ' '));
+}
+
+function titleCase(value) {
+	return String(value || '')
+		.split(/\s+/)
+		.filter(Boolean)
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(' ');
+}
+
+function shortRunId(value) {
+	const text = String(value || '').trim();
+	if (text.length <= 30) return text || '-';
+	return `${text.slice(0, 11)}…${text.slice(-10)}`;
+}
+
+function shortPath(value) {
+	const text = String(value || '').trim();
+	if (!text || text === '-') return '-';
+	const parts = text.split('/').filter(Boolean);
+	if (parts.length <= 2) return text;
+	return `…/${parts.slice(-2).join('/')}`;
+}
+
+function workerProcessLabel(worker) {
+	return worker.pid ? `running pid=${worker.pid}` : 'running';
+}
+
+function overlayTopBorder(theme, width, title) {
+	const label = ` ${title.trim()} `;
+	if (visibleWidth(label) >= width - 2) {
+		return border(theme, `╭${'─'.repeat(width)}╮`);
+	}
+	const left = Math.floor((width - visibleWidth(label)) / 2);
+	const right = Math.max(0, width - visibleWidth(label) - left);
+	return border(theme, `╭${'─'.repeat(left)}`) + fg(theme, 'accent', bold(theme, label)) + border(theme, `${'─'.repeat(right)}╮`);
+}
+
+function overlayBottomBorder(theme, width) {
+	return border(theme, `╰${'─'.repeat(width)}╯`);
+}
+
+function overlayLine(theme, value, width) {
+	const text = String(value || '');
+	const content = text ? ` ${text}` : '';
+	const padded = bg(theme, 'customMessageBg', padRight(truncatePlain(content, width), width));
+	return border(theme, '│') + padded + border(theme, '│');
+}
+
+function border(theme, text) {
+	return fg(theme, 'borderAccent', text);
+}
+
+function sectionHeading(theme, label, meta = '') {
+	const heading = chip(theme, label);
+	return meta ? `${heading} ${fg(theme, 'dim', meta)}` : heading;
+}
+
+function chip(theme, label) {
+	const text = ` ${label} `;
+	const styled = fg(theme, 'text', bold(theme, text));
+	return bg(theme, 'selectedBg', styled);
+}
+
+function treeLine(theme, text, role) {
+	const body = role ? fg(theme, role, text) : String(text || '');
+	return `${fg(theme, 'dim', '└')} ${body}`;
+}
+
+function fg(theme, role, text) {
+	try {
+		return theme && typeof theme.fg === 'function' ? theme.fg(role, String(text || '')) : String(text || '');
+	} catch (_error) {
+		return String(text || '');
+	}
+}
+
+function bg(theme, role, text) {
+	try {
+		return theme && typeof theme.bg === 'function' ? theme.bg(role, String(text || '')) : String(text || '');
+	} catch (_error) {
+		return String(text || '');
+	}
+}
+
+function bold(theme, text) {
+	try {
+		return theme && typeof theme.bold === 'function' ? theme.bold(String(text || '')) : String(text || '');
+	} catch (_error) {
+		return String(text || '');
+	}
+}
+
+function strike(theme, text) {
+	try {
+		return theme && typeof theme.strikethrough === 'function' ? theme.strikethrough(String(text || '')) : String(text || '');
+	} catch (_error) {
+		return String(text || '');
+	}
+}
+
+function statusIcon(status) {
+	const normalized = String(status || '').toLowerCase();
+	if (['completed', 'merged', 'passed', 'success'].includes(normalized)) return '✓';
+	if (normalized === 'running') return '●';
+	if (normalized === 'ready_to_merge') return '◆';
+	if (normalized === 'repair_needed') return '↻';
+	if (normalized === 'pending') return '○';
+	if (normalized === 'blocked') return '!';
+	if (normalized === 'failed') return '✗';
+	if (normalized === 'cancelled' || normalized === 'interrupted') return '×';
+	return '•';
+}
+
+function sliceCheckbox(status) {
+	const normalized = String(status || '').toLowerCase();
+	if (isDoneSliceStatus(normalized)) return '☒';
+	if (['running', 'ready_to_merge', 'repair_needed'].includes(normalized)) return '◐';
+	if (['failed', 'blocked', 'cancelled', 'interrupted'].includes(normalized)) return '✗';
+	return '☐';
+}
+
+function statusRole(status) {
+	const normalized = String(status || '').toLowerCase();
+	if (['completed', 'merged', 'passed', 'success'].includes(normalized)) return 'success';
+	if (['failed', 'blocked'].includes(normalized)) return 'error';
+	if (['cancelled', 'interrupted', 'repair_needed'].includes(normalized)) return 'warning';
+	if (['running', 'ready_to_merge', 'selected'].includes(normalized)) return 'accent';
+	return 'dim';
+}
+
+function isDoneSliceStatus(status) {
+	return ['completed', 'merged', 'passed', 'success'].includes(String(status || '').toLowerCase());
+}
+
+function shortSha(value) {
+	const text = String(value || '').trim();
+	return text ? text.slice(0, 8) : '';
+}
+
+function ageLabel(value) {
+	const elapsed = formatElapsed(value);
+	return elapsed === '-' ? '-' : `${elapsed} ago`;
 }
 
 function supervisorLabel(worker) {
@@ -558,28 +1023,25 @@ function workerQuietWarning(worker) {
 	return `worker is quiet for ${formatDurationSeconds(quietSeconds)}; this may be normal${suffix}`;
 }
 
-function waitingLines(repo) {
+function waitingLines(repo, theme) {
 	return [
-		'Run: -',
-		`Repo: ${valueOrDash(repo)}`,
-		'Status: waiting',
-		'Progress:',
-		'  Phase: waiting',
-		'  Slice: -',
-		'  Command: -',
-		'  Message: waiting for latest active run',
+		sectionHeading(theme, 'Run', 'waiting'),
+		treeLine(theme, `repo ${valueOrDash(repo)}`),
+		treeLine(theme, 'waiting for the latest active daemon-owned run', 'dim'),
 		'',
-		'Recent events:',
-		'  -',
-		'',
-		'Output tail:',
-		'  -',
+		sectionHeading(theme, 'Hint'),
+		treeLine(theme, 'start a run normally; this overlay will attach when status --latest returns one', 'dim'),
 	];
 }
 
-function eventLines(events) {
-	if (!events.length) return ['  -'];
-	return events.slice(-EVENT_TAIL_LINES).map((event) => `  ${eventTime(event.created_at)} ${valueOrDash(event.type)} ${eventSummary(event)}`.trimEnd());
+function eventLines(events, theme) {
+	if (!events.length) return [treeLine(theme, '-', 'dim')];
+	return events.slice(-EVENT_TAIL_LINES).map((event) => {
+		const summary = eventSummary(event);
+		const type = valueOrDash(event.type);
+		const text = summary ? `${eventTime(event.created_at)} ${type} • ${summary}` : `${eventTime(event.created_at)} ${type}`;
+		return treeLine(theme, text, type === 'error' || type === 'blocked' ? 'error' : 'dim');
+	});
 }
 
 function eventSummary(event) {
@@ -596,13 +1058,13 @@ function eventSummary(event) {
 	return truncatePlain(parts.length ? parts.join(' ') : JSON.stringify(payload), 160);
 }
 
-function outputTailLines(outputTail) {
+function outputTailLines(outputTail, theme) {
 	const trimmed = String(outputTail || '').trimEnd();
-	if (!trimmed) return ['  -'];
+	if (!trimmed) return [treeLine(theme, '-', 'dim')];
 	return trimmed
 		.split(/\r?\n/)
 		.slice(-OUTPUT_TAIL_LINES)
-		.map((line) => `  ${truncatePlain(line, 160)}`);
+		.map((line) => treeLine(theme, truncatePlain(line, 160), 'dim'));
 }
 
 function monitorMessage(details) {

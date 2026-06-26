@@ -43,19 +43,9 @@ A normal prompt is soft: it can drift, reinterpret itself, and declare victory w
 
 Khazad-Doom makes the work hard-edged:
 
-```text
-JSON Issue Slice
-      ↓
-validated dependency graph
-      ↓
-one isolated worktree per slice
-      ↓
-JSON-only worker result + committed branch
-      ↓
-verification + serial integration gate
-      ↓
-final report + explicit handoff commands
-```
+<p align="center">
+  <img src="assets/khazad-doom-operating-model.png" width="960" alt="Khazad-Doom operating model: JSON Issue Slice to validated dependency graph to isolated worktree per slice to JSON-only worker result and committed branch to verification and serial integration gate to final report and explicit handoff commands.">
+</p>
 
 That loop is the point. Every slice should leave behind a cleaner branch, a clearer report, and a smaller mystery for the next person or agent.
 
@@ -185,7 +175,7 @@ The extension registers `/khazad-monitor`:
 /khazad-monitor <run-id>
 ```
 
-In Pi TUI mode it opens an overlay that polls `khazad-doom status` and renders run, progress, recent event, and output-tail fields from the daemon JSON. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
+In Pi TUI mode it opens a centered, bordered activity-feed overlay that polls `khazad-doom status` and renders slice todos, current worker/shell progress, warnings, chronological daemon activity, and output-tail fields from the daemon JSON. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
 
 To install only the skill without the optional extension, use Pi package filters in settings:
 
