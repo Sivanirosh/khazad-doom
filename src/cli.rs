@@ -2,8 +2,8 @@ use crate::agent::RunnerSpec;
 use crate::artifact;
 use crate::daemon::{Client, Server};
 use crate::domain::{
-    BranchHandoff, Event, RunDetails, RunInspection, RunStatus, SliceStatus, SliceValidationReport,
-    SliceWriteResult, WorkerAttemptProgress,
+    BranchHandoff, Event, RunDetails, RunEconomics, RunInspection, RunStatus, SliceStatus,
+    SliceValidationReport, SliceWriteResult, WorkerAttemptProgress,
 };
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
@@ -885,6 +885,9 @@ fn print_watch_snapshot(details: &RunDetails) {
         println!("Phase: unknown");
         println!("Elapsed: {}", format_duration(elapsed));
     }
+    if let Some(economics) = &details.economics {
+        print_economics(economics);
+    }
     println!();
 }
 
@@ -979,6 +982,9 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
     if let Some(worker) = progress.and_then(|progress| progress.worker.as_ref()) {
         render_worker_attempt(out, worker)?;
     }
+    if let Some(economics) = &details.economics {
+        render_economics(out, economics)?;
+    }
     writeln!(out, "Recent events:")?;
     render_event_tail(out, &details.events)?;
     writeln!(out, "Output tail:")?;
@@ -997,6 +1003,55 @@ fn progress_phase_label(progress: &crate::domain::RunProgress) -> String {
     } else {
         progress.phase.clone()
     }
+}
+
+fn print_economics(economics: &RunEconomics) {
+    println!(
+        "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
+        economics.agent_call_count,
+        economics.command_execution_count,
+        economics.duplicate_command_count,
+        economics.cache_hits,
+        economics.cache_misses
+    );
+    println!(
+        "Repair: policy={} attempts={}/{} | Fail-fast: {}",
+        economics.repair_policy,
+        economics.repair_attempts,
+        economics.repair_max_attempts,
+        economics.gate_fail_fast
+    );
+    if !economics.sla_violations.is_empty() {
+        println!("SLA violations: {}", economics.sla_violations.join("; "));
+    }
+}
+
+fn render_economics(out: &mut impl Write, economics: &RunEconomics) -> Result<()> {
+    writeln!(
+        out,
+        "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
+        economics.agent_call_count,
+        economics.command_execution_count,
+        economics.duplicate_command_count,
+        economics.cache_hits,
+        economics.cache_misses
+    )?;
+    writeln!(
+        out,
+        "Repair: policy={} attempts={}/{} | Fail-fast: {}",
+        economics.repair_policy,
+        economics.repair_attempts,
+        economics.repair_max_attempts,
+        economics.gate_fail_fast
+    )?;
+    if !economics.sla_violations.is_empty() {
+        writeln!(
+            out,
+            "SLA violations: {}",
+            economics.sla_violations.join("; ")
+        )?;
+    }
+    Ok(())
 }
 
 fn render_worker_attempt(out: &mut impl Write, worker: &WorkerAttemptProgress) -> Result<()> {

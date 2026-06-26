@@ -68,6 +68,12 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
     let status = wait_for_status(&bin, home.path(), &run_id, "completed")?;
     assert_eq!(status["run"]["selected_slice_id"], "slice-001,slice-002");
     assert!(
+        status["economics"]["agent_call_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    );
+    assert!(
         status["events"]
             .as_array()
             .unwrap()
@@ -97,6 +103,11 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
         artifacts
             .iter()
             .any(|artifact| artifact["name"] == "final-report.json")
+    );
+    assert!(
+        artifacts.iter().any(|artifact| {
+            artifact["kind"] == "output" && artifact["name"] == "economics.json"
+        })
     );
     assert!(
         artifacts.iter().any(|artifact| {
@@ -1256,6 +1267,14 @@ result = {
     "commit_sha": sha,
     "changed_files": [f"{slice_id}.txt"],
     "tests_run": handoff["slice"].get("verify", []),
+    "acceptance_status": [
+        {
+            "criterion": criterion,
+            "status": "satisfied",
+            "evidence": f"{slice_id} implemented by quiet fake pi",
+        }
+        for criterion in handoff["slice"].get("acceptance", [])
+    ],
 }
 event = {
     "type": "agent_end",

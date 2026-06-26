@@ -1,6 +1,7 @@
+use crate::artifact;
 use crate::domain::{
-    BranchHandoff, Run, RunDetails, RunInspection, RunProgress, SliceRun, SliceStatus,
-    SliceWriteResult,
+    BranchHandoff, ImplementationSummary, Run, RunDetails, RunEconomics, RunInspection,
+    RunProgress, SliceRun, SliceStatus, SliceWriteResult,
 };
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
@@ -184,10 +185,12 @@ impl Server {
         if let Some(progress) = progress.as_mut() {
             annotate_parallel_progress(progress, &slice_runs);
         }
+        let economics = read_run_economics(&run).ok();
         Ok(RunDetails {
             slice_runs,
             progress,
             events: self.store.get_events(&run_id, events_limit)?,
+            economics,
             run,
         })
     }
@@ -341,6 +344,19 @@ impl Server {
             _ => bail!("unknown method {method:?}"),
         }
     }
+}
+
+fn read_run_economics(run: &Run) -> Result<RunEconomics> {
+    let store = artifact::Store::new(&run.repo_path);
+    let live_path = store.output_path(&run.id, "economics.json");
+    if live_path.exists()
+        && let Ok(economics) = artifact::read_json(live_path)
+    {
+        return Ok(economics);
+    }
+    let summary: ImplementationSummary =
+        artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+    Ok(summary.economics)
 }
 
 fn annotate_parallel_progress(progress: &mut RunProgress, slice_runs: &[SliceRun]) {

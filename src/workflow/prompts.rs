@@ -1,6 +1,8 @@
 use crate::domain::{Handoff, Slice};
 use serde::Serialize;
 
+const IMPLEMENTER_STYLE_GUIDANCE: &str = "- Follow YAGNI: implement only what the slice/evidence requires.\n- Prefer one-line or surgical fixes when correct and readable; otherwise use the smallest clear change.\n- Do not add abstractions, frameworks, broad refactors, or speculative extensibility.\n";
+
 pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(
@@ -15,7 +17,8 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("- The JSON slice is authoritative. GitHub/PRD text is extra context only.\n");
     prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, return status=blocked with an ask-user finding.\n");
     prompt.push_str("- Preserve unrelated changes.\n");
-    prompt.push_str("- Run the requested verification commands when possible.\n");
+    prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
+    prompt.push_str("- Do not run daemon-owned verification commands unless needed for your own confidence; the daemon will run required checks.\n");
     prompt.push_str("- Commit all intended changes on the current branch before finishing.\n");
     prompt.push_str("- Leave the worktree clean.\n");
     prompt.push_str("- Do not create markdown reports; return only JSON.\n");
@@ -27,7 +30,7 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("\nSlice summary:\n");
     prompt.push_str(&must_json(&handoff.slice));
     prompt.push_str(
-        "\n\nFinal JSON must summarize what you did and include commit_sha if available.\n",
+        "\n\nFinal JSON must summarize what you did, include commit_sha if available, and include acceptance_status objects for every acceptance criterion with criterion, status, and evidence.\n",
     );
     prompt
 }
@@ -37,19 +40,22 @@ pub fn integration_repair_prompt(
     integration_worktree: &str,
     slices: &[Slice],
     check_summary: &str,
+    gate_summary: &str,
+    trigger: &str,
 ) -> String {
     format!(
         r#"You are a Khazad-Doom Integration Repair Worker.
 
 Run ID: {run_id}
 Worktree: {integration_worktree}
+Repair trigger: {trigger}
 
 Task:
 - Inspect the already-merged integration branch.
-- Always perform a quick integration repair pass, even if the expected result is no-op.
-- Fix only cross-slice/integration breakage or verification breakage for this run.
+{IMPLEMENTER_STYLE_GUIDANCE}- Repair only the integration breakage evidenced below.
 - Do not add new product scope.
 - Do not rewrite completed slice work for preference.
+- Do not rerun the full daemon verification suite; the daemon will rerun the integration gate.
 - If no issue exists, return status "no-op".
 - If you fix anything, commit the repair on the current branch and leave the worktree clean.
 - If fixing would require inventing product intent, return status "blocked" with an ask-user finding.
@@ -58,8 +64,11 @@ Task:
 Slices now integrated:
 {}
 
-Recent check summary:
+Worker check summary:
 {check_summary}
+
+Integration gate evidence:
+{gate_summary}
 "#,
         must_json(&slices)
     )

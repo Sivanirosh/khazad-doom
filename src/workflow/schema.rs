@@ -9,7 +9,18 @@ pub const WORKER_RESULT_SCHEMA: &str = r#"{
     "changed_files": {"type": "array", "items": {"type": "string"}},
     "public_interfaces_changed": {"type": "array", "items": {"type": "string"}},
     "tests_run": {"type": "array", "items": {"type": "string"}},
-    "acceptance_status": {"type": "array", "items": {"type": "string"}},
+    "acceptance_status": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "criterion": {"type": "string"},
+          "status": {"type": "string", "enum": ["satisfied", "blocked", "failed"]},
+          "evidence": {"type": "string"}
+        },
+        "required": ["criterion", "status", "evidence"]
+      }
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -27,7 +38,7 @@ pub const WORKER_RESULT_SCHEMA: &str = r#"{
     },
     "assumptions": {"type": "array", "items": {"type": "string"}}
   },
-  "required": ["slice_id", "status", "summary"]
+  "required": ["slice_id", "status", "summary", "acceptance_status"]
 }"#;
 
 pub const REPAIR_RESULT_SCHEMA: &str = r#"{

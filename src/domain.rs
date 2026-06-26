@@ -49,6 +49,13 @@ pub struct WorkflowConfig {
     pub worker_no_output_warning_seconds: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_termination_grace_seconds: u64,
+    #[serde(
+        default = "default_integration_repair_policy",
+        skip_serializing_if = "is_default_integration_repair_policy"
+    )]
+    pub integration_repair: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub gate_fail_fast: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_branch: String,
     #[serde(default, skip_serializing_if = "HandoffDefaults::is_empty")]
@@ -66,6 +73,8 @@ impl Default for WorkflowConfig {
             worker_attempt_timeout_seconds: 0,
             worker_no_output_warning_seconds: 900,
             worker_termination_grace_seconds: 30,
+            integration_repair: default_integration_repair_policy(),
+            gate_fail_fast: true,
             base_branch: String::new(),
             handoff: HandoffDefaults::default(),
             verify_profiles: BTreeMap::new(),
@@ -264,7 +273,7 @@ pub struct WorkerResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tests_run: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub acceptance_status: Vec<String>,
+    pub acceptance_status: Vec<AcceptanceEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -288,10 +297,50 @@ pub struct CheckResult {
     pub commit_found: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AcceptanceEvidence {
+    pub criterion: String,
+    pub status: String,
+    pub evidence: String,
+}
+
+impl<'de> Deserialize<'de> for AcceptanceEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(text) = value.as_str() {
+            return Ok(Self {
+                criterion: text.to_string(),
+                status: "satisfied".to_string(),
+                evidence: text.to_string(),
+            });
+        }
+        #[derive(Deserialize)]
+        struct StructuredAcceptanceEvidence {
+            criterion: String,
+            status: String,
+            evidence: String,
+        }
+        let structured =
+            StructuredAcceptanceEvidence::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            criterion: structured.criterion,
+            status: structured.status,
+            evidence: structured.evidence,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepairResult {
     pub status: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trigger: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub attempts: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub commit_sha: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -310,6 +359,16 @@ pub struct GateCommandResult {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dedupe_key: String,
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
+    pub duration_ms: u128,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skip_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -320,6 +379,81 @@ pub struct GateResult {
     pub commands: Vec<GateCommandResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PhaseDuration {
+    pub phase: String,
+    pub duration_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentCallEconomics {
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slice_id: String,
+    pub attempt: usize,
+    pub kind: String,
+    pub runner: String,
+    pub status: String,
+    pub duration_ms: u128,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub input_tokens: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub output_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommandExecutionEconomics {
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slice_id: String,
+    pub attempt: usize,
+    pub command: String,
+    pub cwd: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub duration_ms: u128,
+    pub dedupe_key: String,
+    pub tree_sha: String,
+    pub cache_key: String,
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skip_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DuplicateCommandEconomics {
+    pub dedupe_key: String,
+    pub command: String,
+    pub executions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RunEconomics {
+    pub repair_policy: String,
+    pub gate_fail_fast: bool,
+    pub worker_max_attempts: usize,
+    pub repair_max_attempts: usize,
+    pub repair_attempts: usize,
+    pub agent_call_count: usize,
+    pub command_execution_count: usize,
+    pub duplicate_command_count: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_calls: Vec<AgentCallEconomics>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_durations: BTreeMap<String, PhaseDuration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_executions: Vec<CommandExecutionEconomics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_commands: Vec<DuplicateCommandEconomics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sla_violations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,7 +467,11 @@ pub struct ImplementationSummary {
     pub completed_slices: Vec<WorkerResult>,
     pub checks: Vec<CheckResult>,
     pub integration_repair: RepairResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_repair_integration_gate: Option<GateResult>,
     pub integration_gate: GateResult,
+    #[serde(default)]
+    pub economics: RunEconomics,
     pub created_at: DateTime<Utc>,
 }
 
@@ -410,6 +548,8 @@ pub struct RunDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<RunProgress>,
     pub events: Vec<Event>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economics: Option<RunEconomics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,6 +699,18 @@ fn default_slice_status() -> String {
     SLICE_STATUS_OPEN.to_string()
 }
 
+pub fn default_integration_repair_policy() -> String {
+    "auto".to_string()
+}
+
+fn is_default_integration_repair_policy(value: &str) -> bool {
+    value.is_empty() || value == "auto"
+}
+
+fn default_true() -> bool {
+    true
+}
+
 pub fn is_open_status(value: &str) -> bool {
     value.is_empty() || value == SLICE_STATUS_OPEN
 }
@@ -573,6 +725,14 @@ fn is_zero_u64(value: &u64) -> bool {
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
+}
+
+fn is_zero_u128(value: &u128) -> bool {
+    *value == 0
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn is_false(value: &bool) -> bool {

@@ -403,6 +403,18 @@ impl Runner for FakeRunner {
             ],
         )?;
         let sha = gitutil::head_sha(&job.cwd)?;
+        let acceptance_status = handoff
+            .slice
+            .acceptance
+            .iter()
+            .map(|criterion| {
+                json!({
+                    "criterion": criterion,
+                    "status": "satisfied",
+                    "evidence": format!("{} implemented by fake runner", handoff.slice.id),
+                })
+            })
+            .collect::<Vec<_>>();
         emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
         Ok(ResultData {
             text: "{}".to_string(),
@@ -415,7 +427,8 @@ impl Runner for FakeRunner {
                     format!("{}.txt", handoff.slice.id),
                     format!(".khazad-fake/{}.txt", handoff.slice.id)
                 ],
-                "tests_run": handoff.slice.verify
+                "tests_run": handoff.slice.verify,
+                "acceptance_status": acceptance_status
             })),
             usage: Usage::default(),
         })

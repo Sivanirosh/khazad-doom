@@ -1,23 +1,47 @@
+use super::economics::RunEconomicsRecorder;
 use super::shell::{ShellCommand, ShellProgress};
 use super::{CancelledError, check_cancelled};
 use crate::agent::CancellationToken;
-use crate::domain::{Finding, GateCommandResult, GateResult, Slice, VerifyCommand, WorkflowConfig};
+use crate::domain::{
+    CommandExecutionEconomics, Finding, GateCommandResult, GateResult, Slice, VerifyCommand,
+    WorkflowConfig,
+};
+use crate::gitutil;
 use crate::state::{ProgressReporter, ProgressScope};
 use anyhow::{Result, anyhow, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub(crate) const DEFAULT_VERIFY_TIMEOUT_SECONDS: u64 = 600;
 
 pub(crate) struct WorkflowGate {
     progress: ProgressReporter,
+    economics: Option<RunEconomicsRecorder>,
+    cache: VerificationCommandCache,
 }
 
 impl WorkflowGate {
+    #[cfg(test)]
     pub(crate) fn new(progress: ProgressReporter) -> Self {
-        Self { progress }
+        Self {
+            progress,
+            economics: None,
+            cache: VerificationCommandCache::default(),
+        }
+    }
+
+    pub(crate) fn with_economics(
+        progress: ProgressReporter,
+        economics: RunEconomicsRecorder,
+        cache: VerificationCommandCache,
+    ) -> Self {
+        Self {
+            progress,
+            economics: Some(economics),
+            cache,
+        }
     }
 
     pub(crate) fn verify_slice_commands(
@@ -32,50 +56,30 @@ impl WorkflowGate {
             }
             check_cancelled(cancel)?;
             result.tests_run.push(command.command.clone());
-            let cwd = verify_command_cwd(request.worker_worktree, &command)?;
-            self.mark_progress(
-                "worker_verify",
-                &request.slice.id,
-                request.attempt,
-                &command.command,
-                "running slice verification command",
-            );
-            let progress = self.shell_progress_sink(
-                "worker_verify",
-                &request.slice.id,
-                request.attempt,
-                &command.command,
-                "running slice verification command",
-            );
-            let output = match ShellCommand::new(&cwd, &command.command)
-                .timeout(verify_command_timeout(
-                    request.slice,
-                    &command,
-                    request.config,
-                ))
-                .envs(&command.env)
-                .progress(Some(progress))
-                .run(cancel)
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    if cancel.is_cancelled() {
-                        return Err(CancelledError::new("run cancelled").into());
-                    }
-                    let summary = format!(
-                        "verify command failed or timed out: {}: {err}",
-                        command.command
-                    );
-                    result.failure = Some(SliceVerificationFailure::auto_fix(summary));
-                    return Ok(result);
-                }
-            };
-            if !output.success() {
-                let summary = format!(
-                    "verify command failed: {}\n{}",
-                    command.command,
-                    output.trimmed_combined_output()
-                );
+            let outcome = self.run_verify_command(
+                VerifyCommandExecutionRequest {
+                    phase: "worker_verify",
+                    slice_id: &request.slice.id,
+                    attempt: request.attempt,
+                    worktree_root: request.worker_worktree,
+                    command: &command,
+                    timeout: verify_command_timeout(request.slice, &command, request.config),
+                    message: "running slice verification command",
+                },
+                cancel,
+            )?;
+            if outcome.result.status != "passed" {
+                let summary = if outcome.result.exit_code.is_some() {
+                    format!(
+                        "verify command failed: {}\n{}",
+                        command.command, outcome.result.output
+                    )
+                } else {
+                    format!(
+                        "verify command failed or timed out: {}: {}",
+                        command.command, outcome.result.output
+                    )
+                };
                 result.failure = Some(SliceVerificationFailure::auto_fix(summary));
                 return Ok(result);
             }
@@ -100,73 +104,49 @@ impl WorkflowGate {
 
         let mut results = Vec::new();
         let mut findings = Vec::new();
+        let mut failed = false;
         for command in commands {
             check_cancelled(cancel)?;
-            let cwd = verify_command_cwd(request.integration_worktree, &command)?;
-            self.mark_progress(
-                "integration_gate",
-                "",
-                0,
-                &command.command,
-                "running integration gate command",
-            );
-            let progress = self.shell_progress_sink(
-                "integration_gate",
-                "",
-                0,
-                &command.command,
-                "running integration gate command",
-            );
-            let output = ShellCommand::new(&cwd, &command.command)
-                .timeout(verify_command_timeout_for_command(&command, request.config))
-                .envs(&command.env)
-                .progress(Some(progress))
-                .run(cancel);
-            match output {
-                Ok(output) => {
-                    let status = if output.success() { "passed" } else { "failed" };
-                    if !output.success() {
-                        findings.push(Finding {
-                            id: String::new(),
-                            severity: "error".to_string(),
-                            action: "auto-fix".to_string(),
-                            file: String::new(),
-                            line: 0,
-                            description: format!("integration gate failed: {}", command.command),
-                        });
-                    }
-                    results.push(GateCommandResult {
-                        command: command.command,
-                        status: status.to_string(),
-                        exit_code: output.exit_code(),
-                        output: output.trimmed_combined_output(),
-                    });
-                }
-                Err(err) => {
-                    if cancel.is_cancelled() {
-                        return Err(CancelledError::new("run cancelled").into());
-                    }
-                    findings.push(Finding {
-                        id: String::new(),
-                        severity: "error".to_string(),
-                        action: "auto-fix".to_string(),
-                        file: String::new(),
-                        line: 0,
-                        description: format!(
-                            "integration gate command failed to start or timed out: {}: {err}",
-                            command.command
-                        ),
-                    });
-                    results.push(GateCommandResult {
-                        command: command.command,
-                        status: "failed".to_string(),
-                        exit_code: None,
-                        output: err.to_string(),
-                    });
-                }
+            if failed && request.config.gate_fail_fast {
+                results.push(self.skipped_command_result(
+                    request.integration_worktree,
+                    &command,
+                    "skipped because gate_fail_fast stopped after an earlier failure",
+                )?);
+                continue;
             }
+            let outcome = self.run_verify_command(
+                VerifyCommandExecutionRequest {
+                    phase: "integration_gate",
+                    slice_id: "",
+                    attempt: 0,
+                    worktree_root: request.integration_worktree,
+                    command: &command,
+                    timeout: verify_command_timeout_for_command(&command, request.config),
+                    message: "running integration gate command",
+                },
+                cancel,
+            )?;
+            if outcome.result.status == "failed" {
+                failed = true;
+                findings.push(Finding {
+                    id: String::new(),
+                    severity: "error".to_string(),
+                    action: "auto-fix".to_string(),
+                    file: String::new(),
+                    line: 0,
+                    description: if outcome.result.exit_code.is_some() {
+                        format!("integration gate failed: {}", command.command)
+                    } else {
+                        format!(
+                            "integration gate command failed to start or timed out: {}: {}",
+                            command.command, outcome.result.output
+                        )
+                    },
+                });
+            }
+            results.push(outcome.result);
         }
-        let failed = results.iter().any(|result| result.status != "passed");
         Ok(GateResult {
             status: if failed { "failed" } else { "passed" }.to_string(),
             summary: if failed {
@@ -177,6 +157,159 @@ impl WorkflowGate {
             commands: results,
             findings,
         })
+    }
+
+    fn run_verify_command(
+        &self,
+        request: VerifyCommandExecutionRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<VerifyCommandExecutionOutcome> {
+        let cwd = verify_command_cwd(request.worktree_root, request.command)?;
+        let cwd_label = if request.command.cwd.trim().is_empty() {
+            ".".to_string()
+        } else {
+            request.command.cwd.clone()
+        };
+        let dedupe_key = verify_command_key(request.command);
+        let tree_sha = command_tree_sha(request.worktree_root);
+        let cache_key = command_cache_key(request.worktree_root, &tree_sha, &dedupe_key);
+        if let Some(mut cached) = self.cache.get(&cache_key) {
+            cached.cache_hit = true;
+            cached.duration_ms = 0;
+            self.record_command_economics(CommandExecutionEconomics {
+                phase: request.phase.to_string(),
+                slice_id: request.slice_id.to_string(),
+                attempt: request.attempt,
+                command: request.command.command.clone(),
+                cwd: cwd_label,
+                status: cached.status.clone(),
+                exit_code: cached.exit_code,
+                duration_ms: 0,
+                dedupe_key,
+                tree_sha,
+                cache_key,
+                cache_hit: true,
+                skip_reason: String::new(),
+            });
+            return Ok(VerifyCommandExecutionOutcome { result: cached });
+        }
+
+        self.mark_progress(
+            request.phase,
+            request.slice_id,
+            request.attempt,
+            &request.command.command,
+            request.message,
+        );
+        let progress = self.shell_progress_sink(
+            request.phase,
+            request.slice_id,
+            request.attempt,
+            &request.command.command,
+            request.message,
+        );
+        let started_at = Instant::now();
+        let output = ShellCommand::new(&cwd, &request.command.command)
+            .timeout(request.timeout)
+            .envs(&request.command.env)
+            .progress(Some(progress))
+            .run(cancel);
+        let duration_ms = started_at.elapsed().as_millis();
+        let result = match output {
+            Ok(output) => GateCommandResult {
+                command: request.command.command.clone(),
+                status: if output.success() { "passed" } else { "failed" }.to_string(),
+                exit_code: output.exit_code(),
+                output: output.trimmed_combined_output(),
+                cwd: cwd_label.clone(),
+                dedupe_key: dedupe_key.clone(),
+                duration_ms,
+                cache_hit: false,
+                skip_reason: String::new(),
+            },
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(CancelledError::new("run cancelled").into());
+                }
+                GateCommandResult {
+                    command: request.command.command.clone(),
+                    status: "failed".to_string(),
+                    exit_code: None,
+                    output: err.to_string(),
+                    cwd: cwd_label.clone(),
+                    dedupe_key: dedupe_key.clone(),
+                    duration_ms,
+                    cache_hit: false,
+                    skip_reason: String::new(),
+                }
+            }
+        };
+        self.record_command_economics(CommandExecutionEconomics {
+            phase: request.phase.to_string(),
+            slice_id: request.slice_id.to_string(),
+            attempt: request.attempt,
+            command: request.command.command.clone(),
+            cwd: cwd_label,
+            status: result.status.clone(),
+            exit_code: result.exit_code,
+            duration_ms,
+            dedupe_key,
+            tree_sha,
+            cache_key: cache_key.clone(),
+            cache_hit: false,
+            skip_reason: String::new(),
+        });
+        self.cache.insert(cache_key, result.clone());
+        Ok(VerifyCommandExecutionOutcome { result })
+    }
+
+    fn skipped_command_result(
+        &self,
+        worktree_root: &Path,
+        command: &VerifyCommand,
+        reason: &str,
+    ) -> Result<GateCommandResult> {
+        let _cwd = verify_command_cwd(worktree_root, command)?;
+        let cwd_label = if command.cwd.trim().is_empty() {
+            ".".to_string()
+        } else {
+            command.cwd.clone()
+        };
+        let dedupe_key = verify_command_key(command);
+        let tree_sha = command_tree_sha(worktree_root);
+        let cache_key = command_cache_key(worktree_root, &tree_sha, &dedupe_key);
+        self.record_command_economics(CommandExecutionEconomics {
+            phase: "integration_gate".to_string(),
+            slice_id: String::new(),
+            attempt: 0,
+            command: command.command.clone(),
+            cwd: cwd_label.clone(),
+            status: "skipped".to_string(),
+            exit_code: None,
+            duration_ms: 0,
+            dedupe_key: dedupe_key.clone(),
+            tree_sha,
+            cache_key,
+            cache_hit: false,
+            skip_reason: reason.to_string(),
+        });
+        Ok(GateCommandResult {
+            command: command.command.clone(),
+            status: "skipped".to_string(),
+            exit_code: None,
+            output: String::new(),
+            cwd: cwd_label,
+            dedupe_key,
+            duration_ms: 0,
+            cache_hit: false,
+            skip_reason: reason.to_string(),
+        })
+    }
+
+    fn record_command_economics(&self, command: CommandExecutionEconomics) {
+        if let Some(economics) = &self.economics {
+            economics.record_command(command);
+        }
     }
 
     fn mark_progress(
@@ -249,28 +382,69 @@ pub(crate) struct IntegrationGateRequest<'a> {
     pub(crate) config: &'a WorkflowConfig,
 }
 
+#[derive(Debug)]
+struct VerifyCommandExecutionRequest<'a> {
+    phase: &'a str,
+    slice_id: &'a str,
+    attempt: usize,
+    worktree_root: &'a Path,
+    command: &'a VerifyCommand,
+    timeout: Duration,
+    message: &'a str,
+}
+
+#[derive(Debug)]
+struct VerifyCommandExecutionOutcome {
+    result: GateCommandResult,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VerificationCommandCache {
+    inner: Arc<Mutex<BTreeMap<String, GateCommandResult>>>,
+}
+
+impl VerificationCommandCache {
+    fn get(&self, key: &str) -> Option<GateCommandResult> {
+        self.inner
+            .lock()
+            .expect("verification command cache mutex poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    fn insert(&self, key: String, result: GateCommandResult) {
+        if result.status != "skipped" {
+            self.inner
+                .lock()
+                .expect("verification command cache mutex poisoned")
+                .insert(key, result);
+        }
+    }
+}
+
 fn integration_gate_commands(
     slices: &[Slice],
     config: &WorkflowConfig,
 ) -> Result<Vec<VerifyCommand>> {
-    let mut commands: BTreeMap<String, VerifyCommand> = BTreeMap::new();
+    let mut commands: Vec<VerifyCommand> = Vec::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
     for slice in slices {
         for command in effective_verify_commands(slice, config)? {
             if command.command.trim().is_empty() {
                 continue;
             }
             let key = verify_command_key(&command);
-            commands
-                .entry(key)
-                .and_modify(|existing| {
-                    if command.timeout_seconds > existing.timeout_seconds {
-                        existing.timeout_seconds = command.timeout_seconds;
-                    }
-                })
-                .or_insert(command);
+            if let Some(index) = by_key.get(&key).copied() {
+                if command.timeout_seconds > commands[index].timeout_seconds {
+                    commands[index].timeout_seconds = command.timeout_seconds;
+                }
+            } else {
+                by_key.insert(key, commands.len());
+                commands.push(command);
+            }
         }
     }
-    Ok(commands.into_values().collect())
+    Ok(commands)
 }
 
 fn effective_verify_commands(slice: &Slice, config: &WorkflowConfig) -> Result<Vec<VerifyCommand>> {
@@ -344,6 +518,27 @@ fn verify_command_key(command: &VerifyCommand) -> String {
         .collect::<Vec<_>>()
         .join(";");
     format!("{}\0{}\0{}", command.cwd, env, command.command)
+}
+
+fn command_tree_sha(worktree_root: &Path) -> String {
+    gitutil::run(worktree_root, &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|_| {
+        format!(
+            "non-git:{}",
+            worktree_root
+                .canonicalize()
+                .unwrap_or_else(|_| worktree_root.to_path_buf())
+                .display()
+        )
+    })
+}
+
+fn command_cache_key(worktree_root: &Path, tree_sha: &str, dedupe_key: &str) -> String {
+    let context = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf())
+        .display()
+        .to_string();
+    format!("{context}\0{tree_sha}\0{dedupe_key}")
 }
 
 #[cfg(test)]
@@ -428,6 +623,108 @@ mod tests {
         assert_eq!(result.summary, "integration gate passed");
         assert_eq!(result.commands.len(), 1);
         assert_eq!(result.commands[0].status, "passed");
+        Ok(())
+    }
+
+    #[test]
+    fn integration_gate_preserves_profile_order() -> Result<()> {
+        let (_home, gate) = test_gate()?;
+        let worktree = tempfile::tempdir()?;
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "full".to_string(),
+            VerifyProfile {
+                commands: vec![
+                    VerifyCommand {
+                        command: "printf fmt".to_string(),
+                        timeout_seconds: 5,
+                        ..VerifyCommand::default()
+                    },
+                    VerifyCommand {
+                        command: "printf test".to_string(),
+                        timeout_seconds: 5,
+                        ..VerifyCommand::default()
+                    },
+                    VerifyCommand {
+                        command: "printf clippy".to_string(),
+                        timeout_seconds: 5,
+                        ..VerifyCommand::default()
+                    },
+                ],
+            },
+        );
+        let config = WorkflowConfig {
+            verify_profiles: profiles,
+            gate_fail_fast: false,
+            ..WorkflowConfig::default()
+        };
+        let mut first = slice("slice-001");
+        first.verify_profile = "full".to_string();
+        let slices = vec![first];
+
+        let result = gate.run_integration_gate(
+            IntegrationGateRequest {
+                slices: &slices,
+                integration_worktree: worktree.path(),
+                config: &config,
+            },
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(
+            result
+                .commands
+                .iter()
+                .map(|command| command.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["printf fmt", "printf test", "printf clippy"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn integration_gate_fail_fast_skips_remaining_commands() -> Result<()> {
+        let (_home, gate) = test_gate()?;
+        let worktree = tempfile::tempdir()?;
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "full".to_string(),
+            VerifyProfile {
+                commands: vec![
+                    VerifyCommand {
+                        command: "printf fmt; false".to_string(),
+                        timeout_seconds: 5,
+                        ..VerifyCommand::default()
+                    },
+                    VerifyCommand {
+                        command: "printf test".to_string(),
+                        timeout_seconds: 5,
+                        ..VerifyCommand::default()
+                    },
+                ],
+            },
+        );
+        let config = WorkflowConfig {
+            verify_profiles: profiles,
+            ..WorkflowConfig::default()
+        };
+        let mut first = slice("slice-001");
+        first.verify_profile = "full".to_string();
+        let slices = vec![first];
+
+        let result = gate.run_integration_gate(
+            IntegrationGateRequest {
+                slices: &slices,
+                integration_worktree: worktree.path(),
+                config: &config,
+            },
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.commands[0].status, "failed");
+        assert_eq!(result.commands[1].status, "skipped");
+        assert!(result.commands[1].skip_reason.contains("gate_fail_fast"));
         Ok(())
     }
 

@@ -250,6 +250,8 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
   "worker_attempt_timeout_seconds": 0,
   "worker_no_output_warning_seconds": 900,
   "worker_termination_grace_seconds": 30,
+  "integration_repair": "auto",
+  "gate_fail_fast": true,
   "handoff": { "push": false, "create_pr": false },
   "verify_profiles": {
     "quick": {
@@ -262,7 +264,11 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 }
 ```
 
-A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts.
+A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure.
+
+`integration_repair` controls when the repair agent runs: `auto` runs repair only after failed integration-gate evidence, `never` surfaces the failed gate without repair, and `always` runs repair even when the pre-repair gate passed. Repair never bypasses the gate; any repair is followed by a second integration gate.
+
+Status/watch/monitor and final reports include runtime economics for release triage: agent call counts, daemon-owned command execution counts, duplicate command telemetry, cache hits/misses, repair policy/attempts, phase durations, and SLA violations.
 
 Khazad-Doom does not use a hidden global workflow timeout. Runs are daemon-owned and may outlive the CLI or Pi tool call that started them. Timeouts are explicit guardrails for individual verification/gate commands so hung shell commands do not stall a run forever.
 

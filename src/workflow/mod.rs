@@ -1,3 +1,4 @@
+mod economics;
 mod gate;
 mod manager;
 mod prompts;

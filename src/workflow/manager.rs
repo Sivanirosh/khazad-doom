@@ -1,4 +1,7 @@
-use super::gate::{IntegrationGateRequest, SliceVerificationRequest, WorkflowGate};
+use super::economics::{RunEconomicsRecorder, agent_call};
+use super::gate::{
+    IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
+};
 use super::{
     CancelledError, REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, check_cancelled,
     integration_repair_prompt, worker_prompt,
@@ -8,10 +11,10 @@ use crate::agent::{
 };
 use crate::artifact;
 use crate::domain::{
-    BranchHandoff, CheckResult, Finding, Handoff, HandoffActionResult, HandoffDiagnostics,
-    ImplementationSummary, MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection,
-    RunStatus, Slice, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
-    WorkflowConfig,
+    BranchHandoff, CheckResult, Finding, GateResult, Handoff, HandoffActionResult,
+    HandoffDiagnostics, ImplementationSummary, MergeConflictReport, RepairResult, Run,
+    RunCheckpoint, RunInspection, RunStatus, Slice, SliceRun, SliceStatus, SliceValidationReport,
+    SliceWriteResult, WorkerResult, WorkflowConfig,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -35,7 +38,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const MAX_REPAIR_ATTEMPTS: usize = 3;
+pub const MAX_WORKER_ATTEMPTS: usize = 3;
+pub const DEFAULT_REPAIR_ATTEMPTS: usize = 1;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
@@ -99,9 +103,12 @@ struct IntegrationRepairContext<'a> {
     slices: &'a [Slice],
     integration_worktree: &'a Path,
     checks: &'a [CheckResult],
+    gate_failure: &'a GateResult,
+    trigger: &'a str,
     cancel: &'a CancellationToken,
     runner: Arc<dyn Runner>,
     config: &'a WorkflowConfig,
+    economics: RunEconomicsRecorder,
 }
 
 #[derive(Debug, Clone)]
@@ -869,6 +876,15 @@ impl Manager {
         check_cancelled(cancel)?;
         let store = artifact::Store::new(&run.repo_path);
         let config = store.read_config()?;
+        let repair_policy = RepairPolicy::parse(&config.integration_repair)?;
+        let economics = RunEconomicsRecorder::new(
+            repair_policy.as_str(),
+            config.gate_fail_fast,
+            MAX_WORKER_ATTEMPTS,
+            DEFAULT_REPAIR_ATTEMPTS,
+        )
+        .with_snapshot_path(store.output_path(&run.id, "economics.json"));
+        let verification_cache = VerificationCommandCache::default();
         store.ensure_run_dirs(&run.id)?;
         let root_worktree = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
         let integration_worktree = root_worktree.join("integration");
@@ -883,6 +899,7 @@ impl Manager {
             "",
             "creating integration worktree",
         );
+        let setup_phase = economics.start_phase("integration_setup");
         match integration_mode {
             IntegrationMode::Fresh => gitutil::worktree_add(
                 &run.repo_path,
@@ -898,6 +915,7 @@ impl Manager {
             )
             .context("create existing integration worktree")?,
         }
+        setup_phase.finish();
 
         let mut completed_slices = Vec::new();
         let mut checks = Vec::new();
@@ -912,6 +930,12 @@ impl Manager {
         for layer in artifact::dependency_layers(worker_slices)? {
             check_cancelled(cancel)?;
             let slice_base_sha = gitutil::head_sha(&integration_worktree)?;
+            let layer_ids = layer
+                .iter()
+                .map(|slice| slice.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let worker_phase = economics.start_phase(format!("worker_layer:{layer_ids}"));
             let outcomes = self.run_worker_layer(
                 run,
                 &layer,
@@ -923,7 +947,10 @@ impl Manager {
                 runner.clone(),
                 parallelism,
                 &config,
+                economics.clone(),
+                verification_cache.clone(),
             )?;
+            worker_phase.finish();
             for worker in outcomes {
                 let slice = worker.slice.clone();
                 self.mark_progress(
@@ -978,24 +1005,7 @@ impl Manager {
         }
 
         check_cancelled(cancel)?;
-        self.mark_progress(
-            &run.id,
-            "integration_repair",
-            "",
-            0,
-            "",
-            "checking whether integration repair is needed",
-        );
-        let repair = self.integration_repair(IntegrationRepairContext {
-            run,
-            slices: gate_slices,
-            integration_worktree: &integration_worktree,
-            checks: &checks,
-            cancel,
-            runner: runner.clone(),
-            config: &config,
-        })?;
-        check_cancelled(cancel)?;
+        let gate_phase = economics.start_phase("integration_gate:initial");
         self.mark_progress(
             &run.id,
             "integration_gate",
@@ -1004,7 +1014,12 @@ impl Manager {
             "",
             "running integration gate commands",
         );
-        let gate = WorkflowGate::new(self.progress_reporter(&run.id)).run_integration_gate(
+        let mut gate = WorkflowGate::with_economics(
+            self.progress_reporter(&run.id),
+            economics.clone(),
+            verification_cache.clone(),
+        )
+        .run_integration_gate(
             IntegrationGateRequest {
                 slices: gate_slices,
                 integration_worktree: &integration_worktree,
@@ -1012,6 +1027,63 @@ impl Manager {
             },
             cancel,
         )?;
+        gate_phase.finish();
+
+        let mut pre_repair_gate = None;
+        let repair = if should_run_integration_repair(repair_policy, &gate) {
+            pre_repair_gate = Some(gate.clone());
+            check_cancelled(cancel)?;
+            self.mark_progress(
+                &run.id,
+                "integration_repair",
+                "",
+                0,
+                "",
+                "repairing failed integration gate evidence",
+            );
+            let repair_phase = economics.start_phase("integration_repair");
+            let repair = self.integration_repair(IntegrationRepairContext {
+                run,
+                slices: gate_slices,
+                integration_worktree: &integration_worktree,
+                checks: &checks,
+                gate_failure: &gate,
+                trigger: repair_trigger_for_gate(repair_policy, &gate),
+                cancel,
+                runner: runner.clone(),
+                config: &config,
+                economics: economics.clone(),
+            })?;
+            repair_phase.finish();
+
+            check_cancelled(cancel)?;
+            self.mark_progress(
+                &run.id,
+                "integration_gate",
+                "",
+                0,
+                "",
+                "rerunning integration gate after repair",
+            );
+            let rerun_phase = economics.start_phase("integration_gate:after_repair");
+            gate = WorkflowGate::with_economics(
+                self.progress_reporter(&run.id),
+                economics.clone(),
+                verification_cache.clone(),
+            )
+            .run_integration_gate(
+                IntegrationGateRequest {
+                    slices: gate_slices,
+                    integration_worktree: &integration_worktree,
+                    config: &config,
+                },
+                cancel,
+            )?;
+            rerun_phase.finish();
+            repair
+        } else {
+            skipped_repair_result(repair_policy, &gate)
+        };
         let integration_store = artifact::Store::new(&integration_worktree);
         if gate.status == "passed" {
             let completed_slice_ids: Vec<_> = completed_slices
@@ -1034,7 +1106,9 @@ impl Manager {
             completed_slices,
             checks,
             integration_repair: repair,
+            pre_repair_integration_gate: pre_repair_gate,
             integration_gate: gate.clone(),
+            economics: economics.snapshot(),
             created_at: Utc::now(),
         };
 
@@ -1069,6 +1143,8 @@ impl Manager {
         runner: Arc<dyn Runner>,
         parallelism: usize,
         config: &WorkflowConfig,
+        economics: RunEconomicsRecorder,
+        verification_cache: VerificationCommandCache,
     ) -> Result<Vec<SliceWorkerOutcome>> {
         if parallelism <= 1 || layer.len() <= 1 {
             let mut outcomes = Vec::new();
@@ -1083,6 +1159,8 @@ impl Manager {
                     cancel,
                     runner.clone(),
                     config,
+                    economics.clone(),
+                    verification_cache.clone(),
                 )?);
             }
             return Ok(outcomes);
@@ -1102,6 +1180,8 @@ impl Manager {
                 cancel,
                 runner.clone(),
                 config,
+                economics.clone(),
+                verification_cache.clone(),
             )?;
             outcomes.append(&mut batch_outcomes);
         }
@@ -1121,6 +1201,8 @@ impl Manager {
         cancel: &CancellationToken,
         runner: Arc<dyn Runner>,
         config: &WorkflowConfig,
+        economics: RunEconomicsRecorder,
+        verification_cache: VerificationCommandCache,
     ) -> Result<Vec<SliceWorkerOutcome>> {
         let batch_ids: Vec<_> = batch.iter().map(|slice| slice.id.clone()).collect();
         let batch_label = batch_ids.join(",");
@@ -1166,6 +1248,8 @@ impl Manager {
             let cancel = batch_cancel.clone();
             let runner = runner.clone();
             let config = config.clone();
+            let economics = economics.clone();
+            let verification_cache = verification_cache.clone();
             let tx = tx.clone();
             handles.push(ParallelWorkerHandle {
                 slice_id: slice_id.clone(),
@@ -1180,6 +1264,8 @@ impl Manager {
                         &cancel,
                         runner,
                         &config,
+                        economics,
+                        verification_cache,
                     );
                     let _ = tx.send(ParallelWorkerResult { slice_id, result });
                 }),
@@ -1372,6 +1458,8 @@ impl Manager {
         cancel: &CancellationToken,
         runner: Arc<dyn Runner>,
         config: &WorkflowConfig,
+        economics: RunEconomicsRecorder,
+        verification_cache: VerificationCommandCache,
     ) -> Result<SliceWorkerOutcome> {
         let store = artifact::Store::new(&run.repo_path);
         let worker_worktree = root_worktree.join(&slice.id);
@@ -1411,7 +1499,7 @@ impl Manager {
 
         let mut all_checks = Vec::new();
         let mut last_failure = String::new();
-        for attempt in 1..=MAX_REPAIR_ATTEMPTS {
+        for attempt in 1..=MAX_WORKER_ATTEMPTS {
             check_cancelled(cancel)?;
             let output_path = store.output_path(
                 &run.id,
@@ -1439,6 +1527,7 @@ impl Manager {
                 runner.name(),
                 "slice worker is running",
             );
+            let agent_started_at = Instant::now();
             let result = match self.run_supervised_worker_job(
                 runner.clone(),
                 Job {
@@ -1451,8 +1540,32 @@ impl Manager {
                 cancel,
                 WorkerAttemptContext::new(&run.id, "worker_running", &slice.id, attempt, config),
             ) {
-                Ok(result) => result,
+                Ok(result) => {
+                    economics.record_agent_call(agent_call(
+                        "slice_worker",
+                        &slice.id,
+                        attempt,
+                        "slice-worker",
+                        runner.name(),
+                        "succeeded",
+                        agent_started_at.elapsed(),
+                        Some(&result.usage),
+                        "",
+                    ));
+                    result
+                }
                 Err(err) => {
+                    economics.record_agent_call(agent_call(
+                        "slice_worker",
+                        &slice.id,
+                        attempt,
+                        "slice-worker",
+                        runner.name(),
+                        "failed",
+                        agent_started_at.elapsed(),
+                        None,
+                        err.to_string(),
+                    ));
                     if cancel.is_cancelled() {
                         return Err(CancelledError::new("run cancelled").into());
                     }
@@ -1491,6 +1604,8 @@ impl Manager {
                     base_sha: slice_base_sha,
                     attempt,
                     config,
+                    economics: economics.clone(),
+                    verification_cache: verification_cache.clone(),
                 },
                 cancel,
             )?;
@@ -1552,7 +1667,7 @@ impl Manager {
                 ))
                 .into());
             }
-            if attempt == MAX_REPAIR_ATTEMPTS {
+            if attempt == MAX_WORKER_ATTEMPTS {
                 self.state.update_slice_status(
                     &run.id,
                     &slice.id,
@@ -1562,7 +1677,7 @@ impl Manager {
                 bail!(
                     "slice {} failed lightweight checks after {} attempts: {}",
                     slice.id,
-                    MAX_REPAIR_ATTEMPTS,
+                    MAX_WORKER_ATTEMPTS,
                     last_failure
                 );
             }
@@ -1646,16 +1761,20 @@ impl Manager {
             return Ok(check);
         }
 
-        let verification = WorkflowGate::new(self.progress_reporter(ctx.run_id))
-            .verify_slice_commands(
-                SliceVerificationRequest {
-                    slice: ctx.slice,
-                    worker_worktree: ctx.worker_worktree,
-                    attempt: ctx.attempt,
-                    config: ctx.config,
-                },
-                cancel,
-            )?;
+        let verification = WorkflowGate::with_economics(
+            self.progress_reporter(ctx.run_id),
+            ctx.economics.clone(),
+            ctx.verification_cache.clone(),
+        )
+        .verify_slice_commands(
+            SliceVerificationRequest {
+                slice: ctx.slice,
+                worker_worktree: ctx.worker_worktree,
+                attempt: ctx.attempt,
+                config: ctx.config,
+            },
+            cancel,
+        )?;
         check.tests_run = verification.tests_run;
         if let Some(failure) = verification.failure {
             check.status = "failed".to_string();
@@ -1673,10 +1792,14 @@ impl Manager {
         let cancel = context.cancel;
         let runner = context.runner;
         let config = context.config;
+        let economics = context.economics;
         let check_summary =
             serde_json::to_string_pretty(context.checks).unwrap_or_else(|_| "[]".to_string());
+        let gate_summary =
+            serde_json::to_string_pretty(context.gate_failure).unwrap_or_else(|_| "{}".to_string());
         let mut last_error = String::new();
-        for attempt in 1..=MAX_REPAIR_ATTEMPTS {
+        for attempt in 1..=DEFAULT_REPAIR_ATTEMPTS {
+            economics.set_repair_attempts(attempt);
             check_cancelled(cancel)?;
             self.mark_progress(
                 &run.id,
@@ -1691,7 +1814,10 @@ impl Manager {
                 &integration_worktree.to_string_lossy(),
                 slices,
                 &check_summary,
+                &gate_summary,
+                context.trigger,
             );
+            let agent_started_at = Instant::now();
             let agent_result = match self.run_supervised_worker_job(
                 runner.clone(),
                 Job {
@@ -1704,8 +1830,32 @@ impl Manager {
                 cancel,
                 WorkerAttemptContext::new(&run.id, "integration_repair", "", attempt, config),
             ) {
-                Ok(result) => result,
+                Ok(result) => {
+                    economics.record_agent_call(agent_call(
+                        "integration_repair",
+                        "",
+                        attempt,
+                        "integration-repair",
+                        runner.name(),
+                        "succeeded",
+                        agent_started_at.elapsed(),
+                        Some(&result.usage),
+                        "",
+                    ));
+                    result
+                }
                 Err(err) => {
+                    economics.record_agent_call(agent_call(
+                        "integration_repair",
+                        "",
+                        attempt,
+                        "integration-repair",
+                        runner.name(),
+                        "failed",
+                        agent_started_at.elapsed(),
+                        None,
+                        err.to_string(),
+                    ));
                     if cancel.is_cancelled() {
                         return Err(CancelledError::new("run cancelled").into());
                     }
@@ -1756,6 +1906,8 @@ impl Manager {
             {
                 result.commit_sha = head;
             }
+            result.trigger = context.trigger.to_string();
+            result.attempts = attempt;
             self.state.record_event(
                 &run.id,
                 "integration_repair_completed",
@@ -1765,7 +1917,7 @@ impl Manager {
         }
         Err(anyhow!(
             "integration repair failed after {} attempts: {}",
-            MAX_REPAIR_ATTEMPTS,
+            DEFAULT_REPAIR_ATTEMPTS,
             last_error
         ))
     }
@@ -1857,6 +2009,8 @@ struct LightweightCheckContext<'a> {
     base_sha: &'a str,
     attempt: usize,
     config: &'a WorkflowConfig,
+    economics: RunEconomicsRecorder,
+    verification_cache: VerificationCommandCache,
 }
 
 fn parallel_layer_success_outcomes(
@@ -1950,6 +2104,74 @@ fn parallel_results_all_cancelled(results: &BTreeMap<String, Result<SliceWorkerO
     results
         .values()
         .all(|result| matches!(result, Err(err) if err.downcast_ref::<CancelledError>().is_some()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairPolicy {
+    Auto,
+    Never,
+    Always,
+}
+
+impl RepairPolicy {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "" | "auto" => Ok(Self::Auto),
+            "never" => Ok(Self::Never),
+            "always" => Ok(Self::Always),
+            other => bail!(
+                "unknown integration_repair policy {other:?}; expected auto, never, or always"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Never => "never",
+            Self::Always => "always",
+        }
+    }
+}
+
+fn should_run_integration_repair(policy: RepairPolicy, gate: &GateResult) -> bool {
+    match policy {
+        RepairPolicy::Auto => gate.status != "passed",
+        RepairPolicy::Never => false,
+        RepairPolicy::Always => true,
+    }
+}
+
+fn repair_trigger_for_gate(policy: RepairPolicy, gate: &GateResult) -> &'static str {
+    if gate.status == "passed" && policy == RepairPolicy::Always {
+        "policy_always_gate_passed"
+    } else {
+        "integration_gate_failed"
+    }
+}
+
+fn skipped_repair_result(policy: RepairPolicy, gate: &GateResult) -> RepairResult {
+    let (trigger, summary) = if gate.status == "passed" {
+        (
+            "gate_passed",
+            format!(
+                "integration gate passed; integration_repair={} skipped repair",
+                policy.as_str()
+            ),
+        )
+    } else {
+        (
+            "policy_never_gate_failed",
+            "integration gate failed; integration_repair=never skipped repair".to_string(),
+        )
+    };
+    RepairResult {
+        status: "skipped".to_string(),
+        summary,
+        trigger: trigger.to_string(),
+        attempts: 0,
+        ..RepairResult::default()
+    }
 }
 
 fn sh_quote(value: &str) -> String {
@@ -2265,6 +2487,45 @@ fn validate_worker_result(result: &WorkerResult, slice: &Slice) -> Result<()> {
     if result.summary.trim().is_empty() {
         bail!("worker summary is required");
     }
+    validate_acceptance_evidence(result, slice)?;
+    Ok(())
+}
+
+fn validate_acceptance_evidence(result: &WorkerResult, slice: &Slice) -> Result<()> {
+    for evidence in &result.acceptance_status {
+        match evidence.status.as_str() {
+            "satisfied" | "blocked" | "failed" => {}
+            other => bail!("unknown acceptance status {other:?}"),
+        }
+        if evidence.criterion.trim().is_empty() {
+            bail!("acceptance criterion is required");
+        }
+        if evidence.evidence.trim().is_empty() {
+            bail!(
+                "acceptance evidence is required for {:?}",
+                evidence.criterion
+            );
+        }
+    }
+    if result.status != "complete" {
+        return Ok(());
+    }
+    for criterion in &slice.acceptance {
+        let Some(evidence) = result
+            .acceptance_status
+            .iter()
+            .find(|evidence| evidence.criterion == *criterion)
+        else {
+            bail!("missing acceptance evidence for {criterion:?}");
+        };
+        if evidence.status != "satisfied" {
+            bail!(
+                "acceptance criterion {:?} is not satisfied: {}",
+                criterion,
+                evidence.status
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2324,8 +2585,8 @@ mod tests {
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        Handoff, RepairResult, Run, RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand,
-        VerifyProfile, WorkerResult, WorkflowConfig,
+        AcceptanceEvidence, Handoff, ImplementationSummary, RepairResult, Run, RunStatus, Slice,
+        SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -2368,6 +2629,31 @@ mod tests {
             ..WorkerResult::default()
         };
         assert!(validate_worker_result(&result, &slice("slice-001")).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_acceptance_evidence_for_completed_worker() {
+        let result = WorkerResult {
+            slice_id: "slice-001".to_string(),
+            status: "complete".to_string(),
+            summary: "done".to_string(),
+            ..WorkerResult::default()
+        };
+        let err = validate_worker_result(&result, &slice("slice-001")).unwrap_err();
+        assert!(err.to_string().contains("missing acceptance evidence"));
+
+        let result = WorkerResult {
+            slice_id: "slice-001".to_string(),
+            status: "complete".to_string(),
+            summary: "done".to_string(),
+            acceptance_status: vec![AcceptanceEvidence {
+                criterion: "done".to_string(),
+                status: "satisfied".to_string(),
+                evidence: "implemented".to_string(),
+            }],
+            ..WorkerResult::default()
+        };
+        validate_worker_result(&result, &slice("slice-001")).unwrap();
     }
 
     #[test]
@@ -2536,6 +2822,23 @@ mod tests {
                 .exists()
         );
         assert!(store.output_path(&run.id, "final-report.json").exists());
+        assert!(store.output_path(&run.id, "economics.json").exists());
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.integration_repair.status, "skipped");
+        assert_eq!(summary.integration_repair.trigger, "gate_passed");
+        assert_eq!(summary.economics.repair_policy, "auto");
+        assert_eq!(summary.economics.repair_attempts, 0);
+        assert_eq!(summary.economics.agent_call_count, 2);
+        assert!(summary.economics.command_execution_count >= 2);
+        assert_eq!(summary.economics.duplicate_command_count, 0);
+        assert!(summary.economics.sla_violations.is_empty());
+        assert!(
+            summary
+                .completed_slices
+                .iter()
+                .all(|worker| !worker.acceptance_status.is_empty())
+        );
         gitutil::run(
             repo.path(),
             &[
@@ -2587,6 +2890,116 @@ mod tests {
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_always_reruns_gate_and_uses_cache_for_noop() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let config = WorkflowConfig {
+            integration_repair: "always".to_string(),
+            ..WorkflowConfig::default()
+        };
+        artifact::write_json(store.config_path(), &config)?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice and config"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.integration_repair.status, "no-op");
+        assert_eq!(
+            summary.integration_repair.trigger,
+            "policy_always_gate_passed"
+        );
+        assert_eq!(summary.integration_repair.attempts, 1);
+        assert!(summary.pre_repair_integration_gate.is_some());
+        assert_eq!(summary.integration_gate.status, "passed");
+        assert_eq!(summary.economics.repair_policy, "always");
+        assert_eq!(summary.economics.repair_attempts, 1);
+        assert!(summary.economics.cache_hits >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_never_preserves_failed_gate_evidence() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut config = WorkflowConfig {
+            integration_repair: "never".to_string(),
+            ..WorkflowConfig::default()
+        };
+        config.gate_fail_fast = true;
+        artifact::write_json(store.config_path(), &config)?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["git branch --show-current | grep /slice-001".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice and config"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Failed);
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.integration_repair.status, "skipped");
+        assert_eq!(
+            summary.integration_repair.trigger,
+            "policy_never_gate_failed"
+        );
+        assert_eq!(summary.integration_gate.status, "failed");
+        assert!(summary.pre_repair_integration_gate.is_none());
+        assert_eq!(summary.economics.repair_policy, "never");
+        assert_eq!(summary.economics.repair_attempts, 0);
+        assert!(
+            summary
+                .economics
+                .command_executions
+                .iter()
+                .any(|command| command.phase == "integration_gate" && command.status == "failed")
+        );
         Ok(())
     }
 
@@ -2713,6 +3126,8 @@ mod tests {
                 worker_attempt_timeout_seconds: 0,
                 worker_no_output_warning_seconds: 900,
                 worker_termination_grace_seconds: 30,
+                integration_repair: "auto".to_string(),
+                gate_fail_fast: true,
                 base_branch: String::new(),
                 handoff: Default::default(),
                 verify_profiles: profiles,
@@ -2903,6 +3318,7 @@ mod tests {
                 &["commit", "-m", &format!("implement {}", handoff.slice.id)],
             )?;
             let sha = gitutil::head_sha(&job.cwd)?;
+            let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
                 text: "{}".to_string(),
                 output: Some(json!({
@@ -2910,7 +3326,8 @@ mod tests {
                     "status": "complete",
                     "summary": "implemented",
                     "commit_sha": sha,
-                    "changed_files": [format!("{}.txt", handoff.slice.id)]
+                    "changed_files": [format!("{}.txt", handoff.slice.id)],
+                    "acceptance_status": acceptance_status
                 })),
                 usage: Usage::default(),
             })
@@ -2952,6 +3369,7 @@ mod tests {
                 &["commit", "-m", &format!("implement {}", handoff.slice.id)],
             )?;
             let sha = gitutil::head_sha(&job.cwd)?;
+            let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
                 text: "{}".to_string(),
                 output: Some(json!({
@@ -2959,7 +3377,8 @@ mod tests {
                     "status": "complete",
                     "summary": "implemented conflicting shared file",
                     "commit_sha": sha,
-                    "changed_files": ["shared.txt"]
+                    "changed_files": ["shared.txt"],
+                    "acceptance_status": acceptance_status
                 })),
                 usage: Usage::default(),
             })
@@ -2968,6 +3387,20 @@ mod tests {
         fn name(&self) -> &str {
             "conflict"
         }
+    }
+
+    fn acceptance_status_json(slice: &Slice) -> serde_json::Value {
+        json!(
+            slice
+                .acceptance
+                .iter()
+                .map(|criterion| json!({
+                    "criterion": criterion,
+                    "status": "satisfied",
+                    "evidence": format!("{} implemented", slice.id),
+                }))
+                .collect::<Vec<_>>()
+        )
     }
 
     fn handoff_path_from_prompt(prompt: &str) -> Result<String> {
