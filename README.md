@@ -150,6 +150,38 @@ Run the command above from the repo checkout; from elsewhere, use the absolute `
 
 Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. A Pi extension can be an optional adapter over the same daemon state, but it is not required and does not own core workflow state.
 
+### Optional Pi adapter
+
+This repository is also a Pi package. Its `package.json` declares the existing `khazad-doom` skill and an optional Pi extension at `extensions/khazad-monitor`.
+
+Enable it intentionally from a trusted checkout or package source; Khazad-Doom never writes Pi user settings automatically:
+
+```bash
+pi install /path/to/khazad-doom
+# or try for one Pi session:
+pi -e /path/to/khazad-doom
+```
+
+The extension registers `/khazad-monitor`:
+
+```text
+/khazad-monitor --latest [--repo /path/to/repo]
+/khazad-monitor --run <run-id>
+/khazad-monitor <run-id>
+```
+
+In Pi TUI mode it opens an overlay that polls `khazad-doom status` and renders run, progress, recent event, and output-tail fields from the daemon JSON. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
+
+To install only the skill without the optional extension, use Pi package filters in settings:
+
+```json
+{
+  "packages": [
+    { "source": "/path/to/khazad-doom", "extensions": [] }
+  ]
+}
+```
+
 ## Commands
 
 | Command | What it does |
