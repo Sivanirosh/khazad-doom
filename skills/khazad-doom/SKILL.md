@@ -45,6 +45,7 @@ khazad-doom daemon status
 ## Protocol
 
 - JSON Issue Slices in `.workflow/slices/*.json` are the machine source of truth.
+- `docs/workflow-invariants.md` records daemon workflow invariants that behavior-preserving refactors must keep stable.
 - `.workflow/khazad.json` carries repo defaults and verification profiles.
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
 - Worker output is JSON-only.
