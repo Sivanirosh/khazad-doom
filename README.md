@@ -177,7 +177,7 @@ The extension registers `/khazad-monitor`:
 /khazad-monitor <run-id>
 ```
 
-In Pi TUI mode it opens a centered, bordered activity-feed overlay that polls `khazad-doom status` and renders slice todos, current worker/shell progress, warnings, chronological daemon activity, and output-tail fields from the daemon JSON. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
+In Pi TUI mode it opens a centered, bordered activity-feed overlay that polls `khazad-doom status` and renders slice todos, current worker/shell progress, warnings, chronological daemon activity, and output-tail fields from the daemon JSON. When the feed is taller than the overlay, it shows a right-side scrollbar; use ↑/↓ or PgUp/PgDn to scroll. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
 
 To install only the skill without the optional extension, use Pi package filters in settings:
 

@@ -11,7 +11,8 @@
     "pi-extension"
   ],
   "scripts": {
-    "check:extension": "node --check extensions/khazad-monitor/index.js"
+    "check:extension": "node --check extensions/khazad-monitor/index.js",
+    "test:extension": "node --test tests/khazad-monitor-extension.test.mjs"
   },
   "pi": {
     "skills": [

@@ -7,6 +7,11 @@ const OUTPUT_TAIL_LINES = 4;
 const FEED_BLOCK_LIMIT = 7;
 const EVENT_TAIL_LINES = 6;
 const MAX_TODO_ITEMS = 8;
+const OVERLAY_WIDTH = 96;
+const OVERLAY_MIN_WIDTH = 64;
+const OVERLAY_MAX_HEIGHT = '86%';
+const OVERLAY_MAX_HEIGHT_PERCENT = 86;
+const OVERLAY_MARGIN = 1;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted']);
 
 function khazadMonitorExtension(pi) {
@@ -45,6 +50,7 @@ function khazadMonitorExtension(pi) {
 							pi,
 							config,
 							theme,
+							tui,
 							done,
 							requestRender: () => tui.requestRender(),
 						});
@@ -54,11 +60,11 @@ function khazadMonitorExtension(pi) {
 					{
 						overlay: true,
 						overlayOptions: {
-							width: 96,
-							minWidth: 64,
-							maxHeight: '86%',
+							width: OVERLAY_WIDTH,
+							minWidth: OVERLAY_MIN_WIDTH,
+							maxHeight: OVERLAY_MAX_HEIGHT,
 							anchor: 'center',
-							margin: 1,
+							margin: OVERLAY_MARGIN,
 						},
 					},
 				);
@@ -76,10 +82,11 @@ function khazadMonitorExtension(pi) {
 }
 
 class KhazadMonitorOverlay {
-	constructor({ pi, config, theme, done, requestRender }) {
+	constructor({ pi, config, theme, tui, done, requestRender }) {
 		this.pi = pi;
 		this.config = config;
 		this.theme = theme;
+		this.tui = tui;
 		this.done = done;
 		this.requestRender = requestRender;
 		this.timer = undefined;
@@ -90,6 +97,9 @@ class KhazadMonitorOverlay {
 		this.feedRunId = undefined;
 		this.feedEvents = [];
 		this.feedEventKeys = new Set();
+		this.scrollOffset = 0;
+		this.maxScrollOffset = 0;
+		this.scrollPageSize = 1;
 		this.state = {
 			loading: true,
 			details: undefined,
@@ -124,7 +134,24 @@ class KhazadMonitorOverlay {
 		}
 		if (data === 'r' || data === 'R') {
 			this.poll();
+			return;
 		}
+		const scroll = scrollInputAction(data, this.scrollPageSize);
+		if (scroll) {
+			this.applyScroll(scroll);
+		}
+	}
+
+	applyScroll(action) {
+		const previous = this.scrollOffset;
+		if (action === 'top') {
+			this.scrollOffset = 0;
+		} else if (action === 'bottom') {
+			this.scrollOffset = this.maxScrollOffset;
+		} else {
+			this.scrollOffset = clamp(this.scrollOffset + action, 0, this.maxScrollOffset);
+		}
+		if (this.scrollOffset !== previous) this.requestRender();
 	}
 
 	async poll() {
@@ -201,12 +228,40 @@ class KhazadMonitorOverlay {
 	render(width) {
 		const safeWidth = Math.max(28, width || 80);
 		const innerWidth = Math.max(1, safeWidth - 2);
-		const lines = [overlayTopBorder(this.theme, innerWidth, ' Khazad-Doom Monitor ')];
-		for (const line of this.snapshotLines()) {
-			lines.push(overlayLine(this.theme, line, innerWidth));
+		const maxLines = this.overlayMaxLines();
+		const top = overlayTopBorder(this.theme, innerWidth, ' Khazad-Doom Monitor ');
+		if (maxLines <= 1) return [top];
+
+		const bottom = overlayBottomBorder(this.theme, innerWidth);
+		const availableRows = Math.max(0, maxLines - 2);
+		const snapshot = this.snapshotLines();
+		const { body, footer } = splitFixedFooter(snapshot, availableRows);
+		const footerRows = footer.length;
+		const bodyRows = Math.max(0, availableRows - footerRows);
+		const needsScroll = bodyRows > 0 && body.length > bodyRows;
+		this.maxScrollOffset = needsScroll ? body.length - bodyRows : 0;
+		this.scrollOffset = clamp(this.scrollOffset, 0, this.maxScrollOffset);
+		this.scrollPageSize = Math.max(1, bodyRows - 1);
+
+		const visibleBody = bodyRows > 0 ? body.slice(this.scrollOffset, this.scrollOffset + bodyRows) : [];
+		const blankRows = needsScroll ? Math.max(0, availableRows - visibleBody.length - footer.length) : 0;
+		const visibleContent = footer.length
+			? [...visibleBody, ...Array(blankRows).fill(''), ...footer]
+			: [...visibleBody, ...Array(blankRows).fill('')];
+		const lines = [top];
+		for (let index = 0; index < visibleContent.length; index++) {
+			const scrollChar = needsScroll ? scrollbarChar(index, bodyRows, body.length, this.scrollOffset) : undefined;
+			lines.push(overlayLine(this.theme, visibleContent[index], innerWidth, scrollChar));
 		}
-		lines.push(overlayBottomBorder(this.theme, innerWidth));
+		lines.push(bottom);
 		return lines;
+	}
+
+	overlayMaxLines() {
+		const terminalRows = Number(this.tui && this.tui.terminal && this.tui.terminal.rows) || 24;
+		const available = Math.max(1, terminalRows - OVERLAY_MARGIN * 2);
+		const percentageMax = Math.max(1, Math.floor((terminalRows * OVERLAY_MAX_HEIGHT_PERCENT) / 100));
+		return Math.max(1, Math.min(available, percentageMax));
 	}
 
 	invalidate() {}
@@ -804,7 +859,7 @@ function eventKey(event) {
 function footerLine(theme, config, updatedAt) {
 	const updated = updatedAt ? `updated ${updatedAt.toLocaleTimeString()}` : 'waiting';
 	const scope = config.mode === 'run' ? `run ${config.runId}` : `latest ${shortPath(config.repo)}`;
-	return fg(theme, 'dim', `q/Esc detach • r refresh • ${updated} • ${scope}`);
+	return fg(theme, 'dim', `↑↓/Pg scroll • q/Esc detach • r refresh • ${updated} • ${scope}`);
 }
 
 function phaseLabel(phase) {
@@ -887,11 +942,51 @@ function overlayBottomBorder(theme, width) {
 	return border(theme, `╰${'─'.repeat(width)}╯`);
 }
 
-function overlayLine(theme, value, width) {
+function overlayLine(theme, value, width, scrollChar) {
 	const text = String(value || '');
+	const hasScrollColumn = scrollChar !== undefined;
+	const textWidth = hasScrollColumn ? Math.max(1, width - 1) : width;
 	const content = text ? ` ${text}` : '';
-	const padded = bg(theme, 'customMessageBg', padRight(truncatePlain(content, width), width));
+	const body = padRight(truncatePlain(content, textWidth), textWidth);
+	const bar = hasScrollColumn ? fg(theme, scrollChar === '┃' ? 'accent' : 'dim', scrollChar) : '';
+	const padded = bg(theme, 'customMessageBg', `${body}${bar}`);
 	return border(theme, '│') + padded + border(theme, '│');
+}
+
+function splitFixedFooter(lines, availableRows) {
+	const all = [...(lines || [])];
+	if (availableRows < 4 || all.length === 0) return { body: all, footer: [] };
+	let footerStart = all.length - 1;
+	if (footerStart > 0 && all[footerStart - 1] === '') footerStart--;
+	const footer = all.slice(footerStart);
+	if (footer.length >= availableRows) return { body: all, footer: [] };
+	return { body: all.slice(0, footerStart), footer };
+}
+
+function scrollbarChar(row, viewportRows, totalRows, offset) {
+	if (row >= viewportRows) return ' ';
+	if (viewportRows <= 0 || totalRows <= viewportRows) return ' ';
+	const thumbSize = Math.max(1, Math.floor((viewportRows * viewportRows) / totalRows));
+	const maxThumbTop = Math.max(0, viewportRows - thumbSize);
+	const maxOffset = Math.max(1, totalRows - viewportRows);
+	const thumbTop = Math.round((clamp(offset, 0, maxOffset) / maxOffset) * maxThumbTop);
+	return row >= thumbTop && row < thumbTop + thumbSize ? '┃' : '│';
+}
+
+function scrollInputAction(data, pageSize) {
+	const text = String(data || '');
+	const lowered = text.toLowerCase();
+	if (text === '\x1b[A' || lowered === 'up' || lowered === 'arrowup' || text === 'k') return -1;
+	if (text === '\x1b[B' || lowered === 'down' || lowered === 'arrowdown' || text === 'j') return 1;
+	if (text === '\x1b[5~' || lowered === 'pageup' || lowered === 'page-up') return -Math.max(1, pageSize || 1);
+	if (text === '\x1b[6~' || lowered === 'pagedown' || lowered === 'page-down') return Math.max(1, pageSize || 1);
+	if (text === '\x1b[H' || text === '\x1bOH' || text === '\x1b[1~' || lowered === 'home') return 'top';
+	if (text === '\x1b[F' || text === '\x1bOF' || text === '\x1b[4~' || lowered === 'end') return 'bottom';
+	return undefined;
+}
+
+function clamp(value, min, max) {
+	return Math.max(min, Math.min(max, Number(value) || 0));
 }
 
 function border(theme, text) {
@@ -1151,3 +1246,9 @@ function padRight(value, width) {
 
 module.exports = khazadMonitorExtension;
 module.exports.default = khazadMonitorExtension;
+module.exports._test = {
+	KhazadMonitorOverlay,
+	scrollInputAction,
+	scrollbarChar,
+	splitFixedFooter,
+};
