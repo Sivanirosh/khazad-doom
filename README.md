@@ -126,6 +126,8 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Conflict artifacts | Merge conflicts become structured blocked reports, not half-merged chaos. |
 | Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
 
+Behavior-preserving refactor guardrails are collected in [`docs/workflow-invariants.md`](docs/workflow-invariants.md).
+
 ## Live progress
 
 The recommended harness-neutral live progress path is an always-on monitor:
