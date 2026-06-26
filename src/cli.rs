@@ -3,7 +3,7 @@ use crate::artifact;
 use crate::daemon::{Client, Server};
 use crate::domain::{
     BranchHandoff, Event, RunDetails, RunInspection, RunStatus, SliceStatus, SliceValidationReport,
-    SliceWriteResult,
+    SliceWriteResult, WorkerAttemptProgress,
 };
 use crate::ipc::{
     CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
@@ -855,6 +855,10 @@ fn print_watch_snapshot(details: &RunDetails) {
         println!("Elapsed: {}", format_duration(elapsed));
         println!("Updated: {}", progress.updated_at);
         println!("Message: {}", progress.message);
+        if let Some(worker) = &progress.worker {
+            let mut out = io::stdout();
+            let _ = render_worker_attempt(&mut out, worker);
+        }
         if !progress.output_tail.trim().is_empty() {
             println!("Last output:");
             for line in progress
@@ -960,6 +964,9 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
         "Message: {}",
         truncate_display(&message, MONITOR_LINE_WIDTH)
     )?;
+    if let Some(worker) = progress.and_then(|progress| progress.worker.as_ref()) {
+        render_worker_attempt(out, worker)?;
+    }
     writeln!(out, "Recent events:")?;
     render_event_tail(out, &details.events)?;
     writeln!(out, "Output tail:")?;
@@ -970,6 +977,118 @@ fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> 
             .unwrap_or_default(),
     )?;
     Ok(())
+}
+
+fn render_worker_attempt(out: &mut impl Write, worker: &WorkerAttemptProgress) -> Result<()> {
+    writeln!(out, "Supervisor: {}", supervisor_label(worker))?;
+    writeln!(out, "Worker process: {}", worker_process_label(worker))?;
+    writeln!(
+        out,
+        "Worker runtime: {}",
+        since_time(worker.attempt_started_at)
+    )?;
+    writeln!(
+        out,
+        "Last worker event: {}",
+        last_worker_event_label(worker)
+    )?;
+    writeln!(
+        out,
+        "Last semantic progress: {}",
+        worker
+            .last_semantic_progress_at
+            .map(since_time)
+            .unwrap_or_else(|| "unknown".to_string())
+    )?;
+    writeln!(out, "Timeout: {}", timeout_label(worker))?;
+    if let Some(warning) = worker_quiet_warning(worker) {
+        writeln!(out, "Warning: {warning}")?;
+        writeln!(out, "Hint: wait, inspect, or cancel")?;
+    }
+    Ok(())
+}
+
+fn supervisor_label(worker: &WorkerAttemptProgress) -> String {
+    match worker.process_observed_at {
+        Some(observed_at) => format!("alive, observed child {} ago", since_time(observed_at)),
+        None => "starting, no child observation yet".to_string(),
+    }
+}
+
+fn worker_process_label(worker: &WorkerAttemptProgress) -> String {
+    match worker.pid {
+        Some(pid) => format!("running pid={pid}"),
+        None => "running".to_string(),
+    }
+}
+
+fn last_worker_event_label(worker: &WorkerAttemptProgress) -> String {
+    match worker.last_event_at {
+        Some(last_event_at) if worker.last_event_kind.trim().is_empty() => {
+            format!("{} ago", since_time(last_event_at))
+        }
+        Some(last_event_at) => format!(
+            "{} ago ({})",
+            since_time(last_event_at),
+            worker.last_event_kind
+        ),
+        None => "none".to_string(),
+    }
+}
+
+fn timeout_label(worker: &WorkerAttemptProgress) -> String {
+    if worker.attempt_timeout_seconds == 0 {
+        return "disabled".to_string();
+    }
+    let elapsed = Utc::now()
+        .signed_duration_since(worker.attempt_started_at)
+        .to_std()
+        .unwrap_or_default();
+    let timeout = Duration::from_secs(worker.attempt_timeout_seconds);
+    if elapsed >= timeout {
+        return format!(
+            "{}s, exceeded by {}",
+            worker.attempt_timeout_seconds,
+            format_duration(elapsed.saturating_sub(timeout))
+        );
+    }
+    format!(
+        "{}s, remaining {}",
+        worker.attempt_timeout_seconds,
+        format_duration(timeout.saturating_sub(elapsed))
+    )
+}
+
+fn worker_quiet_warning(worker: &WorkerAttemptProgress) -> Option<String> {
+    if worker.no_output_warning_seconds == 0 {
+        return None;
+    }
+    let reference = worker.last_event_at.unwrap_or(worker.attempt_started_at);
+    let quiet_for = Utc::now()
+        .signed_duration_since(reference)
+        .to_std()
+        .unwrap_or_default();
+    if quiet_for < Duration::from_secs(worker.no_output_warning_seconds) {
+        return None;
+    }
+    let timeout_suffix = if worker.attempt_timeout_seconds == 0 {
+        "; no timeout configured"
+    } else {
+        ""
+    };
+    Some(format!(
+        "worker is quiet for {}; this may be normal{}",
+        format_duration(quiet_for),
+        timeout_suffix
+    ))
+}
+
+fn since_time(time: chrono::DateTime<Utc>) -> String {
+    let duration = Utc::now()
+        .signed_duration_since(time)
+        .to_std()
+        .unwrap_or_default();
+    format_duration(duration)
 }
 
 fn render_event_tail(out: &mut impl Write, events: &[Event]) -> Result<()> {

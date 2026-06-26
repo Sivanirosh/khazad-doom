@@ -1,0 +1,39 @@
+{
+  "id": "slice-037",
+  "title": "Worker attempt supervision",
+  "goal": "Expose daemon-owned worker attempt supervision that distinguishes process liveness from worker output activity, warns on quiet workers without treating silence as failure by default, and keeps any fatal worker timeout explicit.",
+  "depends_on": [
+    "slice-036"
+  ],
+  "areas": [
+    "src/agent.rs",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/workflow/manager.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "README.md",
+    "skills/khazad-doom/SKILL.md",
+    "extensions/khazad-monitor/index.js"
+  ],
+  "acceptance": [
+    "Run progress includes structured worker attempt supervision for active slice and integration repair workers: attempt start, child PID when available, last child observation, last stdout/stderr/JSON worker event, semantic progress placeholder, configured attempt timeout, and quiet-output warning threshold.",
+    "Pi runner supervision updates are durable daemon state and survive outer CLI/Pi tool watcher timeouts; status/watch/monitor read the same state without owning run lifetime.",
+    "Monitor/watch output clearly separates supervisor liveness from worker output activity and can show quiet-worker warnings while saying silence may be normal.",
+    "Missing worker output is not failure by default; worker_attempt_timeout_seconds=0 disables fatal timeout and remains the default.",
+    "Any nonzero worker attempt timeout is explicit repo/operator policy, separate from global run lifetime, and timed-out attempts preserve normal retry/attempt history.",
+    "Cancellation/timeout termination attempts graceful stop before force kill using the configured worker termination grace period.",
+    "Tests cover a quiet Pi-compatible worker so status/monitor expose supervision fields and warning text before the run completes.",
+    "The optional Pi monitor overlay renders the same worker supervision fields from daemon status JSON when present."
+  ],
+  "must_ask_if": [
+    "The implementation would add a hidden global workflow timeout.",
+    "The implementation would treat missing worker output as failure by default.",
+    "The implementation would auto-retry lost/stale work without preserving attempt history or at-least-once semantics."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 120
+}

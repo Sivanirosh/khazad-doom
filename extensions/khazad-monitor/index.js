@@ -496,6 +496,7 @@ function runDetailsLines(details) {
 		`  Elapsed: ${formatElapsed(elapsedStart)}`,
 		`  Updated: ${updated}`,
 		`  Message: ${valueOrDash(message)}`,
+		...workerLines(progress && progress.worker),
 		'',
 		'Recent events:',
 		...eventLines(details.events || []),
@@ -504,6 +505,57 @@ function runDetailsLines(details) {
 		...outputTailLines(progress && progress.output_tail ? progress.output_tail : ''),
 	];
 	return lines;
+}
+
+function workerLines(worker) {
+	if (!worker) return [];
+	const lines = [
+		`  Supervisor: ${supervisorLabel(worker)}`,
+		`  Worker process: ${worker.pid ? `running pid=${worker.pid}` : 'running'}`,
+		`  Worker runtime: ${formatElapsed(worker.attempt_started_at)}`,
+		`  Last worker event: ${lastWorkerEventLabel(worker)}`,
+		`  Last semantic progress: ${worker.last_semantic_progress_at ? formatElapsed(worker.last_semantic_progress_at) : 'unknown'}`,
+		`  Timeout: ${workerTimeoutLabel(worker)}`,
+	];
+	const warning = workerQuietWarning(worker);
+	if (warning) {
+		lines.push(`  Warning: ${warning}`);
+		lines.push('  Hint: wait, inspect, or cancel');
+	}
+	return lines;
+}
+
+function supervisorLabel(worker) {
+	return worker.process_observed_at ? `alive, observed child ${formatElapsed(worker.process_observed_at)} ago` : 'starting, no child observation yet';
+}
+
+function lastWorkerEventLabel(worker) {
+	if (!worker.last_event_at) return 'none';
+	const kind = worker.last_event_kind ? ` (${worker.last_event_kind})` : '';
+	return `${formatElapsed(worker.last_event_at)} ago${kind}`;
+}
+
+function workerTimeoutLabel(worker) {
+	const timeoutSeconds = Number(worker.attempt_timeout_seconds || 0);
+	if (!timeoutSeconds) return 'disabled';
+	const startedAt = Date.parse(worker.attempt_started_at || '');
+	if (!Number.isFinite(startedAt)) return `${timeoutSeconds}s`;
+	const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+	if (elapsedSeconds >= timeoutSeconds) {
+		return `${timeoutSeconds}s, exceeded by ${formatDurationSeconds(elapsedSeconds - timeoutSeconds)}`;
+	}
+	return `${timeoutSeconds}s, remaining ${formatDurationSeconds(timeoutSeconds - elapsedSeconds)}`;
+}
+
+function workerQuietWarning(worker) {
+	const warningSeconds = Number(worker.no_output_warning_seconds || 0);
+	if (!warningSeconds) return '';
+	const reference = Date.parse(worker.last_event_at || worker.attempt_started_at || '');
+	if (!Number.isFinite(reference)) return '';
+	const quietSeconds = Math.max(0, Math.floor((Date.now() - reference) / 1000));
+	if (quietSeconds < warningSeconds) return '';
+	const suffix = Number(worker.attempt_timeout_seconds || 0) === 0 ? '; no timeout configured' : '';
+	return `worker is quiet for ${formatDurationSeconds(quietSeconds)}; this may be normal${suffix}`;
 }
 
 function waitingLines(repo) {
@@ -584,10 +636,14 @@ function formatElapsed(start) {
 	if (!start) return '-';
 	const startedAt = Date.parse(start);
 	if (!Number.isFinite(startedAt)) return '-';
-	const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-	const hours = Math.floor(seconds / 3600);
-	const minutes = Math.floor((seconds % 3600) / 60);
-	const rest = seconds % 60;
+	return formatDurationSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+}
+
+function formatDurationSeconds(seconds) {
+	const safeSeconds = Math.max(0, Number(seconds) || 0);
+	const hours = Math.floor(safeSeconds / 3600);
+	const minutes = Math.floor((safeSeconds % 3600) / 60);
+	const rest = safeSeconds % 60;
 	if (hours > 0) return `${hours}h ${minutes}m ${rest}s`;
 	if (minutes > 0) return `${minutes}m ${rest}s`;
 	return `${rest}s`;

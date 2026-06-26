@@ -150,6 +150,21 @@ Run the command above from the repo checkout; from elsewhere, use the absolute `
 
 Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. A Pi extension can be an optional adapter over the same daemon state, but it is not required and does not own core workflow state.
 
+During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity:
+
+```text
+Supervisor: alive, observed child 8s ago
+Worker process: running pid=12345
+Worker runtime: 22m14s
+Last worker event: none
+Last semantic progress: unknown
+Timeout: disabled
+Warning: worker is quiet for 15m00s; this may be normal; no timeout configured
+Hint: wait, inspect, or cancel
+```
+
+A quiet worker is not considered failed by default. Khazad-Doom reports that the daemon is still supervising the process, shows when stdout/stderr/JSON events last arrived, and leaves the wait/inspect/cancel decision explicit unless a repo config opts into a worker-attempt timeout.
+
 ### Optional Pi adapter
 
 This repository is also a Pi package. Its `package.json` declares the existing `khazad-doom` skill and an optional Pi extension at `extensions/khazad-monitor`.
@@ -232,6 +247,9 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
   "agent": "pi",
   "parallelism": 1,
   "verify_timeout_seconds": 600,
+  "worker_attempt_timeout_seconds": 0,
+  "worker_no_output_warning_seconds": 900,
+  "worker_termination_grace_seconds": 30,
   "handoff": { "push": false, "create_pr": false },
   "verify_profiles": {
     "quick": {
@@ -247,6 +265,14 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts.
 
 Khazad-Doom does not use a hidden global workflow timeout. Runs are daemon-owned and may outlive the CLI or Pi tool call that started them. Timeouts are explicit guardrails for individual verification/gate commands so hung shell commands do not stall a run forever.
+
+Worker supervision has separate knobs:
+
+- `worker_attempt_timeout_seconds`: explicit per-worker-attempt cap. `0` disables fatal timeout, which is the default.
+- `worker_no_output_warning_seconds`: advisory quiet-worker warning threshold for monitor/watch/status. Missing output alone is not failure.
+- `worker_termination_grace_seconds`: grace period used when Khazad-Doom asks a Pi worker process to stop before force-kill escalation.
+
+Retries preserve attempt history and should be treated as at-least-once execution, not exactly-once continuation.
 
 ## Files and state
 

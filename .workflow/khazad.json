@@ -2,6 +2,9 @@
   "agent": "pi",
   "parallelism": 1,
   "verify_timeout_seconds": 600,
+  "worker_attempt_timeout_seconds": 0,
+  "worker_no_output_warning_seconds": 900,
+  "worker_termination_grace_seconds": 30,
   "handoff": {
     "push": false,
     "create_pr": false

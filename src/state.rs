@@ -1,4 +1,6 @@
-use crate::domain::{Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus};
+use crate::domain::{
+    Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptProgress,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -160,6 +162,49 @@ impl Store {
             );
             "#,
         )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_attempt_started_at",
+            "worker_attempt_started_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(&conn, "run_progress", "worker_pid", "worker_pid INTEGER")?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_process_observed_at",
+            "worker_process_observed_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_last_event_at",
+            "worker_last_event_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_last_event_kind",
+            "worker_last_event_kind TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_last_semantic_progress_at",
+            "worker_last_semantic_progress_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_attempt_timeout_seconds",
+            "worker_attempt_timeout_seconds INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_no_output_warning_seconds",
+            "worker_no_output_warning_seconds INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -313,8 +358,11 @@ impl Store {
         };
         conn.execute(
             r#"INSERT INTO run_progress
-               (run_id, phase, slice_id, attempt, command, message, output_tail, phase_started_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (run_id, phase, slice_id, attempt, command, message, output_tail, phase_started_at,
+                updated_at, worker_attempt_started_at, worker_pid, worker_process_observed_at,
+                worker_last_event_at, worker_last_event_kind, worker_last_semantic_progress_at,
+                worker_attempt_timeout_seconds, worker_no_output_warning_seconds)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', NULL, '', '', '', '', 0, 0)
                ON CONFLICT(run_id) DO UPDATE SET
                  phase=excluded.phase,
                  slice_id=excluded.slice_id,
@@ -323,7 +371,15 @@ impl Store {
                  message=excluded.message,
                  output_tail=excluded.output_tail,
                  phase_started_at=excluded.phase_started_at,
-                 updated_at=excluded.updated_at"#,
+                 updated_at=excluded.updated_at,
+                 worker_attempt_started_at=excluded.worker_attempt_started_at,
+                 worker_pid=excluded.worker_pid,
+                 worker_process_observed_at=excluded.worker_process_observed_at,
+                 worker_last_event_at=excluded.worker_last_event_at,
+                 worker_last_event_kind=excluded.worker_last_event_kind,
+                 worker_last_semantic_progress_at=excluded.worker_last_semantic_progress_at,
+                 worker_attempt_timeout_seconds=excluded.worker_attempt_timeout_seconds,
+                 worker_no_output_warning_seconds=excluded.worker_no_output_warning_seconds"#,
             params![
                 run_id,
                 phase,
@@ -346,7 +402,65 @@ impl Store {
             output_tail: output_tail.to_string(),
             phase_started_at: parse_time("phase_started_at", &phase_started_at)?,
             updated_at: now,
+            worker: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_worker_attempt(
+        &self,
+        run_id: &str,
+        phase: &str,
+        slice_id: &str,
+        attempt: usize,
+        pid: Option<u32>,
+        event_kind: &str,
+        attempt_timeout_seconds: u64,
+        no_output_warning_seconds: u64,
+    ) -> Result<Option<RunProgress>> {
+        let conn = self.conn()?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let is_process_observation = matches!(event_kind, "started" | "process_observed");
+        let is_worker_event = matches!(event_kind, "stdout" | "stderr");
+        conn.execute(
+            r#"UPDATE run_progress SET
+                 updated_at=?1,
+                 worker_attempt_started_at=CASE
+                   WHEN worker_attempt_started_at='' THEN ?1
+                   ELSE worker_attempt_started_at
+                 END,
+                 worker_pid=COALESCE(?2, worker_pid),
+                 worker_process_observed_at=CASE
+                   WHEN ?3 THEN ?1
+                   ELSE worker_process_observed_at
+                 END,
+                 worker_last_event_at=CASE
+                   WHEN ?4 THEN ?1
+                   ELSE worker_last_event_at
+                 END,
+                 worker_last_event_kind=CASE
+                   WHEN ?4 THEN ?5
+                   ELSE worker_last_event_kind
+                 END,
+                 worker_attempt_timeout_seconds=?6,
+                 worker_no_output_warning_seconds=?7
+               WHERE run_id=?8 AND phase=?9 AND slice_id=?10 AND attempt=?11"#,
+            params![
+                now_text,
+                pid.map(|pid| pid as i64),
+                is_process_observation,
+                is_worker_event,
+                event_kind,
+                attempt_timeout_seconds as i64,
+                no_output_warning_seconds as i64,
+                run_id,
+                phase,
+                slice_id,
+                attempt as i64,
+            ],
+        )?;
+        self.get_progress(run_id)
     }
 
     pub fn get_progress(&self, run_id: &str) -> Result<Option<RunProgress>> {
@@ -354,7 +468,10 @@ impl Store {
         let row = conn
             .query_row(
                 r#"SELECT run_id, phase, slice_id, attempt, command, message, output_tail,
-                          phase_started_at, updated_at
+                          phase_started_at, updated_at, worker_attempt_started_at, worker_pid,
+                          worker_process_observed_at, worker_last_event_at, worker_last_event_kind,
+                          worker_last_semantic_progress_at, worker_attempt_timeout_seconds,
+                          worker_no_output_warning_seconds
                    FROM run_progress WHERE run_id=?1"#,
                 params![run_id],
                 run_progress_tuple_from_row,
@@ -526,6 +643,18 @@ impl Store {
     }
 }
 
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+    Ok(())
+}
+
 type RunTuple = (
     String,
     String,
@@ -552,6 +681,14 @@ type RunProgressTuple = (
     String,
     String,
     String,
+    String,
+    Option<i64>,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
 );
 
 fn run_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunTuple> {
@@ -603,6 +740,14 @@ fn run_progress_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunP
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
     ))
 }
 
@@ -671,7 +816,38 @@ fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
         output_tail,
         phase_started_at,
         updated_at,
+        worker_attempt_started_at,
+        worker_pid,
+        worker_process_observed_at,
+        worker_last_event_at,
+        worker_last_event_kind,
+        worker_last_semantic_progress_at,
+        worker_attempt_timeout_seconds,
+        worker_no_output_warning_seconds,
     ) = row;
+    let worker = if worker_attempt_started_at.trim().is_empty() {
+        None
+    } else {
+        Some(WorkerAttemptProgress {
+            attempt_started_at: parse_time(
+                "worker_attempt_started_at",
+                &worker_attempt_started_at,
+            )?,
+            pid: worker_pid.and_then(|pid| u32::try_from(pid).ok()),
+            process_observed_at: parse_optional_time(
+                "worker_process_observed_at",
+                &worker_process_observed_at,
+            )?,
+            last_event_at: parse_optional_time("worker_last_event_at", &worker_last_event_at)?,
+            last_event_kind: worker_last_event_kind,
+            last_semantic_progress_at: parse_optional_time(
+                "worker_last_semantic_progress_at",
+                &worker_last_semantic_progress_at,
+            )?,
+            attempt_timeout_seconds: worker_attempt_timeout_seconds as u64,
+            no_output_warning_seconds: worker_no_output_warning_seconds as u64,
+        })
+    };
     Ok(RunProgress {
         run_id,
         phase,
@@ -682,6 +858,7 @@ fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
         output_tail,
         phase_started_at: parse_time("phase_started_at", &phase_started_at)?,
         updated_at: parse_time("updated_at", &updated_at)?,
+        worker,
     })
 }
 
@@ -689,6 +866,13 @@ fn parse_time(field: &str, value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("parse {field}: {value:?}"))?
         .with_timezone(&Utc))
+}
+
+fn parse_optional_time(field: &str, value: &str) -> Result<Option<DateTime<Utc>>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_time(field, value).map(Some)
 }
 
 #[cfg(test)]

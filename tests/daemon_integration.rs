@@ -366,6 +366,84 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
 }
 
 #[test]
+fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_quiet_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    fs::write(
+        repo.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "pi",
+                "parallelism": 1,
+                "verify_timeout_seconds": 600,
+                "worker_attempt_timeout_seconds": 0,
+                "worker_no_output_warning_seconds": 1,
+                "worker_termination_grace_seconds": 1
+            }))?
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Quiet pi worker slice",
+            "goal": "Use a quiet pi-compatible worker long enough for supervisor status to be visible.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["test -f slice-001.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add quiet worker slice"])?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &["run", "--repo", path(repo.path()), "--agent", "pi", "--all"],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let status = wait_for_worker_supervision(&bin, home.path(), &run_id)?;
+    assert_eq!(status["progress"]["phase"], "worker_running");
+    assert_eq!(status["progress"]["worker"]["attempt_timeout_seconds"], 0);
+    assert!(status["progress"]["worker"]["process_observed_at"].is_string());
+    assert!(status["progress"]["worker"]["pid"].is_number());
+
+    let monitored = wait_for_monitor_text(
+        &bin,
+        home.path(),
+        &run_id,
+        &[
+            "Supervisor: alive, observed child",
+            "Worker process: running pid=",
+            "Last worker event: none",
+            "Last semantic progress: unknown",
+            "Timeout: disabled",
+            "Warning: worker is quiet",
+            "Hint: wait, inspect, or cancel",
+        ],
+    )?;
+    assert!(monitored.contains(&format!("Run: {run_id}")));
+
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -770,6 +848,63 @@ fn wait_for_progress_output(
     }
 }
 
+fn wait_for_worker_supervision(bin: &Path, home: &Path, run_id: &str) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&output)?;
+        if value["progress"]["phase"].as_str() == Some("worker_running")
+            && value["progress"]["worker"]["process_observed_at"].is_string()
+        {
+            return Ok(value);
+        }
+        if matches!(
+            value["run"]["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled" | "interrupted" | "completed")
+        ) {
+            panic!("run reached terminal state before worker supervision was visible: {value:#}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for worker supervision"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_monitor_text(
+    bin: &Path,
+    home: &Path,
+    run_id: &str,
+    wanted: &[&str],
+) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(
+            bin,
+            home,
+            &["monitor", "--run", run_id, "--once", "--interval-ms", "100"],
+        )?;
+        let text = String::from_utf8(output.stdout)?;
+        if wanted.iter().all(|needle| text.contains(needle)) {
+            return Ok(text);
+        }
+        let status = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&status)?;
+        if matches!(
+            value["run"]["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled" | "interrupted" | "completed")
+        ) {
+            panic!("run reached terminal state before monitor text was visible: {text}\n{value:#}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for monitor text; last output:\n{text}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn kill_daemon(home: &Path) -> TestResult {
     let pid = fs::read_to_string(home.join("daemon.pid"))?
         .trim()
@@ -809,6 +944,78 @@ JSON
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms)?;
     Ok(())
+}
+
+fn write_quiet_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import time
+
+prompt = sys.stdin.read()
+handoff_path = ""
+lines = prompt.splitlines()
+for index, line in enumerate(lines):
+    if line.strip() == "Read this handoff JSON first:" and index + 1 < len(lines):
+        handoff_path = lines[index + 1].strip()
+        break
+if not handoff_path:
+    result = {"status": "no-op", "summary": "quiet fake pi: no repair needed"}
+    event = {
+        "type": "agent_end",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": json.dumps(result)}],
+            }
+        ],
+    }
+    print(json.dumps(event), flush=True)
+    sys.exit(0)
+with open(handoff_path, encoding="utf-8") as fh:
+    handoff = json.load(fh)
+slice_id = handoff["slice"]["id"]
+time.sleep(float(os.environ.get("FAKE_PI_SLEEP", "4")))
+with open(f"{slice_id}.txt", "w", encoding="utf-8") as fh:
+    fh.write(f"quiet fake pi implementation for {slice_id}\n")
+subprocess.run(["git", "add", "."], check=True)
+subprocess.run(
+    ["git", "commit", "-m", f"fake pi implement {slice_id}"],
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+result = {
+    "slice_id": slice_id,
+    "status": "complete",
+    "summary": "quiet fake pi completed deterministic slice implementation",
+    "commit_sha": sha,
+    "changed_files": [f"{slice_id}.txt"],
+    "tests_run": handoff["slice"].get("verify", []),
+}
+event = {
+    "type": "agent_end",
+    "messages": [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": json.dumps(result)}],
+        }
+    ],
+}
+print(json.dumps(event), flush=True)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
 }
 
 fn prepend_path(dir: &Path) -> String {

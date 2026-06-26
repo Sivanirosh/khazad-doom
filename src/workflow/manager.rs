@@ -1,5 +1,7 @@
 use super::{REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, integration_repair_prompt, worker_prompt};
-use crate::agent::{CancellationToken, Job, Runner, RunnerSpec, runner_from_spec};
+use crate::agent::{
+    CancellationToken, Job, Runner, RunnerEvent, RunnerEventSink, RunnerSpec, runner_from_spec,
+};
 use crate::artifact;
 use crate::domain::{
     BranchHandoff, CheckResult, Finding, GateCommandResult, GateResult, Handoff,
@@ -24,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -91,6 +93,47 @@ enum IntegrationMode {
     Existing,
 }
 
+struct IntegrationRepairContext<'a> {
+    run: &'a Run,
+    slices: &'a [Slice],
+    integration_worktree: &'a Path,
+    checks: &'a [CheckResult],
+    cancel: &'a CancellationToken,
+    runner: Arc<dyn Runner>,
+    config: &'a WorkflowConfig,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerAttemptContext {
+    run_id: String,
+    phase: String,
+    slice_id: String,
+    attempt: usize,
+    timeout_seconds: u64,
+    no_output_warning_seconds: u64,
+    termination_grace_seconds: u64,
+}
+
+impl WorkerAttemptContext {
+    fn new(
+        run_id: &str,
+        phase: &str,
+        slice_id: &str,
+        attempt: usize,
+        config: &WorkflowConfig,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            phase: phase.to_string(),
+            slice_id: slice_id.to_string(),
+            attempt,
+            timeout_seconds: config.worker_attempt_timeout_seconds,
+            no_output_warning_seconds: config.worker_no_output_warning_seconds,
+            termination_grace_seconds: config.worker_termination_grace_seconds,
+        }
+    }
+}
+
 impl Manager {
     pub fn new(paths: Paths, state: StateStore) -> Self {
         Self {
@@ -147,6 +190,87 @@ impl Manager {
         Arc::new(move |output_tail| {
             reporter.update_output_tail(&scope, &output_tail);
         })
+    }
+
+    fn worker_event_sink(&self, context: &WorkerAttemptContext) -> RunnerEventSink {
+        let state = self.state.clone();
+        let context = context.clone();
+        Arc::new(move |event: RunnerEvent| {
+            let _ = state.observe_worker_attempt(
+                &context.run_id,
+                &context.phase,
+                &context.slice_id,
+                context.attempt,
+                event.pid,
+                event.kind.as_str(),
+                context.timeout_seconds,
+                context.no_output_warning_seconds,
+            );
+        })
+    }
+
+    fn run_supervised_worker_job(
+        &self,
+        runner: Arc<dyn Runner>,
+        mut job: Job,
+        cancel: &CancellationToken,
+        context: WorkerAttemptContext,
+    ) -> Result<crate::agent::ResultData> {
+        job.termination_grace_seconds = context.termination_grace_seconds;
+        let events = Some(self.worker_event_sink(&context));
+        if context.timeout_seconds == 0 {
+            return runner.run(job, cancel.clone(), events);
+        }
+
+        let attempt_cancel = CancellationToken::new();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let parent_cancel = cancel.clone();
+        let timeout = Duration::from_secs(context.timeout_seconds);
+        let timeout_cancel = attempt_cancel.clone();
+        let timeout_flag = timed_out.clone();
+        let done_flag = done.clone();
+        let supervisor = thread::spawn(move || {
+            let started = Instant::now();
+            loop {
+                if done_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                if parent_cancel.is_cancelled() {
+                    timeout_cancel.cancel();
+                    return;
+                }
+                if started.elapsed() >= timeout {
+                    timeout_flag.store(true, Ordering::SeqCst);
+                    timeout_cancel.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let result = runner.run(job, attempt_cancel, events);
+        done.store(true, Ordering::SeqCst);
+        let _ = supervisor.join();
+        if timed_out.load(Ordering::SeqCst) {
+            let message = format!(
+                "worker attempt {} exceeded worker_attempt_timeout_seconds={}",
+                context.attempt, context.timeout_seconds
+            );
+            self.state.record_event(
+                &context.run_id,
+                "worker_attempt_timeout",
+                &json!({
+                    "phase": context.phase,
+                    "slice_id": context.slice_id,
+                    "attempt": context.attempt,
+                    "timeout_seconds": context.timeout_seconds,
+                    "message": message,
+                }),
+            )?;
+            bail!(message);
+        }
+        result
     }
 
     fn ensure_repo_run_available(&self, repo_id: &str, allowed_run_id: Option<&str>) -> Result<()> {
@@ -850,14 +974,15 @@ impl Manager {
             "",
             "checking whether integration repair is needed",
         );
-        let repair = self.integration_repair(
+        let repair = self.integration_repair(IntegrationRepairContext {
             run,
-            gate_slices,
-            &integration_worktree,
-            &checks,
+            slices: gate_slices,
+            integration_worktree: &integration_worktree,
+            checks: &checks,
             cancel,
-            runner.clone(),
-        )?;
+            runner: runner.clone(),
+            config: &config,
+        })?;
         check_cancelled(cancel)?;
         self.mark_progress(
             &run.id,
@@ -1082,14 +1207,17 @@ impl Manager {
                 runner.name(),
                 "slice worker is running",
             );
-            let result = match runner.run(
+            let result = match self.run_supervised_worker_job(
+                runner.clone(),
                 Job {
                     kind: "slice-worker".to_string(),
                     prompt,
                     cwd: worker_worktree.clone(),
                     json_schema: WORKER_RESULT_SCHEMA.to_string(),
+                    termination_grace_seconds: 0,
                 },
-                cancel.clone(),
+                cancel,
+                WorkerAttemptContext::new(&run.id, "worker_running", &slice.id, attempt, config),
             ) {
                 Ok(result) => result,
                 Err(err) => {
@@ -1364,17 +1492,15 @@ impl Manager {
         Ok(check)
     }
 
-    fn integration_repair(
-        &self,
-        run: &Run,
-        slices: &[Slice],
-        integration_worktree: &Path,
-        checks: &[CheckResult],
-        cancel: &CancellationToken,
-        runner: Arc<dyn Runner>,
-    ) -> Result<RepairResult> {
+    fn integration_repair(&self, context: IntegrationRepairContext<'_>) -> Result<RepairResult> {
+        let run = context.run;
+        let slices = context.slices;
+        let integration_worktree = context.integration_worktree;
+        let cancel = context.cancel;
+        let runner = context.runner;
+        let config = context.config;
         let check_summary =
-            serde_json::to_string_pretty(checks).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_string_pretty(context.checks).unwrap_or_else(|_| "[]".to_string());
         let mut last_error = String::new();
         for attempt in 1..=MAX_REPAIR_ATTEMPTS {
             check_cancelled(cancel)?;
@@ -1392,14 +1518,17 @@ impl Manager {
                 slices,
                 &check_summary,
             );
-            let agent_result = match runner.run(
+            let agent_result = match self.run_supervised_worker_job(
+                runner.clone(),
                 Job {
                     kind: "integration-repair".to_string(),
                     prompt,
                     cwd: integration_worktree.to_path_buf(),
                     json_schema: REPAIR_RESULT_SCHEMA.to_string(),
+                    termination_grace_seconds: 0,
                 },
-                cancel.clone(),
+                cancel,
+                WorkerAttemptContext::new(&run.id, "integration_repair", "", attempt, config),
             ) {
                 Ok(result) => result,
                 Err(err) => {
@@ -2338,7 +2467,7 @@ mod tests {
         Manager, PROGRESS_OUTPUT_TAIL_BYTES, ShellProgress, StartOptions, run_shell_command,
         validate_repair_result, validate_worker_result,
     };
-    use crate::agent::{CancellationToken, Job, ResultData, Runner, Usage};
+    use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         Handoff, RepairResult, Run, RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand,
@@ -2704,6 +2833,9 @@ mod tests {
                 agent: "fake".to_string(),
                 parallelism: 1,
                 verify_timeout_seconds: 30,
+                worker_attempt_timeout_seconds: 0,
+                worker_no_output_warning_seconds: 900,
+                worker_termination_grace_seconds: 30,
                 base_branch: String::new(),
                 handoff: Default::default(),
                 verify_profiles: profiles,
@@ -2866,7 +2998,12 @@ mod tests {
     struct FakeRunner;
 
     impl Runner for FakeRunner {
-        fn run(&self, job: Job, cancel: CancellationToken) -> Result<ResultData> {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
             if cancel.is_cancelled() {
                 anyhow::bail!("cancelled");
             }
@@ -2910,7 +3047,12 @@ mod tests {
     struct ConflictRunner;
 
     impl Runner for ConflictRunner {
-        fn run(&self, job: Job, cancel: CancellationToken) -> Result<ResultData> {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
             if cancel.is_cancelled() {
                 anyhow::bail!("cancelled");
             }

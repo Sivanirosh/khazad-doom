@@ -34,6 +34,12 @@ pub struct WorkflowConfig {
     pub parallelism: usize,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub verify_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub worker_attempt_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub worker_no_output_warning_seconds: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub worker_termination_grace_seconds: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_branch: String,
     #[serde(default, skip_serializing_if = "HandoffDefaults::is_empty")]
@@ -48,6 +54,9 @@ impl Default for WorkflowConfig {
             agent: "pi".to_string(),
             parallelism: 1,
             verify_timeout_seconds: 600,
+            worker_attempt_timeout_seconds: 0,
+            worker_no_output_warning_seconds: 900,
+            worker_termination_grace_seconds: 30,
             base_branch: String::new(),
             handoff: HandoffDefaults::default(),
             verify_profiles: BTreeMap::new(),
@@ -358,6 +367,27 @@ pub struct RunProgress {
     pub output_tail: String,
     pub phase_started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerAttemptProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAttemptProgress {
+    pub attempt_started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_observed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_event_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_semantic_progress_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub attempt_timeout_seconds: u64,
+    #[serde(default)]
+    pub no_output_warning_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

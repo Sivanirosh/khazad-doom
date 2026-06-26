@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
@@ -34,6 +34,84 @@ impl CancellationToken {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerEventKind {
+    Started,
+    ProcessObserved,
+    Stdout,
+    Stderr,
+    Finished,
+}
+
+impl RunnerEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::ProcessObserved => "process_observed",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Finished => "finished",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerEvent {
+    pub kind: RunnerEventKind,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+}
+
+impl RunnerEvent {
+    pub fn started(pid: Option<u32>) -> Self {
+        Self {
+            kind: RunnerEventKind::Started,
+            pid,
+            exit_code: None,
+        }
+    }
+
+    pub fn process_observed(pid: Option<u32>) -> Self {
+        Self {
+            kind: RunnerEventKind::ProcessObserved,
+            pid,
+            exit_code: None,
+        }
+    }
+
+    pub fn stdout(pid: Option<u32>) -> Self {
+        Self {
+            kind: RunnerEventKind::Stdout,
+            pid,
+            exit_code: None,
+        }
+    }
+
+    pub fn stderr(pid: Option<u32>) -> Self {
+        Self {
+            kind: RunnerEventKind::Stderr,
+            pid,
+            exit_code: None,
+        }
+    }
+
+    pub fn finished(pid: Option<u32>, exit_code: Option<i32>) -> Self {
+        Self {
+            kind: RunnerEventKind::Finished,
+            pid,
+            exit_code,
+        }
+    }
+}
+
+pub type RunnerEventSink = Arc<dyn Fn(RunnerEvent) + Send + Sync + 'static>;
+
+fn emit_runner_event(sink: &Option<RunnerEventSink>, event: RunnerEvent) {
+    if let Some(sink) = sink {
+        sink(event);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     #[allow(dead_code)]
@@ -41,6 +119,7 @@ pub struct Job {
     pub prompt: String,
     pub cwd: PathBuf,
     pub json_schema: String,
+    pub termination_grace_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +141,12 @@ pub struct Usage {
 
 #[allow(dead_code)]
 pub trait Runner: Send + Sync {
-    fn run(&self, job: Job, cancel: CancellationToken) -> Result<ResultData>;
+    fn run(
+        &self,
+        job: Job,
+        cancel: CancellationToken,
+        events: Option<RunnerEventSink>,
+    ) -> Result<ResultData>;
     fn name(&self) -> &str;
 }
 
@@ -132,7 +216,12 @@ pub struct PiRunner {
 }
 
 impl Runner for PiRunner {
-    fn run(&self, job: Job, cancel: CancellationToken) -> Result<ResultData> {
+    fn run(
+        &self,
+        job: Job,
+        cancel: CancellationToken,
+        events: Option<RunnerEventSink>,
+    ) -> Result<ResultData> {
         if cancel.is_cancelled() {
             bail!("job cancelled");
         }
@@ -150,6 +239,8 @@ impl Runner for PiRunner {
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().with_context(|| format!("start {bin}"))?;
+        let pid = child.id();
+        emit_runner_event(&events, RunnerEvent::started(Some(pid)));
 
         {
             let mut stdin = child.stdin.take().context("pi stdin")?;
@@ -157,30 +248,45 @@ impl Runner for PiRunner {
         }
 
         let stderr = child.stderr.take().context("pi stderr")?;
+        let stderr_events = events.clone();
         let stderr_thread = thread::spawn(move || {
-            let mut stderr = stderr;
+            let reader = BufReader::new(stderr);
             let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                emit_runner_event(&stderr_events, RunnerEvent::stderr(Some(pid)));
+                buf.push_str(&line);
+                buf.push('\n');
+            }
             buf
         });
 
         let stdout = child.stdout.take().context("pi stdout")?;
+        let stdout_events = events.clone();
         let parser_thread = thread::spawn(move || {
             let mut parser = PiParser::default();
-            parser.parse(stdout)?;
+            parser.parse(stdout, stdout_events, Some(pid))?;
             Ok::<PiParser, anyhow::Error>(parser)
         });
 
+        let mut next_observation = Instant::now();
         let status = loop {
             if cancel.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(
+                    &mut child,
+                    Duration::from_secs(job.termination_grace_seconds),
+                );
                 let _ = parser_thread.join();
                 let _ = stderr_thread.join();
                 bail!("job cancelled");
             }
             if let Some(status) = child.try_wait()? {
+                emit_runner_event(&events, RunnerEvent::finished(Some(pid), status.code()));
                 break status;
+            }
+            if Instant::now() >= next_observation {
+                emit_runner_event(&events, RunnerEvent::process_observed(Some(pid)));
+                next_observation = Instant::now() + Duration::from_secs(1);
             }
             thread::sleep(Duration::from_millis(50));
         };
@@ -218,15 +324,51 @@ impl Runner for PiRunner {
     }
 }
 
+fn terminate_child(child: &mut std::process::Child, grace: Duration) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if grace.as_millis() > 0 {
+        request_child_terminate(child.id());
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn request_child_terminate(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn request_child_terminate(_pid: u32) {}
+
 #[derive(Debug, Clone)]
 pub struct FakeRunner;
 
 impl Runner for FakeRunner {
-    fn run(&self, job: Job, cancel: CancellationToken) -> Result<ResultData> {
+    fn run(
+        &self,
+        job: Job,
+        cancel: CancellationToken,
+        events: Option<RunnerEventSink>,
+    ) -> Result<ResultData> {
         if cancel.is_cancelled() {
             bail!("job cancelled");
         }
+        emit_runner_event(&events, RunnerEvent::started(None));
+        emit_runner_event(&events, RunnerEvent::process_observed(None));
         if job.kind == "integration-repair" {
+            emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
             return Ok(ResultData {
                 text: "{}".to_string(),
                 output: Some(
@@ -261,6 +403,7 @@ impl Runner for FakeRunner {
             ],
         )?;
         let sha = gitutil::head_sha(&job.cwd)?;
+        emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
         Ok(ResultData {
             text: "{}".to_string(),
             output: Some(json!({
@@ -331,10 +474,16 @@ struct PiParser {
 }
 
 impl PiParser {
-    fn parse(&mut self, stdout: impl Read) -> Result<()> {
+    fn parse(
+        &mut self,
+        stdout: impl Read,
+        events: Option<RunnerEventSink>,
+        pid: Option<u32>,
+    ) -> Result<()> {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let line = line?;
+            emit_runner_event(&events, RunnerEvent::stdout(pid));
             if line.trim().is_empty() {
                 continue;
             }

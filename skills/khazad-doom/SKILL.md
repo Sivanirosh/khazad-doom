@@ -63,5 +63,8 @@ khazad-doom daemon status
 - If the optional Pi package extension is installed, `/khazad-monitor --latest` or `/khazad-monitor --run <run-id>` may open a Pi TUI overlay over the same `status` JSON. Closing it with `q` or `Esc` only detaches the overlay; never treat it as run cancellation.
 - Do not require the Pi extension for non-Pi harnesses or core monitoring; keep `khazad-doom monitor --repo . --latest` as the harness-neutral path and `watch`/`status` as fallbacks.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
+- Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
+- Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.
+- `worker_attempt_timeout_seconds: 0` means no fatal worker-attempt timeout. Any nonzero worker attempt timeout is an explicit repo/operator policy, separate from run lifetime.
 
 If a run blocks with an `ask-user` finding, relay the blocker to the user with exact details and ask for a decision before resuming.
