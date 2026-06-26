@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/khazad-doom-pixel.svg" width="760" alt="Pixel art parody: a JSON wizard says You shall not slop to a fiery slop daemon on a bridge">
+  <img src="assets/khazad-doom-banner.png" width="960" alt="Khazad-Doom banner: a JSON wizard blocks a fiery slope daemon on a lava bridge">
 </p>
 
 <h1 align="center">Khazad-Doom</h1>
 
 <p align="center">
-  <em>You shall not slop.</em>
+  <em>Guard the schema. Block the slope. Ship with proof.</em>
 </p>
 
 <p align="center">
@@ -19,13 +19,29 @@
 
 Agent work goes downhill quietly: one vague instruction becomes six unrelated edits, a dirty worktree, and a victory paragraph where proof should be.
 
-Khazad-Doom is the bridge guard for that moment: **You shall not slop!**
+Khazad-Doom is the bridge guard for that moment: **you shall not slop.**
 
 It makes the contract explicit before the agent starts. A **JSON Issue Slice** says what is authorized, what must be verified, and when the worker must stop and ask. The daemon runs that slice in an isolated worktree, demands a commit and JSON result, gates integration, and leaves a PR-ready handoff instead of vibes.
 
-## The idea
+## What Khazad-Doom is
 
-A normal agent prompt is soft. Khazad-Doom makes it hard:
+Khazad-Doom is a local Rust CLI and daemon for turning agentic coding work into bounded, reviewable units.
+
+It does not try to be the agent. It is the foreman around the agent:
+
+- **plan in JSON** so scope is explicit and diffable
+- **run in worktrees** so each worker is isolated
+- **verify before merge** so done means proven
+- **checkpoint progress** so interrupted runs can resume cleanly
+- **handoff with commands** so pushing and PR creation stay intentional
+
+The agent writes code. Khazad-Doom decides what counts as done.
+
+## The operating model
+
+A normal prompt is soft: it can drift, reinterpret itself, and declare victory without evidence.
+
+Khazad-Doom makes the work hard-edged:
 
 ```text
 JSON Issue Slice
@@ -36,34 +52,40 @@ one isolated worktree per slice
       ↓
 JSON-only worker result + committed branch
       ↓
-verification + integration repair + gate
+verification + serial integration gate
       ↓
-final report + handoff commands
+final report + explicit handoff commands
 ```
 
-The agent writes code. The daemon decides what counts as done.
+That loop is the point. Every slice should leave behind a cleaner branch, a clearer report, and a smaller mystery for the next person or agent.
 
-## Before / after
+## Quick start
 
-Without Khazad-Doom:
+Install from a checkout:
 
-```text
-"Implement this issue"
-      ↓
-chat transcript
-      ↓
-unclear scope, unclear status, unclear proof
+```bash
+cargo install --path .
 ```
 
-With Khazad-Doom:
+Initialize a repository and run one slice:
 
-```text
+```bash
+khazad-doom init
+khazad-doom slices new \
+  --id slice-001 \
+  --title "Add retry policy" \
+  --goal "Add bounded retries for transient job failures" \
+  --verify "cargo test"
+khazad-doom slices validate
 khazad-doom run --slice slice-001 --wait
-      ↓
-clean branch, structured result, verification output, final report
+khazad-doom handoff --run <run-id>
 ```
 
-No vague victory laps. No hidden scope creep. No unreviewable agent sludge.
+For a deterministic smoke test that does not invoke Pi:
+
+```bash
+khazad-doom run --agent fake --all --wait
+```
 
 ## Issue Slices
 
@@ -95,84 +117,42 @@ An Issue Slice is the smallest unit of work Khazad-Doom will hand to an agent. I
 
 The JSON wins over chat. `must_ask_if` is the line where the worker must stop and ask instead of guessing.
 
-## What Khazad-Doom guarantees
+## What the gate enforces
 
-- **Bounded work** — each worker receives exactly one slice.
-- **Isolation** — each slice runs in its own git worktree and branch.
-- **Structured output** — worker and repair results must be JSON.
-- **Committed handoff** — completed slice work must be committed with a clean worktree.
-- **Verification** — slice `verify` commands run before merge and again through the integration gate.
-- **Dependency order** — requested slices automatically include their dependencies.
-- **Parallel workers** — independent slices can run concurrently, then merge serially.
-- **Repo/run locking** — one active run per repository prevents branch/worktree collisions.
-- **Config defaults** — `.workflow/khazad.json` can set agent, parallelism, base branch, handoff, and verification profiles.
-- **Timeout policy** — slice and profile verification commands have bounded runtime.
-- **Durable checkpoints** — completed merges write checkpoints; `resume` continues remaining work explicitly.
-- **Conflict artifacts** — merge conflicts become structured blocked reports instead of half-merged chaos.
-- **No surprise PRs** — handoff prints commands by default and only pushes/creates PRs with explicit flags.
-
-## Install
-
-From a checkout:
-
-```bash
-cargo install --path .
-```
-
-Or install into a local prefix:
-
-```bash
-PREFIX="$HOME/.local" scripts/install.sh
-```
-
-Package a local release tarball:
-
-```bash
-scripts/package.sh
-```
-
-## Quick start
-
-Inside a git repository:
-
-```bash
-khazad-doom init
-khazad-doom slices new --id slice-001 --title "Add retry policy" --goal "Add bounded retries" --verify "cargo test"
-khazad-doom slices validate
-khazad-doom slices schema --write
-khazad-doom run --slice slice-001 --wait
-khazad-doom status --run <run-id>
-khazad-doom handoff --run <run-id>
-```
-
-For a deterministic smoke test that does not invoke Pi:
-
-```bash
-khazad-doom run --agent fake --all --wait
-```
+| Guarantee | Why it matters |
+|---|---|
+| Bounded work | Each worker receives exactly one slice and its declared context. |
+| Dependency order | Requested slices automatically include dependencies and reject cycles. |
+| Worktree isolation | Parallel workers cannot trample the same checkout. |
+| Structured output | Worker and repair results must be machine-readable JSON. |
+| Committed handoff | Completed slice work must be committed with a clean worktree. |
+| Verification | Slice commands and profile commands run before integration completes. |
+| Durable checkpoints | `resume` continues remaining work from recorded state instead of pretending nothing happened. |
+| Conflict artifacts | Merge conflicts become structured blocked reports, not half-merged chaos. |
+| Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `khazad-doom init` | Create `.workflow/` and register the repo. |
-| `khazad-doom slices validate` | Validate slice JSON, IDs, dependencies, and cycles. |
-| `khazad-doom slices list` | Print compact slice summaries. |
 | `khazad-doom slices new ...` | Generate a JSON Issue Slice template. |
 | `khazad-doom slices import-github --issue <url>` | Import a GitHub issue via `gh issue view`. |
 | `khazad-doom slices import-github --issue <url> --dry-run` | Preview generated slice JSON without writing. |
-| `khazad-doom slices schema --write` | Print/write the JSON Schema for slice files. |
+| `khazad-doom slices validate` | Validate slice JSON, IDs, dependencies, and cycles. |
+| `khazad-doom slices list` | Print compact slice summaries. |
+| `khazad-doom slices schema --write` | Write the JSON Schema for editor and CI validation. |
 | `khazad-doom run --slice <id>` | Run one slice plus its dependencies. |
 | `khazad-doom run --all --parallel <n>` | Run all slices; independent workers may run concurrently. |
-| `khazad-doom resume --run <id>` | Continue an interrupted/failed/cancelled run from checkpoint. |
+| `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, and events. |
+| `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
 | `khazad-doom handoff --run <id>` | Print push/PR handoff JSON for a completed run. |
-| `khazad-doom handoff --run <id> --dry-run` | Suppress configured push/PR defaults and print diagnostics only. |
 | `khazad-doom handoff --run <id> --push --create-pr` | Explicitly push and open a PR with `gh`. |
-| `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom daemon start` | Start the local daemon. |
+| `khazad-doom daemon status` | Show daemon process/status information. |
 | `khazad-doom daemon stop` | Stop the daemon when no runs are active. |
 
 ## Runners
@@ -225,7 +205,7 @@ A slice can reference `"verify_profile": "quick"` and still add inline `verify` 
 | `~/.khazad-doom/state.sqlite` | Run, slice, and event state. |
 | `~/.khazad-doom/worktrees/` | Daemon-managed temporary worktrees. |
 
-If the daemon starts and finds active runs from a previous process, it marks them `interrupted`, records recovery events, and cleans daemon worktrees where possible. `khazad-doom resume --run <id>` is explicit: it reuses the integration branch and checkpoint state for remaining slices. It does not pretend a crashed worker survived.
+If the daemon starts and finds active runs from a previous process, it marks them `interrupted`, records recovery events, and cleans daemon worktrees where possible. `khazad-doom resume --run <id>` is explicit: it reuses the integration branch and checkpoint state for remaining slices.
 
 ## Handoff
 
@@ -255,12 +235,18 @@ Run the daemon path through the fake runner:
 cargo test --test daemon_integration
 ```
 
+Package a local release tarball:
+
+```bash
+scripts/package.sh
+```
+
 Create a release by pushing a `v*` tag. CI builds the package tarball, writes `SHA256SUMS`, and attaches both to the GitHub release.
 
 ## FAQ
 
 **Is Khazad-Doom an agent?**
-No. It is the foreman. It gives agents bounded work, checks the result, and records evidence.
+No. It is the foreman around an agent. It gives agents bounded work, checks the result, and records evidence.
 
 **Why JSON?**
 Because prose is where scope creep hides. JSON is compact, diffable, validatable, and explicit.
