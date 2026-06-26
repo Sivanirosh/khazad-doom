@@ -9,10 +9,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/rust-2024-111111?style=flat-square" alt="Rust 2024">
-  <img src="https://img.shields.io/badge/workflow-JSON%20Issue%20Slices-111111?style=flat-square" alt="JSON Issue Slices">
-  <img src="https://img.shields.io/badge/daemon-local-111111?style=flat-square" alt="Local daemon">
-  <img src="https://img.shields.io/badge/license-MIT-111111?style=flat-square" alt="MIT license">
+  <img src="https://img.shields.io/badge/rust%20edition-2024-b7410e?style=flat-square" alt="Rust edition 2024">
+  <img src="https://img.shields.io/badge/workflow-JSON%20Issue%20Slices-2563eb?style=flat-square" alt="Workflow: JSON Issue Slices">
+  <img src="https://img.shields.io/badge/isolation-git%20worktrees-7c3aed?style=flat-square" alt="Isolation: git worktrees">
+  <img src="https://img.shields.io/badge/verification-gated%20handoffs-059669?style=flat-square" alt="Verification: gated handoffs">
+  <img src="https://img.shields.io/badge/license-MIT-64748b?style=flat-square" alt="License: MIT">
 </p>
 
 ---
