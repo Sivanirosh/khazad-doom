@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
-use crate::state::{Repo, Store as StateStore};
+use crate::state::{ProgressReporter, ProgressScope, Repo, Store as StateStore};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rand::RngCore;
@@ -115,7 +115,10 @@ impl Manager {
         self.active.count()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn progress_reporter(&self, run_id: &str) -> ProgressReporter {
+        ProgressReporter::new(self.state.clone(), run_id)
+    }
+
     fn mark_progress(
         &self,
         run_id: &str,
@@ -124,22 +127,12 @@ impl Manager {
         attempt: usize,
         command: &str,
         message: &str,
-        output_tail: &str,
     ) {
-        if let Ok(progress) = self.state.update_progress(
-            run_id,
-            phase,
-            slice_id,
-            attempt,
-            command,
-            message,
-            output_tail,
-        ) {
-            let _ = self.state.record_event(run_id, "progress", &progress);
-        }
+        self.progress_reporter(run_id).mark(&ProgressScope::new(
+            phase, slice_id, attempt, command, message,
+        ));
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn shell_progress_sink(
         &self,
         run_id: &str,
@@ -149,22 +142,10 @@ impl Manager {
         command: &str,
         message: &str,
     ) -> ShellProgress {
-        let state = self.state.clone();
-        let run_id = run_id.to_string();
-        let phase = phase.to_string();
-        let slice_id = slice_id.to_string();
-        let command = command.to_string();
-        let message = message.to_string();
+        let reporter = self.progress_reporter(run_id);
+        let scope = ProgressScope::new(phase, slice_id, attempt, command, message);
         Arc::new(move |output_tail| {
-            let _ = state.update_progress(
-                &run_id,
-                &phase,
-                &slice_id,
-                attempt,
-                &command,
-                &message,
-                &output_tail,
-            );
+            reporter.update_output_tail(&scope, &output_tail);
         })
     }
 
@@ -357,7 +338,7 @@ impl Manager {
             "run_started",
             &json!({ "run": run, "selected_slices": selected_ids, "agent": runner.name() }),
         )?;
-        self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon", "");
+        self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
 
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
@@ -461,7 +442,7 @@ impl Manager {
             "run_resumed",
             &json!({ "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>() }),
         )?;
-        self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon", "");
+        self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let config = store.read_config()?;
         let runner = if let Some(runner) = &self.runner_override {
             runner.clone()
@@ -705,7 +686,6 @@ impl Manager {
                     0,
                     "",
                     "run completed; handoff artifacts are ready",
-                    "",
                 );
                 let _ =
                     self.state
@@ -717,7 +697,7 @@ impl Manager {
                 let message = err.to_string();
                 if status == RunStatus::Cancelled {
                     let _ = self.state.cancel_active_slice_runs(&run.id, &message);
-                    self.mark_progress(&run.id, "cancelled", "", 0, "", &message, "");
+                    self.mark_progress(&run.id, "cancelled", "", 0, "", &message);
                     let _ = self.state.record_event(
                         &run.id,
                         "run_cancelled",
@@ -729,7 +709,7 @@ impl Manager {
                     } else {
                         "failed"
                     };
-                    self.mark_progress(&run.id, phase, "", 0, "", &message, "");
+                    self.mark_progress(&run.id, phase, "", 0, "", &message);
                     let _ =
                         self.state
                             .record_event(&run.id, "run_error", &json!({ "error": message }));
@@ -766,7 +746,6 @@ impl Manager {
             0,
             "",
             "creating integration worktree",
-            "",
         );
         match integration_mode {
             IntegrationMode::Fresh => gitutil::worktree_add(
@@ -818,7 +797,6 @@ impl Manager {
                     worker.attempts,
                     "git merge",
                     "merging slice branch into integration branch",
-                    "",
                 );
                 if let Err(err) = gitutil::merge(
                     &integration_worktree,
@@ -871,7 +849,6 @@ impl Manager {
             0,
             "",
             "checking whether integration repair is needed",
-            "",
         );
         let repair = self.integration_repair(
             run,
@@ -889,7 +866,6 @@ impl Manager {
             0,
             "",
             "running integration gate commands",
-            "",
         );
         let gate =
             self.integration_gate(run, gate_slices, &integration_worktree, cancel, &config)?;
@@ -1074,7 +1050,6 @@ impl Manager {
             0,
             "",
             "slice worker started",
-            "",
         );
 
         let mut all_checks = Vec::new();
@@ -1106,7 +1081,6 @@ impl Manager {
                 attempt,
                 runner.name(),
                 "slice worker is running",
-                "",
             );
             let result = match runner.run(
                 Job {
@@ -1180,7 +1154,6 @@ impl Manager {
                     attempt,
                     "",
                     "slice passed worker checks and is ready to merge",
-                    "",
                 );
                 self.state.upsert_slice_run(&SliceRun {
                     run_id: run.id.clone(),
@@ -1327,7 +1300,6 @@ impl Manager {
                 ctx.attempt,
                 &command.command,
                 "running slice verification command",
-                "",
             );
             let progress = self.shell_progress_sink(
                 ctx.run_id,
@@ -1413,7 +1385,6 @@ impl Manager {
                 attempt,
                 runner.name(),
                 "integration repair worker is running",
-                "",
             );
             let prompt = integration_repair_prompt(
                 &run.id,
@@ -1542,7 +1513,6 @@ impl Manager {
                 0,
                 &command.command,
                 "running integration gate command",
-                "",
             );
             let progress = self.shell_progress_sink(
                 &run.id,
@@ -2052,55 +2022,99 @@ fn run_shell_command(
     let mut child = process.spawn()?;
     let stdout = child.stdout.take().context("command stdout")?;
     let stderr = child.stderr.take().context("command stderr")?;
-    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-    let combined_tail = Arc::new(Mutex::new(Vec::new()));
-    let stdout_thread = spawn_output_reader(
-        stdout,
-        stdout_buf.clone(),
-        combined_tail.clone(),
-        progress.clone(),
-    );
-    let stderr_thread = spawn_output_reader(
-        stderr,
-        stderr_buf.clone(),
-        combined_tail.clone(),
-        progress.clone(),
-    );
+    let monitor = ShellCommandMonitor::spawn(stdout, stderr, progress);
 
     let started_at = Instant::now();
     let mut last_heartbeat = Instant::now();
     let status = loop {
         if cancel.is_cancelled() {
             terminate_process_group(&mut child);
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            let _ = monitor.finish();
             return Err(CancelledError::new("run cancelled").into());
         }
         if !timeout.is_zero() && started_at.elapsed() >= timeout {
             terminate_process_group(&mut child);
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            let _ = monitor.finish();
             bail!("command timed out after {} seconds", timeout.as_secs());
         }
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if last_heartbeat.elapsed() >= Duration::from_secs(5) {
-            if let Some(progress) = &progress {
-                progress(tail_text(&combined_tail));
-            }
+            monitor.emit_progress();
             last_heartbeat = Instant::now();
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
+    let (stdout, stderr) = monitor.finish();
     Ok(Output {
         status,
-        stdout: stdout_buf.lock().expect("stdout mutex poisoned").clone(),
-        stderr: stderr_buf.lock().expect("stderr mutex poisoned").clone(),
+        stdout,
+        stderr,
     })
+}
+
+struct ShellCommandMonitor {
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    combined_tail: Arc<Mutex<Vec<u8>>>,
+    progress: Option<ShellProgress>,
+    stdout_thread: thread::JoinHandle<()>,
+    stderr_thread: thread::JoinHandle<()>,
+}
+
+impl ShellCommandMonitor {
+    fn spawn(
+        stdout: impl Read + Send + 'static,
+        stderr: impl Read + Send + 'static,
+        progress: Option<ShellProgress>,
+    ) -> Self {
+        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let combined_tail = Arc::new(Mutex::new(Vec::new()));
+        let stdout_thread = spawn_output_reader(
+            stdout,
+            stdout_buf.clone(),
+            combined_tail.clone(),
+            progress.clone(),
+        );
+        let stderr_thread = spawn_output_reader(
+            stderr,
+            stderr_buf.clone(),
+            combined_tail.clone(),
+            progress.clone(),
+        );
+        Self {
+            stdout_buf,
+            stderr_buf,
+            combined_tail,
+            progress,
+            stdout_thread,
+            stderr_thread,
+        }
+    }
+
+    fn emit_progress(&self) {
+        if let Some(progress) = &self.progress {
+            progress(tail_text(&self.combined_tail));
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, Vec<u8>) {
+        let Self {
+            stdout_buf,
+            stderr_buf,
+            stdout_thread,
+            stderr_thread,
+            ..
+        } = self;
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+        (
+            stdout_buf.lock().expect("stdout mutex poisoned").clone(),
+            stderr_buf.lock().expect("stderr mutex poisoned").clone(),
+        )
+    }
 }
 
 fn spawn_output_reader<R: Read + Send + 'static>(
@@ -2321,7 +2335,8 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Manager, StartOptions, run_shell_command, validate_repair_result, validate_worker_result,
+        Manager, PROGRESS_OUTPUT_TAIL_BYTES, ShellProgress, StartOptions, run_shell_command,
+        validate_repair_result, validate_worker_result,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
@@ -2338,7 +2353,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2425,6 +2440,50 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("run cancelled"));
         assert!(started.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[test]
+    fn shell_command_progress_is_bounded_and_preserves_streams() -> Result<()> {
+        let cancel = CancellationToken::new();
+        let tails = Arc::new(Mutex::new(Vec::new()));
+        let observed_tails = tails.clone();
+        let progress: ShellProgress = Arc::new(move |tail| {
+            observed_tails
+                .lock()
+                .expect("progress tails mutex poisoned")
+                .push(tail);
+        });
+
+        let output = run_shell_command(
+            Path::new("."),
+            "printf '%05000d' 0 | tr '0' 'o'; printf 'err-line\\n' >&2",
+            &cancel,
+            Duration::from_secs(5),
+            &BTreeMap::new(),
+            Some(progress),
+        )?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 5000);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err-line\n");
+        let tails = tails.lock().expect("progress tails mutex poisoned");
+        assert!(
+            !tails.is_empty(),
+            "progress sink should receive output tails"
+        );
+        assert!(
+            tails
+                .iter()
+                .all(|tail| tail.len() <= PROGRESS_OUTPUT_TAIL_BYTES),
+            "progress tails should stay bounded: {tails:#?}"
+        );
+        assert!(
+            tails
+                .iter()
+                .any(|tail| tail.contains("err-line") || tail.contains('o')),
+            "progress should include streamed stdout or stderr: {tails:#?}"
+        );
         Ok(())
     }
 
