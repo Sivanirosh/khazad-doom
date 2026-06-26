@@ -1,0 +1,28 @@
+{
+  "id": "slice-038",
+  "title": "Document workflow invariants",
+  "goal": "Capture the daemon workflow invariants that must remain stable during v0.1.0 release-polish refactors, especially run lifetime, slice ordering, worker attempts, cancellation, progress, artifacts, and release gates.",
+  "areas": [
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Add a concise docs/workflow-invariants.md that records the behavior-preserving invariants for daemon-owned runs before extracting workflow seams.",
+    "Document run lifetime versus Pi/tool/session lifetime, including the rule that no hidden global workflow timeout exists by default.",
+    "Document slice lifecycle invariants: dependency order, worker worktrees, worker commits before merge, serial integration merges, checkpoints after successful merges, and repair-before-gate behavior.",
+    "Document worker attempt supervision invariants: attempt history, at-least-once semantics, process liveness distinct from output activity, quiet-worker warnings as advisory, and explicit attempt timeout policy.",
+    "Document cancellation, verification/gate timeouts, progress/status/monitor state ownership, artifact/handoff behavior, and release/tag safety in terms future refactors can test against.",
+    "Link the invariants document from user-facing or contributor-facing docs without changing CLI/daemon behavior."
+  ],
+  "must_ask_if": [
+    "The implementation would change any CLI, daemon status JSON, monitor, handoff, or artifact contract.",
+    "The implementation would add or imply a hidden global workflow timeout.",
+    "The implementation would weaken the rule that handoff does not mutate remotes unless explicitly requested."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 120
+}

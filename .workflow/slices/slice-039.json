@@ -1,0 +1,35 @@
+{
+  "id": "slice-039",
+  "title": "Extract integration gate seam",
+  "goal": "Perform the first behavior-preserving workflow manager seam extraction by moving integration gate and shell command execution responsibilities behind a compact, deep interface without broad mechanical splitting.",
+  "depends_on": [
+    "slice-038"
+  ],
+  "areas": [
+    "src/workflow/manager.rs",
+    "src/workflow/mod.rs",
+    "src/workflow/gate.rs",
+    "src/workflow/shell.rs",
+    "src/domain.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Extract integration gate and shell command execution into one or more workflow modules with a compact API that returns typed results and does not expose Manager internals or create callback-heavy shallow modules.",
+    "Preserve all existing gate and shell-command behavior: cwd/env handling, sh -c execution, output tailing, cancellation checks, timeout handling, process-group cleanup, progress reporting, command result artifacts, and error text semantics.",
+    "Manager orchestration remains responsible for lifecycle ordering, retries, repair decisions, checkpointing, and state transitions; the new seam owns command/gate execution details only.",
+    "No public CLI contract, daemon IPC contract, status JSON shape, monitor rendering, slice schema, handoff format, or repo config semantics change as part of this refactor.",
+    "Tests are added or adjusted where needed so the extracted seam is covered for success, failure, timeout, and cancellation-sensitive behavior without relying only on full daemon happy paths.",
+    "docs/workflow-invariants.md is kept accurate after the extraction, especially the integration repair-before-gate and verification timeout invariants."
+  ],
+  "must_ask_if": [
+    "The implementation would change public JSON/string contracts rather than preserving them through wrappers or adapters.",
+    "The implementation would introduce a new global workflow timeout, change default worker timeout behavior, or make quiet output terminal by default.",
+    "The implementation would require broad unrelated splits of workflow::manager beyond the integration gate/shell seam."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 120
+}
