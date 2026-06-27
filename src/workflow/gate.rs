@@ -1,5 +1,5 @@
 use super::economics::RunEconomicsRecorder;
-use super::shell::{ShellCommand, ShellProgress};
+use super::shell::{ShellCommand, ShellCommandError, ShellProgress};
 use super::{CancelledError, check_cancelled};
 use crate::agent::CancellationToken;
 use crate::domain::{
@@ -69,18 +69,10 @@ impl WorkflowGate {
                 cancel,
             )?;
             if outcome.result.status != "passed" {
-                let summary = if outcome.result.exit_code.is_some() {
-                    format!(
-                        "verify command failed: {}\n{}",
-                        command.command, outcome.result.output
-                    )
-                } else {
-                    format!(
-                        "verify command failed or timed out: {}: {}",
-                        command.command, outcome.result.output
-                    )
-                };
-                result.failure = Some(SliceVerificationFailure::auto_fix(summary));
+                result.failure = Some(SliceVerificationFailure::from_command_result(
+                    &command.command,
+                    &outcome.result,
+                ));
                 return Ok(result);
             }
         }
@@ -132,17 +124,14 @@ impl WorkflowGate {
                 findings.push(Finding {
                     id: String::new(),
                     severity: "error".to_string(),
-                    action: "auto-fix".to_string(),
+                    action: finding_action_for_failure_kind(&outcome.result.failure_kind)
+                        .to_string(),
                     file: String::new(),
                     line: 0,
-                    description: if outcome.result.exit_code.is_some() {
-                        format!("integration gate failed: {}", command.command)
-                    } else {
-                        format!(
-                            "integration gate command failed to start or timed out: {}: {}",
-                            command.command, outcome.result.output
-                        )
-                    },
+                    description: integration_gate_failure_description(
+                        &command.command,
+                        &outcome.result,
+                    ),
                 });
             }
             results.push(outcome.result);
@@ -164,15 +153,46 @@ impl WorkflowGate {
         request: VerifyCommandExecutionRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<VerifyCommandExecutionOutcome> {
-        let cwd = verify_command_cwd(request.worktree_root, request.command)?;
-        let cwd_label = if request.command.cwd.trim().is_empty() {
-            ".".to_string()
-        } else {
-            request.command.cwd.clone()
-        };
+        let cwd_label = verify_command_cwd_label(request.command);
         let dedupe_key = verify_command_key(request.command);
         let tree_sha = command_tree_sha(request.worktree_root);
         let cache_key = command_cache_key(request.worktree_root, &tree_sha, &dedupe_key);
+        let cwd = match verify_command_cwd(request.worktree_root, request.command) {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                let result = GateCommandResult {
+                    command: request.command.command.clone(),
+                    status: "failed".to_string(),
+                    exit_code: None,
+                    output: format_command_environment_hint(
+                        request.command,
+                        format!("invalid verify command cwd: {err}"),
+                    ),
+                    cwd: cwd_label.clone(),
+                    dedupe_key: dedupe_key.clone(),
+                    duration_ms: 0,
+                    cache_hit: false,
+                    skip_reason: String::new(),
+                    failure_kind: "invalid_cwd".to_string(),
+                };
+                self.record_command_economics(CommandExecutionEconomics {
+                    phase: request.phase.to_string(),
+                    slice_id: request.slice_id.to_string(),
+                    attempt: request.attempt,
+                    command: request.command.command.clone(),
+                    cwd: cwd_label,
+                    status: result.status.clone(),
+                    exit_code: result.exit_code,
+                    duration_ms: 0,
+                    dedupe_key,
+                    tree_sha,
+                    cache_key,
+                    cache_hit: false,
+                    skip_reason: String::new(),
+                });
+                return Ok(VerifyCommandExecutionOutcome { result });
+            }
+        };
         if let Some(mut cached) = self.cache.get(&cache_key) {
             cached.cache_hit = true;
             cached.duration_ms = 0;
@@ -216,31 +236,45 @@ impl WorkflowGate {
             .run(cancel);
         let duration_ms = started_at.elapsed().as_millis();
         let result = match output {
-            Ok(output) => GateCommandResult {
-                command: request.command.command.clone(),
-                status: if output.success() { "passed" } else { "failed" }.to_string(),
-                exit_code: output.exit_code(),
-                output: output.trimmed_combined_output(),
-                cwd: cwd_label.clone(),
-                dedupe_key: dedupe_key.clone(),
-                duration_ms,
-                cache_hit: false,
-                skip_reason: String::new(),
-            },
-            Err(err) => {
-                if cancel.is_cancelled() {
-                    return Err(CancelledError::new("run cancelled").into());
-                }
+            Ok(output) => {
+                let failure_kind = command_failure_kind(output.exit_code(), output.success());
                 GateCommandResult {
                     command: request.command.command.clone(),
-                    status: "failed".to_string(),
-                    exit_code: None,
-                    output: err.to_string(),
+                    status: if output.success() { "passed" } else { "failed" }.to_string(),
+                    exit_code: output.exit_code(),
+                    output: maybe_add_environment_hint(
+                        request.command,
+                        &failure_kind,
+                        output.trimmed_combined_output(),
+                    ),
                     cwd: cwd_label.clone(),
                     dedupe_key: dedupe_key.clone(),
                     duration_ms,
                     cache_hit: false,
                     skip_reason: String::new(),
+                    failure_kind,
+                }
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(CancelledError::new("run cancelled").into());
+                }
+                let failure_kind = shell_error_failure_kind(err.as_ref()).to_string();
+                GateCommandResult {
+                    command: request.command.command.clone(),
+                    status: "failed".to_string(),
+                    exit_code: None,
+                    output: maybe_add_environment_hint(
+                        request.command,
+                        &failure_kind,
+                        err.to_string(),
+                    ),
+                    cwd: cwd_label.clone(),
+                    dedupe_key: dedupe_key.clone(),
+                    duration_ms,
+                    cache_hit: false,
+                    skip_reason: String::new(),
+                    failure_kind,
                 }
             }
         };
@@ -270,11 +304,7 @@ impl WorkflowGate {
         reason: &str,
     ) -> Result<GateCommandResult> {
         let _cwd = verify_command_cwd(worktree_root, command)?;
-        let cwd_label = if command.cwd.trim().is_empty() {
-            ".".to_string()
-        } else {
-            command.cwd.clone()
-        };
+        let cwd_label = verify_command_cwd_label(command);
         let dedupe_key = verify_command_key(command);
         let tree_sha = command_tree_sha(worktree_root);
         let cache_key = command_cache_key(worktree_root, &tree_sha, &dedupe_key);
@@ -303,6 +333,7 @@ impl WorkflowGate {
             duration_ms: 0,
             cache_hit: false,
             skip_reason: reason.to_string(),
+            failure_kind: String::new(),
         })
     }
 
@@ -358,19 +389,22 @@ pub(crate) struct SliceVerificationResult {
 pub(crate) struct SliceVerificationFailure {
     pub(crate) summary: String,
     pub(crate) finding: Finding,
+    pub(crate) failure_kind: String,
 }
 
 impl SliceVerificationFailure {
-    fn auto_fix(summary: String) -> Self {
+    fn from_command_result(command: &str, result: &GateCommandResult) -> Self {
+        let summary = slice_verify_failure_summary(command, result);
         Self {
             finding: Finding {
                 id: String::new(),
                 severity: "error".to_string(),
-                action: "auto-fix".to_string(),
+                action: finding_action_for_failure_kind(&result.failure_kind).to_string(),
                 file: String::new(),
                 line: 0,
                 description: summary.clone(),
             },
+            failure_kind: result.failure_kind.clone(),
             summary,
         }
     }
@@ -510,6 +544,14 @@ fn verify_command_cwd(root: &Path, command: &VerifyCommand) -> Result<PathBuf> {
     Ok(root.join(cwd))
 }
 
+fn verify_command_cwd_label(command: &VerifyCommand) -> String {
+    if command.cwd.trim().is_empty() {
+        ".".to_string()
+    } else {
+        command.cwd.clone()
+    }
+}
+
 fn verify_command_key(command: &VerifyCommand) -> String {
     let env = command
         .env
@@ -539,6 +581,103 @@ fn command_cache_key(worktree_root: &Path, tree_sha: &str, dedupe_key: &str) -> 
         .display()
         .to_string();
     format!("{context}\0{tree_sha}\0{dedupe_key}")
+}
+
+fn command_failure_kind(exit_code: Option<i32>, success: bool) -> String {
+    if success {
+        return String::new();
+    }
+    match exit_code {
+        Some(126) => "command_not_executable".to_string(),
+        Some(127) => "tool_missing".to_string(),
+        Some(_) => "command_failed".to_string(),
+        None => "command_failed".to_string(),
+    }
+}
+
+fn shell_error_failure_kind(err: &(dyn std::error::Error + Send + Sync + 'static)) -> &'static str {
+    if let Some(shell) = err.downcast_ref::<ShellCommandError>() {
+        return shell.kind().as_str();
+    }
+    "spawn_failed"
+}
+
+pub(crate) fn failure_kind_needs_operator(failure_kind: &str) -> bool {
+    matches!(
+        failure_kind,
+        "tool_missing" | "command_not_executable" | "spawn_failed" | "invalid_cwd"
+    )
+}
+
+fn finding_action_for_failure_kind(failure_kind: &str) -> &'static str {
+    if failure_kind_needs_operator(failure_kind) {
+        "operator-fix"
+    } else {
+        "auto-fix"
+    }
+}
+
+fn slice_verify_failure_summary(command: &str, result: &GateCommandResult) -> String {
+    let prefix = if failure_kind_needs_operator(&result.failure_kind) {
+        "verify command failed due to daemon/operator environment"
+    } else if result.failure_kind == "timeout" {
+        "verify command timed out"
+    } else {
+        "verify command failed"
+    };
+    if result.output.trim().is_empty() {
+        format!("{prefix}: {command}")
+    } else {
+        format!("{prefix}: {command}\n{}", result.output)
+    }
+}
+
+fn integration_gate_failure_description(command: &str, result: &GateCommandResult) -> String {
+    if failure_kind_needs_operator(&result.failure_kind) {
+        format!(
+            "integration gate failed due to daemon/operator environment: {command}: {}",
+            result.output
+        )
+    } else if result.failure_kind == "timeout" {
+        format!(
+            "integration gate command timed out: {command}: {}",
+            result.output
+        )
+    } else if result.exit_code.is_some() {
+        format!("integration gate failed: {command}")
+    } else {
+        format!(
+            "integration gate command failed to start or timed out: {command}: {}",
+            result.output
+        )
+    }
+}
+
+fn maybe_add_environment_hint(
+    command: &VerifyCommand,
+    failure_kind: &str,
+    output: String,
+) -> String {
+    if failure_kind_needs_operator(failure_kind) {
+        format_command_environment_hint(command, output)
+    } else {
+        output
+    }
+}
+
+fn format_command_environment_hint(command: &VerifyCommand, output: String) -> String {
+    let path = command
+        .env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let mut parts = Vec::new();
+    if !output.trim().is_empty() {
+        parts.push(output.trim().to_string());
+    }
+    parts.push(format!("daemon PATH={path}"));
+    parts.join("\n")
 }
 
 #[cfg(test)]
@@ -788,10 +927,41 @@ mod tests {
                 .output
                 .contains("command timed out after 1 seconds")
         );
+        assert_eq!(result.commands[0].failure_kind, "timeout");
         assert_eq!(
             result.findings[0].description,
-            "integration gate command failed to start or timed out: sleep 30: command timed out after 1 seconds"
+            "integration gate command timed out: sleep 30: command timed out after 1 seconds"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn slice_verification_missing_command_is_operator_failure() -> Result<()> {
+        let (_home, gate) = test_gate()?;
+        let worktree = tempfile::tempdir()?;
+        let mut slice = slice("slice-001");
+        slice.verify = vec!["definitely_missing_khazad_tool_127".to_string()];
+
+        let result = gate.verify_slice_commands(
+            SliceVerificationRequest {
+                slice: &slice,
+                worker_worktree: worktree.path(),
+                attempt: 1,
+                config: &WorkflowConfig::default(),
+            },
+            &CancellationToken::new(),
+        )?;
+
+        let failure = result.failure.expect("verification should fail");
+        assert_eq!(failure.failure_kind, "tool_missing");
+        assert_eq!(failure.finding.action, "operator-fix");
+        assert!(failure.summary.contains("daemon/operator environment"));
+        assert!(
+            failure
+                .summary
+                .contains("definitely_missing_khazad_tool_127")
+        );
+        assert!(failure.summary.contains("daemon PATH="));
         Ok(())
     }
 
@@ -850,6 +1020,7 @@ mod tests {
             failure.summary,
             "verify command failed: printf 'verify-fail'; false\nverify-fail"
         );
+        assert_eq!(failure.failure_kind, "command_failed");
         assert_eq!(failure.finding.description, failure.summary);
         Ok(())
     }

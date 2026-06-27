@@ -1,6 +1,6 @@
 use crate::agent::RunnerSpec;
 use crate::artifact;
-use crate::daemon::{Client, Server};
+use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
     BranchHandoff, Event, RunDetails, RunEconomics, RunIncident, RunInspection, RunStatus,
     SliceStatus, SliceValidationReport, SliceWriteResult, WorkerAttemptProgress,
@@ -19,6 +19,7 @@ use serde::Serialize;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -78,6 +79,9 @@ enum CommandArgs {
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
+        /// Allow starting from a dirty source repo; recorded in preflight artifacts.
+        #[arg(long)]
+        allow_dirty: bool,
         #[arg(long)]
         wait: bool,
     },
@@ -117,8 +121,14 @@ enum CommandArgs {
     },
     /// Inspect run artifacts and daemon log tail.
     Inspect {
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         run: String,
+        /// Repository path used with --latest. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Inspect the latest run for a repository, including terminal runs.
+        #[arg(long)]
+        latest: bool,
         #[arg(long, default_value_t = 50)]
         log_tail: usize,
     },
@@ -259,8 +269,20 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             all,
             agent,
             parallel,
+            allow_dirty,
             wait,
-        } => run_start(paths, repo, slices, all, agent, parallel, wait),
+        } => run_start(
+            paths,
+            RunStartOptions {
+                repo,
+                slices,
+                all,
+                agent,
+                parallel,
+                allow_dirty,
+                wait,
+            },
+        ),
         CommandArgs::Resume {
             run,
             agent,
@@ -274,7 +296,12 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             create_pr,
             dry_run,
         } => run_handoff(paths, run, push, create_pr, dry_run),
-        CommandArgs::Inspect { run, log_tail } => run_inspect(paths, run, log_tail),
+        CommandArgs::Inspect {
+            run,
+            repo,
+            latest,
+            log_tail,
+        } => run_inspect(paths, run, repo, latest, log_tail),
         CommandArgs::Status {
             run,
             repo,
@@ -322,26 +349,29 @@ fn run_init(paths: Paths, repo: PathBuf) -> Result<()> {
     print_json(&result)
 }
 
-fn run_start(
-    paths: Paths,
+struct RunStartOptions {
     repo: PathBuf,
     slices: Vec<String>,
     all: bool,
     agent: String,
     parallel: usize,
+    allow_dirty: bool,
     wait: bool,
-) -> Result<()> {
-    let repo = resolve_repo_path(repo)?;
+}
+
+fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
+    let repo = resolve_repo_path(opts.repo)?;
     let config = artifact::Store::new(&repo)
         .read_config()
         .unwrap_or_default();
-    let effective_agent = if agent.trim().is_empty() && std::env::var("KHAZAD_AGENT").is_err() {
+    let effective_agent = if opts.agent.trim().is_empty() && std::env::var("KHAZAD_AGENT").is_err()
+    {
         config.agent.clone()
     } else {
-        agent
+        opts.agent
     };
     let runner = RunnerSpec::from_agent_and_env(&effective_agent)?;
-    let parallel = effective_cli_parallelism(parallel, config.parallelism);
+    let parallel = effective_cli_parallelism(opts.parallel, config.parallelism);
     let repo_path = repo.to_string_lossy().to_string();
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
@@ -350,16 +380,17 @@ fn run_start(
         &StartRunParams {
             repo_path: repo_path.clone(),
             slice_id: String::new(),
-            slice_ids: slices,
-            all,
+            slice_ids: opts.slices,
+            all: opts.all,
             agent: runner.kind,
             pi_bin: runner.pi_bin,
             pi_args: runner.pi_args,
             parallelism: parallel,
+            allow_dirty: opts.allow_dirty,
         },
     )?;
     let output = RunStartOutput::new(result.run_id, repo_path);
-    if !wait {
+    if !opts.wait {
         return print_json(&output);
     }
     wait_run(&client, &output.run_id)
@@ -436,8 +467,31 @@ fn run_handoff(
     print_json(&handoff)
 }
 
-fn run_inspect(paths: Paths, run_id: String, log_tail_lines: usize) -> Result<()> {
+fn run_inspect(
+    paths: Paths,
+    run_id: String,
+    repo: Option<PathBuf>,
+    latest: bool,
+    log_tail_lines: usize,
+) -> Result<()> {
+    if latest && !run_id.is_empty() {
+        bail!("inspect --latest cannot be combined with --run <run-id>");
+    }
+    if !latest && repo.is_some() {
+        bail!("inspect --repo requires --latest");
+    }
     let client = Client::new(paths);
+    let run_id = if latest {
+        let repo = resolve_repo_path(repo.unwrap_or_else(|| PathBuf::from(".")))?;
+        let repo_path = repo.to_string_lossy().to_string();
+        let details = fetch_latest_run(&client, &repo_path, 1, false)?
+            .ok_or_else(|| anyhow::anyhow!("no runs found for repo {repo_path}"))?;
+        details.run.id
+    } else if run_id.is_empty() {
+        bail!("inspect requires --run <run-id> or --latest");
+    } else {
+        run_id
+    };
     let inspection: RunInspection = client.call(
         "inspectRun",
         &InspectRunParams {
@@ -790,9 +844,14 @@ fn run_daemon(paths: Paths, command: DaemonCommand) -> Result<()> {
         }
         DaemonCommand::Status => {
             let client = Client::new(paths);
-            client.ping()?;
-            println!("running");
-            Ok(())
+            match client.health_check() {
+                DaemonHealth::Running => {
+                    println!("running");
+                    Ok(())
+                }
+                DaemonHealth::Missing => bail!("daemon not running"),
+                DaemonHealth::Unhealthy(reason) => bail!("daemon unhealthy: {reason}"),
+            }
         }
         DaemonCommand::Serve => serve_daemon(paths),
     }
@@ -800,15 +859,16 @@ fn run_daemon(paths: Paths, command: DaemonCommand) -> Result<()> {
 
 fn ensure_daemon(paths: &Paths) -> Result<()> {
     let client = Client::new(paths.clone());
-    if client.ping().is_ok() {
-        return Ok(());
+    match client.health_check() {
+        DaemonHealth::Running => Ok(()),
+        DaemonHealth::Missing => start_daemon(paths, false),
+        DaemonHealth::Unhealthy(reason) => bail!("daemon unhealthy: {reason}"),
     }
-    start_daemon(paths, false)
 }
 
 fn start_daemon(paths: &Paths, announce: bool) -> Result<()> {
     let client = Client::new(paths.clone());
-    if client.ping().is_ok() {
+    if matches!(client.health_check(), DaemonHealth::Running) {
         if announce {
             println!("daemon already running");
         }
@@ -822,17 +882,25 @@ fn start_daemon(paths: &Paths, announce: bool) -> Result<()> {
         .open(paths.daemon_log())
         .with_context(|| format!("open {}", paths.daemon_log().display()))?;
     let stderr = log_file.try_clone()?;
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .args(["daemon", "serve"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("start daemon")?;
+        .stderr(Stdio::from(stderr));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().context("start daemon")?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if client.ping().is_ok() {
+        if matches!(client.health_check(), DaemonHealth::Running) {
             if announce {
                 println!("daemon started pid={}", child.id());
             }
@@ -919,8 +987,9 @@ fn print_watch_snapshot(details: &RunDetails) {
     println!();
 }
 
-const MONITOR_EVENT_LINES: usize = 5;
-const MONITOR_OUTPUT_LINES: usize = 12;
+const MONITOR_ACTIVITY_LIMIT: usize = 7;
+const MONITOR_OUTPUT_LINES: usize = 4;
+const MONITOR_TODO_ITEMS: usize = 8;
 const MONITOR_LINE_WIDTH: usize = 180;
 
 fn render_monitor_snapshot(
@@ -937,6 +1006,7 @@ fn render_monitor_snapshot(
     }
 
     writeln!(out, "Khazad-Doom Monitor")?;
+    writeln!(out)?;
     match details {
         Some(details) => render_run_monitor(&mut out, details)?,
         None => render_waiting_monitor(&mut out, waiting_repo.unwrap_or("-"))?,
@@ -947,82 +1017,290 @@ fn render_monitor_snapshot(
 }
 
 fn render_waiting_monitor(out: &mut impl Write, repo: &str) -> Result<()> {
-    writeln!(out, "Run: -")?;
-    writeln!(out, "Repo: {repo}")?;
-    writeln!(out, "Status: waiting")?;
-    writeln!(out, "Phase: waiting")?;
-    writeln!(out, "Slice: -")?;
-    writeln!(out, "Command: -")?;
-    writeln!(out, "Elapsed: 0s")?;
-    writeln!(out, "Updated: -")?;
-    writeln!(out, "Message: waiting for latest active run")?;
-    writeln!(out, "Recent events:")?;
-    writeln!(out, "  -")?;
-    writeln!(out, "Output tail:")?;
-    writeln!(out, "  -")?;
+    monitor_heading(out, "Run", "waiting")?;
+    monitor_tree(out, &format!("repo {repo}"))?;
+    monitor_tree_dim(out, "waiting for the latest active daemon-owned run")?;
+    writeln!(out)?;
+    monitor_heading(out, "Hint", "")?;
+    monitor_tree_dim(
+        out,
+        "start a run normally; this dashboard will attach when status --latest returns one",
+    )?;
     Ok(())
 }
 
 fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> {
-    let progress = details.progress.as_ref();
-    let phase = match progress {
-        Some(progress) if !progress.phase.trim().is_empty() => progress_phase_label(progress),
-        _ if is_terminal_status(details.run.status) => details.run.status.as_str().to_string(),
-        _ => "unknown".to_string(),
-    };
-    let command = progress
-        .map(|progress| progress.command.as_str())
-        .unwrap_or_default();
-    let message = monitor_message(details);
-    let elapsed_start = progress
-        .map(|progress| progress.phase_started_at)
-        .unwrap_or(details.run.started_at);
-    let elapsed = Utc::now()
-        .signed_duration_since(elapsed_start)
-        .to_std()
-        .unwrap_or_default();
-    let updated = progress
-        .map(|progress| progress.updated_at.to_rfc3339())
-        .unwrap_or_else(|| details.run.updated_at.to_rfc3339());
-
-    writeln!(out, "Run: {}", details.run.id)?;
-    writeln!(out, "Repo: {}", details.run.repo_path)?;
-    writeln!(out, "Status: {}", details.run.status)?;
-    writeln!(out, "Phase: {phase}")?;
-    writeln!(out, "Slice: {}", monitor_slice_label(details))?;
-    if let Some(progress) = progress
-        && !progress.parallel_slices.is_empty()
-    {
-        writeln!(
-            out,
-            "Parallel layer: {}",
-            progress.parallel_slices.join(", ")
-        )?;
-    }
-    writeln!(out, "Command: {}", display_or_dash(command))?;
-    writeln!(out, "Elapsed: {}", format_duration(elapsed))?;
-    writeln!(out, "Updated: {updated}")?;
-    writeln!(
-        out,
-        "Message: {}",
-        truncate_display(&message, MONITOR_LINE_WIDTH)
-    )?;
-    if let Some(worker) = progress.and_then(|progress| progress.worker.as_ref()) {
-        render_worker_attempt(out, worker)?;
-    }
+    render_todos(out, details)?;
+    writeln!(out)?;
+    render_run_summary(out, details)?;
+    render_current_progress(out, details)?;
     if let Some(economics) = &details.economics {
+        writeln!(out)?;
         render_economics(out, economics)?;
     }
     render_incidents(out, &details.incidents)?;
-    writeln!(out, "Recent events:")?;
-    render_event_tail(out, &details.events)?;
-    writeln!(out, "Output tail:")?;
-    render_output_tail(
+    render_activity(out, details)?;
+    render_tail(out, details)?;
+    render_monitor_footer(out, details)?;
+    Ok(())
+}
+
+fn render_todos(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    let items = selected_slice_items(details);
+    let item_label = if items.len() == 1 { "item" } else { "items" };
+    monitor_heading(out, "Todos", &format!("({} {item_label})", items.len()))?;
+    if items.is_empty() {
+        monitor_tree_dim(out, "no selected slices recorded")?;
+        return Ok(());
+    }
+    for slice in items.iter().take(MONITOR_TODO_ITEMS) {
+        writeln!(out, "{}", todo_line(slice))?;
+    }
+    if items.len() > MONITOR_TODO_ITEMS {
+        monitor_tree_dim(out, &format!("… {} more", items.len() - MONITOR_TODO_ITEMS))?;
+    }
+    Ok(())
+}
+
+fn selected_slice_items(details: &RunDetails) -> Vec<crate::domain::SliceRun> {
+    if !details.slice_runs.is_empty() {
+        return details.slice_runs.clone();
+    }
+    details
+        .run
+        .selected_slice_id
+        .split(',')
+        .map(str::trim)
+        .filter(|slice_id| !slice_id.is_empty())
+        .map(|slice_id| crate::domain::SliceRun {
+            run_id: details.run.id.clone(),
+            slice_id: slice_id.to_string(),
+            status: SliceStatus::Pending,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 0,
+            last_error: String::new(),
+        })
+        .collect()
+}
+
+fn todo_line(slice: &crate::domain::SliceRun) -> String {
+    let mut meta = Vec::new();
+    meta.push(slice.status.to_string());
+    if slice.attempts > 0 {
+        meta.push(format!(
+            "{} {}",
+            slice.attempts,
+            if slice.attempts == 1 {
+                "attempt"
+            } else {
+                "attempts"
+            }
+        ));
+    }
+    if !slice.commit_sha.trim().is_empty() {
+        meta.push(short_sha(&slice.commit_sha));
+    }
+    format!(
+        "{} {}{}",
+        slice_checkbox(slice.status),
+        slice.slice_id,
+        if meta.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", meta.join(" • "))
+        }
+    )
+}
+
+fn render_run_summary(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    let progress = details.progress.as_ref();
+    let phase = progress
+        .map(progress_phase_label)
+        .filter(|phase| !phase.trim().is_empty())
+        .unwrap_or_else(|| {
+            if is_terminal_status(details.run.status) {
+                details.run.status.as_str().to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+    let elapsed_start = progress
+        .map(|progress| progress.phase_started_at)
+        .unwrap_or(details.run.started_at);
+    monitor_heading(
         out,
-        progress
-            .map(|progress| progress.output_tail.as_str())
-            .unwrap_or_default(),
+        "Run",
+        &format!(
+            "{} {} • {}",
+            status_icon(details.run.status),
+            details.run.status,
+            short_run_id(&details.run.id)
+        ),
     )?;
+    monitor_tree(
+        out,
+        &format!("phase {phase} • elapsed {}", since_time(elapsed_start)),
+    )?;
+    monitor_tree_dim(out, &format!("repo {}", short_path(&details.run.repo_path)))?;
+    let message = monitor_message(details);
+    if !message.trim().is_empty() {
+        monitor_tree(out, &truncate_display(&message, MONITOR_LINE_WIDTH))?;
+    }
+    Ok(())
+}
+
+fn render_current_progress(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    let Some(progress) = details.progress.as_ref() else {
+        return Ok(());
+    };
+    if is_terminal_status(details.run.status) && is_terminal_phase(&progress.phase) {
+        return Ok(());
+    }
+    writeln!(out)?;
+    if let Some(worker) = &progress.worker {
+        render_worker_progress_block(out, details, progress, worker)?;
+    } else if !progress.command.trim().is_empty() {
+        render_command_progress_block(out, details, progress)?;
+    } else {
+        render_generic_progress_block(out, details, progress)?;
+    }
+    if let Some(worker) = &progress.worker
+        && let Some(warning) = worker_quiet_warning(worker)
+    {
+        writeln!(out)?;
+        monitor_heading(out, "Warn", "")?;
+        monitor_tree(out, &warning)?;
+        monitor_tree_dim(out, "wait, inspect, or cancel explicitly")?;
+    }
+    Ok(())
+}
+
+fn render_worker_progress_block(
+    out: &mut impl Write,
+    details: &RunDetails,
+    progress: &crate::domain::RunProgress,
+    worker: &WorkerAttemptProgress,
+) -> Result<()> {
+    let mut meta = Vec::new();
+    let slice = monitor_slice_label(details);
+    if slice != "-" {
+        meta.push(slice);
+    }
+    if progress.attempt > 0 {
+        meta.push(format!("attempt {}", progress.attempt));
+    }
+    meta.push("now".to_string());
+    monitor_heading(out, "Worker", &format!("({})", meta.join(" • ")))?;
+    if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+        monitor_tree(
+            out,
+            &format!("Parallel layer: {}", progress.parallel_slices.join(", ")),
+        )?;
+    }
+    monitor_tree(out, &format!("Supervisor: {}", supervisor_label(worker)))?;
+    monitor_tree(out, &format!("Process: {}", worker_process_label(worker)))?;
+    monitor_tree(
+        out,
+        &format!("Runtime: {}", since_time(worker.attempt_started_at)),
+    )?;
+    monitor_tree(
+        out,
+        &format!("Last worker event: {}", last_worker_event_label(worker)),
+    )?;
+    monitor_tree(
+        out,
+        &format!(
+            "Last semantic progress: {}",
+            worker
+                .last_semantic_progress_at
+                .map(since_time)
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+    )?;
+    monitor_tree(out, &format!("Timeout: {}", timeout_label(worker)))?;
+    Ok(())
+}
+
+fn render_command_progress_block(
+    out: &mut impl Write,
+    details: &RunDetails,
+    progress: &crate::domain::RunProgress,
+) -> Result<()> {
+    let label = command_block_label(&progress.phase, &progress.command);
+    let mut meta = Vec::new();
+    if label == "Worker" && !progress.slice_id.trim().is_empty() {
+        meta.push(progress.slice_id.clone());
+    }
+    if label == "Worker" && progress.attempt > 0 {
+        meta.push(format!("attempt {}", progress.attempt));
+    }
+    if label != "Worker" {
+        meta.push(command_meta(&progress.command));
+    }
+    meta.push("now".to_string());
+    monitor_heading(out, label, &format!("({})", meta.join(" • ")))?;
+    if label != "Worker" || progress.command.trim() != "pi" {
+        monitor_tree_dim(
+            out,
+            &truncate_display(&progress.command, MONITOR_LINE_WIDTH),
+        )?;
+    }
+    render_progress_scope(out, details, progress)?;
+    if !progress.message.trim().is_empty() {
+        monitor_tree(
+            out,
+            &truncate_display(&progress.message, MONITOR_LINE_WIDTH),
+        )?;
+    }
+    monitor_tree_dim(
+        out,
+        &format!("updated {} ago", since_time(progress.updated_at)),
+    )?;
+    Ok(())
+}
+
+fn render_generic_progress_block(
+    out: &mut impl Write,
+    details: &RunDetails,
+    progress: &crate::domain::RunProgress,
+) -> Result<()> {
+    monitor_heading(out, phase_label(&progress.phase), "(now)")?;
+    render_progress_scope(out, details, progress)?;
+    if !progress.message.trim().is_empty() {
+        monitor_tree(
+            out,
+            &truncate_display(&progress.message, MONITOR_LINE_WIDTH),
+        )?;
+    }
+    monitor_tree_dim(
+        out,
+        &format!("updated {} ago", since_time(progress.updated_at)),
+    )?;
+    Ok(())
+}
+
+fn render_progress_scope(
+    out: &mut impl Write,
+    details: &RunDetails,
+    progress: &crate::domain::RunProgress,
+) -> Result<()> {
+    if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+        monitor_tree(
+            out,
+            &format!("Parallel layer: {}", progress.parallel_slices.join(", ")),
+        )?;
+    } else if !progress.slice_id.trim().is_empty() {
+        monitor_tree(out, &format!("slice {}", progress.slice_id))?;
+    } else {
+        monitor_tree(out, &monitor_slice_label(details))?;
+    }
+    if progress.phase_started_at != progress.updated_at {
+        monitor_tree_dim(
+            out,
+            &format!("elapsed {}", since_time(progress.phase_started_at)),
+        )?;
+    }
     Ok(())
 }
 
@@ -1030,16 +1308,68 @@ fn render_incidents(out: &mut impl Write, incidents: &[RunIncident]) -> Result<(
     if incidents.is_empty() {
         return Ok(());
     }
-    writeln!(out, "Incidents:")?;
+    writeln!(out)?;
+    monitor_heading(out, "Incidents", &format!("({})", incidents.len()))?;
     for incident in incidents.iter().rev().take(8).rev() {
-        writeln!(
+        monitor_tree(
             out,
-            "  - [{}] {}: {}",
-            incident.severity,
-            incident.kind,
-            truncate_display(&incident.message, MONITOR_LINE_WIDTH)
+            &format!(
+                "{}: {}",
+                incident.kind,
+                truncate_display(&incident.message, MONITOR_LINE_WIDTH)
+            ),
         )?;
     }
+    Ok(())
+}
+
+fn render_activity(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    let lines = details
+        .events
+        .iter()
+        .filter_map(|event| activity_line(event, details))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let visible = lines
+        .iter()
+        .rev()
+        .take(MONITOR_ACTIVITY_LIMIT)
+        .collect::<Vec<_>>();
+    writeln!(out)?;
+    monitor_heading(out, "Activity", &format!("({} recent)", visible.len()))?;
+    for line in visible.into_iter().rev() {
+        monitor_tree(out, line)?;
+    }
+    Ok(())
+}
+
+fn render_tail(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    let output_tail = details
+        .progress
+        .as_ref()
+        .map(|progress| progress.output_tail.as_str())
+        .unwrap_or_default();
+    if output_tail.trim().is_empty() {
+        return Ok(());
+    }
+    writeln!(out)?;
+    monitor_heading(out, "Tail", "")?;
+    render_output_tail(out, output_tail)?;
+    Ok(())
+}
+
+fn render_monitor_footer(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    writeln!(out)?;
+    monitor_tree_dim(
+        out,
+        &format!(
+            "Ctrl-C detach • updated {} • run {}",
+            details.run.updated_at.format("%H:%M:%S"),
+            short_run_id(&details.run.id)
+        ),
+    )?;
     Ok(())
 }
 
@@ -1052,50 +1382,47 @@ fn progress_phase_label(progress: &crate::domain::RunProgress) -> String {
 }
 
 fn print_economics(economics: &RunEconomics) {
-    println!(
-        "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
-        economics.agent_call_count,
-        economics.command_execution_count,
-        economics.duplicate_command_count,
-        economics.cache_hits,
-        economics.cache_misses
-    );
-    println!(
-        "Repair: policy={} attempts={}/{} | Fail-fast: {}",
-        economics.repair_policy,
-        economics.repair_attempts,
-        economics.repair_max_attempts,
-        economics.gate_fail_fast
-    );
-    if !economics.sla_violations.is_empty() {
-        println!("SLA violations: {}", economics.sla_violations.join("; "));
-    }
+    let mut stdout = io::stdout().lock();
+    let _ = write_economics(&mut stdout, economics, false);
 }
 
 fn render_economics(out: &mut impl Write, economics: &RunEconomics) -> Result<()> {
-    writeln!(
-        out,
-        "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
-        economics.agent_call_count,
-        economics.command_execution_count,
-        economics.duplicate_command_count,
-        economics.cache_hits,
-        economics.cache_misses
-    )?;
-    writeln!(
-        out,
-        "Repair: policy={} attempts={}/{} | Fail-fast: {}",
-        economics.repair_policy,
-        economics.repair_attempts,
-        economics.repair_max_attempts,
-        economics.gate_fail_fast
-    )?;
+    monitor_heading(out, "Economics", "")?;
+    write_economics(out, economics, true)
+}
+
+fn write_economics(out: &mut impl Write, economics: &RunEconomics, tree: bool) -> Result<()> {
+    let lines = [
+        format!(
+            "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
+            economics.agent_call_count,
+            economics.command_execution_count,
+            economics.duplicate_command_count,
+            economics.cache_hits,
+            economics.cache_misses
+        ),
+        format!(
+            "Repair: policy={} attempts={}/{} | Fail-fast: {}",
+            economics.repair_policy,
+            economics.repair_attempts,
+            economics.repair_max_attempts,
+            economics.gate_fail_fast
+        ),
+    ];
+    for line in lines {
+        if tree {
+            monitor_tree(out, &line)?;
+        } else {
+            writeln!(out, "{line}")?;
+        }
+    }
     if !economics.sla_violations.is_empty() {
-        writeln!(
-            out,
-            "SLA violations: {}",
-            economics.sla_violations.join("; ")
-        )?;
+        let line = format!("SLA violations: {}", economics.sla_violations.join("; "));
+        if tree {
+            monitor_tree(out, &line)?;
+        } else {
+            writeln!(out, "{line}")?;
+        }
     }
     Ok(())
 }
@@ -1212,42 +1539,10 @@ fn since_time(time: chrono::DateTime<Utc>) -> String {
     format_duration(duration)
 }
 
-fn render_event_tail(out: &mut impl Write, events: &[Event]) -> Result<()> {
-    if events.is_empty() {
-        writeln!(out, "  -")?;
-        return Ok(());
-    }
-    let recent = events
-        .iter()
-        .rev()
-        .take(MONITOR_EVENT_LINES)
-        .collect::<Vec<_>>();
-    for event in recent.into_iter().rev() {
-        let summary = event_summary(event);
-        if summary.is_empty() {
-            writeln!(
-                out,
-                "  {} {}",
-                event.created_at.format("%H:%M:%S"),
-                event.typ
-            )?;
-        } else {
-            writeln!(
-                out,
-                "  {} {} {}",
-                event.created_at.format("%H:%M:%S"),
-                event.typ,
-                summary
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn render_output_tail(out: &mut impl Write, output_tail: &str) -> Result<()> {
     let trimmed = output_tail.trim_end();
     if trimmed.is_empty() {
-        writeln!(out, "  -")?;
+        monitor_tree_dim(out, "-")?;
         return Ok(());
     }
     let lines = trimmed
@@ -1256,9 +1551,175 @@ fn render_output_tail(out: &mut impl Write, output_tail: &str) -> Result<()> {
         .take(MONITOR_OUTPUT_LINES)
         .collect::<Vec<_>>();
     for line in lines.into_iter().rev() {
-        writeln!(out, "  {}", truncate_display(line, MONITOR_LINE_WIDTH))?;
+        monitor_tree_dim(out, &truncate_display(line, MONITOR_LINE_WIDTH))?;
     }
     Ok(())
+}
+
+fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
+    let payload = event.payload.as_object();
+    match event.typ.as_str() {
+        "run_started" => {
+            let selected = payload
+                .and_then(|payload| payload.get("selected_slices"))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or_else(|| selected_slice_items(details).len());
+            Some(format!(
+                "Run (started): {selected} selected {}",
+                if selected == 1 { "slice" } else { "slices" }
+            ))
+        }
+        "slice_started" => Some(format!(
+            "Worker ({}): slice worker started",
+            payload_text(payload, "slice_id").unwrap_or_else(|| "-".to_string())
+        )),
+        "slice_merged" => {
+            let slice_id = payload_text(payload, "slice_id").unwrap_or_else(|| "slice".to_string());
+            let sha = payload_text(payload, "commit_sha")
+                .filter(|sha| !sha.trim().is_empty())
+                .map(|sha| format!(" • {}", short_sha(&sha)))
+                .unwrap_or_default();
+            Some(format!("Todos ({slice_id}): ☒ {slice_id}  merged{sha}"))
+        }
+        "integration_repair_completed" => {
+            let status = payload_text(payload, "status").unwrap_or_else(|| "-".to_string());
+            let summary = payload_text(payload, "summary")
+                .unwrap_or_else(|| "integration repair completed".to_string());
+            Some(format!("Repair ({status}): {summary}"))
+        }
+        "implementation_summary" => implementation_summary_line(payload),
+        "run_completed" => Some("Run (completed): handoff artifacts are ready".to_string()),
+        "worktrees_cleaned" => Some("Cleanup: worker worktrees cleaned".to_string()),
+        "checkpoint_written" => checkpoint_line(payload),
+        "progress" => progress_activity_line(event, payload),
+        _ => {
+            let summary = event_summary(event);
+            if summary.is_empty() {
+                Some(event_label(&event.typ))
+            } else {
+                Some(format!("{}: {summary}", event_label(&event.typ)))
+            }
+        }
+    }
+}
+
+fn implementation_summary_line(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let mut parts = Vec::new();
+    if let Some(completed) = payload
+        .get("completed_slices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+    {
+        parts.push(format!(
+            "{completed} completed {}",
+            if completed == 1 { "slice" } else { "slices" }
+        ));
+    }
+    if let Some(gate) = payload
+        .get("integration_gate")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(summary) = gate.get("summary").and_then(serde_json::Value::as_str) {
+            if !summary.trim().is_empty() {
+                parts.push(summary.to_string());
+            }
+        } else if let Some(status) = gate.get("status").and_then(serde_json::Value::as_str) {
+            parts.push(format!("integration gate {status}"));
+        }
+    }
+    if let Some(final_sha) = payload.get("final_sha").and_then(serde_json::Value::as_str)
+        && !final_sha.trim().is_empty()
+    {
+        parts.push(format!("final {}", short_sha(final_sha)));
+    }
+    (!parts.is_empty()).then(|| format!("Summary: {}", parts.join(" • ")))
+}
+
+fn checkpoint_line(payload: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    let payload = payload?;
+    let completed = payload
+        .get("completed_slices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let remaining = payload
+        .get("remaining_slices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    Some(format!(
+        "State: checkpoint written • {completed} done • {remaining} remaining"
+    ))
+}
+
+fn progress_activity_line(
+    event: &Event,
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let phase = payload_text(Some(payload), "phase").unwrap_or_else(|| "activity".to_string());
+    if phase == "completed" {
+        return None;
+    }
+    let label = if let Some(command) = payload_text(Some(payload), "command") {
+        command_block_label(&phase, &command).to_string()
+    } else {
+        phase_label(&phase).to_string()
+    };
+    let mut meta = Vec::new();
+    if let Some(slice_id) = payload_text(Some(payload), "slice_id")
+        && !slice_id.trim().is_empty()
+    {
+        meta.push(slice_id);
+    }
+    if let Some(attempt) = payload.get("attempt").and_then(serde_json::Value::as_u64)
+        && attempt > 0
+    {
+        meta.push(format!("attempt {attempt}"));
+    }
+    if label != "Worker"
+        && let Some(command) = payload_text(Some(payload), "command")
+    {
+        meta.push(command_meta(&command));
+    }
+    let message = payload_text(Some(payload), "message")
+        .unwrap_or_else(|| event_summary(event))
+        .trim()
+        .to_string();
+    let summary = if message.is_empty() {
+        phase.replace('_', " ")
+    } else {
+        message
+    };
+    Some(format!(
+        "{}{}: {}",
+        label,
+        if meta.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", meta.join(" • "))
+        },
+        truncate_display(&summary, MONITOR_LINE_WIDTH)
+    ))
+}
+
+fn payload_text(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    payload
+        .and_then(|payload| payload.get(key))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| (!value.is_null()).then(|| value.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn event_summary(event: &Event) -> String {
@@ -1330,6 +1791,170 @@ fn monitor_slice_label(details: &RunDetails) -> String {
         return format!("{} ({})", slice_run.slice_id, slice_run.status);
     }
     display_or_dash(&details.run.selected_slice_id).to_string()
+}
+
+fn monitor_heading(out: &mut impl Write, label: &str, meta: &str) -> Result<()> {
+    if meta.trim().is_empty() {
+        writeln!(out, "{label}")?;
+    } else {
+        writeln!(out, "{label} {meta}")?;
+    }
+    Ok(())
+}
+
+fn monitor_tree(out: &mut impl Write, text: &str) -> Result<()> {
+    writeln!(out, "└ {}", truncate_display(text, MONITOR_LINE_WIDTH))?;
+    Ok(())
+}
+
+fn monitor_tree_dim(out: &mut impl Write, text: &str) -> Result<()> {
+    monitor_tree(out, text)
+}
+
+fn status_icon(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Completed => "✓",
+        RunStatus::Running => "●",
+        RunStatus::Blocked => "!",
+        RunStatus::Failed => "✗",
+        RunStatus::Cancelled | RunStatus::Interrupted => "×",
+        RunStatus::Pending => "○",
+    }
+}
+
+fn slice_checkbox(status: SliceStatus) -> &'static str {
+    match status {
+        SliceStatus::Merged => "☒",
+        SliceStatus::Running | SliceStatus::ReadyToMerge | SliceStatus::RepairNeeded => "◐",
+        SliceStatus::Failed
+        | SliceStatus::Blocked
+        | SliceStatus::Cancelled
+        | SliceStatus::Interrupted => "✗",
+        SliceStatus::Pending => "☐",
+    }
+}
+
+fn short_sha(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn short_run_id(value: &str) -> String {
+    if value.chars().count() <= 30 {
+        return display_or_dash(value).to_string();
+    }
+    let prefix = value.chars().take(11).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn short_path(value: &str) -> String {
+    let text = value.trim();
+    if text.is_empty() {
+        return "-".to_string();
+    }
+    let parts = text
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 2 {
+        return text.to_string();
+    }
+    format!("…/{}", parts[parts.len().saturating_sub(2)..].join("/"))
+}
+
+fn phase_label(phase: &str) -> &'static str {
+    let normalized = phase.to_ascii_lowercase();
+    if normalized.starts_with("worker") {
+        if normalized == "worker_verify" {
+            "Shell"
+        } else {
+            "Worker"
+        }
+    } else if normalized.contains("gate") {
+        "Shell"
+    } else if normalized.contains("merge") {
+        "Merge"
+    } else if normalized.contains("repair") {
+        "Repair"
+    } else if normalized == "ready_to_merge" {
+        "Todos"
+    } else if matches!(
+        normalized.as_str(),
+        "completed" | "started" | "integration_setup"
+    ) {
+        "Run"
+    } else {
+        "Activity"
+    }
+}
+
+fn command_block_label(phase: &str, command: &str) -> &'static str {
+    let normalized = phase.to_ascii_lowercase();
+    let text = command.to_ascii_lowercase();
+    if normalized == "worker_running" || text == "pi" {
+        "Worker"
+    } else if normalized.contains("merge") || text.starts_with("git merge") {
+        "Merge"
+    } else if normalized.contains("repair") {
+        "Repair"
+    } else {
+        "Shell"
+    }
+}
+
+fn command_meta(command: &str) -> String {
+    let mut text = command.trim().to_string();
+    while let Some((prefix, rest)) = text.split_once(' ') {
+        if is_env_assignment(prefix) {
+            text = rest.trim_start().to_string();
+        } else {
+            break;
+        }
+    }
+    truncate_display(if text.is_empty() { command } else { &text }, 34)
+}
+
+fn is_env_assignment(value: &str) -> bool {
+    let Some((key, _value)) = value.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+}
+
+fn event_label(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_terminal_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "completed" | "failed" | "blocked" | "cancelled" | "interrupted"
+    )
 }
 
 fn display_or_dash(value: &str) -> &str {

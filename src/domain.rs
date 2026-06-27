@@ -295,6 +295,8 @@ pub struct CheckResult {
     #[serde(rename = "worktree_clean")]
     pub worktree_ok: bool,
     pub commit_found: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -369,6 +371,8 @@ pub struct GateCommandResult {
     pub cache_hit: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub skip_reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -456,6 +460,31 @@ pub struct RunEconomics {
     pub sla_violations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowExitStates {
+    pub run: String,
+    pub handoff: String,
+    pub evidence: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<SliceExitState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SliceExitState {
+    pub slice_id: String,
+    pub worker: String,
+    pub daemon: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceAttestation {
+    pub status: String,
+    pub attester: String,
+    pub worker_self_approved: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub basis: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementationSummary {
     pub run_id: String,
@@ -470,6 +499,10 @@ pub struct ImplementationSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_repair_integration_gate: Option<GateResult>,
     pub integration_gate: GateResult,
+    #[serde(default)]
+    pub exit_states: WorkflowExitStates,
+    #[serde(default)]
+    pub evidence_attestation: EvidenceAttestation,
     #[serde(default)]
     pub economics: RunEconomics,
     pub created_at: DateTime<Utc>,
@@ -620,6 +653,10 @@ pub struct BranchHandoff {
     pub final_sha: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_slices: Vec<String>,
+    #[serde(default)]
+    pub exit_states: WorkflowExitStates,
+    #[serde(default)]
+    pub evidence_attestation: EvidenceAttestation,
     pub summary_path: String,
     pub final_report_path: String,
     pub push_command: String,

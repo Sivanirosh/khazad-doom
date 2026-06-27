@@ -1,20 +1,23 @@
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
+    failure_kind_needs_operator,
 };
 use super::{
     CancelledError, REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, check_cancelled,
     integration_repair_prompt, worker_prompt,
 };
 use crate::agent::{
-    CancellationToken, Job, Runner, RunnerEvent, RunnerEventSink, RunnerSpec, runner_from_spec,
+    CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerSpec,
+    runner_from_spec,
 };
 use crate::artifact;
 use crate::domain::{
-    BranchHandoff, CheckResult, Finding, GateResult, Handoff, HandoffActionResult,
-    HandoffDiagnostics, ImplementationSummary, MergeConflictReport, RepairResult, Run,
-    RunCheckpoint, RunInspection, RunStatus, Slice, SliceRun, SliceStatus, SliceValidationReport,
-    SliceWriteResult, WorkerResult, WorkflowConfig,
+    BranchHandoff, CheckResult, EvidenceAttestation, Finding, GateResult, Handoff,
+    HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
+    RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun,
+    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult, WorkflowConfig,
+    WorkflowExitStates,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -59,6 +62,7 @@ pub struct StartOptions {
     pub pi_bin: String,
     pub pi_args: Vec<String>,
     pub parallelism: usize,
+    pub allow_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,19 @@ struct IntegrationRepairContext<'a> {
     economics: RunEconomicsRecorder,
 }
 
+#[derive(Clone)]
+struct WorkerExecutionContext {
+    run: Run,
+    root_worktree: PathBuf,
+    slice_base_sha: String,
+    dependency_summary: BTreeMap<String, String>,
+    cancel: CancellationToken,
+    runner: Arc<dyn Runner>,
+    config: WorkflowConfig,
+    economics: RunEconomicsRecorder,
+    verification_cache: VerificationCommandCache,
+}
+
 #[derive(Debug, Clone)]
 struct WorkerAttemptContext {
     run_id: String,
@@ -120,6 +137,12 @@ struct WorkerAttemptContext {
     timeout_seconds: u64,
     no_output_warning_seconds: u64,
     termination_grace_seconds: u64,
+}
+
+struct AgentCallContext<'a> {
+    phase: &'a str,
+    slice_id: &'a str,
+    attempt: usize,
 }
 
 impl WorkerAttemptContext {
@@ -265,6 +288,51 @@ impl Manager {
         result
     }
 
+    fn run_recorded_agent_job(
+        &self,
+        runner: Arc<dyn Runner>,
+        job: Job,
+        cancel: &CancellationToken,
+        context: WorkerAttemptContext,
+        economics: &RunEconomicsRecorder,
+        call: AgentCallContext<'_>,
+    ) -> Result<crate::agent::ResultData> {
+        let kind = job.kind.clone();
+        let runner_name = runner.name().to_string();
+        let started_at = Instant::now();
+        match self.run_supervised_worker_job(runner, job, cancel, context) {
+            Ok(result) => {
+                economics.record_agent_call(agent_call(
+                    call.phase,
+                    call.slice_id,
+                    call.attempt,
+                    kind.as_str(),
+                    runner_name.as_str(),
+                    "succeeded",
+                    started_at.elapsed(),
+                    Some(&result.usage),
+                    "",
+                ));
+                Ok(result)
+            }
+            Err(err) => {
+                let error = err.to_string();
+                economics.record_agent_call(agent_call(
+                    call.phase,
+                    call.slice_id,
+                    call.attempt,
+                    kind.as_str(),
+                    runner_name.as_str(),
+                    "failed",
+                    started_at.elapsed(),
+                    None,
+                    &error,
+                ));
+                Err(err)
+            }
+        }
+    }
+
     fn ensure_repo_run_available(&self, repo_id: &str, allowed_run_id: Option<&str>) -> Result<()> {
         if let Some(active) = self.state.active_run_for_repo(repo_id, allowed_run_id)? {
             bail!(
@@ -281,18 +349,28 @@ impl Manager {
         opts: &StartOptions,
         config: &WorkflowConfig,
     ) -> Result<Arc<dyn Runner>> {
+        self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, config)
+    }
+
+    fn runner_for_parts(
+        &self,
+        agent: &str,
+        pi_bin: &str,
+        pi_args: &[String],
+        config: &WorkflowConfig,
+    ) -> Result<Arc<dyn Runner>> {
         if let Some(runner) = &self.runner_override {
             return Ok(runner.clone());
         }
-        let agent = if opts.agent.trim().is_empty() {
-            config.agent.clone()
+        let agent = if agent.trim().is_empty() {
+            config.agent.as_str()
         } else {
-            opts.agent.clone()
+            agent
         };
         Ok(runner_from_spec(RunnerSpec::from_parts(
-            &agent,
-            opts.pi_bin.clone(),
-            opts.pi_args.clone(),
+            agent,
+            pi_bin.to_string(),
+            pi_args.to_vec(),
         )?))
     }
 
@@ -432,6 +510,13 @@ impl Manager {
             .iter()
             .map(|slice| slice.id.clone())
             .collect();
+        let dirty_status = gitutil::status_porcelain(&repo.path)?;
+        if !dirty_status.trim().is_empty() && !opts.allow_dirty {
+            bail!(
+                "source repo has uncommitted changes; commit/stash them or rerun with --allow-dirty\n{}",
+                dirty_status.trim()
+            );
+        }
         let runner = self.runner_for_options(&opts, &config)?;
         let parallelism = effective_parallelism(opts.parallelism, &config);
         let base_branch = if config.base_branch.trim().is_empty() {
@@ -460,6 +545,22 @@ impl Manager {
             updated_at: now,
         };
         self.state.insert_run(&run)?;
+        artifact::Store::new(&run.repo_path).ensure_run_dirs(&run.id)?;
+        artifact::write_json(
+            artifact::Store::new(&run.repo_path).output_path(&run.id, "preflight.json"),
+            &json!({
+                "run_id": run.id,
+                "repo_path": run.repo_path,
+                "base_branch": run.base_branch,
+                "base_sha": run.base_sha,
+                "dirty": !dirty_status.trim().is_empty(),
+                "allow_dirty": opts.allow_dirty,
+                "status_porcelain": dirty_status,
+                "selected_slices": &selected_ids,
+                "daemon_path": std::env::var("PATH").unwrap_or_default(),
+                "created_at": now,
+            }),
+        )?;
         for slice in &selected_slices {
             self.state.upsert_slice_run(&SliceRun {
                 run_id: run.id.clone(),
@@ -588,16 +689,7 @@ impl Manager {
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let config = store.read_config()?;
-        let runner = if let Some(runner) = &self.runner_override {
-            runner.clone()
-        } else {
-            let agent = if opts.agent.trim().is_empty() {
-                config.agent.clone()
-            } else {
-                opts.agent.clone()
-            };
-            runner_from_spec(RunnerSpec::from_parts(&agent, opts.pi_bin, opts.pi_args)?)
-        };
+        let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
         let manager = self.clone();
@@ -686,16 +778,26 @@ impl Manager {
             .filter(|sha| !sha.is_empty())
             .or_else(|| gitutil::run(&run.repo_path, &["rev-parse", &run.integration_branch]).ok())
             .unwrap_or_default();
-        let completed_slices = summary
+        let completed_slices: Vec<String> = summary
             .as_ref()
             .map(|summary| {
                 summary
                     .completed_slices
                     .iter()
                     .map(|slice| slice.slice_id.clone())
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let exit_states = summary
+            .as_ref()
+            .map(|summary| summary.exit_states.clone())
+            .filter(|exit_states| !exit_states.run.trim().is_empty())
+            .unwrap_or_else(|| historical_handoff_exit_states(run.status, &completed_slices));
+        let evidence_attestation = summary
+            .as_ref()
+            .map(|summary| summary.evidence_attestation.clone())
+            .filter(|attestation| !attestation.status.trim().is_empty())
+            .unwrap_or_else(historical_evidence_attestation);
         let pr_title = format!("Khazad-Doom {}: {}", run.id, run.selected_slice_id);
         let pr_body = format!(
             "Khazad-Doom run `{}` completed.\n\nIntegration branch: `{}`\nBase branch: `{}`\nFinal SHA: `{}`\nFinal report: `{}`\n",
@@ -757,6 +859,8 @@ impl Manager {
             base_sha: run.base_sha,
             final_sha,
             completed_slices,
+            exit_states,
+            evidence_attestation,
             summary_path: summary_path.to_string_lossy().to_string(),
             final_report_path: final_report_path.to_string_lossy().to_string(),
             push_command,
@@ -785,6 +889,68 @@ impl Manager {
         })
     }
 
+    fn write_terminal_run_summary(
+        &self,
+        run: &Run,
+        status: RunStatus,
+        message: &str,
+    ) -> Result<()> {
+        let store = artifact::Store::new(&run.repo_path);
+        store.ensure_run_dirs(&run.id)?;
+        let events = self.state.get_events(&run.id, 500)?;
+        let slice_runs = self.state.get_slice_runs(&run.id)?;
+        let progress = self.state.get_progress(&run.id)?;
+        let economics: Option<crate::domain::RunEconomics> =
+            artifact::read_json(store.output_path(&run.id, "economics.json")).ok();
+        let cancel_reason = latest_cancel_reason(&events);
+        let primary_failure = primary_failure_for_terminal_summary(message, &slice_runs, &events);
+        let summary = json!({
+            "run_id": run.id,
+            "repo_path": run.repo_path,
+            "status": status,
+            "base_branch": run.base_branch,
+            "base_sha": run.base_sha,
+            "integration_branch": run.integration_branch,
+            "selected_slice_id": run.selected_slice_id,
+            "message": message,
+            "primary_failure": primary_failure,
+            "cancel_reason": cancel_reason,
+            "slice_runs": slice_runs,
+            "progress": progress,
+            "economics": economics,
+            "worktree_snapshots": self.run_worktree_snapshots(run),
+            "next_commands": terminal_next_commands(run, status),
+            "created_at": Utc::now(),
+        });
+        artifact::write_json(store.output_path(&run.id, "run-summary.json"), &summary)?;
+        self.state.record_event(
+            &run.id,
+            "terminal_summary_written",
+            &json!({ "path": store.output_path(&run.id, "run-summary.json") }),
+        )?;
+        Ok(())
+    }
+
+    fn run_worktree_snapshots(&self, run: &Run) -> Vec<serde_json::Value> {
+        let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .map(|path| {
+                json!({
+                    "path": path.to_string_lossy(),
+                    "status": git_output_or_empty(&path, &["status", "--porcelain"]),
+                    "diff_tail": bounded_text(&git_output_or_empty(&path, &["diff"]), 20_000),
+                    "head": gitutil::head_sha(&path).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_run(
         &self,
@@ -805,40 +971,30 @@ impl Manager {
             parallelism,
             integration_mode,
         );
-        match self.cleanup_run_worktrees(&run) {
-            Ok(()) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "worktrees_cleaned",
-                    &json!({ "run_id": run.id }),
-                );
-            }
-            Err(err) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "worktree_cleanup_error",
-                    &json!({ "error": err.to_string() }),
-                );
-            }
-        }
-        match &outcome {
+        let (terminal_status, terminal_message) = match &outcome {
             Ok(_) => {
-                self.mark_progress(
-                    &run.id,
-                    "completed",
-                    "",
-                    0,
-                    "",
-                    "run completed; handoff artifacts are ready",
-                );
+                let message = "run completed; handoff artifacts are ready".to_string();
+                self.mark_progress(&run.id, "completed", "", 0, "", &message);
                 let _ =
                     self.state
                         .record_event(&run.id, "run_completed", &json!({ "run_id": run.id }));
-                let _ = self.state.update_run(&run.id, RunStatus::Completed, "");
+                (RunStatus::Completed, String::new())
             }
             Err(err) => {
                 let status = classify_run_failure(err);
-                let message = format!("{err:#}");
+                let raw_message = format!("{err:#}");
+                let message = if status == RunStatus::Cancelled {
+                    latest_cancel_reason(&self.state.get_events(&run.id, 200).unwrap_or_default())
+                        .trim()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let message = if message.is_empty() {
+                    raw_message
+                } else {
+                    message
+                };
                 if status == RunStatus::Cancelled {
                     let _ = self.state.cancel_active_slice_runs(&run.id, &message);
                     self.mark_progress(&run.id, "cancelled", "", 0, "", &message);
@@ -858,7 +1014,27 @@ impl Manager {
                         self.state
                             .record_event(&run.id, "run_error", &json!({ "error": message }));
                 }
-                let _ = self.state.update_run(&run.id, status, &message);
+                (status, message)
+            }
+        };
+        let _ = self.write_terminal_run_summary(&run, terminal_status, &terminal_message);
+        let _ = self
+            .state
+            .update_run(&run.id, terminal_status, &terminal_message);
+        match self.cleanup_run_worktrees(&run) {
+            Ok(()) => {
+                let _ = self.state.record_event(
+                    &run.id,
+                    "worktrees_cleaned",
+                    &json!({ "run_id": run.id }),
+                );
+            }
+            Err(err) => {
+                let _ = self.state.record_event(
+                    &run.id,
+                    "worktree_cleanup_error",
+                    &json!({ "error": err.to_string() }),
+                );
             }
         }
     }
@@ -937,20 +1113,18 @@ impl Manager {
                 .collect::<Vec<_>>()
                 .join(",");
             let worker_phase = economics.start_phase(format!("worker_layer:{layer_ids}"));
-            let outcomes = self.run_worker_layer(
-                run,
-                &layer,
-                &root_worktree,
-                &integration_worktree,
-                &slice_base_sha,
-                &dependency_summary,
-                cancel,
-                runner.clone(),
-                parallelism,
-                &config,
-                economics.clone(),
-                verification_cache.clone(),
-            )?;
+            let worker_context = WorkerExecutionContext {
+                run: run.clone(),
+                root_worktree: root_worktree.clone(),
+                slice_base_sha,
+                dependency_summary: dependency_summary.clone(),
+                cancel: cancel.clone(),
+                runner: runner.clone(),
+                config: config.clone(),
+                economics: economics.clone(),
+                verification_cache: verification_cache.clone(),
+            };
+            let outcomes = self.run_worker_layer(&layer, &worker_context, parallelism)?;
             worker_phase.finish();
             for worker in outcomes {
                 let slice = worker.slice.clone();
@@ -1109,6 +1283,8 @@ impl Manager {
             }
         }
         let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
+        let exit_states = final_exit_states(&gate, &completed_slices);
+        let evidence_attestation = final_evidence_attestation(&gate);
         let summary = ImplementationSummary {
             run_id: run.id.clone(),
             repo_path: run.repo_path.clone(),
@@ -1120,6 +1296,8 @@ impl Manager {
             integration_repair: repair,
             pre_repair_integration_gate: pre_repair_gate,
             integration_gate: gate.clone(),
+            exit_states,
+            evidence_attestation,
             economics: economics.snapshot(),
             created_at: Utc::now(),
         };
@@ -1142,38 +1320,16 @@ impl Manager {
         Ok(summary)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_worker_layer(
         &self,
-        run: &Run,
         layer: &[Slice],
-        root_worktree: &Path,
-        integration_worktree: &Path,
-        slice_base_sha: &str,
-        dependency_summary: &BTreeMap<String, String>,
-        cancel: &CancellationToken,
-        runner: Arc<dyn Runner>,
+        ctx: &WorkerExecutionContext,
         parallelism: usize,
-        config: &WorkflowConfig,
-        economics: RunEconomicsRecorder,
-        verification_cache: VerificationCommandCache,
     ) -> Result<Vec<SliceWorkerOutcome>> {
         if parallelism <= 1 || layer.len() <= 1 {
             let mut outcomes = Vec::new();
             for slice in layer {
-                outcomes.push(self.run_slice_worker(
-                    run,
-                    slice,
-                    root_worktree,
-                    integration_worktree,
-                    slice_base_sha,
-                    dependency_summary,
-                    cancel,
-                    runner.clone(),
-                    config,
-                    economics.clone(),
-                    verification_cache.clone(),
-                )?);
+                outcomes.push(self.run_slice_worker(slice, ctx)?);
             }
             return Ok(outcomes);
         }
@@ -1182,59 +1338,37 @@ impl Manager {
         let mut outcomes = Vec::new();
         while !queue.is_empty() {
             let batch: Vec<_> = (0..parallelism).filter_map(|_| queue.pop_front()).collect();
-            let mut batch_outcomes = self.run_parallel_worker_batch(
-                run,
-                &batch,
-                root_worktree,
-                integration_worktree,
-                slice_base_sha,
-                dependency_summary,
-                cancel,
-                runner.clone(),
-                config,
-                economics.clone(),
-                verification_cache.clone(),
-            )?;
+            let mut batch_outcomes = self.run_parallel_worker_batch(&batch, ctx)?;
             outcomes.append(&mut batch_outcomes);
         }
         outcomes.sort_by(|a, b| a.slice.id.cmp(&b.slice.id));
         Ok(outcomes)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_parallel_worker_batch(
         &self,
-        run: &Run,
         batch: &[Slice],
-        root_worktree: &Path,
-        integration_worktree: &Path,
-        slice_base_sha: &str,
-        dependency_summary: &BTreeMap<String, String>,
-        cancel: &CancellationToken,
-        runner: Arc<dyn Runner>,
-        config: &WorkflowConfig,
-        economics: RunEconomicsRecorder,
-        verification_cache: VerificationCommandCache,
+        ctx: &WorkerExecutionContext,
     ) -> Result<Vec<SliceWorkerOutcome>> {
         let batch_ids: Vec<_> = batch.iter().map(|slice| slice.id.clone()).collect();
         let batch_label = batch_ids.join(",");
         self.mark_progress(
-            &run.id,
+            &ctx.run.id,
             "parallel_worker_layer",
             &batch_label,
             0,
-            runner.name(),
+            ctx.runner.name(),
             &format!("parallel worker layer running: {}", batch_ids.join(", ")),
         );
         self.state.record_event(
-            &run.id,
+            &ctx.run.id,
             "parallel_layer_started",
             &json!({ "slices": batch_ids }),
         )?;
 
         let batch_cancel = CancellationToken::new();
         let batch_done = Arc::new(AtomicBool::new(false));
-        let parent_cancel = cancel.clone();
+        let parent_cancel = ctx.cancel.clone();
         let bridge_cancel = batch_cancel.clone();
         let bridge_done = batch_done.clone();
         let cancel_bridge = thread::spawn(move || {
@@ -1252,33 +1386,13 @@ impl Manager {
         for slice in batch.iter().cloned() {
             let slice_id = slice.id.clone();
             let manager = self.clone();
-            let run = run.clone();
-            let root_worktree = root_worktree.to_path_buf();
-            let integration_worktree = integration_worktree.to_path_buf();
-            let slice_base_sha = slice_base_sha.to_string();
-            let dependency_summary = dependency_summary.clone();
-            let cancel = batch_cancel.clone();
-            let runner = runner.clone();
-            let config = config.clone();
-            let economics = economics.clone();
-            let verification_cache = verification_cache.clone();
+            let mut worker_ctx = ctx.clone();
+            worker_ctx.cancel = batch_cancel.clone();
             let tx = tx.clone();
             handles.push(ParallelWorkerHandle {
                 slice_id: slice_id.clone(),
                 handle: thread::spawn(move || {
-                    let result = manager.run_slice_worker(
-                        &run,
-                        &slice,
-                        &root_worktree,
-                        &integration_worktree,
-                        &slice_base_sha,
-                        &dependency_summary,
-                        &cancel,
-                        runner,
-                        &config,
-                        economics,
-                        verification_cache,
-                    );
+                    let result = manager.run_slice_worker(&slice, &worker_ctx);
                     let _ = tx.send(ParallelWorkerResult { slice_id, result });
                 }),
             });
@@ -1318,12 +1432,16 @@ impl Manager {
         }
 
         if results.values().any(Result::is_err) {
-            let parent_cancelled = cancel.is_cancelled();
-            let outcomes =
-                self.record_parallel_layer_outcomes(run, &batch_ids, &results, parent_cancelled)?;
+            let parent_cancelled = ctx.cancel.is_cancelled();
+            let outcomes = self.record_parallel_layer_outcomes(
+                &ctx.run,
+                &batch_ids,
+                &results,
+                parent_cancelled,
+            )?;
             let summary = parallel_layer_failure_summary(&outcomes);
             self.state.record_event(
-                &run.id,
+                &ctx.run.id,
                 "parallel_layer_failed",
                 &json!({ "slices": batch_ids, "outcomes": outcomes, "summary": summary }),
             )?;
@@ -1338,7 +1456,7 @@ impl Manager {
 
         let outcomes = parallel_layer_success_outcomes(&results);
         self.state.record_event(
-            &run.id,
+            &ctx.run.id,
             "parallel_layer_completed",
             &json!({ "slices": batch_ids, "outcomes": outcomes }),
         )?;
@@ -1458,23 +1576,19 @@ impl Manager {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_slice_worker(
         &self,
-        run: &Run,
         slice: &Slice,
-        root_worktree: &Path,
-        _integration_worktree: &Path,
-        slice_base_sha: &str,
-        dependency_summary: &BTreeMap<String, String>,
-        cancel: &CancellationToken,
-        runner: Arc<dyn Runner>,
-        config: &WorkflowConfig,
-        economics: RunEconomicsRecorder,
-        verification_cache: VerificationCommandCache,
+        ctx: &WorkerExecutionContext,
     ) -> Result<SliceWorkerOutcome> {
+        let run = &ctx.run;
+        let cancel = &ctx.cancel;
+        let runner = ctx.runner.clone();
+        let config = &ctx.config;
+        let economics = ctx.economics.clone();
+        let verification_cache = ctx.verification_cache.clone();
         let store = artifact::Store::new(&run.repo_path);
-        let worker_worktree = root_worktree.join(&slice.id);
+        let worker_worktree = ctx.root_worktree.join(&slice.id);
         let worker_branch = format!("khazad/{}/{}", run.id, slice.id);
         {
             let _git_lock = WORKTREE_ADD_LOCK
@@ -1484,7 +1598,7 @@ impl Manager {
                 &run.repo_path,
                 &worker_worktree,
                 &worker_branch,
-                slice_base_sha,
+                &ctx.slice_base_sha,
             )
             .context("create worker worktree")?;
         }
@@ -1511,6 +1625,8 @@ impl Manager {
 
         let mut all_checks = Vec::new();
         let mut last_failure = String::new();
+        let mut primary_failure: Option<String> = None;
+        let mut secondary_failures: Vec<String> = Vec::new();
         for attempt in 1..=MAX_WORKER_ATTEMPTS {
             check_cancelled(cancel)?;
             let output_path = store.output_path(
@@ -1524,7 +1640,7 @@ impl Manager {
                 worktree_path: worker_worktree.to_string_lossy().to_string(),
                 branch: worker_branch.clone(),
                 slice: slice.clone(),
-                dependency_summary: dependency_summary.clone(),
+                dependency_summary: ctx.dependency_summary.clone(),
                 output_path: output_path.to_string_lossy().to_string(),
                 contract: "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
                     .to_string(),
@@ -1539,8 +1655,7 @@ impl Manager {
                 runner.name(),
                 "slice worker is running",
             );
-            let agent_started_at = Instant::now();
-            let result = match self.run_supervised_worker_job(
+            let result = match self.run_recorded_agent_job(
                 runner.clone(),
                 Job {
                     kind: "slice-worker".to_string(),
@@ -1551,41 +1666,44 @@ impl Manager {
                 },
                 cancel,
                 WorkerAttemptContext::new(&run.id, "worker_running", &slice.id, attempt, config),
+                &economics,
+                AgentCallContext {
+                    phase: "slice_worker",
+                    slice_id: &slice.id,
+                    attempt,
+                },
             ) {
-                Ok(result) => {
-                    economics.record_agent_call(agent_call(
-                        "slice_worker",
-                        &slice.id,
-                        attempt,
-                        "slice-worker",
-                        runner.name(),
-                        "succeeded",
-                        agent_started_at.elapsed(),
-                        Some(&result.usage),
-                        "",
-                    ));
-                    result
-                }
+                Ok(result) => result,
                 Err(err) => {
-                    economics.record_agent_call(agent_call(
-                        "slice_worker",
-                        &slice.id,
+                    last_failure = err.to_string();
+                    remember_attempt_failure(
+                        &mut primary_failure,
+                        &mut secondary_failures,
+                        &last_failure,
+                    );
+                    self.write_worker_attempt_failure_artifact(
+                        run,
+                        slice,
                         attempt,
-                        "slice-worker",
-                        runner.name(),
-                        "failed",
-                        agent_started_at.elapsed(),
-                        None,
-                        err.to_string(),
-                    ));
+                        "worker_error",
+                        &last_failure,
+                        &worker_worktree,
+                        &output_path,
+                        Some(err.as_ref()),
+                    )?;
                     if cancel.is_cancelled() {
                         return Err(CancelledError::new("run cancelled").into());
                     }
-                    last_failure = err.to_string();
                     self.state.record_event(
                         &run.id,
                         "worker_error",
-                        &json!({ "slice_id": slice.id, "attempt": attempt, "error": last_failure }),
+                        &json!({
+                            "slice_id": slice.id,
+                            "attempt": attempt,
+                            "error": last_failure,
+                            "primary_failure": &primary_failure,
+                            "secondary_failures": &secondary_failures,
+                        }),
                     )?;
                     continue;
                 }
@@ -1593,17 +1711,32 @@ impl Manager {
 
             let Some(output) = result.output else {
                 last_failure = "worker returned no JSON output".to_string();
+                remember_attempt_failure(
+                    &mut primary_failure,
+                    &mut secondary_failures,
+                    &last_failure,
+                );
                 continue;
             };
             let mut worker_result: WorkerResult = match serde_json::from_value(output) {
                 Ok(value) => value,
                 Err(err) => {
                     last_failure = format!("worker JSON did not match result model: {err}");
+                    remember_attempt_failure(
+                        &mut primary_failure,
+                        &mut secondary_failures,
+                        &last_failure,
+                    );
                     continue;
                 }
             };
             if let Err(err) = validate_worker_result(&worker_result, slice) {
                 last_failure = format!("worker JSON failed validation: {err}");
+                remember_attempt_failure(
+                    &mut primary_failure,
+                    &mut secondary_failures,
+                    &last_failure,
+                );
                 continue;
             }
             artifact::write_json(&output_path, &worker_result)?;
@@ -1613,7 +1746,7 @@ impl Manager {
                     run_id: &run.id,
                     slice,
                     worker_worktree: &worker_worktree,
-                    base_sha: slice_base_sha,
+                    base_sha: &ctx.slice_base_sha,
                     attempt,
                     config,
                     economics: economics.clone(),
@@ -1666,6 +1799,31 @@ impl Manager {
             } else {
                 check.summary.clone()
             };
+            if check.status != "passed" || worker_result.status == "failed" {
+                remember_attempt_failure(
+                    &mut primary_failure,
+                    &mut secondary_failures,
+                    &last_failure,
+                );
+            }
+            if check_failure_needs_operator(&check) {
+                let message = final_attempt_failure_message(
+                    &slice.id,
+                    primary_failure.as_deref(),
+                    &last_failure,
+                    &secondary_failures,
+                );
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: slice.id.clone(),
+                    status: SliceStatus::Failed,
+                    branch: worker_branch.clone(),
+                    commit_sha: check.worker_head.clone(),
+                    attempts: attempt,
+                    last_error: message.clone(),
+                })?;
+                bail!(message);
+            }
             if worker_result.status == "blocked" {
                 self.state.update_slice_status(
                     &run.id,
@@ -1680,18 +1838,19 @@ impl Manager {
                 .into());
             }
             if attempt == MAX_WORKER_ATTEMPTS {
+                let message = final_attempt_failure_message(
+                    &slice.id,
+                    primary_failure.as_deref(),
+                    &last_failure,
+                    &secondary_failures,
+                );
                 self.state.update_slice_status(
                     &run.id,
                     &slice.id,
                     SliceStatus::Failed,
-                    &last_failure,
+                    &message,
                 )?;
-                bail!(
-                    "slice {} failed lightweight checks after {} attempts: {}",
-                    slice.id,
-                    MAX_WORKER_ATTEMPTS,
-                    last_failure
-                );
+                bail!(message);
             }
             self.state.upsert_slice_run(&SliceRun {
                 run_id: run.id.clone(),
@@ -1703,9 +1862,15 @@ impl Manager {
                 last_error: check.summary.clone(),
             })?;
         }
+        let message = final_attempt_failure_message(
+            &slice.id,
+            primary_failure.as_deref(),
+            &last_failure,
+            &secondary_failures,
+        );
         self.state
-            .update_slice_status(&run.id, &slice.id, SliceStatus::Failed, &last_failure)?;
-        bail!("slice {} did not become ready: {}", slice.id, last_failure)
+            .update_slice_status(&run.id, &slice.id, SliceStatus::Failed, &message)?;
+        bail!(message)
     }
 
     fn lightweight_check(
@@ -1723,6 +1888,7 @@ impl Manager {
             worker_head: String::new(),
             worktree_ok: true,
             commit_found: true,
+            failure_kind: String::new(),
         };
 
         let status = match gitutil::status_porcelain(ctx.worker_worktree) {
@@ -1730,6 +1896,7 @@ impl Manager {
             Err(err) => {
                 check.status = "failed".to_string();
                 check.summary = err.to_string();
+                check.failure_kind = "git_status_failed".to_string();
                 return Ok(check);
             }
         };
@@ -1737,6 +1904,7 @@ impl Manager {
             check.worktree_ok = false;
             check.status = "failed".to_string();
             check.summary = "worker worktree is not clean".to_string();
+            check.failure_kind = "dirty_worktree".to_string();
             check.findings.push(Finding {
                 id: String::new(),
                 severity: "error".to_string(),
@@ -1754,6 +1922,7 @@ impl Manager {
             Err(err) => {
                 check.status = "failed".to_string();
                 check.summary = err.to_string();
+                check.failure_kind = "git_head_failed".to_string();
                 return Ok(check);
             }
         };
@@ -1762,6 +1931,7 @@ impl Manager {
             check.commit_found = false;
             check.status = "failed".to_string();
             check.summary = "worker did not create a slice commit".to_string();
+            check.failure_kind = "missing_slice_commit".to_string();
             check.findings.push(Finding {
                 id: String::new(),
                 severity: "error".to_string(),
@@ -1769,6 +1939,33 @@ impl Manager {
                 file: String::new(),
                 line: 0,
                 description: "slice worker must commit completed work on its branch".to_string(),
+            });
+            return Ok(check);
+        }
+
+        if let Some(outside) = changed_files_outside_slice_areas(
+            ctx.worker_worktree,
+            ctx.base_sha,
+            &head,
+            &ctx.slice.areas,
+        )? {
+            check.status = "failed".to_string();
+            check.summary = format!(
+                "worker changed files outside slice areas: {}",
+                outside.join(", ")
+            );
+            check.failure_kind = "scope_violation".to_string();
+            check.findings.push(Finding {
+                id: String::new(),
+                severity: "error".to_string(),
+                action: "auto-fix".to_string(),
+                file: outside.first().cloned().unwrap_or_default(),
+                line: 0,
+                description: format!(
+                    "slice areas are [{}]; worker changed outside-area files: {}",
+                    ctx.slice.areas.join(", "),
+                    outside.join(", ")
+                ),
             });
             return Ok(check);
         }
@@ -1791,10 +1988,65 @@ impl Manager {
         if let Some(failure) = verification.failure {
             check.status = "failed".to_string();
             check.summary = failure.summary;
+            check.failure_kind = failure.failure_kind;
             check.findings.push(failure.finding);
             return Ok(check);
         }
         Ok(check)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_worker_attempt_failure_artifact(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        attempt: usize,
+        phase: &str,
+        error: &str,
+        worker_worktree: &Path,
+        output_path: &Path,
+        source: Option<&(dyn Error + Send + Sync + 'static)>,
+    ) -> Result<()> {
+        let store = artifact::Store::new(&run.repo_path);
+        store.ensure_run_dirs(&run.id)?;
+        let transcript = source
+            .and_then(|err| err.downcast_ref::<RunnerError>())
+            .map(|err| err.transcript().clone())
+            .unwrap_or_default();
+        let progress = self.state.get_progress(&run.id)?;
+        let cancel_reason = latest_cancel_reason(&self.state.get_events(&run.id, 200)?);
+        let diagnostic = json!({
+            "run_id": run.id,
+            "slice_id": slice.id,
+            "attempt": attempt,
+            "phase": phase,
+            "error": error,
+            "cancel_reason": cancel_reason,
+            "output_path": output_path.to_string_lossy(),
+            "worktree_path": worker_worktree.to_string_lossy(),
+            "worktree_status": git_output_or_empty(worker_worktree, &["status", "--porcelain"]),
+            "worktree_diff_tail": bounded_text(&git_output_or_empty(worker_worktree, &["diff"]), 20_000),
+            "committed_diff_name_only": git_output_or_empty(worker_worktree, &["diff", "--name-only", &self.current_slice_base_for_artifact(run, slice), "HEAD"]),
+            "stdout_tail": transcript.stdout_tail,
+            "stderr_tail": transcript.stderr_tail,
+            "assistant_tail": transcript.assistant_tail,
+            "progress": progress,
+            "created_at": Utc::now(),
+        });
+        artifact::write_json(
+            store.output_path(
+                &run.id,
+                &format!("{}.worker.attempt-{attempt}.failure.json", slice.id),
+            ),
+            &diagnostic,
+        )?;
+        Ok(())
+    }
+
+    fn current_slice_base_for_artifact(&self, run: &Run, _slice: &Slice) -> String {
+        // Best-effort only: attempt artifacts are diagnostic and must not fail the workflow.
+        gitutil::run(&run.repo_path, &["rev-parse", &run.integration_branch])
+            .unwrap_or_else(|_| run.base_sha.clone())
     }
 
     fn integration_repair(&self, context: IntegrationRepairContext<'_>) -> Result<RepairResult> {
@@ -1829,8 +2081,7 @@ impl Manager {
                 &gate_summary,
                 context.trigger,
             );
-            let agent_started_at = Instant::now();
-            let agent_result = match self.run_supervised_worker_job(
+            let agent_result = match self.run_recorded_agent_job(
                 runner.clone(),
                 Job {
                     kind: "integration-repair".to_string(),
@@ -1841,33 +2092,15 @@ impl Manager {
                 },
                 cancel,
                 WorkerAttemptContext::new(&run.id, "integration_repair", "", attempt, config),
+                &economics,
+                AgentCallContext {
+                    phase: "integration_repair",
+                    slice_id: "",
+                    attempt,
+                },
             ) {
-                Ok(result) => {
-                    economics.record_agent_call(agent_call(
-                        "integration_repair",
-                        "",
-                        attempt,
-                        "integration-repair",
-                        runner.name(),
-                        "succeeded",
-                        agent_started_at.elapsed(),
-                        Some(&result.usage),
-                        "",
-                    ));
-                    result
-                }
+                Ok(result) => result,
                 Err(err) => {
-                    economics.record_agent_call(agent_call(
-                        "integration_repair",
-                        "",
-                        attempt,
-                        "integration-repair",
-                        runner.name(),
-                        "failed",
-                        agent_started_at.elapsed(),
-                        None,
-                        err.to_string(),
-                    ));
                     if cancel.is_cancelled() {
                         return Err(CancelledError::new("run cancelled").into());
                     }
@@ -2050,6 +2283,145 @@ struct LightweightCheckContext<'a> {
     verification_cache: VerificationCommandCache,
 }
 
+fn remember_attempt_failure(
+    primary: &mut Option<String>,
+    secondary: &mut Vec<String>,
+    failure: &str,
+) {
+    let failure = failure.trim();
+    if failure.is_empty() {
+        return;
+    }
+    match primary {
+        None => *primary = Some(failure.to_string()),
+        Some(existing) if existing == failure => {}
+        Some(_) if secondary.iter().any(|entry| entry == failure) => {}
+        Some(_) => secondary.push(failure.to_string()),
+    }
+}
+
+fn final_attempt_failure_message(
+    slice_id: &str,
+    primary: Option<&str>,
+    latest: &str,
+    secondary: &[String],
+) -> String {
+    let primary = primary
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(latest);
+    let mut message = format!("slice {slice_id} did not become ready: {primary}");
+    let details = secondary
+        .iter()
+        .filter(|failure| failure.as_str() != primary)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !details.is_empty() {
+        message.push_str("; secondary failures: ");
+        message.push_str(&details.join("; "));
+    }
+    message
+}
+
+fn check_failure_needs_operator(check: &CheckResult) -> bool {
+    failure_kind_needs_operator(&check.failure_kind)
+        || check
+            .findings
+            .iter()
+            .any(|finding| finding.action == "operator-fix")
+}
+
+fn latest_cancel_reason(events: &[crate::domain::Event]) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.typ == "run_cancel_requested")
+        .and_then(|event| event.payload.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn primary_failure_for_terminal_summary(
+    message: &str,
+    slice_runs: &[SliceRun],
+    events: &[crate::domain::Event],
+) -> String {
+    if !message.trim().is_empty() {
+        return message.to_string();
+    }
+    slice_runs
+        .iter()
+        .find(|slice_run| !slice_run.last_error.trim().is_empty())
+        .map(|slice_run| slice_run.last_error.clone())
+        .or_else(|| {
+            events
+                .iter()
+                .rev()
+                .find(|event| event.typ == "run_error")
+                .and_then(|event| event.payload.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn terminal_next_commands(run: &Run, status: RunStatus) -> Vec<String> {
+    match status {
+        RunStatus::Completed => vec![format!("khazad-doom handoff --run {}", run.id)],
+        RunStatus::Failed | RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => {
+            vec![
+                format!("khazad-doom inspect --run {}", run.id),
+                format!("khazad-doom resume --run {}", run.id),
+            ]
+        }
+        RunStatus::Pending | RunStatus::Running => Vec::new(),
+    }
+}
+
+fn git_output_or_empty(worktree: &Path, args: &[&str]) -> String {
+    gitutil::run(worktree, args).unwrap_or_default()
+}
+
+fn bounded_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) && start < text.len() {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
+fn changed_files_outside_slice_areas(
+    worktree: &Path,
+    base_sha: &str,
+    head_sha: &str,
+    areas: &[String],
+) -> Result<Option<Vec<String>>> {
+    if areas.is_empty() || areas.iter().any(|area| area.trim() == ".") {
+        return Ok(None);
+    }
+    let output = gitutil::run(worktree, &["diff", "--name-only", base_sha, head_sha])?;
+    let outside = output
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter(|path| !areas.iter().any(|area| path_matches_area(path, area)))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok((!outside.is_empty()).then_some(outside))
+}
+
+fn path_matches_area(path: &str, area: &str) -> bool {
+    let area = area.trim().trim_matches('/');
+    if area.is_empty() || area == "." {
+        return true;
+    }
+    let path = path.trim().trim_matches('/');
+    path == area || path.starts_with(&format!("{area}/"))
+}
+
 fn parallel_layer_success_outcomes(
     results: &BTreeMap<String, Result<SliceWorkerOutcome>>,
 ) -> Vec<serde_json::Value> {
@@ -2208,6 +2580,94 @@ fn skipped_repair_result(policy: RepairPolicy, gate: &GateResult) -> RepairResul
         trigger: trigger.to_string(),
         attempts: 0,
         ..RepairResult::default()
+    }
+}
+
+fn final_exit_states(gate: &GateResult, completed_slices: &[WorkerResult]) -> WorkflowExitStates {
+    let gate_passed = gate.status == "passed";
+    WorkflowExitStates {
+        run: if gate_passed { "completed" } else { "failed" }.to_string(),
+        handoff: if gate_passed {
+            "ready_for_handoff"
+        } else {
+            "not_ready"
+        }
+        .to_string(),
+        evidence: if gate_passed {
+            "daemon_attested"
+        } else {
+            "daemon_rejected"
+        }
+        .to_string(),
+        slices: completed_slices
+            .iter()
+            .map(|result| SliceExitState {
+                slice_id: result.slice_id.clone(),
+                worker: result.status.clone(),
+                daemon: "merged".to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn final_evidence_attestation(gate: &GateResult) -> EvidenceAttestation {
+    let gate_passed = gate.status == "passed";
+    let mut basis = vec![
+        "worker acceptance_status is treated as an evidence claim, not approval".to_string(),
+        "daemon required a committed clean worktree before merge".to_string(),
+        "daemon required slice verification/lightweight checks before merge".to_string(),
+    ];
+    if gate_passed {
+        basis.push("daemon integration gate passed before handoff".to_string());
+    } else {
+        basis.push(format!(
+            "daemon integration gate did not attest handoff: {}",
+            gate.summary
+        ));
+    }
+    EvidenceAttestation {
+        status: if gate_passed {
+            "daemon_attested"
+        } else {
+            "daemon_rejected"
+        }
+        .to_string(),
+        attester: "khazad-doom-daemon".to_string(),
+        worker_self_approved: false,
+        basis,
+    }
+}
+
+fn historical_handoff_exit_states(
+    status: RunStatus,
+    completed_slices: &[String],
+) -> WorkflowExitStates {
+    WorkflowExitStates {
+        run: status.as_str().to_string(),
+        handoff: if status == RunStatus::Completed {
+            "ready_for_handoff"
+        } else {
+            "not_ready"
+        }
+        .to_string(),
+        evidence: "attestation_unavailable".to_string(),
+        slices: completed_slices
+            .iter()
+            .map(|slice_id| SliceExitState {
+                slice_id: slice_id.clone(),
+                worker: "complete".to_string(),
+                daemon: "merged".to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn historical_evidence_attestation() -> EvidenceAttestation {
+    EvidenceAttestation {
+        status: "attestation_unavailable".to_string(),
+        attester: "khazad-doom-daemon".to_string(),
+        worker_self_approved: false,
+        basis: vec!["historical summary did not include attestation metadata".to_string()],
     }
 }
 
@@ -2622,8 +3082,9 @@ mod tests {
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, Handoff, ImplementationSummary, RepairResult, Run, RunStatus, Slice,
-        SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
+        AcceptanceEvidence, CheckResult, Handoff, ImplementationSummary, RepairResult, Run,
+        RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult,
+        WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -2778,7 +3239,7 @@ mod tests {
         second.verify = vec!["test -f slice-002.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
         artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
-        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slices"])?;
 
         let home = tempfile::tempdir()?;
@@ -2796,6 +3257,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 2,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -2823,7 +3285,7 @@ mod tests {
         second.verify = vec!["test -f slice-002.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
         artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
-        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slices"])?;
 
         let home = tempfile::tempdir()?;
@@ -2841,6 +3303,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 1,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -2866,6 +3329,27 @@ mod tests {
         assert_eq!(summary.integration_repair.trigger, "gate_passed");
         assert_eq!(summary.economics.repair_policy, "auto");
         assert_eq!(summary.economics.repair_attempts, 0);
+        assert_eq!(summary.exit_states.run, "completed");
+        assert_eq!(summary.exit_states.handoff, "ready_for_handoff");
+        assert_eq!(summary.exit_states.evidence, "daemon_attested");
+        assert_eq!(summary.exit_states.slices.len(), 2);
+        assert!(
+            summary
+                .exit_states
+                .slices
+                .iter()
+                .all(|slice| slice.worker == "complete" && slice.daemon == "merged")
+        );
+        assert_eq!(summary.evidence_attestation.status, "daemon_attested");
+        assert_eq!(summary.evidence_attestation.attester, "khazad-doom-daemon");
+        assert!(!summary.evidence_attestation.worker_self_approved);
+        assert!(
+            summary
+                .evidence_attestation
+                .basis
+                .iter()
+                .any(|basis| basis.contains("claim, not approval"))
+        );
         assert_eq!(summary.economics.agent_call_count, 2);
         assert!(summary.economics.command_execution_count >= 2);
         assert_eq!(summary.economics.duplicate_command_count, 0);
@@ -2915,6 +3399,9 @@ mod tests {
         );
         let handoff = manager.branch_handoff(&run.id, false, false, false)?;
         assert_eq!(handoff.integration_branch, completed.integration_branch);
+        assert_eq!(handoff.exit_states.handoff, "ready_for_handoff");
+        assert_eq!(handoff.evidence_attestation.status, "daemon_attested");
+        assert!(!handoff.evidence_attestation.worker_self_approved);
         assert!(handoff.push_command.contains(&completed.integration_branch));
         assert!(handoff.pr_command.contains("gh pr create"));
         let inspection = manager.inspect_run(&run.id, 10)?;
@@ -2939,7 +3426,7 @@ mod tests {
         let mut first = slice("slice-001");
         first.verify = vec!["test -f slice-001.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
-        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
 
         let home = tempfile::tempdir()?;
@@ -2995,6 +3482,144 @@ mod tests {
     }
 
     #[test]
+    fn missing_verify_tool_fails_once_and_preserves_primary_cause() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["definitely_missing_khazad_tool_for_retry_regression".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add missing-tool slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let failed = wait_for_run(&state, &run.id)?;
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert!(failed.error.contains("daemon/operator environment"));
+        assert!(
+            failed
+                .error
+                .contains("definitely_missing_khazad_tool_for_retry_regression")
+        );
+        assert!(!failed.error.contains("nothing to commit"));
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert_eq!(slice_runs[0].attempts, 1);
+        assert_eq!(slice_runs[0].status, SliceStatus::Failed);
+        let check: CheckResult =
+            artifact::read_json(store.output_path(&run.id, "slice-001.check.attempt-1.json"))?;
+        assert_eq!(check.failure_kind, "tool_missing");
+        assert_eq!(check.findings[0].action, "operator-fix");
+        let run_summary: serde_json::Value =
+            artifact::read_json(store.output_path(&run.id, "run-summary.json"))?;
+        assert_eq!(run_summary["status"], "failed");
+        assert!(
+            run_summary["primary_failure"]
+                .as_str()
+                .unwrap()
+                .contains("daemon/operator environment")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_source_repo_requires_explicit_allow_dirty() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+        fs::write(repo.path().join("dirty.txt"), "uncommitted\n")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state, Arc::new(FakeRunner));
+        let err = manager
+            .start_run(StartOptions {
+                repo_path: repo.path().to_path_buf(),
+                slice_ids: vec!["slice-001".to_string()],
+                all: false,
+                agent: "fake".to_string(),
+                pi_bin: String::new(),
+                pi_args: Vec::new(),
+                parallelism: 1,
+                allow_dirty: false,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("source repo has uncommitted changes")
+        );
+        assert!(err.to_string().contains("dirty.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_files_outside_slice_areas_block_worker() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.areas = vec!["src".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add scoped slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let failed = wait_for_run(&state, &run.id)?;
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert!(failed.error.contains("outside slice areas"));
+        assert!(failed.error.contains("slice-001.txt"));
+        let check: CheckResult =
+            artifact::read_json(store.output_path(&run.id, "slice-001.check.attempt-1.json"))?;
+        assert_eq!(check.failure_kind, "scope_violation");
+        Ok(())
+    }
+
+    #[test]
     fn untracked_workflow_slices_do_not_fail_successful_finalization() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -3019,6 +3644,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 1,
+            allow_dirty: true,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -3048,7 +3674,7 @@ mod tests {
         let mut first = slice("slice-001");
         first.verify = vec!["test -f slice-001.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
-        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slice and config"])?;
 
         let home = tempfile::tempdir()?;
@@ -3066,6 +3692,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 1,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -3101,7 +3728,7 @@ mod tests {
         let mut first = slice("slice-001");
         first.verify = vec!["git branch --show-current | grep /slice-001".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
-        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slice and config"])?;
 
         let home = tempfile::tempdir()?;
@@ -3119,6 +3746,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 1,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -3159,7 +3787,7 @@ mod tests {
         second.verify = vec!["test -f slice-002.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
         artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
-        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(
             repo.path(),
             &["commit", "-m", "add closed dependency and open slice"],
@@ -3180,6 +3808,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 1,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -3212,7 +3841,7 @@ mod tests {
         closed.closed_by_run = "kd-prior".to_string();
         closed.closed_at = Utc::now().to_rfc3339();
         artifact::write_json(store.slices_dir().join("slice-001.json"), &closed)?;
-        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add closed slice"])?;
 
         let home = tempfile::tempdir()?;
@@ -3231,6 +3860,7 @@ mod tests {
                 pi_bin: String::new(),
                 pi_args: Vec::new(),
                 parallelism: 1,
+                allow_dirty: false,
             })
             .unwrap_err();
         assert!(err.to_string().contains("is closed"));
@@ -3277,7 +3907,7 @@ mod tests {
         let mut first = slice("slice-001");
         first.verify_profile = "quick".to_string();
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
-        gitutil::run(repo.path(), &["add", ".workflow"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add configured slice"])?;
 
         let home = tempfile::tempdir()?;
@@ -3295,6 +3925,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 0,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -3311,7 +3942,7 @@ mod tests {
         let mut first = slice("slice-001");
         first.verify = vec!["sleep 2 && test -f slice-001.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
-        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
 
         let home = tempfile::tempdir()?;
@@ -3329,6 +3960,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 1,
+            allow_dirty: false,
         })?;
 
         let err = manager
@@ -3340,6 +3972,7 @@ mod tests {
                 pi_bin: String::new(),
                 pi_args: Vec::new(),
                 parallelism: 1,
+                allow_dirty: false,
             })
             .unwrap_err();
         assert!(err.to_string().contains("already has active run"));
@@ -3362,7 +3995,7 @@ mod tests {
             store.slices_dir().join("slice-002.json"),
             &slice("slice-002"),
         )?;
-        gitutil::run(repo.path(), &["add", ".workflow/slices"])?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
         gitutil::run(repo.path(), &["commit", "-m", "add slices"])?;
 
         let home = tempfile::tempdir()?;
@@ -3380,6 +4013,7 @@ mod tests {
             pi_bin: String::new(),
             pi_args: Vec::new(),
             parallelism: 2,
+            allow_dirty: false,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -3442,7 +4076,6 @@ mod tests {
             }
             if job.kind == "integration-repair" {
                 return Ok(ResultData {
-                    text: "{}".to_string(),
                     output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
                     usage: Usage::default(),
                 });
@@ -3461,7 +4094,6 @@ mod tests {
             let sha = gitutil::head_sha(&job.cwd)?;
             let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
-                text: "{}".to_string(),
                 output: Some(json!({
                     "slice_id": handoff.slice.id,
                     "status": "complete",
@@ -3493,7 +4125,6 @@ mod tests {
             }
             if job.kind == "integration-repair" {
                 return Ok(ResultData {
-                    text: "{}".to_string(),
                     output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
                     usage: Usage::default(),
                 });
@@ -3512,7 +4143,6 @@ mod tests {
             let sha = gitutil::head_sha(&job.cwd)?;
             let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
-                text: "{}".to_string(),
                 output: Some(json!({
                     "slice_id": handoff.slice.id,
                     "status": "complete",

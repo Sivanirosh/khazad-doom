@@ -47,6 +47,8 @@ pub struct StartRunParams {
     pub pi_args: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallelism: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -87,6 +87,18 @@ function noisyDetails() {
 			},
 			output_tail: Array.from({ length: 8 }, (_, index) => `tail line ${index + 1}`).join('\n'),
 		},
+		economics: {
+			agent_call_count: 2,
+			command_execution_count: 3,
+			duplicate_command_count: 1,
+			cache_hits: 4,
+			cache_misses: 5,
+			repair_policy: 'auto',
+			repair_attempts: 0,
+			repair_max_attempts: 1,
+			gate_fail_fast: true,
+			sla_violations: [],
+		},
 		events: Array.from({ length: 18 }, (_, index) => ({
 			id: index + 1,
 			created_at: `2026-06-26T20:34:${String(index).padStart(2, '0')}Z`,
@@ -148,7 +160,9 @@ test('khazad monitor overlay collapses duplicate historical sections into activi
 	assert.equal(sectionCount(lines, 'Run'), 1);
 	assert.equal(sectionCount(lines, 'Worker'), 1);
 	assert.equal(sectionCount(lines, 'Activity'), 1);
+	assert.equal(sectionCount(lines, 'Economics'), 1);
 	assert.match(text, /Activity.*recent/);
+	assert.match(text, /Agent calls: 2 \| Commands: 3/);
 	assert.match(text, /Run \(started\): 5 selected slices/);
 	assert.doesNotMatch(text, /Worker \(KF-CHECK-VALIDATOR-01 • attempt 1\): slice KF-CHECK-VALIDATOR-01/);
 });
@@ -213,6 +227,36 @@ test('khazad monitor overlay escalates completed runs with incidents', () => {
 	assert.match(text, /run_resumed/);
 	assert.match(text, /integration_repair_completed: fixed stabilized flaky smoke/);
 	assert.match(text, /slice_close_skipped: slice metadata missing/);
+});
+
+test('khazad monitor overlay renders status incidents outside event tail', () => {
+	const { overlay } = makeOverlay(40);
+	const details = noisyDetails();
+	details.events = [];
+	details.incidents = [
+		{ severity: 'warning', kind: 'slice_close_skipped', message: 'slice metadata missing' },
+	];
+	overlay.state.details = details;
+
+	const text = overlay.render(120).join('\n');
+
+	assert.match(text, /Incidents/);
+	assert.match(text, /slice_close_skipped: slice metadata missing/);
+});
+
+test('khazad monitor overlay renders active parallel layer fields', () => {
+	const { overlay } = makeOverlay(40);
+	const details = noisyDetails();
+	details.progress.parallel_layer = true;
+	details.progress.parallel_slices = ['slice-001', 'slice-002'];
+	details.progress.slice_id = 'slice-001,slice-002';
+	details.progress.attempt = 1;
+	overlay.state.details = details;
+
+	const text = overlay.render(120).join('\n');
+
+	assert.match(text, /Worker\s+\(parallel layer: slice-001, slice-002 • attempt 1 • now\)/);
+	assert.match(text, /Parallel layer: slice-001, slice-002/);
 });
 
 test('khazad monitor overlay caps tall feeds and keeps a visible scrollbar/footer', () => {

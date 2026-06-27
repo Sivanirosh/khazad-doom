@@ -1,6 +1,6 @@
 use super::CancelledError;
 use crate::agent::CancellationToken;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -11,6 +11,49 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) const PROGRESS_OUTPUT_TAIL_BYTES: usize = 4_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellFailureKind {
+    Spawn,
+    Timeout,
+}
+
+impl ShellFailureKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn_failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShellCommandError {
+    kind: ShellFailureKind,
+    message: String,
+}
+
+impl ShellCommandError {
+    fn new(kind: ShellFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> ShellFailureKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for ShellCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ShellCommandError {}
+
 pub(crate) type ShellProgress = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 pub(crate) struct ShellCommand {
@@ -67,7 +110,15 @@ impl ShellCommand {
                 }
             });
         }
-        let mut child = process.spawn()?;
+        let mut child = process.spawn().map_err(|err| {
+            ShellCommandError::new(
+                ShellFailureKind::Spawn,
+                format!(
+                    "failed to start verify shell in {}: {err}",
+                    self.cwd.display()
+                ),
+            )
+        })?;
         let stdout = child.stdout.take().context("command stdout")?;
         let stderr = child.stderr.take().context("command stderr")?;
         let monitor = ShellCommandMonitor::spawn(stdout, stderr, self.progress);
@@ -83,7 +134,11 @@ impl ShellCommand {
             if !self.timeout.is_zero() && started_at.elapsed() >= self.timeout {
                 terminate_process_group(&mut child);
                 let _ = monitor.finish();
-                bail!("command timed out after {} seconds", self.timeout.as_secs());
+                return Err(ShellCommandError::new(
+                    ShellFailureKind::Timeout,
+                    format!("command timed out after {} seconds", self.timeout.as_secs()),
+                )
+                .into());
             }
             if let Some(status) = child.try_wait()? {
                 break status;

@@ -121,6 +121,7 @@ The JSON wins over chat. `must_ask_if` is the line where the worker must stop an
 | Worktree isolation | Parallel workers cannot trample the same checkout. |
 | Parallel layer safety | Every spawned worker in a parallel batch is joined and recorded before success/failure; integration starts only after the whole layer succeeds. |
 | Structured output | Worker and repair results must be machine-readable JSON. |
+| Evidence separation | Workers produce acceptance evidence claims; daemon checks/gates attest or reject them. Workers do not approve their own evidence. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
 | Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `monitor`, `watch`, and optional Pi adapters. |
@@ -134,6 +135,8 @@ Behavior-preserving refactor guardrails are collected in [`docs/workflow-invaria
 
 Slices use a small issue-style lifecycle. New slices are `open` by default. A successful daemon run closes completed slice JSON in the integration branch with `status: "closed"`, `closed_by_run`, and `closed_at`. Future runs skip closed dependencies instead of launching historical work again, and explicitly requesting a closed slice is rejected; create a follow-up slice for new work.
 
+Final reports and handoff JSON include explicit `exit_states` plus `evidence_attestation`. These are read-only summaries over existing worker, slice, gate, and handoff states; they do not add another gate or let a worker approve its own evidence.
+
 ## Live progress
 
 The recommended harness-neutral live progress path is an always-on monitor:
@@ -142,26 +145,36 @@ The recommended harness-neutral live progress path is an always-on monitor:
 khazad-doom monitor --repo . --latest
 ```
 
-`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while any harness starts daemon-owned runs normally. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. Khazad-Doom does not auto-open external windows by default.
+`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while any harness starts daemon-owned runs normally. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. `Ctrl-C` exits only the terminal monitor; the daemon is detached from the monitor process group and keeps owning any run. Khazad-Doom does not auto-open external windows by default.
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so a harness can display those commands directly instead of guessing how to launch user-visible progress.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. A Pi extension can be an optional adapter over the same daemon state, but it is not required and does not own core workflow state.
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. The terminal `monitor` and optional Pi overlay intentionally share the same activity-feed vocabulary over daemon `status` JSON: `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, and `Tail`.
 
 During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
 
 ```text
-Phase: parallel_worker_layer (worker_running)
-Slice: parallel layer: slice-001, slice-002
-Parallel layer: slice-001, slice-002
-Supervisor: alive, observed child 8s ago
-Worker process: running pid=12345
-Worker runtime: 22m14s
-Last worker event: none
-Last semantic progress: unknown
-Timeout: disabled
-Warning: worker is quiet for 15m00s; this may be normal; no timeout configured
-Hint: wait, inspect, or cancel
+Todos (2 items)
+◐ slice-001  running
+☐ slice-002  pending
+
+Run ● running • kd-20260627-090458-b91f6fbf
+└ phase parallel_worker_layer (worker_running) • elapsed 22m14s
+└ repo …/example/repo
+└ slice worker is running
+
+Worker (parallel layer: slice-001, slice-002 • attempt 1 • now)
+└ Parallel layer: slice-001, slice-002
+└ Supervisor: alive, observed child 8s ago
+└ Process: running pid=12345
+└ Runtime: 22m14s
+└ Last worker event: none
+└ Last semantic progress: unknown
+└ Timeout: disabled
+
+Warn
+└ worker is quiet for 15m00s; this may be normal; no timeout configured
+└ wait, inspect, or cancel explicitly
 ```
 
 A quiet worker is not considered failed by default. Khazad-Doom reports that the daemon is still supervising the process, shows when stdout/stderr/JSON events last arrived, and leaves the wait/inspect/cancel decision explicit unless a repo config opts into a worker-attempt timeout. The status JSON includes `progress.parallel_layer: true` and `progress.parallel_slices` while a parallel worker layer is active.
@@ -188,7 +201,7 @@ The extension registers `/khazad-monitor`:
 /khazad-monitor <run-id>
 ```
 
-In Pi TUI mode it opens a centered, bordered activity-feed overlay that polls `khazad-doom status` and renders slice todos, current worker/shell progress, warnings, chronological daemon activity, and output-tail fields from the daemon JSON. When the feed is taller than the overlay, it shows a right-side scrollbar; use ↑/↓ or PgUp/PgDn to scroll. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
+In Pi TUI mode it opens a centered, bordered version of the same activity-feed dashboard as `khazad-doom monitor`: slice todos, current worker/shell progress, warnings, economics, chronological daemon activity, and output-tail fields from daemon JSON. When the feed is taller than the overlay, it shows a right-side scrollbar; use ↑/↓ or PgUp/PgDn to scroll. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
 
 To install only the skill without the optional extension, use Pi package filters in settings:
 
@@ -213,6 +226,7 @@ To install only the skill without the optional extension, use Pi package filters
 | `khazad-doom slices schema --write` | Write the JSON Schema for editor and CI validation. |
 | `khazad-doom run --slice <id>` | Run one open slice plus open dependencies; closed dependencies are treated as satisfied. |
 | `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently, then integrate only after the whole parallel layer succeeds. |
+| `khazad-doom run --allow-dirty ...` | Explicitly allow a dirty source repo; the preflight artifact records the dirty snapshot. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |
@@ -222,6 +236,7 @@ To install only the skill without the optional extension, use Pi package filters
 | `khazad-doom monitor --run <id>` | Open the dashboard TUI for one specific run. |
 | `khazad-doom watch --run <id>` | Plain text fallback for one specific run. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
+| `khazad-doom inspect --repo . --latest` | Inspect the latest run for a repo, including terminal runs. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
 | `khazad-doom handoff --run <id>` | Print push/PR handoff JSON for a completed run. |
 | `khazad-doom handoff --run <id> --push --create-pr` | Explicitly push and open a PR with `gh`. |
@@ -268,7 +283,9 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 }
 ```
 
-A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure.
+A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure. Missing tools, invalid verify cwd, shell spawn failures, and non-executable commands are classified as daemon/operator environment failures instead of worker auto-fix failures.
+
+Run start is clean-by-default: Khazad-Doom rejects a dirty source repo unless `--allow-dirty` is explicit, and every run writes `.workflow/runs/<run>/outputs/preflight.json` with base branch/SHA and dirty status. Worker changes are also checked against slice `areas` when areas are declared; outside-area changes block the slice as a scope violation.
 
 `integration_repair` controls when the repair agent runs: `auto` runs repair only after failed integration-gate evidence, `never` surfaces the failed gate without repair, and `always` runs repair even when the pre-repair gate passed. Repair never bypasses the gate; any repair is followed by a second integration gate.
 
@@ -293,7 +310,7 @@ Retries preserve attempt history and should be treated as at-least-once executio
 | `.workflow/schema/slice.schema.json` | JSON Schema for editor/CI validation. |
 | `.workflow/plans/` | Optional planning artifacts. |
 | `.workflow/reports/` | Reports committed to integration branches. |
-| `.workflow/runs/` | Transient handoffs and raw outputs; gitignored. |
+| `.workflow/runs/` | Transient handoffs, preflight snapshots, terminal run summaries, attempt diagnostics, and raw outputs; gitignored. |
 | `~/.khazad-doom/socket` | Daemon IPC socket. |
 | `~/.khazad-doom/state.sqlite` | Run, slice, event, and live progress state. |
 | `~/.khazad-doom/worktrees/` | Daemon-managed temporary worktrees. |

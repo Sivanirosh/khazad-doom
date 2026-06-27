@@ -19,6 +19,7 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("- Preserve unrelated changes.\n");
     prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
     prompt.push_str("- Do not run daemon-owned verification commands unless needed for your own confidence; the daemon will run required checks.\n");
+    prompt.push_str("- Do not approve your own evidence; acceptance_status is your claim plus evidence only, and the daemon will attest or reject it.\n");
     prompt.push_str("- Commit all intended changes on the current branch before finishing.\n");
     prompt.push_str("- Leave the worktree clean.\n");
     prompt.push_str("- Do not create markdown reports; return only JSON.\n");

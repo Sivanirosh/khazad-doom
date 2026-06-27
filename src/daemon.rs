@@ -20,7 +20,14 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
+const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const ACCEPT_LOOP_IDLE_SLEEP: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -37,9 +44,17 @@ impl Client {
         P: Serialize,
         O: DeserializeOwned,
     {
+        self.call_with_timeout(method, params, CLIENT_RPC_TIMEOUT)
+    }
+
+    pub fn call_with_timeout<P, O>(&self, method: &str, params: &P, timeout: Duration) -> Result<O>
+    where
+        P: Serialize,
+        O: DeserializeOwned,
+    {
         let mut stream = UnixStream::connect(self.paths.socket())?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         let id = request_id();
         let request = Request {
             id,
@@ -67,22 +82,43 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    pub fn ping(&self) -> Result<()> {
-        let _: serde_json::Value = self.call(
+    pub fn ping_with_timeout(&self, timeout: Duration) -> Result<()> {
+        let _: serde_json::Value = self.call_with_timeout(
             "status",
             &StatusParams {
                 limit: 1,
                 ..StatusParams::default()
             },
+            timeout,
         )?;
         Ok(())
     }
+
+    pub fn health_check(&self) -> DaemonHealth {
+        if !self.paths.socket().exists() {
+            return DaemonHealth::Missing;
+        }
+        match self.ping_with_timeout(DAEMON_HEALTH_TIMEOUT) {
+            Ok(()) => DaemonHealth::Running,
+            Err(err) if is_missing_socket_error(err.as_ref()) => DaemonHealth::Missing,
+            Err(err) => DaemonHealth::Unhealthy(err.to_string()),
+        }
+    }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonHealth {
+    Running,
+    Missing,
+    Unhealthy(String),
+}
+
+#[derive(Clone)]
 pub struct Server {
     paths: Paths,
     store: StateStore,
     manager: Manager,
+    request_lock: Arc<Mutex<()>>,
 }
 
 impl Server {
@@ -92,6 +128,7 @@ impl Server {
             paths,
             store,
             manager,
+            request_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -99,10 +136,22 @@ impl Server {
         self.paths.ensure()?;
         let socket = self.paths.socket();
         if socket.exists() {
-            if UnixStream::connect(&socket).is_ok() {
-                bail!("daemon already running at {}", socket.display());
+            match Client::new(self.paths.clone()).health_check() {
+                DaemonHealth::Running => bail!("daemon already running at {}", socket.display()),
+                DaemonHealth::Missing => {
+                    let _ = fs::remove_file(&socket);
+                }
+                DaemonHealth::Unhealthy(reason) => {
+                    if let Some(pid) = live_daemon_pid(&self.paths) {
+                        bail!(
+                            "daemon socket at {} is unhealthy but daemon pid {pid} is still running: {reason}",
+                            socket.display()
+                        );
+                    }
+                    let _ = fs::remove_file(&socket);
+                    let _ = fs::remove_file(self.paths.pid_file());
+                }
             }
-            let _ = fs::remove_file(&socket);
         }
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("listen on {}", socket.display()))?;
@@ -117,19 +166,44 @@ impl Server {
     }
 
     fn accept_loop(&self, listener: UnixListener) -> Result<()> {
-        for stream in listener.incoming() {
-            let stream = stream?;
-            let shutdown = self.handle_conn(stream);
-            match shutdown {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(err) => eprintln!("khazad-doom daemon: {err:#}"),
+        listener.set_nonblocking(true)?;
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        loop {
+            if shutdown_rx.try_recv().unwrap_or(false) {
+                return Ok(());
+            }
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    let server = self.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    thread::spawn(move || {
+                        let shutdown = server.handle_conn(stream);
+                        match shutdown {
+                            Ok(true) => {
+                                let _ = shutdown_tx.send(true);
+                            }
+                            Ok(false) => {}
+                            Err(err) => eprintln!("khazad-doom daemon: {err:#}"),
+                        }
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if shutdown_rx
+                        .recv_timeout(ACCEPT_LOOP_IDLE_SLEEP)
+                        .unwrap_or(false)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
             }
         }
-        Ok(())
     }
 
     fn handle_conn(&self, mut stream: UnixStream) -> Result<bool> {
+        stream.set_read_timeout(Some(DAEMON_REQUEST_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(CLIENT_RPC_TIMEOUT))?;
         let mut line = String::new();
         BufReader::new(stream.try_clone()?).read_line(&mut line)?;
         if line.trim().is_empty() {
@@ -154,7 +228,13 @@ impl Server {
             }
         };
         let id = request.id.clone();
-        let handled = self.handle(request.method.as_str(), request.params.clone());
+        let handled = {
+            let _request_guard = self
+                .request_lock
+                .lock()
+                .expect("daemon request mutex poisoned");
+            self.handle(request.method.as_str(), request.params.clone())
+        };
         let mut shutdown = false;
         let response = match handled {
             Ok(HandleOutcome {
@@ -182,8 +262,9 @@ impl Server {
         let run_id = run.id.clone();
         let slice_runs = self.store.get_slice_runs(&run_id)?;
         let mut progress = self.store.get_progress(&run_id)?;
+        let events = self.store.get_events(&run_id, events_limit)?;
         if let Some(progress) = progress.as_mut() {
-            annotate_parallel_progress(progress, &slice_runs);
+            annotate_parallel_progress(progress, &slice_runs, &events);
         }
         let economics = read_run_economics(&run).ok();
         let incidents = run_incidents_from_events(&self.store.get_incident_events(&run_id)?);
@@ -191,7 +272,7 @@ impl Server {
             slice_runs,
             progress,
             incidents,
-            events: self.store.get_events(&run_id, events_limit)?,
+            events,
             economics,
             run,
         })
@@ -221,6 +302,7 @@ impl Server {
                     pi_bin: params.pi_bin,
                     pi_args: params.pi_args,
                     parallelism: params.parallelism,
+                    allow_dirty: params.allow_dirty,
                 })?;
                 Ok(HandleOutcome::result(StartRunResult { run_id: run.id })?)
             }
@@ -422,16 +504,14 @@ fn read_run_economics(run: &Run) -> Result<RunEconomics> {
     Ok(summary.economics)
 }
 
-fn annotate_parallel_progress(progress: &mut RunProgress, slice_runs: &[SliceRun]) {
+fn annotate_parallel_progress(
+    progress: &mut RunProgress,
+    slice_runs: &[SliceRun],
+    events: &[Event],
+) {
     if progress.phase == "parallel_worker_layer" && !progress.slice_id.trim().is_empty() {
         progress.parallel_layer = true;
-        progress.parallel_slices = progress
-            .slice_id
-            .split(',')
-            .map(str::trim)
-            .filter(|slice_id| !slice_id.is_empty())
-            .map(str::to_string)
-            .collect();
+        progress.parallel_slices = split_parallel_slice_ids(&progress.slice_id);
         return;
     }
     if !is_worker_layer_phase(&progress.phase) {
@@ -445,6 +525,11 @@ fn annotate_parallel_progress(progress: &mut RunProgress, slice_runs: &[SliceRun
     if active.len() > 1 {
         progress.parallel_layer = true;
         progress.parallel_slices = active;
+        return;
+    }
+    if let Some(layer) = current_parallel_layer_from_events(events) {
+        progress.parallel_layer = true;
+        progress.parallel_slices = layer;
     }
 }
 
@@ -453,6 +538,36 @@ fn is_worker_layer_phase(phase: &str) -> bool {
         phase,
         "worker_started" | "worker_running" | "worker_verify" | "ready_to_merge"
     )
+}
+
+fn current_parallel_layer_from_events(events: &[Event]) -> Option<Vec<String>> {
+    for event in events.iter().rev() {
+        match event.typ.as_str() {
+            "parallel_layer_completed" | "parallel_layer_failed" => return None,
+            "parallel_layer_started" => {
+                let slices = event
+                    .payload
+                    .get("slices")
+                    .and_then(serde_json::Value::as_array)?
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                return (slices.len() > 1).then_some(slices);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_parallel_slice_ids(slice_ids: &str) -> Vec<String> {
+    slice_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|slice_id| !slice_id.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn is_parallel_layer_slice_status(status: SliceStatus) -> bool {
@@ -487,6 +602,36 @@ fn write_json_line<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<(
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn is_missing_socket_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let Some(io) = err.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+fn live_daemon_pid(paths: &Paths) -> Option<u32> {
+    let pid = fs::read_to_string(paths.pid_file())
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    process_is_alive(pid).then_some(pid)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn request_id() -> String {

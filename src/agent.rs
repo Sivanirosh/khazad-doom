@@ -55,11 +55,12 @@ impl RunnerEventKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerEvent {
     pub kind: RunnerEventKind,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+    pub text: String,
 }
 
 impl RunnerEvent {
@@ -68,6 +69,7 @@ impl RunnerEvent {
             kind: RunnerEventKind::Started,
             pid,
             exit_code: None,
+            text: String::new(),
         }
     }
 
@@ -76,22 +78,25 @@ impl RunnerEvent {
             kind: RunnerEventKind::ProcessObserved,
             pid,
             exit_code: None,
+            text: String::new(),
         }
     }
 
-    pub fn stdout(pid: Option<u32>) -> Self {
+    pub fn stdout(pid: Option<u32>, text: impl Into<String>) -> Self {
         Self {
             kind: RunnerEventKind::Stdout,
             pid,
             exit_code: None,
+            text: text.into(),
         }
     }
 
-    pub fn stderr(pid: Option<u32>) -> Self {
+    pub fn stderr(pid: Option<u32>, text: impl Into<String>) -> Self {
         Self {
             kind: RunnerEventKind::Stderr,
             pid,
             exit_code: None,
+            text: text.into(),
         }
     }
 
@@ -100,6 +105,7 @@ impl RunnerEvent {
             kind: RunnerEventKind::Finished,
             pid,
             exit_code,
+            text: String::new(),
         }
     }
 }
@@ -124,12 +130,46 @@ pub struct Job {
 
 #[derive(Debug, Clone)]
 pub struct ResultData {
-    #[allow(dead_code)]
-    pub text: String,
     pub output: Option<Value>,
-    #[allow(dead_code)]
     pub usage: Usage,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunnerTranscript {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout_tail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr_tail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub assistant_tail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerError {
+    message: String,
+    transcript: RunnerTranscript,
+}
+
+impl RunnerError {
+    fn new(message: impl Into<String>, transcript: RunnerTranscript) -> Self {
+        Self {
+            message: message.into(),
+            transcript,
+        }
+    }
+
+    pub fn transcript(&self) -> &RunnerTranscript {
+        &self.transcript
+    }
+}
+
+impl std::fmt::Display for RunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunnerError {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -254,7 +294,7 @@ impl Runner for PiRunner {
             let mut buf = String::new();
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                emit_runner_event(&stderr_events, RunnerEvent::stderr(Some(pid)));
+                emit_runner_event(&stderr_events, RunnerEvent::stderr(Some(pid), line.clone()));
                 buf.push_str(&line);
                 buf.push('\n');
             }
@@ -276,9 +316,13 @@ impl Runner for PiRunner {
                     &mut child,
                     Duration::from_secs(job.termination_grace_seconds),
                 );
-                let _ = parser_thread.join();
-                let _ = stderr_thread.join();
-                bail!("job cancelled");
+                let parser = join_parser(parser_thread)?;
+                let stderr = stderr_thread.join().unwrap_or_default();
+                return Err(RunnerError::new(
+                    "job cancelled",
+                    transcript_from_parser(&parser, &stderr),
+                )
+                .into());
             }
             if let Some(status) = child.try_wait()? {
                 emit_runner_event(&events, RunnerEvent::finished(Some(pid), status.code()));
@@ -291,16 +335,16 @@ impl Runner for PiRunner {
             thread::sleep(Duration::from_millis(50));
         };
 
-        let parser = parser_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("pi stdout parser panicked"))??;
+        let parser = join_parser(parser_thread)?;
         let stderr = stderr_thread.join().unwrap_or_default();
         if !status.success() {
             let msg = stderr.trim();
-            if msg.is_empty() {
-                bail!("pi exited with {status}");
-            }
-            bail!("pi exited with {status}: {msg}");
+            let message = if msg.is_empty() {
+                format!("pi exited with {status}")
+            } else {
+                format!("pi exited with {status}: {msg}")
+            };
+            return Err(RunnerError::new(message, transcript_from_parser(&parser, &stderr)).into());
         }
 
         let text = parser.final_text().trim().to_string();
@@ -313,7 +357,6 @@ impl Runner for PiRunner {
             )
         };
         Ok(ResultData {
-            text,
             output,
             usage: parser.usage,
         })
@@ -322,6 +365,31 @@ impl Runner for PiRunner {
     fn name(&self) -> &str {
         "pi"
     }
+}
+
+fn join_parser(parser_thread: thread::JoinHandle<Result<PiParser>>) -> Result<PiParser> {
+    parser_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("pi stdout parser panicked"))?
+}
+
+fn transcript_from_parser(parser: &PiParser, stderr: &str) -> RunnerTranscript {
+    RunnerTranscript {
+        stdout_tail: parser.raw_tail.clone(),
+        stderr_tail: tail_string(stderr, 12_000),
+        assistant_tail: tail_string(&parser.final_text(), 12_000),
+    }
+}
+
+fn tail_string(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) && start < text.len() {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 fn terminate_child(child: &mut std::process::Child, grace: Duration) {
@@ -370,7 +438,6 @@ impl Runner for FakeRunner {
         if job.kind == "integration-repair" {
             emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
             return Ok(ResultData {
-                text: "{}".to_string(),
                 output: Some(
                     json!({ "status": "no-op", "summary": "fake runner: no repair needed" }),
                 ),
@@ -417,7 +484,6 @@ impl Runner for FakeRunner {
             .collect::<Vec<_>>();
         emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
         Ok(ResultData {
-            text: "{}".to_string(),
             output: Some(json!({
                 "slice_id": handoff.slice.id,
                 "status": "complete",
@@ -484,6 +550,7 @@ struct PiParser {
     complete_text: BTreeMap<usize, String>,
     final_assistant: Option<Value>,
     usage: Usage,
+    raw_tail: String,
 }
 
 impl PiParser {
@@ -496,7 +563,8 @@ impl PiParser {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let line = line?;
-            emit_runner_event(&events, RunnerEvent::stdout(pid));
+            emit_runner_event(&events, RunnerEvent::stdout(pid, line.clone()));
+            self.remember_raw_line(&line);
             if line.trim().is_empty() {
                 continue;
             }
@@ -506,6 +574,11 @@ impl PiParser {
             self.handle(&event);
         }
         Ok(())
+    }
+
+    fn remember_raw_line(&mut self, line: &str) {
+        append_bounded(&mut self.raw_tail, line, 12_000);
+        append_bounded(&mut self.raw_tail, "\n", 12_000);
     }
 
     fn handle(&mut self, event: &Value) {
@@ -592,6 +665,17 @@ fn join_indexed(parts: &BTreeMap<usize, String>) -> String {
         out.push_str(value);
     }
     out
+}
+
+fn append_bounded(target: &mut String, text: &str, max_bytes: usize) {
+    target.push_str(text);
+    if target.len() > max_bytes {
+        let mut remove = target.len() - max_bytes;
+        while !target.is_char_boundary(remove) && remove < target.len() {
+            remove += 1;
+        }
+        target.drain(..remove);
+    }
 }
 
 fn usage_from_value(value: &Value) -> Usage {

@@ -565,6 +565,11 @@ function runDetailsLines(details, theme, rememberedEvents) {
 		}
 	}
 
+	const economics = economicsBlock(details);
+	if (economics) {
+		lines.push('', ...renderFeedBlock(economics, theme));
+	}
+
 	const incidents = incidentLines(details, theme);
 	if (incidents.length) {
 		lines.push('', sectionHeading(theme, 'Incidents', `(${incidents.length})`), ...incidents);
@@ -671,6 +676,24 @@ function currentProgressBlock(details) {
 function currentWorkerWarning(details) {
 	const worker = details.progress && details.progress.worker;
 	return worker ? workerQuietWarning(worker) : '';
+}
+
+function economicsBlock(details) {
+	const economics = details && details.economics;
+	if (!economics || typeof economics !== 'object') return undefined;
+	const lines = [
+		{ text: `Agent calls: ${numberOrZero(economics.agent_call_count)} | Commands: ${numberOrZero(economics.command_execution_count)} | Duplicates: ${numberOrZero(economics.duplicate_command_count)} | Cache: ${numberOrZero(economics.cache_hits)}/${numberOrZero(economics.cache_misses)} hit/miss` },
+		{ text: `Repair: policy=${valueOrDash(economics.repair_policy)} attempts=${numberOrZero(economics.repair_attempts)}/${numberOrZero(economics.repair_max_attempts)} | Fail-fast: ${String(Boolean(economics.gate_fail_fast))}` },
+	];
+	if (Array.isArray(economics.sla_violations) && economics.sla_violations.length) {
+		lines.push({ text: `SLA violations: ${economics.sla_violations.join('; ')}`, role: 'warning' });
+	}
+	return { label: 'Economics', lines };
+}
+
+function numberOrZero(value) {
+	const number = Number(value);
+	return Number.isFinite(number) ? number : 0;
 }
 
 function buildFeedBlocks(details, events) {
@@ -780,7 +803,7 @@ function commandProgressBlock(progress, details, options = {}) {
 	if (options.current) metaParts.push('now');
 	const lines = [];
 	if (command !== '-' && !(label === 'Worker' && command === 'pi')) lines.push({ text: command, role: 'dim' });
-	const scope = progress.slice_id ? `slice ${progress.slice_id}` : phase.replace(/_/g, ' ');
+	const scope = progressScopeLabel(progress, details);
 	const elapsed = progress.phase_started_at ? ` • elapsed ${formatElapsed(progress.phase_started_at)}` : '';
 	lines.push({ text: `${scope}${elapsed}` });
 	if (progress.message) lines.push({ text: progress.message, role: progressRole(phase) });
@@ -793,24 +816,29 @@ function progressSemanticKey(progress) {
 }
 
 function workerBlock(worker, progress, details, options = {}) {
-	const slice = progress && progress.slice_id ? progress.slice_id : monitorSliceLabel(details);
+	const slice = monitorSliceLabel(details);
 	const meta = [];
 	if (slice !== '-') meta.push(slice);
 	if (progress && progress.attempt) meta.push(`attempt ${progress.attempt}`);
 	if (options.current) meta.push('now');
+	const lines = [];
+	if (progress && progress.parallel_layer && Array.isArray(progress.parallel_slices) && progress.parallel_slices.length) {
+		lines.push({ text: `Parallel layer: ${progress.parallel_slices.join(', ')}` });
+	}
+	lines.push(
+		{ text: `Supervisor: ${supervisorLabel(worker)}` },
+		{ text: `Process: ${workerProcessLabel(worker)}` },
+		{ text: `Runtime: ${formatElapsed(worker.attempt_started_at)}` },
+		{ text: `Last worker event: ${lastWorkerEventLabel(worker)}` },
+		{ text: `Last semantic progress: ${worker.last_semantic_progress_at ? ageLabel(worker.last_semantic_progress_at) : 'unknown'}` },
+		{ text: `Timeout: ${workerTimeoutLabel(worker)}` },
+	);
 	return {
 		key: progressKey(progress || {}, options.event),
 		semanticKey: progressSemanticKey(progress || {}),
 		label: 'Worker',
 		meta: meta.length ? `(${meta.join(' • ')})` : '',
-		lines: [
-			{ text: `Supervisor: ${supervisorLabel(worker)}` },
-			{ text: `Process: ${workerProcessLabel(worker)}` },
-			{ text: `Runtime: ${formatElapsed(worker.attempt_started_at)}` },
-			{ text: `Last worker event: ${lastWorkerEventLabel(worker)}` },
-			{ text: `Last semantic progress: ${worker.last_semantic_progress_at ? ageLabel(worker.last_semantic_progress_at) : 'unknown'}` },
-			{ text: `Timeout: ${workerTimeoutLabel(worker)}` },
-		],
+		lines,
 	};
 }
 
@@ -820,11 +848,16 @@ function genericEventBlock(type, payload, event) {
 }
 
 function incidentLines(details, theme) {
-	const incidents = (details.events || [])
-		.map(incidentSummary)
-		.filter(Boolean)
-		.slice(-8);
-	return incidents.map((incident) => treeLine(theme, truncatePlain(incident, 180), 'warning'));
+	const direct = (details.incidents || []).map((incident) => `${valueOrDash(incident.kind)}: ${valueOrDash(incident.message || incident.error)}`);
+	const fromEvents = (details.events || []).map(incidentSummary).filter(Boolean);
+	const seen = new Set();
+	const incidents = [];
+	for (const incident of [...direct, ...fromEvents]) {
+		if (!incident || seen.has(incident)) continue;
+		seen.add(incident);
+		incidents.push(incident);
+	}
+	return incidents.slice(-8).map((incident) => treeLine(theme, truncatePlain(incident, 180), 'warning'));
 }
 
 function incidentSummary(event) {
@@ -1232,6 +1265,9 @@ function monitorMessage(details) {
 }
 
 function monitorSliceLabel(details) {
+	if (details.progress && details.progress.parallel_layer && Array.isArray(details.progress.parallel_slices) && details.progress.parallel_slices.length) {
+		return `parallel layer: ${details.progress.parallel_slices.join(', ')}`;
+	}
 	if (details.progress && details.progress.slice_id && details.progress.slice_id.trim()) {
 		return details.progress.slice_id;
 	}
@@ -1242,6 +1278,14 @@ function monitorSliceLabel(details) {
 	}
 	if (sliceRuns.length === 1) return `${sliceRuns[0].slice_id} (${sliceRuns[0].status})`;
 	return valueOrDash(details.run && details.run.selected_slice_id);
+}
+
+function progressScopeLabel(progress, details) {
+	if (progress && progress.parallel_layer && Array.isArray(progress.parallel_slices) && progress.parallel_slices.length) {
+		return `Parallel layer: ${progress.parallel_slices.join(', ')}`;
+	}
+	if (progress && progress.slice_id) return `slice ${progress.slice_id}`;
+	return monitorSliceLabel(details) || String((progress && progress.phase) || 'activity').replace(/_/g, ' ');
 }
 
 function isTerminalStatus(status) {

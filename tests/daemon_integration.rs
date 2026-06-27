@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -39,7 +40,7 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
             "verify": ["test -f slice-002.txt"]
         }),
     )?;
-    git(repo.path(), &["add", ".gitignore", ".workflow/slices"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo.path(), &["commit", "-m", "add slices"])?;
 
     let validate = kd_ok(
@@ -84,6 +85,14 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
     let handoff = kd_ok(&bin, home.path(), &["handoff", "--run", &run_id])?;
     let handoff = json_stdout(&handoff)?;
     assert_eq!(handoff["run_id"], run_id);
+    assert_eq!(handoff["exit_states"]["run"], "completed");
+    assert_eq!(handoff["exit_states"]["handoff"], "ready_for_handoff");
+    assert_eq!(handoff["exit_states"]["evidence"], "daemon_attested");
+    assert_eq!(handoff["evidence_attestation"]["status"], "daemon_attested");
+    assert_eq!(
+        handoff["evidence_attestation"]["worker_self_approved"],
+        false
+    );
     assert!(handoff["push_command"].as_str().unwrap().contains("git -C"));
     assert!(
         handoff["pr_command"]
@@ -135,6 +144,107 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
 }
 
 #[test]
+fn daemon_status_responds_while_raw_socket_client_is_idle_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["daemon", "start"])?;
+    let _idle_client = UnixStream::connect(home.path().join("socket"))?;
+
+    let status = kd_with_timeout(
+        &bin,
+        home.path(),
+        &["daemon", "status"],
+        Duration::from_secs(2),
+    )?;
+    assert!(
+        status.status.success(),
+        "daemon status failed while an idle socket client was connected\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "running");
+
+    let start = kd_with_timeout(
+        &bin,
+        home.path(),
+        &["daemon", "start"],
+        Duration::from_secs(2),
+    )?;
+    assert!(
+        start.status.success(),
+        "daemon start failed while an idle socket client was connected\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&start.stdout).contains("daemon already running"),
+        "daemon start should classify the existing healthy daemon as running: {}",
+        String::from_utf8_lossy(&start.stdout)
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn daemon_start_detaches_from_parent_process_group_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["daemon", "start"])?;
+    let pid = read_daemon_pid(home.path())?;
+    let daemon_pgrp = unsafe { libc::getpgid(pid) };
+    assert_ne!(daemon_pgrp, -1, "daemon pid should have a process group");
+    let parent_pgrp = unsafe { libc::getpgrp() };
+    assert_ne!(
+        daemon_pgrp, parent_pgrp,
+        "daemon should be detached from the CLI process group so terminal Ctrl-C/Ctrl-Z cannot stop it"
+    );
+    assert_eq!(
+        daemon_pgrp, pid,
+        "daemon should become its own session/process-group leader"
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn daemon_status_reports_stopped_daemon_without_hanging_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["daemon", "start"])?;
+    let pid = read_daemon_pid(home.path())?;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let status_result = kd_with_timeout(
+        &bin,
+        home.path(),
+        &["daemon", "status"],
+        Duration::from_secs(2),
+    );
+    let _ = unsafe { libc::kill(pid, libc::SIGCONT) };
+    let status = status_result?;
+    assert!(
+        !status.status.success(),
+        "stopped daemon should be unhealthy, not reported running"
+    );
+    assert!(
+        String::from_utf8_lossy(&status.stderr).contains("daemon unhealthy"),
+        "stopped daemon status should explain unhealthy daemon\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -164,6 +274,7 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
             "--agent",
             "fake",
             "--all",
+            "--allow-dirty",
         ],
     )?;
     let run_id = json_stdout(&started)?["run_id"]
@@ -217,8 +328,8 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
         ],
     )?;
     let latest_monitor = String::from_utf8(latest_monitor.stdout)?;
-    assert!(latest_monitor.contains(&format!("Run: {run_id}")));
-    assert!(latest_monitor.contains("Status: completed"));
+    assert!(latest_monitor.contains(&run_id));
+    assert!(latest_monitor.contains("Run ✓ completed"));
 
     guard.stop();
     Ok(())
@@ -299,7 +410,7 @@ fn schema_import_and_handoff_v2_black_box() -> TestResult {
             "verify": ["test -f slice-001.txt"]
         }),
     )?;
-    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo.path(), &["commit", "-m", "add workflow"])?;
     let started = kd_ok(
         &bin,
@@ -374,7 +485,7 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
             "verify": ["printf 'started-progress\\n'; sleep 4; printf 'finished-progress\\n'; test -f slice-001.txt"]
         }),
     )?;
-    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(
         repo.path(),
         &["commit", "-m", "add long verification slice"],
@@ -431,15 +542,15 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
     )?;
     let monitored_once = String::from_utf8(monitored_once.stdout)?;
     assert!(monitored_once.contains("Khazad-Doom Monitor"));
-    assert!(monitored_once.contains(&format!("Run: {run_id}")));
-    assert!(monitored_once.contains("Status:"));
-    assert!(monitored_once.contains("Phase:"));
-    assert!(monitored_once.contains("Slice: slice-001"));
-    assert!(monitored_once.contains("Command:"));
-    assert!(monitored_once.contains("Elapsed:"));
-    assert!(monitored_once.contains("Message:"));
-    assert!(monitored_once.contains("Recent events:"));
-    assert!(monitored_once.contains("Output tail:"));
+    assert!(monitored_once.contains(&run_id));
+    assert!(monitored_once.contains("Todos"));
+    assert!(monitored_once.contains("Run ● running"));
+    assert!(monitored_once.contains("phase worker_verify"));
+    assert!(monitored_once.contains("slice slice-001"));
+    assert!(monitored_once.contains("Shell"));
+    assert!(monitored_once.contains("elapsed"));
+    assert!(monitored_once.contains("Activity"));
+    assert!(monitored_once.contains("Tail"));
     assert!(monitored_once.contains("started-progress"));
 
     wait_for_status(&bin, home.path(), &run_id, "completed")?;
@@ -449,8 +560,8 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
         &["monitor", "--run", &run_id, "--interval-ms", "100"],
     )?;
     let monitored_completed = String::from_utf8(monitored_completed.stdout)?;
-    assert!(monitored_completed.contains(&format!("Run: {run_id}")));
-    assert!(monitored_completed.contains("Status: completed"));
+    assert!(monitored_completed.contains(&run_id));
+    assert!(monitored_completed.contains("Run ✓ completed"));
 
     let watched = kd_ok(
         &bin,
@@ -501,7 +612,7 @@ fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> Test
             "verify": ["test -f slice-001.txt"]
         }),
     )?;
-    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo.path(), &["commit", "-m", "add quiet worker slice"])?;
 
     let fake_pi_string = path(&fake_pi).to_string();
@@ -528,17 +639,101 @@ fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> Test
         &run_id,
         &[
             "Supervisor: alive, observed child",
-            "Worker process: running pid=",
+            "Process: running pid=",
             "Last worker event: none",
             "Last semantic progress: unknown",
             "Timeout: disabled",
-            "Warning: worker is quiet",
-            "Hint: wait, inspect, or cancel",
+            "worker is quiet",
+            "wait, inspect, or cancel explicitly",
         ],
     )?;
-    assert!(monitored.contains(&format!("Run: {run_id}")));
+    assert!(monitored.contains(&run_id));
 
     wait_for_status(&bin, home.path(), &run_id, "completed")?;
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_cancellable_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    fs::write(
+        repo.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "pi",
+                "worker_termination_grace_seconds": 1
+            }))?
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Cancellable pi worker slice",
+            "goal": "Stay running until cancellation so terminal artifacts can be captured.",
+            "acceptance": ["cancellation is retained"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add cancellable worker slice"],
+    )?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &["run", "--repo", path(repo.path()), "--agent", "pi", "--all"],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_worker_supervision(&bin, home.path(), &run_id)?;
+
+    let reason = "test cancellation keeps forensic evidence";
+    kd_ok(
+        &bin,
+        home.path(),
+        &["cancel", "--run", &run_id, "--reason", reason],
+    )?;
+    let cancelled = wait_for_status(&bin, home.path(), &run_id, "cancelled")?;
+    assert_eq!(cancelled["run"]["error"], reason);
+
+    let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
+    let inspected = json_stdout(&inspected)?;
+    let run_summary_path = artifact_path(&inspected, "run-summary.json")?;
+    let run_summary: Value = serde_json::from_str(&fs::read_to_string(run_summary_path)?)?;
+    assert_eq!(run_summary["cancel_reason"], reason);
+    assert_eq!(run_summary["primary_failure"], reason);
+
+    let failure_path = artifact_path(&inspected, "slice-001.worker.attempt-1.failure.json")?;
+    let failure: Value = serde_json::from_str(&fs::read_to_string(failure_path)?)?;
+    assert!(
+        failure["stdout_tail"]
+            .as_str()
+            .unwrap()
+            .contains("partial stdout")
+    );
+    assert!(
+        failure["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("partial stderr")
+    );
 
     guard.stop();
     Ok(())
@@ -581,7 +776,7 @@ fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> Test
             "verify": ["test -f slice-002.txt"]
         }),
     )?;
-    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(
         repo.path(),
         &["commit", "-m", "add parallel failure slices"],
@@ -630,8 +825,14 @@ fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> Test
         ],
     )?;
     let monitored = String::from_utf8(monitored.stdout)?;
-    assert!(monitored.contains("parallel_worker_layer"));
-    assert!(monitored.contains("Parallel layer: slice-001, slice-002"));
+    assert!(
+        monitored.contains("parallel_worker_layer"),
+        "monitor should show parallel phase; output:\n{monitored}"
+    );
+    assert!(
+        monitored.contains("Parallel layer: slice-001, slice-002"),
+        "monitor should show active parallel layer; output:\n{monitored}"
+    );
 
     let failed = wait_for_terminal_status(&bin, home.path(), &run_id, "failed")?;
     assert!(
@@ -697,7 +898,7 @@ fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult
             "verify": ["printf 'monitor-fail\\n'; false"]
         }),
     )?;
-    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo.path(), &["commit", "-m", "add failing monitor slice"])?;
 
     let started = kd_ok(
@@ -724,8 +925,8 @@ fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult
     assert!(!monitored.status.success());
     let stdout = String::from_utf8_lossy(&monitored.stdout);
     let stderr = String::from_utf8_lossy(&monitored.stderr);
-    assert!(stdout.contains(&format!("Run: {run_id}")));
-    assert!(stdout.contains("Status: failed"));
+    assert!(stdout.contains(&run_id));
+    assert!(stdout.contains("Run ✗ failed"));
     assert!(stderr.contains("run ended with status failed"));
 
     guard.stop();
@@ -767,8 +968,8 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
         ],
     )?;
     let empty_monitor = String::from_utf8(empty_monitor.stdout)?;
-    assert!(empty_monitor.contains("Status: waiting"));
-    assert!(empty_monitor.contains("waiting for latest active run"));
+    assert!(empty_monitor.contains("Run waiting"));
+    assert!(empty_monitor.contains("waiting for the latest active daemon-owned run"));
 
     kd_ok(&bin, home.path(), &["init", "--repo", path(repo_a.path())])?;
     kd_ok(&bin, home.path(), &["init", "--repo", path(repo_b.path())])?;
@@ -792,11 +993,11 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
             "verify": ["printf 'latest-b\\n'; sleep 6; test -f slice-001.txt"]
         }),
     )?;
-    git(repo_a.path(), &["add", ".workflow"])?;
+    git(repo_a.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo_a.path(), &["commit", "-m", "add long slice a"])?;
     let repo_a_subdir = repo_a.path().join("nested");
     fs::create_dir_all(&repo_a_subdir)?;
-    git(repo_b.path(), &["add", ".workflow"])?;
+    git(repo_b.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo_b.path(), &["commit", "-m", "add long slice b"])?;
 
     let started_a = kd_ok(
@@ -842,10 +1043,9 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
     )?;
     let latest_monitor = String::from_utf8(latest_monitor.stdout)?;
     assert!(latest_monitor.contains("Khazad-Doom Monitor"));
-    assert!(latest_monitor.contains(&format!("Run: {run_a}")));
-    assert!(latest_monitor.contains("Status: running"));
-    assert!(latest_monitor.contains("Recent events:"));
-    assert!(latest_monitor.contains("Output tail:"));
+    assert!(latest_monitor.contains(&run_a));
+    assert!(latest_monitor.contains("Run ● running"));
+    assert!(latest_monitor.contains("Activity"));
 
     let started_b = kd_ok(
         &bin,
@@ -877,6 +1077,14 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
         &["status", "--repo", path(repo_a.path()), "--latest"],
     )?;
     assert!(json_stdout(&no_active)?.is_null());
+    let latest_inspect = kd_ok(
+        &bin,
+        home.path(),
+        &["inspect", "--repo", path(repo_a.path()), "--latest"],
+    )?;
+    let latest_inspect = json_stdout(&latest_inspect)?;
+    assert_eq!(latest_inspect["run"]["id"], run_a.as_str());
+    assert!(artifact_path(&latest_inspect, "run-summary.json").is_ok());
 
     guard.stop();
     Ok(())
@@ -914,7 +1122,7 @@ fn interrupted_run_resumes_without_duplicate_merges_black_box() -> TestResult {
             "verify": [format!("test -f slice-002.txt && if test -f '{}'; then sleep 30; fi", path(&hold))]
         }),
     )?;
-    git(repo.path(), &["add", ".workflow"])?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
     git(repo.path(), &["commit", "-m", "add resumable slices"])?;
 
     let started = kd_ok(
@@ -963,6 +1171,12 @@ fn interrupted_run_resumes_without_duplicate_merges_black_box() -> TestResult {
 
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_khazad-doom"))
+}
+
+fn read_daemon_pid(home: &Path) -> TestResult<libc::pid_t> {
+    Ok(fs::read_to_string(home.join("daemon.pid"))?
+        .trim()
+        .parse::<libc::pid_t>()?)
 }
 
 struct DaemonGuard {
@@ -1281,7 +1495,7 @@ else:
     (marker_dir / f"{slice_id}.started").write_text("started\n", encoding="utf-8")
 
     if slice_id == "slice-001":
-        time.sleep(2)
+        time.sleep(4)
         emit({
             "slice_id": slice_id,
             "status": "failed",
@@ -1296,6 +1510,35 @@ else:
     signal.signal(signal.SIGTERM, terminate)
     while True:
         time.sleep(0.1)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
+}
+
+fn write_cancellable_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import signal
+import sys
+import time
+
+_ = sys.stdin.read()
+print("partial stdout from cancellable fake pi", flush=True)
+print("partial stderr from cancellable fake pi", file=sys.stderr, flush=True)
+
+def terminate(signum, frame):
+    print("terminating cancellable fake pi", file=sys.stderr, flush=True)
+    sys.exit(143)
+
+signal.signal(signal.SIGTERM, terminate)
+while True:
+    time.sleep(0.1)
 "#,
     )?;
     let mut perms = fs::metadata(&path)?.permissions();
@@ -1458,6 +1701,40 @@ fn kd(bin: &Path, home: &Path, args: &[&str]) -> TestResult<Output> {
     kd_with_env(bin, home, &[], args)
 }
 
+fn kd_with_timeout(
+    bin: &Path,
+    home: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> TestResult<Output> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .env("KHAZAD_HOME", home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output()?;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "khazad-doom {} did not finish within {:?}\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            timeout,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+    .into())
+}
+
 fn kd_with_env(
     bin: &Path,
     home: &Path,
@@ -1474,6 +1751,25 @@ fn kd_with_env(
 
 fn json_stdout(output: &Output) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn artifact_path<'a>(inspection: &'a Value, name: &str) -> TestResult<&'a str> {
+    inspection["artifacts"]
+        .as_array()
+        .and_then(|artifacts| {
+            artifacts.iter().find_map(|artifact| {
+                (artifact["name"].as_str() == Some(name))
+                    .then(|| artifact["path"].as_str())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("artifact {name:?} not found in inspection: {inspection:#}"),
+            )
+            .into()
+        })
 }
 
 fn path(path: &Path) -> &str {

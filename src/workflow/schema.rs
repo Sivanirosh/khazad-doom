@@ -10,6 +10,7 @@ pub const WORKER_RESULT_SCHEMA: &str = r#"{
     "public_interfaces_changed": {"type": "array", "items": {"type": "string"}},
     "tests_run": {"type": "array", "items": {"type": "string"}},
     "acceptance_status": {
+      "description": "Worker evidence claims only; not approval. Khazad-Doom attests or rejects evidence separately.",
       "type": "array",
       "items": {
         "type": "object",
