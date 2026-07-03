@@ -12,6 +12,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 ## Slice lifecycle and integration
 
 - JSON Issue Slices are the authoritative work contract. Open slices represent runnable work; closed slices represent accepted historical work.
+- JSON Issue Slices are bounded intent contracts, not frozen implementation plans. Acceptance criteria are minimum evidence, not an exhaustive case inventory. Learning is allowed inside the JSON fence; moving the fence requires approval. During an open slice, TDD/code-inspection discoveries directly implied by the slice goal or acceptance and inside declared `areas` may be implemented with the smallest clear change and reported in worker output. Discoveries that require new product intent, public API semantics, dependencies, verification policy, or paths outside `areas` must become `ask-user` blockers or follow-up slices.
 - Requested open slices include open dependencies before dependents. Closed dependencies are treated as satisfied and must not launch historical workers again. Explicitly requesting a closed slice is rejected; create a follow-up slice for new work.
 - Cycles are invalid across the slice graph.
 - Each worker attempt runs one open slice in a daemon-managed isolated worktree. Parallel workers must not share a checkout.

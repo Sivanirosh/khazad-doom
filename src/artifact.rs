@@ -1,6 +1,6 @@
 use crate::domain::{
-    ArtifactEntry, Handoff, ImplementationSummary, RunCheckpoint, Slice, SliceSummary,
-    SliceValidationIssue, SliceValidationReport, SliceWriteResult, WorkflowConfig,
+    AgentProfilesConfig, ArtifactEntry, Handoff, ImplementationSummary, RunCheckpoint, Slice,
+    SliceSummary, SliceValidationIssue, SliceValidationReport, SliceWriteResult, WorkflowConfig,
 };
 use crate::gitutil;
 use anyhow::{Context, Result, bail};
@@ -35,6 +35,7 @@ impl Store {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
         self.ensure_default_config()?;
+        self.ensure_default_agent_profiles()?;
         self.write_slice_schema()?;
         ensure_gitignore(&self.repo_path)
     }
@@ -65,6 +66,10 @@ impl Store {
 
     pub fn config_path(&self) -> PathBuf {
         self.workflow_dir().join("khazad.json")
+    }
+
+    pub fn agent_profiles_path(&self) -> PathBuf {
+        self.workflow_dir().join("agents.toml")
     }
 
     pub fn slice_schema_path(&self) -> PathBuf {
@@ -218,6 +223,24 @@ impl Store {
         let path = self.config_path();
         if !path.exists() {
             write_json(path, &WorkflowConfig::default())?;
+        }
+        Ok(())
+    }
+
+    pub fn read_agent_profiles(&self) -> Result<AgentProfilesConfig> {
+        let path = self.agent_profiles_path();
+        if !path.exists() {
+            return Ok(AgentProfilesConfig::default());
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        parse_agent_profiles_toml(&text).with_context(|| format!("parse {}", path.display()))
+    }
+
+    pub fn ensure_default_agent_profiles(&self) -> Result<()> {
+        let path = self.agent_profiles_path();
+        if !path.exists() {
+            fs::write(&path, default_agent_profiles_toml())
+                .with_context(|| format!("write {}", path.display()))?;
         }
         Ok(())
     }
@@ -593,6 +616,195 @@ pub fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<()>
     Ok(())
 }
 
+fn default_agent_profiles_toml() -> &'static str {
+    r#"# Khazad-Doom agent launch profiles.
+# Code-writing workers must use the implementer profile. The Pi adapter
+# enforces provider/model/reasoning before launching real workers; fake is
+# exempt for deterministic smoke tests.
+
+[profiles.implementer]
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "xhigh"
+mode = "fast"
+required = true
+
+[profiles.planner]
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "high"
+mode = "normal"
+read_only = true
+
+[profiles.verifier]
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "high"
+mode = "fast"
+read_only = true
+"#
+}
+
+fn parse_agent_profiles_toml(text: &str) -> Result<AgentProfilesConfig> {
+    let mut config = AgentProfilesConfig {
+        profiles: BTreeMap::new(),
+    };
+    let mut current_profile: Option<String> = None;
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = strip_toml_comment(raw_line).trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !(line.starts_with("[profiles.") && line.ends_with(']')) {
+                bail!("line {line_number}: expected [profiles.<name>] section");
+            }
+            let name = &line[10..line.len() - 1];
+            if name.trim().is_empty() || name.contains(char::is_whitespace) {
+                bail!("line {line_number}: invalid profile name {name:?}");
+            }
+            current_profile = Some(name.to_string());
+            config.profiles.entry(name.to_string()).or_default();
+            continue;
+        }
+        let profile_name = current_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("line {line_number}: key outside profile section"))?
+            .clone();
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("line {line_number}: expected key = value"))?;
+        let key = key.trim();
+        let value = value.trim();
+        let profile = config
+            .profiles
+            .get_mut(&profile_name)
+            .expect("profile section created before keys");
+        match key {
+            "provider" => profile.provider = parse_toml_string(value, line_number)?,
+            "model" => profile.model = parse_toml_string(value, line_number)?,
+            "reasoning" => profile.reasoning = parse_toml_string(value, line_number)?,
+            "mode" => profile.mode = parse_toml_string(value, line_number)?,
+            "args" => profile.args = parse_toml_string_array(value, line_number)?,
+            "required" => profile.required = parse_toml_bool(value, line_number)?,
+            "read_only" => profile.read_only = parse_toml_bool(value, line_number)?,
+            other => bail!("line {line_number}: unknown agent profile key {other:?}"),
+        }
+    }
+    Ok(config)
+}
+
+fn strip_toml_comment(line: &str) -> String {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut out = String::new();
+    for ch in line.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_string && ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            out.push(ch);
+            continue;
+        }
+        if !in_string && ch == '#' {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn parse_toml_string(value: &str, line_number: usize) -> Result<String> {
+    if !(value.starts_with('"') && value.ends_with('"')) || value.len() < 2 {
+        bail!("line {line_number}: expected quoted string");
+    }
+    unescape_toml_string(&value[1..value.len() - 1], line_number)
+}
+
+fn parse_toml_string_array(value: &str, line_number: usize) -> Result<Vec<String>> {
+    let trimmed = value.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        bail!("line {line_number}: expected string array");
+    }
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_string && ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            current.push(ch);
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && ch == ',' {
+            items.push(parse_toml_string(current.trim(), line_number)?);
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+    if in_string {
+        bail!("line {line_number}: unterminated string in array");
+    }
+    if !current.trim().is_empty() {
+        items.push(parse_toml_string(current.trim(), line_number)?);
+    }
+    Ok(items)
+}
+
+fn parse_toml_bool(value: &str, line_number: usize) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => bail!("line {line_number}: expected boolean"),
+    }
+}
+
+fn unescape_toml_string(value: &str, line_number: usize) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            bail!("line {line_number}: dangling escape in string");
+        };
+        match escaped {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            other => bail!("line {line_number}: unsupported escape \\{other}"),
+        }
+    }
+    Ok(out)
+}
+
 fn collect_dir_entries(entries: &mut Vec<ArtifactEntry>, kind: &str, dir: &Path) -> Result<()> {
     let read_dir = match fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -712,7 +924,10 @@ fn issue_for_path(path: &Path, slice_id: &str, message: String) -> SliceValidati
 
 #[cfg(test)]
 mod tests {
-    use super::{Slice, dependency_layers, topological_order, validate_slice, validate_slice_set};
+    use super::{
+        Slice, Store, dependency_layers, parse_agent_profiles_toml, topological_order,
+        validate_slice, validate_slice_set,
+    };
 
     fn valid_slice(id: &str) -> Slice {
         Slice {
@@ -746,6 +961,41 @@ mod tests {
     #[test]
     fn accepts_safe_slice_id() {
         validate_slice(&valid_slice("slice-001.alpha_beta")).unwrap();
+    }
+
+    #[test]
+    fn ensure_default_config_uses_parallelism_three() {
+        let repo = tempfile::tempdir().unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+
+        let config = store.read_config().unwrap();
+        assert_eq!(config.parallelism, 3);
+        let profiles = store.read_agent_profiles().unwrap();
+        let implementer = profiles.profiles.get("implementer").unwrap();
+        assert_eq!(implementer.provider, "openai");
+        assert_eq!(implementer.model, "gpt-5.5");
+        assert_eq!(implementer.reasoning, "xhigh");
+        assert_eq!(implementer.mode, "fast");
+    }
+
+    #[test]
+    fn parses_agent_profile_args() {
+        let profiles = parse_agent_profiles_toml(
+            r#"
+            [profiles.implementer]
+            provider = "openai"
+            model = "gpt-5.5"
+            reasoning = "xhigh"
+            mode = "fast"
+            args = ["--flag", "value"]
+            required = true
+            "#,
+        )
+        .unwrap();
+        let implementer = profiles.profiles.get("implementer").unwrap();
+        assert_eq!(implementer.args, ["--flag", "value"]);
+        assert!(implementer.required);
     }
 
     #[test]

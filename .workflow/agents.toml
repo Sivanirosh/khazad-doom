@@ -1,0 +1,25 @@
+# Khazad-Doom agent launch profiles.
+# Code-writing workers must use the implementer profile. The Pi adapter
+# enforces provider/model/reasoning before launching real workers; fake is
+# exempt for deterministic smoke tests.
+
+[profiles.implementer]
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "xhigh"
+mode = "fast"
+required = true
+
+[profiles.planner]
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "high"
+mode = "normal"
+read_only = true
+
+[profiles.verifier]
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "high"
+mode = "fast"
+read_only = true

@@ -179,6 +179,20 @@ pub struct Usage {
     pub output_tokens: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerMetadata {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+}
+
 #[allow(dead_code)]
 pub trait Runner: Send + Sync {
     fn run(
@@ -188,6 +202,9 @@ pub trait Runner: Send + Sync {
         events: Option<RunnerEventSink>,
     ) -> Result<ResultData>;
     fn name(&self) -> &str;
+    fn metadata(&self) -> RunnerMetadata {
+        RunnerMetadata::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +212,7 @@ pub struct RunnerSpec {
     pub kind: String,
     pub pi_bin: String,
     pub pi_args: Vec<String>,
+    pub metadata: RunnerMetadata,
 }
 
 impl RunnerSpec {
@@ -228,11 +246,13 @@ impl RunnerSpec {
                     pi_bin
                 },
                 pi_args,
+                metadata: RunnerMetadata::default(),
             }),
             "fake" => Ok(Self {
                 kind,
                 pi_bin: String::new(),
                 pi_args: Vec::new(),
+                metadata: RunnerMetadata::default(),
             }),
             other => bail!("unknown agent {other:?}; expected \"pi\" or \"fake\""),
         }
@@ -245,6 +265,7 @@ pub fn runner_from_spec(spec: RunnerSpec) -> Arc<dyn Runner> {
         _ => Arc::new(PiRunner {
             bin: spec.pi_bin,
             extra_args: spec.pi_args,
+            metadata: spec.metadata,
         }),
     }
 }
@@ -253,6 +274,7 @@ pub fn runner_from_spec(spec: RunnerSpec) -> Arc<dyn Runner> {
 pub struct PiRunner {
     pub bin: String,
     pub extra_args: Vec<String>,
+    pub metadata: RunnerMetadata,
 }
 
 impl Runner for PiRunner {
@@ -364,6 +386,10 @@ impl Runner for PiRunner {
 
     fn name(&self) -> &str {
         "pi"
+    }
+
+    fn metadata(&self) -> RunnerMetadata {
+        self.metadata.clone()
     }
 }
 

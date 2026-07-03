@@ -16,6 +16,7 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("- Implement only the slice described in the handoff.\n");
     prompt.push_str("- The JSON slice is authoritative. GitHub/PRD text is extra context only.\n");
     prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, return status=blocked with an ask-user finding.\n");
+    prompt.push_str("- Treat acceptance as minimum evidence, not an exhaustive spec: learning is allowed inside the fence; moving the fence requires approval. If TDD or code inspection reveals an additional case directly implied by the slice goal/acceptance and inside declared areas, implement the smallest clear fix and report it in summary/tests/assumptions. If it changes product intent, public API semantics, dependencies, verification policy, or required paths outside areas, return status=blocked with an ask-user finding.\n");
     prompt.push_str("- Preserve unrelated changes.\n");
     prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
     prompt.push_str("- Do not run daemon-owned verification commands unless needed for your own confidence; the daemon will run required checks.\n");
@@ -77,4 +78,53 @@ Integration gate evidence:
 
 fn must_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn worker_prompt_authorizes_within_intent_tdd_discoveries() {
+        let slice = Slice {
+            id: "slice-test".to_string(),
+            title: "Test anti-waterfall prompt".to_string(),
+            goal: "Support the intended behavior".to_string(),
+            github_issue: String::new(),
+            status: "open".to_string(),
+            closed_by_run: String::new(),
+            closed_at: String::new(),
+            depends_on: Vec::new(),
+            areas: vec!["src/".to_string(), "tests/".to_string()],
+            acceptance: vec!["Behavior is covered by tests".to_string()],
+            must_ask_if: Vec::new(),
+            verify_profile: String::new(),
+            verify: Vec::new(),
+            verify_timeout_seconds: 0,
+        };
+        let handoff = Handoff {
+            run_id: "kd-test".to_string(),
+            role: "implementer".to_string(),
+            repo_path: "/repo".to_string(),
+            worktree_path: "/repo/.worktree".to_string(),
+            branch: "khazad/slice-test".to_string(),
+            slice,
+            dependency_summary: BTreeMap::new(),
+            agent_profile: String::new(),
+            agent_provider: String::new(),
+            agent_model: String::new(),
+            agent_reasoning: String::new(),
+            agent_mode: String::new(),
+            output_path: "/tmp/output.json".to_string(),
+            contract: "Return JSON".to_string(),
+        };
+
+        let prompt = worker_prompt("/tmp/handoff.json", &handoff, "");
+
+        assert!(prompt.contains("acceptance as minimum evidence"));
+        assert!(prompt.contains("learning is allowed inside the fence"));
+        assert!(prompt.contains("directly implied by the slice goal/acceptance"));
+        assert!(prompt.contains("status=blocked with an ask-user finding"));
+    }
 }

@@ -8,16 +8,16 @@ use super::{
     integration_repair_prompt, worker_prompt,
 };
 use crate::agent::{
-    CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerSpec,
-    runner_from_spec,
+    CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerMetadata,
+    RunnerSpec, runner_from_spec,
 };
 use crate::artifact;
 use crate::domain::{
-    BranchHandoff, CheckResult, EvidenceAttestation, Finding, GateResult, Handoff,
-    HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
-    RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun,
-    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult, WorkflowConfig,
-    WorkflowExitStates,
+    AgentProfile, BranchHandoff, CheckResult, EvidenceAttestation, Finding, GateResult, Handoff,
+    HandoffActionResult, HandoffDiagnostics, IMPLEMENTER_PROFILE, ImplementationSummary,
+    MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice,
+    SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
+    WorkflowConfig, WorkflowExitStates,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -299,6 +299,7 @@ impl Manager {
     ) -> Result<crate::agent::ResultData> {
         let kind = job.kind.clone();
         let runner_name = runner.name().to_string();
+        let runner_metadata = runner.metadata();
         let started_at = Instant::now();
         match self.run_supervised_worker_job(runner, job, cancel, context) {
             Ok(result) => {
@@ -308,6 +309,7 @@ impl Manager {
                     call.attempt,
                     kind.as_str(),
                     runner_name.as_str(),
+                    &runner_metadata,
                     "succeeded",
                     started_at.elapsed(),
                     Some(&result.usage),
@@ -323,6 +325,7 @@ impl Manager {
                     call.attempt,
                     kind.as_str(),
                     runner_name.as_str(),
+                    &runner_metadata,
                     "failed",
                     started_at.elapsed(),
                     None,
@@ -348,8 +351,9 @@ impl Manager {
         &self,
         opts: &StartOptions,
         config: &WorkflowConfig,
+        store: &artifact::Store,
     ) -> Result<Arc<dyn Runner>> {
-        self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, config)
+        self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, config, store)
     }
 
     fn runner_for_parts(
@@ -358,6 +362,7 @@ impl Manager {
         pi_bin: &str,
         pi_args: &[String],
         config: &WorkflowConfig,
+        store: &artifact::Store,
     ) -> Result<Arc<dyn Runner>> {
         if let Some(runner) = &self.runner_override {
             return Ok(runner.clone());
@@ -367,11 +372,16 @@ impl Manager {
         } else {
             agent
         };
-        Ok(runner_from_spec(RunnerSpec::from_parts(
-            agent,
-            pi_bin.to_string(),
-            pi_args.to_vec(),
-        )?))
+        let mut spec = RunnerSpec::from_parts(agent, pi_bin.to_string(), pi_args.to_vec())?;
+        if spec.kind == "pi" {
+            let profiles = store.read_agent_profiles()?;
+            let profile = profiles
+                .profiles
+                .get(IMPLEMENTER_PROFILE)
+                .ok_or_else(|| anyhow!("missing required agent profile {IMPLEMENTER_PROFILE:?}"))?;
+            apply_implementer_profile_to_pi_spec(&mut spec, profile)?;
+        }
+        Ok(runner_from_spec(spec))
     }
 
     pub fn init_repo(&self, repo_path: impl AsRef<Path>) -> Result<Repo> {
@@ -517,7 +527,7 @@ impl Manager {
                 dirty_status.trim()
             );
         }
-        let runner = self.runner_for_options(&opts, &config)?;
+        let runner = self.runner_for_options(&opts, &config, &store)?;
         let parallelism = effective_parallelism(opts.parallelism, &config);
         let base_branch = if config.base_branch.trim().is_empty() {
             gitutil::current_branch(&repo.path).unwrap_or_default()
@@ -572,6 +582,7 @@ impl Manager {
                 last_error: String::new(),
             })?;
         }
+        let runner_metadata = runner.metadata();
         self.state.record_event(
             &run.id,
             "run_started",
@@ -579,7 +590,12 @@ impl Manager {
                 "run": run,
                 "selected_slices": selected_ids,
                 "skipped_closed_slices": skipped_closed_slices,
-                "agent": runner.name()
+                "agent": runner.name(),
+                "agent_profile": runner_metadata.profile,
+                "agent_provider": runner_metadata.provider,
+                "agent_model": runner_metadata.model,
+                "agent_reasoning": runner_metadata.reasoning,
+                "agent_mode": runner_metadata.mode,
             }),
         )?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
@@ -689,7 +705,8 @@ impl Manager {
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let config = store.read_config()?;
-        let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
+        let runner =
+            self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config, &store)?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
         let manager = self.clone();
@@ -1633,6 +1650,7 @@ impl Manager {
                 &run.id,
                 &format!("{}.worker.attempt-{attempt}.json", slice.id),
             );
+            let runner_metadata = runner.metadata();
             let handoff = Handoff {
                 run_id: run.id.clone(),
                 role: "slice-worker".to_string(),
@@ -1641,6 +1659,11 @@ impl Manager {
                 branch: worker_branch.clone(),
                 slice: slice.clone(),
                 dependency_summary: ctx.dependency_summary.clone(),
+                agent_profile: runner_metadata.profile,
+                agent_provider: runner_metadata.provider,
+                agent_model: runner_metadata.model,
+                agent_reasoning: runner_metadata.reasoning,
+                agent_mode: runner_metadata.mode,
                 output_path: output_path.to_string_lossy().to_string(),
                 contract: "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
                     .to_string(),
@@ -2899,6 +2922,33 @@ fn effective_parallelism(requested: usize, config: &WorkflowConfig) -> usize {
     }
 }
 
+fn apply_implementer_profile_to_pi_spec(
+    spec: &mut RunnerSpec,
+    profile: &AgentProfile,
+) -> Result<()> {
+    profile.validate_required(IMPLEMENTER_PROFILE)?;
+    let metadata = RunnerMetadata {
+        profile: IMPLEMENTER_PROFILE.to_string(),
+        provider: profile.provider.trim().to_string(),
+        model: profile.model.trim().to_string(),
+        reasoning: profile.reasoning.trim().to_string(),
+        mode: profile.mode.trim().to_string(),
+    };
+    let mut args = spec.pi_args.clone();
+    args.extend([
+        "--provider".to_string(),
+        metadata.provider.clone(),
+        "--model".to_string(),
+        metadata.model.clone(),
+        "--thinking".to_string(),
+        metadata.reasoning.clone(),
+    ]);
+    args.extend(profile.args.iter().cloned());
+    spec.pi_args = args;
+    spec.metadata = metadata;
+    Ok(())
+}
+
 fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
     if line_count == 0 || !path.exists() {
         return Ok(Vec::new());
@@ -3078,13 +3128,18 @@ impl Error for BlockedError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Manager, StartOptions, validate_repair_result, validate_worker_result};
-    use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
+    use super::{
+        Manager, StartOptions, apply_implementer_profile_to_pi_spec, validate_repair_result,
+        validate_worker_result,
+    };
+    use crate::agent::{
+        CancellationToken, Job, ResultData, Runner, RunnerEventSink, RunnerSpec, Usage,
+    };
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, CheckResult, Handoff, ImplementationSummary, RepairResult, Run,
-        RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult,
-        WorkflowConfig,
+        AcceptanceEvidence, AgentProfile, CheckResult, Handoff, ImplementationSummary,
+        RepairResult, Run, RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile,
+        WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -3116,6 +3171,28 @@ mod tests {
             verify: Vec::new(),
             verify_timeout_seconds: 0,
         }
+    }
+
+    #[test]
+    fn pi_runner_spec_appends_required_implementer_profile() {
+        let mut spec =
+            RunnerSpec::from_parts("pi", "pi".to_string(), vec!["--some-user-arg".to_string()])
+                .unwrap();
+        apply_implementer_profile_to_pi_spec(&mut spec, &AgentProfile::implementer()).unwrap();
+
+        assert_eq!(spec.metadata.profile, "implementer");
+        assert_eq!(spec.metadata.provider, "openai");
+        assert_eq!(spec.metadata.model, "gpt-5.5");
+        assert_eq!(spec.metadata.reasoning, "xhigh");
+        assert_eq!(spec.metadata.mode, "fast");
+        assert!(spec.pi_args.ends_with(&[
+            "--provider".to_string(),
+            "openai".to_string(),
+            "--model".to_string(),
+            "gpt-5.5".to_string(),
+            "--thinking".to_string(),
+            "xhigh".to_string(),
+        ]));
     }
 
     #[test]

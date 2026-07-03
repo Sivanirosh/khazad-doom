@@ -112,6 +112,8 @@ An Issue Slice is the smallest unit of work Khazad-Doom will hand to an agent. I
 
 The JSON wins over chat. `must_ask_if` is the line where the worker must stop and ask instead of guessing.
 
+Strict does not mean frozen. Acceptance criteria are minimum evidence, not an exhaustive case inventory. The rule is: **learning is allowed inside the fence; moving the fence requires approval**. If TDD or code inspection reveals a case directly implied by the slice goal/acceptance and inside declared `areas`, the worker may implement the smallest clear fix and report the discovery. If it changes product intent, public API semantics, dependencies, verification policy, or required paths outside `areas`, the worker must return an `ask-user` blocker or recommend a follow-up slice.
+
 ## What the gate enforces
 
 | Guarantee | Why it matters |
@@ -264,7 +266,7 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 ```json
 {
   "agent": "pi",
-  "parallelism": 1,
+  "parallelism": 3,
   "verify_timeout_seconds": 600,
   "worker_attempt_timeout_seconds": 0,
   "worker_no_output_warning_seconds": 900,
@@ -284,6 +286,8 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 ```
 
 A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure. Missing tools, invalid verify cwd, shell spawn failures, and non-executable commands are classified as daemon/operator environment failures instead of worker auto-fix failures.
+
+`khazad-doom init` also creates `.workflow/agents.toml`, the central launch-profile file for agent roles. Real Pi code-writing workers are launched through the required `implementer` profile; the default enforces OpenAI `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, and economics snapshots report the actual profile/model/settings used.
 
 Run start is clean-by-default: Khazad-Doom rejects a dirty source repo unless `--allow-dirty` is explicit, and every run writes `.workflow/runs/<run>/outputs/preflight.json` with base branch/SHA and dirty status. Worker changes are also checked against slice `areas` when areas are declared; outside-area changes block the slice as a scope violation.
 
@@ -306,6 +310,7 @@ Retries preserve attempt history and should be treated as at-least-once executio
 | Path | Purpose |
 |---|---|
 | `.workflow/khazad.json` | Shared repo defaults and verification profiles. |
+| `.workflow/agents.toml` | Central per-role agent model/settings profiles; `implementer` is required for real code-writing workers. |
 | `.workflow/slices/*.json` | Durable machine-readable Issue Slices. |
 | `.workflow/schema/slice.schema.json` | JSON Schema for editor/CI validation. |
 | `.workflow/plans/` | Optional planning artifacts. |

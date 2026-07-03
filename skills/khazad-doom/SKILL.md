@@ -52,6 +52,8 @@ khazad-doom daemon status
 - `docs/workflow-invariants.md` records daemon workflow invariants that behavior-preserving refactors must keep stable.
 - `.workflow/khazad.json` carries repo defaults and verification profiles.
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
+- Treat each open slice as bounded intent plus minimum evidence, not a frozen mini-spec: learning is allowed inside the fence; moving the fence requires approval. TDD-discovered cases directly implied by the slice goal or acceptance may be handled inline and reported; discoveries that alter intent or exceed declared `areas` require `ask-user` or a follow-up slice.
+- When authoring slices, include expected test/helper/doc paths in `areas`; narrow `areas` are intentional hard stops, not semantic hints.
 - Worker output is JSON-only.
 - Worker `acceptance_status` is an evidence claim, not approval. Workers must not approve their own evidence; daemon checks/gates and later human review attest or reject it separately.
 - Worker commits are required before merge.
@@ -67,8 +69,31 @@ khazad-doom daemon status
 - Final reports and handoff JSON expose explicit `exit_states` and `evidence_attestation`; treat them as read-only summaries over existing lifecycle state, not extra gates.
 - The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status, monitor output, handoff JSON, and artifact inspection.
 - Runs are daemon-owned durable sessions. A Pi tool call must start/control/observe a run, never define its lifetime.
-- Do not use blocking `--wait` as the primary Pi UX for real `pi` runs. Start the run without `--wait`, capture the JSON (`run_id`, `repo_path`, `monitor_command`, `run_monitor_command`), and recommend or use `khazad-doom monitor --repo . --latest` / the emitted `monitor_command` for user-visible progress.
-- Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable.
+
+## Pi chat UX rule: detach after run start
+
+After `khazad-doom run ...` successfully returns a `run_id`, the assistant MUST:
+
+1. Report the `run_id`.
+2. Report the emitted `monitor_command` / `run_monitor_command`.
+3. Stop.
+
+The assistant MUST NOT run `sleep`, repeated `status`, `watch`, or polling loops after a successful run start.
+
+Allowed exceptions:
+- The user explicitly asks to check status.
+- The run command failed or returned an immediate blocker.
+- The user asks for handoff/inspect/resume/cancel.
+- A single non-looping `status --run` is needed to diagnose ambiguous daemon startup output.
+
+Preferred response after run start:
+
+“Khazad-Doom is running in the background. Monitor with:
+`khazad-doom monitor --run <run-id>`
+I’ll stop polling unless you ask me to inspect or resume it.”
+
+- Do not use blocking `--wait` as the primary Pi UX for real `pi` runs. Start the run without `--wait`, capture the JSON (`run_id`, `repo_path`, `monitor_command`, `run_monitor_command`), report the monitor command, and detach unless an allowed exception above applies.
+- Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable and an allowed exception above applies.
 - Khazad-Doom does not auto-open external windows by default; a Pi extension is an optional adapter over daemon state, not core workflow state.
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
 - `khazad-doom monitor` and the optional `/khazad-monitor` Pi overlay intentionally share the same activity-feed vocabulary over daemon `status` JSON: Todos, Run, Worker/Shell/Merge/Repair, Warn, Economics, Incidents, Activity, and Tail.

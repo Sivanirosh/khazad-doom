@@ -1,4 +1,4 @@
-use crate::agent::Usage;
+use crate::agent::{RunnerMetadata, Usage};
 use crate::domain::{
     AgentCallEconomics, CommandExecutionEconomics, DuplicateCommandEconomics, PhaseDuration,
     RunEconomics,
@@ -168,6 +168,7 @@ pub(crate) fn agent_call(
     attempt: usize,
     kind: impl Into<String>,
     runner: impl Into<String>,
+    metadata: &RunnerMetadata,
     status: impl Into<String>,
     duration: Duration,
     usage: Option<&Usage>,
@@ -180,6 +181,11 @@ pub(crate) fn agent_call(
         attempt,
         kind: kind.into(),
         runner: runner.into(),
+        agent_profile: metadata.profile.clone(),
+        agent_provider: metadata.provider.clone(),
+        agent_model: metadata.model.clone(),
+        agent_reasoning: metadata.reasoning.clone(),
+        agent_mode: metadata.mode.clone(),
         status: status.into(),
         duration_ms: duration.as_millis(),
         error: error.into(),

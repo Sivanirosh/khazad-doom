@@ -68,7 +68,7 @@ impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             agent: "pi".to_string(),
-            parallelism: 1,
+            parallelism: 3,
             verify_timeout_seconds: 600,
             worker_attempt_timeout_seconds: 0,
             worker_no_output_warning_seconds: 900,
@@ -78,6 +78,101 @@ impl Default for WorkflowConfig {
             base_branch: String::new(),
             handoff: HandoffDefaults::default(),
             verify_profiles: BTreeMap::new(),
+        }
+    }
+}
+
+pub const IMPLEMENTER_PROFILE: &str = "implementer";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentProfilesConfig {
+    pub profiles: BTreeMap<String, AgentProfile>,
+}
+
+impl Default for AgentProfilesConfig {
+    fn default() -> Self {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(IMPLEMENTER_PROFILE.to_string(), AgentProfile::implementer());
+        profiles.insert(
+            "planner".to_string(),
+            AgentProfile {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning: "high".to_string(),
+                mode: "normal".to_string(),
+                read_only: true,
+                ..AgentProfile::default()
+            },
+        );
+        profiles.insert(
+            "verifier".to_string(),
+            AgentProfile {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning: "high".to_string(),
+                mode: "fast".to_string(),
+                read_only: true,
+                ..AgentProfile::default()
+            },
+        );
+        Self { profiles }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+}
+
+impl AgentProfile {
+    pub fn implementer() -> Self {
+        Self {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning: "xhigh".to_string(),
+            mode: "fast".to_string(),
+            args: Vec::new(),
+            required: true,
+            read_only: false,
+        }
+    }
+
+    pub fn validate_required(&self, name: &str) -> anyhow::Result<()> {
+        let mut missing = Vec::new();
+        if self.provider.trim().is_empty() {
+            missing.push("provider");
+        }
+        if self.model.trim().is_empty() {
+            missing.push("model");
+        }
+        if self.reasoning.trim().is_empty() {
+            missing.push("reasoning");
+        }
+        if self.mode.trim().is_empty() {
+            missing.push("mode");
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "agent profile {name:?} is missing required settings: {}",
+                missing.join(", ")
+            )
         }
     }
 }
@@ -253,6 +348,16 @@ pub struct Handoff {
     pub slice: Slice,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub dependency_summary: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_reasoning: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_mode: String,
     pub output_path: String,
     pub contract: String,
 }
@@ -399,6 +504,16 @@ pub struct AgentCallEconomics {
     pub attempt: usize,
     pub kind: String,
     pub runner: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_reasoning: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_mode: String,
     pub status: String,
     pub duration_ms: u128,
     #[serde(default, skip_serializing_if = "String::is_empty")]
