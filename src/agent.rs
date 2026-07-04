@@ -144,6 +144,17 @@ pub struct RunnerTranscript {
     pub assistant_tail: String,
 }
 
+pub const AGENT_AUTH_REQUIRED_FAILURE_KIND: &str = "agent_auth_required";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerLaunchFailure {
+    pub failure_kind: String,
+    pub summary: String,
+    pub retryable: bool,
+    pub operator_action_required: bool,
+    pub fix_commands: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunnerError {
     message: String,
@@ -161,6 +172,50 @@ impl RunnerError {
     pub fn transcript(&self) -> &RunnerTranscript {
         &self.transcript
     }
+
+    pub fn classify_launch_failure(
+        &self,
+        metadata: &RunnerMetadata,
+    ) -> Option<RunnerLaunchFailure> {
+        if !self.transcript.assistant_tail.trim().is_empty() {
+            return None;
+        }
+        if !looks_like_pi_auth_failure(&self.transcript.stderr_tail) {
+            return None;
+        }
+        let provider = if metadata.provider.trim().is_empty() {
+            provider_from_auth_failure(&self.transcript.stderr_tail)
+                .unwrap_or_else(|| "configured provider".to_string())
+        } else {
+            metadata.provider.trim().to_string()
+        };
+        Some(RunnerLaunchFailure {
+            failure_kind: AGENT_AUTH_REQUIRED_FAILURE_KIND.to_string(),
+            summary: format!(
+                "Pi is not authenticated for provider {provider}; run `pi /login` or update .workflow/agents.toml to a configured provider/model."
+            ),
+            retryable: false,
+            operator_action_required: true,
+            fix_commands: vec!["pi /login".to_string()],
+        })
+    }
+}
+
+fn looks_like_pi_auth_failure(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no api key found for") && lower.contains("/login")
+}
+
+fn provider_from_auth_failure(stderr: &str) -> Option<String> {
+    let lower = stderr.to_ascii_lowercase();
+    let marker = "no api key found for";
+    let start = lower.find(marker)? + marker.len();
+    let provider = lower[start..]
+        .trim_start()
+        .split(|ch: char| ch == '.' || ch.is_whitespace())
+        .next()?
+        .trim();
+    (!provider.is_empty()).then(|| provider.to_string())
 }
 
 impl std::fmt::Display for RunnerError {
@@ -723,7 +778,62 @@ fn is_zero(value: &usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunnerSpec, extract_json_object};
+    use super::{
+        AGENT_AUTH_REQUIRED_FAILURE_KIND, RunnerError, RunnerMetadata, RunnerSpec,
+        RunnerTranscript, extract_json_object,
+    };
+
+    #[test]
+    fn classifies_pi_auth_failure_only_without_assistant_output() {
+        let metadata = RunnerMetadata {
+            profile: "implementer".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning: "xhigh".to_string(),
+            mode: "fast".to_string(),
+        };
+        let transcript = RunnerTranscript {
+            stderr_tail: "No API key found for openai.\nUse /login to log into a provider via OAuth or API key.\n".to_string(),
+            ..RunnerTranscript::default()
+        };
+        let err = RunnerError::new("pi exited with status 1", transcript);
+
+        let classification = err
+            .classify_launch_failure(&metadata)
+            .expect("auth failure should be classified");
+        assert_eq!(
+            classification.failure_kind,
+            AGENT_AUTH_REQUIRED_FAILURE_KIND
+        );
+        assert!(!classification.retryable);
+        assert!(classification.operator_action_required);
+        assert!(classification.summary.contains("openai"));
+        assert!(
+            classification
+                .fix_commands
+                .iter()
+                .any(|cmd| cmd == "pi /login")
+        );
+
+        let with_assistant = RunnerError::new(
+            "worker mentioned auth after starting",
+            RunnerTranscript {
+                assistant_tail: "implementation failed after mentioning No API key found for openai".to_string(),
+                stderr_tail: "No API key found for openai.\nUse /login to log into a provider via OAuth or API key.\n".to_string(),
+                ..RunnerTranscript::default()
+            },
+        );
+        assert!(with_assistant.classify_launch_failure(&metadata).is_none());
+
+        let unknown = RunnerError::new(
+            "pi exited with status 1",
+            RunnerTranscript {
+                stderr_tail: "connection reset by peer".to_string(),
+                ..RunnerTranscript::default()
+            },
+        );
+        assert!(unknown.classify_launch_failure(&metadata).is_none());
+    }
 
     #[test]
     fn parses_explicit_runner_specs() {

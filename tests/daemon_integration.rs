@@ -656,6 +656,98 @@ fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> Test
 }
 
 #[test]
+fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_auth_failure_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Auth blocked slice",
+            "goal": "Try to launch a pi worker without auth.",
+            "acceptance": ["auth failure blocks without retries"]
+        }),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-002",
+            "title": "Dependent slice should not launch",
+            "goal": "Remain pending because slice-001 blocked.",
+            "depends_on": ["slice-001"],
+            "acceptance": ["later dependency layer does not launch"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add auth blocked slices"])?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &["run", "--repo", path(repo.path()), "--agent", "pi", "--all"],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let blocked = wait_for_terminal_status(&bin, home.path(), &run_id, "blocked")?;
+    assert!(
+        blocked["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Pi is not authenticated for provider openai"),
+        "blocked run should explain auth failure: {blocked:#}"
+    );
+
+    let slice_runs = blocked["slice_runs"].as_array().expect("slice_runs");
+    let slice_run = |slice_id: &str| {
+        slice_runs
+            .iter()
+            .find(|slice_run| slice_run["slice_id"].as_str() == Some(slice_id))
+            .unwrap_or_else(|| panic!("missing slice run {slice_id}: {blocked:#}"))
+    };
+    assert_eq!(slice_run("slice-001")["status"], "blocked");
+    assert_eq!(slice_run("slice-001")["attempts"], 1);
+    assert_eq!(slice_run("slice-002")["status"], "pending");
+    assert_eq!(slice_run("slice-002")["attempts"], 0);
+
+    let incident = blocked["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["type"].as_str() == Some("run_incident")
+                && event["payload"]["failure_kind"].as_str() == Some("agent_auth_required")
+        })
+        .expect("agent auth incident");
+    assert_eq!(incident["payload"]["operator_action_required"], true);
+    assert_eq!(incident["payload"]["retryable"], false);
+    assert_eq!(incident["payload"]["agent_provider"], "openai");
+    assert_eq!(incident["payload"]["agent_model"], "gpt-5.5");
+    assert_eq!(incident["payload"]["agent_profile"], "implementer");
+    assert!(
+        incident["payload"]["fix_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str() == Some("pi /login"))
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -1510,6 +1602,24 @@ else:
     signal.signal(signal.SIGTERM, terminate)
     while True:
         time.sleep(0.1)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
+}
+
+fn write_auth_failure_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env sh
+cat >/dev/null
+printf 'No API key found for openai.\n' >&2
+printf 'Use /login to log into a provider via OAuth or API key.\n' >&2
+exit 1
 "#,
     )?;
     let mut perms = fs::metadata(&path)?.permissions();

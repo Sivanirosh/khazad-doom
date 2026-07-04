@@ -29,6 +29,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 ## Worker attempt supervision
 
 - Attempt history is append-only evidence. Retries add attempts and preserve previous output/failure context.
+- Deterministic operator-class worker launch failures, such as Pi provider authentication failures detected by a narrow no-assistant-output plus known stderr signature, block after the first attempt and must not consume the remaining worker retries. Unknown or ambiguous launch failures preserve the existing retry behavior.
 - Worker execution is at-least-once, not exactly-once. A timed-out, cancelled, or retried attempt may have produced files or commits in its isolated worktree.
 - Parallel worker cancellation is graceful-first. If a run cancellation or sibling layer failure happens while a parallel batch is active, Khazad-Doom propagates cancellation to active workers and still joins every worker thread before the layer returns.
 - Process liveness and output activity are distinct. `Supervisor: alive` means the daemon still observes the child process, not that semantic progress is guaranteed.

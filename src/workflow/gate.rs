@@ -605,7 +605,11 @@ fn shell_error_failure_kind(err: &(dyn std::error::Error + Send + Sync + 'static
 pub(crate) fn failure_kind_needs_operator(failure_kind: &str) -> bool {
     matches!(
         failure_kind,
-        "tool_missing" | "command_not_executable" | "spawn_failed" | "invalid_cwd"
+        "tool_missing"
+            | "command_not_executable"
+            | "spawn_failed"
+            | "invalid_cwd"
+            | "agent_auth_required"
     )
 }
 

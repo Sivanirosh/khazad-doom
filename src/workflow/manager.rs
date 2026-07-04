@@ -8,8 +8,8 @@ use super::{
     integration_repair_prompt, worker_prompt,
 };
 use crate::agent::{
-    CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerMetadata,
-    RunnerSpec, runner_from_spec,
+    CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerLaunchFailure,
+    RunnerMetadata, RunnerSpec, runner_from_spec,
 };
 use crate::artifact;
 use crate::domain::{
@@ -143,6 +143,15 @@ struct AgentCallContext<'a> {
     phase: &'a str,
     slice_id: &'a str,
     attempt: usize,
+}
+
+struct AgentLaunchIncidentContext<'a> {
+    run: &'a Run,
+    phase: &'a str,
+    slice_id: &'a str,
+    attempt: usize,
+    runner_name: &'a str,
+    metadata: &'a RunnerMetadata,
 }
 
 impl WorkerAttemptContext {
@@ -334,6 +343,44 @@ impl Manager {
                 Err(err)
             }
         }
+    }
+
+    fn classify_runner_launch_failure(
+        &self,
+        err: &(dyn Error + Send + Sync + 'static),
+        metadata: &RunnerMetadata,
+    ) -> Option<RunnerLaunchFailure> {
+        err.downcast_ref::<RunnerError>()
+            .and_then(|err| err.classify_launch_failure(metadata))
+    }
+
+    fn record_agent_launch_incident(
+        &self,
+        context: AgentLaunchIncidentContext<'_>,
+        failure: &RunnerLaunchFailure,
+    ) -> Result<()> {
+        self.state.record_event(
+            &context.run.id,
+            "run_incident",
+            &json!({
+                "severity": "error",
+                "kind": &failure.failure_kind,
+                "failure_kind": &failure.failure_kind,
+                "message": &failure.summary,
+                "phase": context.phase,
+                "slice_id": context.slice_id,
+                "attempt": context.attempt,
+                "agent": context.runner_name,
+                "agent_profile": &context.metadata.profile,
+                "agent_provider": &context.metadata.provider,
+                "agent_model": &context.metadata.model,
+                "agent_reasoning": &context.metadata.reasoning,
+                "agent_mode": &context.metadata.mode,
+                "operator_action_required": failure.operator_action_required,
+                "retryable": failure.retryable,
+                "fix_commands": &failure.fix_commands,
+            }),
+        )
     }
 
     fn ensure_repo_run_available(&self, repo_id: &str, allowed_run_id: Option<&str>) -> Result<()> {
@@ -1659,11 +1706,11 @@ impl Manager {
                 branch: worker_branch.clone(),
                 slice: slice.clone(),
                 dependency_summary: ctx.dependency_summary.clone(),
-                agent_profile: runner_metadata.profile,
-                agent_provider: runner_metadata.provider,
-                agent_model: runner_metadata.model,
-                agent_reasoning: runner_metadata.reasoning,
-                agent_mode: runner_metadata.mode,
+                agent_profile: runner_metadata.profile.clone(),
+                agent_provider: runner_metadata.provider.clone(),
+                agent_model: runner_metadata.model.clone(),
+                agent_reasoning: runner_metadata.reasoning.clone(),
+                agent_mode: runner_metadata.mode.clone(),
                 output_path: output_path.to_string_lossy().to_string(),
                 contract: "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
                     .to_string(),
@@ -1698,7 +1745,12 @@ impl Manager {
             ) {
                 Ok(result) => result,
                 Err(err) => {
-                    last_failure = err.to_string();
+                    let launch_failure =
+                        self.classify_runner_launch_failure(err.as_ref(), &runner_metadata);
+                    last_failure = launch_failure
+                        .as_ref()
+                        .map(|failure| failure.summary.clone())
+                        .unwrap_or_else(|| err.to_string());
                     remember_attempt_failure(
                         &mut primary_failure,
                         &mut secondary_failures,
@@ -1726,8 +1778,34 @@ impl Manager {
                             "error": last_failure,
                             "primary_failure": &primary_failure,
                             "secondary_failures": &secondary_failures,
+                            "failure_kind": launch_failure.as_ref().map(|failure| failure.failure_kind.as_str()).unwrap_or_default(),
+                            "retryable": launch_failure.as_ref().map(|failure| failure.retryable),
+                            "operator_action_required": launch_failure.as_ref().map(|failure| failure.operator_action_required),
                         }),
                     )?;
+                    if let Some(launch_failure) = launch_failure {
+                        self.record_agent_launch_incident(
+                            AgentLaunchIncidentContext {
+                                run,
+                                phase: "worker_running",
+                                slice_id: &slice.id,
+                                attempt,
+                                runner_name: runner.name(),
+                                metadata: &runner_metadata,
+                            },
+                            &launch_failure,
+                        )?;
+                        self.state.upsert_slice_run(&SliceRun {
+                            run_id: run.id.clone(),
+                            slice_id: slice.id.clone(),
+                            status: SliceStatus::Blocked,
+                            branch: worker_branch.clone(),
+                            commit_sha: gitutil::head_sha(&worker_worktree).unwrap_or_default(),
+                            attempts: attempt,
+                            last_error: launch_failure.summary.clone(),
+                        })?;
+                        return Err(BlockedError::new(launch_failure.summary).into());
+                    }
                     continue;
                 }
             };
@@ -2096,6 +2174,7 @@ impl Manager {
                 runner.name(),
                 "integration repair worker is running",
             );
+            let runner_metadata = runner.metadata();
             let prompt = integration_repair_prompt(
                 &run.id,
                 &integration_worktree.to_string_lossy(),
@@ -2126,6 +2205,22 @@ impl Manager {
                 Err(err) => {
                     if cancel.is_cancelled() {
                         return Err(CancelledError::new("run cancelled").into());
+                    }
+                    if let Some(launch_failure) =
+                        self.classify_runner_launch_failure(err.as_ref(), &runner_metadata)
+                    {
+                        self.record_agent_launch_incident(
+                            AgentLaunchIncidentContext {
+                                run,
+                                phase: "integration_repair",
+                                slice_id: "",
+                                attempt,
+                                runner_name: runner.name(),
+                                metadata: &runner_metadata,
+                            },
+                            &launch_failure,
+                        )?;
+                        return Err(BlockedError::new(launch_failure.summary).into());
                     }
                     last_error = err.to_string();
                     continue;
