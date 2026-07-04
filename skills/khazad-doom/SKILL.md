@@ -1,6 +1,6 @@
 ---
 name: khazad-doom
-description: "Drive the Khazad-Doom workflow daemon: initialize repo workflow contracts, run JSON Issue Slices through isolated Pi/fake workers, inspect status/artifacts, create handoffs, and report blockers."
+description: "Drive the Khazad-Doom workflow daemon: initialize repo workflow contracts, run JSON Issue Slices through isolated Pi workers, use fake only as a deterministic test seam, inspect status/artifacts, create handoffs, and report blockers."
 argument-hint: "[init|slices|run|resume|status|monitor|watch|cancel|handoff|inspect] [options]"
 ---
 
@@ -61,7 +61,7 @@ khazad-doom daemon status
 - Verification/tooling failures such as missing commands, invalid verify cwd, shell spawn failures, and non-executable commands are daemon/operator environment failures, not worker auto-fix requests.
 - Declared slice `areas` are path guardrails: worker changes outside those areas block the slice as scope violations; do not add semantic scope-policing machinery.
 - Multiple open slices run in dependency order; independent open slices can run in parallel, then merge serially.
-- `--agent fake` is deterministic and only for local tests/dogfooding.
+- Pi is the sole real worker harness. `--agent fake` is deterministic and only for local tests/dogfooding; do not present it as portability or a second production harness.
 - Interrupted daemon runs are marked `interrupted` on next startup; lost workers are not silently resumed.
 - Merge conflicts are structured blocked artifacts; do not paper over them.
 - Runtime artifacts under `.workflow/runs/` are gitignored and include preflight snapshots, raw outputs, terminal run summaries, and bounded failed/cancelled attempt diagnostics.
@@ -98,7 +98,7 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
 - `khazad-doom monitor` and the optional `/khazad-monitor` Pi overlay intentionally share the same activity-feed vocabulary over daemon `status` JSON: Todos, Run, Worker/Shell/Merge/Repair, Warn, Economics, Incidents, Activity, and Tail.
 - If the optional Pi package extension is installed, `/khazad-monitor --latest` or `/khazad-monitor --run <run-id>` may open a centered Pi TUI activity-feed overlay. Closing it with `q` or `Esc` only detaches the overlay; never treat it as run cancellation.
-- Do not require the Pi extension for non-Pi harnesses or core monitoring; keep `khazad-doom monitor --repo . --latest` as the harness-neutral path and `watch`/`status` as fallbacks.
+- Do not require the Pi extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 - Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
 - Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.

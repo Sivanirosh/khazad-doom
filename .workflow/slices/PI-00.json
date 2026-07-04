@@ -1,0 +1,30 @@
+{
+  "id": "PI-00",
+  "title": "Pi-first doctrine",
+  "goal": "Record the Pi-first doctrine so future design work treats Pi as the sole real worker harness, daemon state as durable JSON truth, and fake as a deterministic test seam rather than a portability layer.",
+  "areas": [
+    ".pi/memory/VISION.md",
+    ".pi/memory/PLAN.md",
+    ".pi/memory/DECISIONS.md",
+    "README.md",
+    "docs/workflow-invariants.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "VISION.md states Pi-native worker execution, harness-neutral daemon state, and fake-as-test-seam without implying future multi-harness worker support.",
+    "docs/workflow-invariants.md records product decisions D1-D6, including the Pi documented-surface coupling rule and ambient-feedback doctrine.",
+    "The three standing rejections are recorded with rationale: Pi acceptance gates, fallbackModels silent failover, and auto-login or credential mutation.",
+    "README.md positions Khazad-Doom as a project-level workflow daemon for Pi, complementary to session-scoped delegation tools such as pi-subagents.",
+    "No doc, prompt, or CLI-facing wording claims harness-agnostic or multi-harness worker execution; harness-neutral daemon state/CLI status wording remains allowed."
+  ],
+  "must_ask_if": [
+    "Any code change appears necessary.",
+    "The implementation would remove or weaken the fake runner as the deterministic test seam.",
+    "A document would claim support for a second real worker harness or Pi-side acceptance gates."
+  ],
+  "verify_profile": "quick",
+  "verify": [
+    "bash -lc '! rg -ni \"harness-agnostic|harness agnostic\" README.md .pi/memory docs/workflow-invariants.md skills/khazad-doom/SKILL.md src'"
+  ],
+  "verify_timeout_seconds": 120
+}

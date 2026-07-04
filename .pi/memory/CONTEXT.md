@@ -19,4 +19,4 @@
 - Slice semantics: slices are bounded intent contracts and acceptance is minimum evidence, not an exhaustive mini-spec. Learning is allowed inside the JSON fence; moving the fence requires approval. Within-intent TDD discoveries may proceed inside declared `areas`; intent/path/policy expansion becomes `ask-user` or a follow-up slice.
 - Runtime handoffs, raw worker outputs, checkpoints, and inspection artifacts live under `.workflow/runs/` and are gitignored.
 - Final reports and handoff JSON expose runtime economics, incidents, explicit `exit_states`, and `evidence_attestation`.
-- Monitor UX: core `monitor`/`watch`/`status` are harness-neutral; optional Pi overlay renders the same daemon `status` JSON as an activity feed.
+- Monitor UX: core `monitor`/`watch`/`status` render daemon-owned JSON and stay usable from any terminal; optional Pi adapters should render the same daemon projection and surface attention ambiently in the originating Pi session.

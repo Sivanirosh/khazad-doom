@@ -12,11 +12,11 @@ Status: accepted.
 
 Decision: Implement Khazad-Doom as a local Rust CLI plus per-user daemon. The daemon owns durable run state, worker dispatch, cancellation, progress, checkpoints, verification, and handoff artifacts. Repos keep `.workflow` source artifacts; global runtime state lives outside repos.
 
-## 2026-06-25: Use adapters and isolated worktrees for workers
+## 2026-06-25: Use isolated worktrees for workers
 
-Status: accepted.
+Status: accepted; superseded in part by the 2026-07-04 Pi-first decision.
 
-Decision: Use a worker-agent adapter interface with Pi as the first real adapter and `fake` for deterministic smoke tests. Run slice workers in isolated git worktrees, allow conservative parallelism only for independent slices, and merge serially through an integration branch.
+Decision: Run slice workers in isolated git worktrees, allow conservative parallelism only for independent slices, and merge serially through an integration branch. Pi is now the sole real worker harness; `fake` remains as a deterministic smoke-test seam, not a portability layer.
 
 ## 2026-06-25: Require structured worker handoffs
 
@@ -34,7 +34,7 @@ Decision: Do not merge a slice until lightweight checks pass. Run full integrati
 
 Status: accepted.
 
-Decision: `khazad-doom monitor --repo . --latest` is the harness-neutral live progress path. `/khazad-monitor` is an optional Pi overlay over daemon status JSON; closing it only detaches the overlay and never cancels the run.
+Decision: `khazad-doom monitor --repo . --latest` is the CLI live progress path over daemon-owned state. `/khazad-monitor` is an optional Pi overlay over daemon status JSON; closing it only detaches the overlay and never cancels the run.
 
 ## 2026-06-26: Treat workflow economics as a release invariant
 
@@ -65,3 +65,21 @@ Decision: For SAW/SAFe-inspired ideas, Khazad-Doom should not add new optional g
 Status: accepted.
 
 Decision: JSON Issue Slices remain the authoritative worker authorization envelope: goal, acceptance, areas, dependencies, verification, and `must_ask_if`. Acceptance criteria are minimum required evidence, not an exhaustive list of every valid test case. Operational rule: learning is allowed inside the fence; moving the fence requires approval. While a slice is open, workers may implement the smallest TDD/code-inspection discovery that is directly implied by the slice goal or acceptance and stays within declared areas. If a discovery changes product intent, public API semantics, dependencies, verification policy, or required paths outside `areas`, the worker must block with an `ask-user` finding or recommend a follow-up slice. Do not add new workflow phases, gates, or schema fields until real runs prove the prompt/doc rule is insufficient.
+
+## 2026-07-04: Pi is the sole real worker harness
+
+Status: accepted.
+
+Decision: Khazad-Doom commits to Pi as its only real worker execution harness. Daemon state remains harness-neutral JSON because that neutrality is free and useful; worker execution is Pi-native because speculative multi-harness generality is paid complexity. `FakeRunner` stays permanently as a deterministic test double.
+
+## 2026-07-04: Daemon owns verification and no silent model failover
+
+Status: accepted.
+
+Decision: The daemon is the single verification owner. Pi-side acceptance gates (`attested`, `checked`, `verified`, `reviewed`) are rejected unless daemon verification is retired. `fallbackModels` or other silent worker-model failover is rejected because handoff attestation must name the model that actually did the work.
+
+## 2026-07-04: Feedback comes to the operator
+
+Status: accepted.
+
+Decision: Operators should not need to open a monitor window to learn that a run needs them. Progress and needs-attention states should surface ambiently in the Pi session that started the work, while daemon state remains the source of truth. CLI status/monitor and Pi renderers must paint one shared daemon-side interpretation layer so wording does not diverge.

@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/rust%20edition-2024-b7410e?style=flat-square" alt="Rust edition 2024">
   <img src="https://img.shields.io/badge/workflow-JSON%20Issue%20Slices-2563eb?style=flat-square" alt="Workflow: JSON Issue Slices">
   <img src="https://img.shields.io/badge/isolation-git%20worktrees-7c3aed?style=flat-square" alt="Isolation: git worktrees">
+  <img src="https://img.shields.io/badge/worker%20harness-Pi-0ea5e9?style=flat-square" alt="Worker harness: Pi">
   <img src="https://img.shields.io/badge/verification-gated%20handoffs-059669?style=flat-square" alt="Verification: gated handoffs">
   <img src="https://img.shields.io/badge/license-MIT-64748b?style=flat-square" alt="License: MIT">
 </p>
@@ -22,13 +23,13 @@ Agent work goes downhill quietly: one vague instruction becomes six unrelated ed
 
 Khazad-Doom is the bridge guard for that moment: **you shall not slop.**
 
-It makes the contract explicit before the agent starts. A **JSON Issue Slice** says what is authorized, what must be verified, and when the worker must stop and ask. The daemon runs that slice in an isolated worktree, demands a commit and JSON result, gates integration, and leaves a PR-ready handoff instead of vibes.
+It makes the contract explicit before the agent starts. A **JSON Issue Slice** says what is authorized, what must be verified, and when the worker must stop and ask. The daemon hands that slice to a Pi worker in an isolated worktree, demands a commit and a JSON result, gates integration, and leaves a PR-ready handoff instead of vibes.
 
 ## What Khazad-Doom is
 
-Khazad-Doom is a local Rust CLI and daemon for turning agentic coding work into bounded, reviewable units.
+Khazad-Doom is a local Rust CLI and daemon that turns Pi coding work into bounded, reviewable units.
 
-It does not try to be the agent. It is the foreman around the agent:
+It does not try to be the agent. It is the foreman around Pi:
 
 - **plan in JSON** so scope is explicit and diffable
 - **run in worktrees** so each worker is isolated
@@ -37,6 +38,10 @@ It does not try to be the agent. It is the foreman around the agent:
 - **handoff with commands** so pushing and PR creation stay intentional
 
 The agent writes code. Khazad-Doom decides what counts as done.
+
+Two boundaries keep this honest. Worker execution is Pi-native: Khazad-Doom launches real workers through Pi and commits to Pi's documented surfaces instead of abstracting over harnesses that don't exist. Workflow state is neutral: slices, runs, incidents, and handoffs are plain JSON on disk that any tool, script, or human can read. The built-in `fake` worker is a deterministic smoke-test seam, not a second harness strategy. Session-scoped delegation — subagents, review chains, second opinions — belongs to Pi packages like pi-subagents. Khazad-Doom owns what outlives a session: dependency-ordered slices, integration branches, durable checkpoints, and evidence.
+
+Three shortcuts are intentionally rejected: Pi-side acceptance gates cannot replace daemon verification, silent `fallbackModels` failover cannot hide which model did the work, and Khazad-Doom will not auto-login or mutate Pi credentials. Environmental fixes stay explicit operator action.
 
 ## The operating model
 
@@ -126,7 +131,7 @@ Strict does not mean frozen. Acceptance criteria are minimum evidence, not an ex
 | Evidence separation | Workers produce acceptance evidence claims; daemon checks/gates attest or reject them. Workers do not approve their own evidence. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
-| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `monitor`, `watch`, and optional Pi adapters. |
+| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `monitor`, `watch`, and the Pi overlay. |
 | Durable checkpoints | `resume` continues remaining work from recorded state instead of pretending nothing happened. |
 | Conflict artifacts | Merge conflicts become structured blocked reports, not half-merged chaos. |
 | Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
@@ -141,15 +146,15 @@ Final reports and handoff JSON include explicit `exit_states` plus `evidence_att
 
 ## Live progress
 
-The recommended harness-neutral live progress path is an always-on monitor:
+Live progress is daemon-owned, so you can watch a run from any terminal, with or without Pi open:
 
 ```bash
 khazad-doom monitor --repo . --latest
 ```
 
-`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while any harness starts daemon-owned runs normally. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. `Ctrl-C` exits only the terminal monitor; the daemon is detached from the monitor process group and keeps owning any run. Khazad-Doom does not auto-open external windows by default.
+`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while runs are started from Pi, a script, or another terminal. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. `Ctrl-C` exits only the terminal monitor; the daemon is detached from the monitor process group and keeps owning any run. Khazad-Doom does not auto-open external windows by default.
 
-Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so a harness can display those commands directly instead of guessing how to launch user-visible progress.
+Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so whatever started the run can display those commands directly instead of guessing how to launch user-visible progress.
 
 Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. The terminal `monitor` and optional Pi overlay intentionally share the same activity-feed vocabulary over daemon `status` JSON: `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, and `Tail`.
 
@@ -183,9 +188,9 @@ A quiet worker is not considered failed by default. Khazad-Doom reports that the
 
 Runs also expose an `incidents` array in status JSON and monitor output. A final `completed` status does not hide prior run errors, resumes, cleanup warnings, integration repair, or non-fatal lifecycle warnings; those are escalated as completed-with-incidents signals for release triage.
 
-### Optional Pi adapter
+### The Pi package: skill and overlay
 
-This repository is also a Pi package. Its `package.json` declares the existing `khazad-doom` skill and an optional Pi extension at `extensions/khazad-monitor`.
+This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and a monitor extension at `extensions/khazad-monitor`. Both are adapters over daemon state; neither owns a run.
 
 Enable it intentionally from a trusted checkout or package source; Khazad-Doom never writes Pi user settings automatically:
 
@@ -248,7 +253,7 @@ To install only the skill without the optional extension, use Pi package filters
 
 ## Runners
 
-Default runner: `pi`.
+Pi is the worker harness — the only one. The second runner, `fake`, is a test double, not a harness: it exists so the daemon can be exercised end to end without spending a token.
 
 ```bash
 khazad-doom run --agent pi --slice slice-001
