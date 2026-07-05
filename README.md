@@ -156,7 +156,7 @@ khazad-doom monitor --repo . --latest
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so whatever started the run can display those commands directly instead of guessing how to launch user-visible progress.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. The terminal `monitor` and optional Pi overlay intentionally share the same activity-feed vocabulary over daemon `status` JSON: `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, and `Tail`.
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, the terminal `monitor`, and the optional Pi overlay paint that projection instead of independently interpreting run events. The shared vocabulary includes `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
 
 During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
 
@@ -188,9 +188,20 @@ A quiet worker is not considered failed by default. Khazad-Doom reports that the
 
 Runs also expose an `incidents` array in status JSON and monitor output. A final `completed` status does not hide prior run errors, resumes, cleanup warnings, integration repair, or non-fatal lifecycle warnings; those are escalated as completed-with-incidents signals for release triage.
 
-### The Pi package: skill and overlay
+### Operator questions
 
-This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and a monitor extension at `extensions/khazad-monitor`. Both are adapters over daemon state; neither owns a run.
+If a Pi worker reaches a slice `must_ask_if` fence, it can call the shipped `ask_operator` tool instead of immediately returning blocked JSON. The daemon persists the question, marks progress as `awaiting_operator`, and status/monitor output shows the answer command:
+
+```bash
+khazad-doom questions --run <run-id>
+khazad-doom answer <run-id> <question-id> "your answer"
+```
+
+The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk`. If no answer arrives before the tool timeout, the worker falls back to the existing blocked contract and the unanswered question remains visible as run evidence.
+
+### The Pi package: skill, overlay, and worker tool
+
+This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill, the monitor extension at `extensions/khazad-monitor`, and the worker escalation tool at `extensions/khazad-worker`. These are adapters over daemon state; none owns a run.
 
 Enable it intentionally from a trusted checkout or package source; Khazad-Doom never writes Pi user settings automatically:
 
@@ -208,7 +219,9 @@ The extension registers `/khazad-monitor`:
 /khazad-monitor <run-id>
 ```
 
-In Pi TUI mode it opens a centered, bordered version of the same activity-feed dashboard as `khazad-doom monitor`: slice todos, current worker/shell progress, warnings, economics, chronological daemon activity, and output-tail fields from daemon JSON. When the feed is taller than the overlay, it shows a right-side scrollbar; use ↑/↓ or PgUp/PgDn to scroll. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
+In Pi TUI mode it opens a centered, bordered version of the same daemon projection as `khazad-doom monitor`. When the feed is taller than the overlay, it shows a right-side scrollbar; use ↑/↓ or PgUp/PgDn to scroll. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
+
+Ambient mode is on by default in Pi TUI sessions. The extension polls the current repo for an active run, shows a compact widget when one appears, raises one notification per terminal transition, and raises attention notifications for new pending operator questions. Reattaching to an already-active run shows the widget without replaying old notifications. Set `KHAZAD_MONITOR_AMBIENT=0` to opt out or `KHAZAD_MONITOR_AMBIENT_INTERVAL_MS=<ms>` to tune polling. All widget/notification wording comes from the daemon projection or question records.
 
 To install only the skill without the optional extension, use Pi package filters in settings:
 
@@ -242,6 +255,8 @@ To install only the skill without the optional extension, use Pi package filters
 | `khazad-doom monitor --repo . --latest` | Open the dashboard TUI for the latest active run in this repo. |
 | `khazad-doom monitor --run <id>` | Open the dashboard TUI for one specific run. |
 | `khazad-doom watch --run <id>` | Plain text fallback for one specific run. |
+| `khazad-doom questions --run <id>` | List worker operator-escalation questions for a run. |
+| `khazad-doom answer <run> <question> "text"` | Answer a pending worker question. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom inspect --repo . --latest` | Inspect the latest run for a repo, including terminal runs. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
@@ -292,7 +307,7 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 
 A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure. Missing tools, invalid verify cwd, shell spawn failures, and non-executable commands are classified as daemon/operator environment failures instead of worker auto-fix failures.
 
-`khazad-doom init` also creates `.workflow/agents.toml`, the central launch-profile file for agent roles. Real Pi code-writing workers are launched through the required `implementer` profile; the default enforces OpenAI `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, and economics snapshots report the actual profile/model/settings used.
+`khazad-doom init` also creates `.workflow/agents.toml`, the central launch-profile file for agent roles. Real Pi code-writing workers are launched through the required `implementer` profile; the default enforces the OpenAI Codex provider with `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. CLI/env overrides (`--pi-bin`, `--pi-args`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) flow through the same effective-profile resolver. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, status projection, and economics snapshots report the same `profile_summary`/`launch_summary`. `preflight.json` also records the observed Pi contract (binary, launch flags, supported event vocabulary) for postmortems.
 
 Run start is clean-by-default: Khazad-Doom rejects a dirty source repo unless `--allow-dirty` is explicit, and every run writes `.workflow/runs/<run>/outputs/preflight.json` with base branch/SHA and dirty status. Worker changes are also checked against slice `areas` when areas are declared; outside-area changes block the slice as a scope violation.
 

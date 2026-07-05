@@ -13,8 +13,15 @@ const OVERLAY_MAX_HEIGHT = '86%';
 const OVERLAY_MAX_HEIGHT_PERCENT = 86;
 const OVERLAY_MARGIN = 1;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'blocked', 'cancelled', 'interrupted']);
+const AMBIENT_WIDGET_ID = 'khazad-doom';
+const DEFAULT_AMBIENT_INTERVAL_MS = 3000;
+const DEFAULT_AMBIENT_LINGER_MS = 5000;
 
 function khazadMonitorExtension(pi) {
+	pi.on?.('session_start', (_event, ctx) => {
+		startAmbientMonitor(pi, ctx);
+	});
+
 	pi.registerCommand('khazad-monitor', {
 		description:
 			'Open an optional Khazad-Doom activity-feed overlay. Usage: /khazad-monitor [--latest|--run <run-id>|<run-id>]',
@@ -291,7 +298,11 @@ class KhazadMonitorOverlay {
 		}
 
 		if (this.state.details) {
-			lines.push(...runDetailsLines(this.state.details, this.theme, this.feedEvents));
+			if (this.state.details.feed && Array.isArray(this.state.details.feed.blocks)) {
+				lines.push(...projectionLines(this.state.details.feed, this.theme));
+			} else {
+				lines.push(...runDetailsLines(this.state.details, this.theme, this.feedEvents));
+			}
 		} else if (!this.state.error || this.config.mode === 'latest') {
 			lines.push(...waitingLines(this.state.waitingRepo || this.config.repo, this.theme));
 		}
@@ -299,6 +310,173 @@ class KhazadMonitorOverlay {
 		lines.push('', footerLine(this.theme, this.config, this.state.lastUpdated));
 		return lines;
 	}
+}
+
+function startAmbientMonitor(pi, ctx) {
+	if (process.env.KHAZAD_MONITOR_AMBIENT === '0' || process.env.KHAZAD_MONITOR_AMBIENT === 'false') return;
+	if (!ctx || !ctx.hasUI || !ctx.ui || typeof ctx.ui.setWidget !== 'function') return;
+	const tracker = new AmbientRunTracker({
+		pi,
+		ctx,
+		repo: ctx.cwd || process.cwd(),
+		intervalMs: Number(process.env.KHAZAD_MONITOR_AMBIENT_INTERVAL_MS || DEFAULT_AMBIENT_INTERVAL_MS),
+		lingerMs: Number(process.env.KHAZAD_MONITOR_AMBIENT_LINGER_MS || DEFAULT_AMBIENT_LINGER_MS),
+	});
+	tracker.start();
+}
+
+class AmbientRunTracker {
+	constructor({ pi, ctx, repo, intervalMs, lingerMs }) {
+		this.pi = pi;
+		this.ctx = ctx;
+		this.repo = repo;
+		this.intervalMs = Math.max(500, Number(intervalMs) || DEFAULT_AMBIENT_INTERVAL_MS);
+		this.lingerMs = Math.max(0, Number(lingerMs) || DEFAULT_AMBIENT_LINGER_MS);
+		this.bin = process.env.KHAZAD_DOOM_BIN || 'khazad-doom';
+		this.currentRunId = '';
+		this.attachedAt = new Map();
+		this.notified = new Set();
+		this.knownQuestionIds = new Set();
+		this.timer = undefined;
+		this.lingerTimer = undefined;
+	}
+
+	start() {
+		this.poll().catch((error) => this.showError(error));
+		this.timer = setInterval(() => this.poll().catch((error) => this.showError(error)), this.intervalMs);
+		this.timer.unref?.();
+	}
+
+	async poll() {
+		if (!this.currentRunId) {
+			const active = await this.fetchLatestActive();
+			if (!active) {
+				this.hideWidget();
+				return;
+			}
+			this.attach(active);
+			this.render(active);
+			return;
+		}
+		const details = await this.fetchRun(this.currentRunId);
+		if (!details) {
+			this.currentRunId = '';
+			this.hideWidget();
+			return;
+		}
+		this.render(details);
+		this.notifyTransitions(details);
+		if (isTerminalStatus(details.run && details.run.status)) {
+			this.scheduleHide();
+			this.currentRunId = '';
+		}
+	}
+
+	attach(details) {
+		const runId = details.run && details.run.id;
+		if (!runId) return;
+		this.currentRunId = runId;
+		this.attachedAt.set(runId, Date.now());
+		for (const question of details.questions || []) {
+			if (question && question.id) this.knownQuestionIds.add(`${runId}:${question.id}`);
+		}
+	}
+
+	async fetchLatestActive() {
+		const result = await this.execJson(['status', '--latest', '--repo', this.repo]);
+		return result && result.run ? result : undefined;
+	}
+
+	async fetchRun(runId) {
+		return await this.execJson(['status', '--run', runId]);
+	}
+
+	async execJson(args) {
+		const result = await this.pi.exec(this.bin, args, { cwd: this.repo, timeout: STATUS_TIMEOUT_MS });
+		if (!result || result.code !== 0) {
+			throw new Error((result && result.stderr) || `command failed: ${this.bin} ${args.map(shellQuote).join(' ')}`);
+		}
+		return JSON.parse(result.stdout || 'null');
+	}
+
+	render(details) {
+		const feed = details && details.feed;
+		if (!feed) return;
+		const lines = ambientWidgetLines(feed);
+		if (lines.length === 0) return this.hideWidget();
+		this.ctx.ui.setWidget(AMBIENT_WIDGET_ID, lines, { placement: 'belowEditor' });
+	}
+
+	notifyTransitions(details) {
+		const runId = details.run && details.run.id;
+		if (!runId || !details.feed) return;
+		for (const question of details.questions || []) {
+			if (!question || question.state !== 'pending' || !question.id) continue;
+			const key = `${runId}:question:${question.id}`;
+			if (this.knownQuestionIds.has(`${runId}:${question.id}`)) continue;
+			this.knownQuestionIds.add(`${runId}:${question.id}`);
+			this.notifyOnce(key, attentionTextForQuestion(details.feed, question.id) || question.question, 'warning');
+		}
+		const status = details.run && details.run.status;
+		if (!isTerminalStatus(status)) return;
+		this.notifyOnce(`${runId}:terminal:${status}`, details.feed.summary_line, levelForStatus(status));
+	}
+
+	notifyOnce(key, text, level) {
+		if (!text || this.notified.has(key)) return;
+		this.notified.add(key);
+		if (typeof this.ctx.ui.notify === 'function') {
+			this.ctx.ui.notify(text, level || 'info');
+		}
+	}
+
+	scheduleHide() {
+		if (this.lingerTimer) clearTimeout(this.lingerTimer);
+		this.lingerTimer = setTimeout(() => this.hideWidget(), this.lingerMs);
+		this.lingerTimer.unref?.();
+	}
+
+	showError(error) {
+		const message = error && error.message ? error.message : String(error || 'daemon unreachable');
+		this.ctx.ui.setWidget(AMBIENT_WIDGET_ID, [
+			`Khazad-Doom monitor unavailable: ${truncatePlain(message, 120)}`,
+			'Set KHAZAD_DOOM_BIN or start the daemon, then polling will retry.',
+		]);
+	}
+
+	hideWidget() {
+		this.ctx.ui.setWidget(AMBIENT_WIDGET_ID, []);
+	}
+}
+
+function ambientWidgetLines(feed) {
+	const lines = [];
+	if (feed.summary_line) lines.push(feed.summary_line);
+	for (const attention of feed.attention || []) {
+		if (attention && attention.text) lines.push(attention.text);
+	}
+	if (lines.length > 0) return lines.slice(0, 4);
+	for (const block of feed.blocks || []) {
+		for (const item of block.lines || []) {
+			if (item && item.text) lines.push(item.text);
+			if (lines.length >= 4) return lines;
+		}
+	}
+	return lines;
+}
+
+function attentionTextForQuestion(feed, questionId) {
+	const needle = String(questionId || '');
+	for (const item of feed.attention || []) {
+		if (item && item.text && item.text.includes(needle)) return item.text;
+	}
+	return '';
+}
+
+function levelForStatus(status) {
+	if (status === 'failed') return 'error';
+	if (status === 'completed') return 'info';
+	return 'warning';
 }
 
 function parseCommandArgs(rawArgs, cwd) {
@@ -546,6 +724,33 @@ function statusErrorText(error) {
 
 function errorMessage(error) {
 	return error && error.message ? String(error.message) : String(error);
+}
+
+function projectionLines(feed, theme) {
+	const lines = [];
+	for (const block of feed.blocks || []) {
+		if (!block || !block.label) continue;
+		lines.push(sectionHeading(theme, block.label, block.meta || ''));
+		const blockLines = Array.isArray(block.lines) ? block.lines : [];
+		if (blockLines.length === 0) {
+			lines.push(treeLine(theme, '-', 'dim'));
+		} else {
+			for (const item of blockLines) {
+				lines.push(treeLine(theme, item && item.text, projectionRole(item && item.role)));
+			}
+		}
+		lines.push('');
+	}
+	if (lines.at(-1) === '') lines.pop();
+	return lines;
+}
+
+function projectionRole(role) {
+	const normalized = String(role || 'info');
+	if (['heading', 'info', 'dim', 'success', 'warning', 'error', 'attention'].includes(normalized)) {
+		return normalized === 'attention' ? 'warning' : normalized;
+	}
+	return 'info';
 }
 
 function runDetailsLines(details, theme, rememberedEvents) {
@@ -1351,6 +1556,9 @@ module.exports = khazadMonitorExtension;
 module.exports.default = khazadMonitorExtension;
 module.exports._test = {
 	KhazadMonitorOverlay,
+	AmbientRunTracker,
+	ambientWidgetLines,
+	projectionLines,
 	scrollInputAction,
 	scrollbarChar,
 	splitFixedFooter,

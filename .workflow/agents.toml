@@ -4,21 +4,21 @@
 # exempt for deterministic smoke tests.
 
 [profiles.implementer]
-provider = "openai"
+provider = "openai-codex"
 model = "gpt-5.5"
 reasoning = "xhigh"
 mode = "fast"
 required = true
 
 [profiles.planner]
-provider = "openai"
+provider = "openai-codex"
 model = "gpt-5.5"
 reasoning = "high"
 mode = "normal"
 read_only = true
 
 [profiles.verifier]
-provider = "openai"
+provider = "openai-codex"
 model = "gpt-5.5"
 reasoning = "high"
 mode = "fast"

@@ -97,7 +97,7 @@ impl Default for AgentProfilesConfig {
         profiles.insert(
             "planner".to_string(),
             AgentProfile {
-                provider: "openai".to_string(),
+                provider: "openai-codex".to_string(),
                 model: "gpt-5.5".to_string(),
                 reasoning: "high".to_string(),
                 mode: "normal".to_string(),
@@ -108,7 +108,7 @@ impl Default for AgentProfilesConfig {
         profiles.insert(
             "verifier".to_string(),
             AgentProfile {
-                provider: "openai".to_string(),
+                provider: "openai-codex".to_string(),
                 model: "gpt-5.5".to_string(),
                 reasoning: "high".to_string(),
                 mode: "fast".to_string(),
@@ -142,7 +142,7 @@ pub struct AgentProfile {
 impl AgentProfile {
     pub fn implementer() -> Self {
         Self {
-            provider: "openai".to_string(),
+            provider: "openai-codex".to_string(),
             model: "gpt-5.5".to_string(),
             reasoning: "xhigh".to_string(),
             mode: "fast".to_string(),
@@ -358,6 +358,10 @@ pub struct Handoff {
     pub agent_reasoning: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent_mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub launch_summary: String,
     pub output_path: String,
     pub contract: String,
 }
@@ -514,8 +518,14 @@ pub struct AgentCallEconomics {
     pub agent_reasoning: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent_mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub launch_summary: String,
     pub status: String,
     pub duration_ms: u128,
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
+    pub operator_pause_ms: u128,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
@@ -699,6 +709,62 @@ pub struct RunIncident {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusFeed {
+    pub feed_version: u64,
+    pub summary_line: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<StatusFeedLine>,
+    pub blocks: Vec<StatusFeedBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusFeedBlock {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub meta: String,
+    pub lines: Vec<StatusFeedLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusFeedLine {
+    pub text: String,
+    #[serde(default = "default_status_feed_role")]
+    pub role: StatusFeedRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusFeedRole {
+    Heading,
+    Info,
+    Dim,
+    Success,
+    Warning,
+    Error,
+    Attention,
+}
+
+fn default_status_feed_role() -> StatusFeedRole {
+    StatusFeedRole::Info
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerQuestion {
+    pub id: String,
+    pub run_id: String,
+    pub slice_id: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    pub state: String,
+    pub asked_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
     pub slice_runs: Vec<SliceRun>,
@@ -706,9 +772,13 @@ pub struct RunDetails {
     pub progress: Option<RunProgress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incidents: Vec<RunIncident>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<WorkerQuestion>,
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economics: Option<RunEconomics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<StatusFeed>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

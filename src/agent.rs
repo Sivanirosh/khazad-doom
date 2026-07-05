@@ -1,11 +1,12 @@
 use crate::domain::Handoff;
+use crate::pi_contract::{self, PiContractObservation, PiContractWarning, PiParser};
 use crate::{artifact, gitutil};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -125,6 +126,8 @@ pub struct Job {
     pub prompt: String,
     pub cwd: PathBuf,
     pub json_schema: String,
+    #[allow(dead_code)]
+    pub env: BTreeMap<String, String>,
     pub termination_grace_seconds: u64,
 }
 
@@ -132,6 +135,7 @@ pub struct Job {
 pub struct ResultData {
     pub output: Option<Value>,
     pub usage: Usage,
+    pub contract_warnings: Vec<PiContractWarning>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,45 +181,8 @@ impl RunnerError {
         &self,
         metadata: &RunnerMetadata,
     ) -> Option<RunnerLaunchFailure> {
-        if !self.transcript.assistant_tail.trim().is_empty() {
-            return None;
-        }
-        if !looks_like_pi_auth_failure(&self.transcript.stderr_tail) {
-            return None;
-        }
-        let provider = if metadata.provider.trim().is_empty() {
-            provider_from_auth_failure(&self.transcript.stderr_tail)
-                .unwrap_or_else(|| "configured provider".to_string())
-        } else {
-            metadata.provider.trim().to_string()
-        };
-        Some(RunnerLaunchFailure {
-            failure_kind: AGENT_AUTH_REQUIRED_FAILURE_KIND.to_string(),
-            summary: format!(
-                "Pi is not authenticated for provider {provider}; run `pi /login` or update .workflow/agents.toml to a configured provider/model."
-            ),
-            retryable: false,
-            operator_action_required: true,
-            fix_commands: vec!["pi /login".to_string()],
-        })
+        pi_contract::classify_launch_failure(&self.transcript, metadata)
     }
-}
-
-fn looks_like_pi_auth_failure(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("no api key found for") && lower.contains("/login")
-}
-
-fn provider_from_auth_failure(stderr: &str) -> Option<String> {
-    let lower = stderr.to_ascii_lowercase();
-    let marker = "no api key found for";
-    let start = lower.find(marker)? + marker.len();
-    let provider = lower[start..]
-        .trim_start()
-        .split(|ch: char| ch == '.' || ch.is_whitespace())
-        .next()?
-        .trim();
-    (!provider.is_empty()).then(|| provider.to_string())
 }
 
 impl std::fmt::Display for RunnerError {
@@ -246,6 +213,57 @@ pub struct RunnerMetadata {
     pub reasoning: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub launch_summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fix_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_attribution: BTreeMap<String, String>,
+}
+
+impl RunnerMetadata {
+    pub fn profile_summary(&self) -> String {
+        if !self.profile_summary.trim().is_empty() {
+            return self.profile_summary.clone();
+        }
+        let profile = if self.profile.trim().is_empty() {
+            "default"
+        } else {
+            self.profile.trim()
+        };
+        let mut parts = vec![format!("profile={profile}")];
+        if !self.provider.trim().is_empty() {
+            parts.push(format!("provider={}", self.provider.trim()));
+        }
+        if !self.model.trim().is_empty() {
+            parts.push(format!("model={}", self.model.trim()));
+        }
+        if !self.reasoning.trim().is_empty() {
+            parts.push(format!("reasoning={}", self.reasoning.trim()));
+        }
+        if !self.mode.trim().is_empty() {
+            parts.push(format!("mode={}", self.mode.trim()));
+        }
+        parts.join(" ")
+    }
+
+    pub fn launch_summary(&self) -> String {
+        if !self.launch_summary.trim().is_empty() {
+            self.launch_summary.clone()
+        } else {
+            self.profile_summary()
+        }
+    }
+
+    pub fn auth_fix_commands(&self) -> Vec<String> {
+        if self.fix_commands.is_empty() {
+            vec!["pi /login".to_string()]
+        } else {
+            self.fix_commands.clone()
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -260,6 +278,10 @@ pub trait Runner: Send + Sync {
     fn metadata(&self) -> RunnerMetadata {
         RunnerMetadata::default()
     }
+
+    fn pi_contract_observation(&self) -> Option<PiContractObservation> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +293,7 @@ pub struct RunnerSpec {
 }
 
 impl RunnerSpec {
+    #[allow(dead_code)]
     pub fn from_agent_and_env(agent: &str) -> Result<Self> {
         let kind = if agent.trim().is_empty() {
             std::env::var("KHAZAD_AGENT").unwrap_or_else(|_| "pi".to_string())
@@ -348,8 +371,8 @@ impl Runner for PiRunner {
             &self.bin
         };
         let mut cmd = Command::new(bin);
-        cmd.args(&self.extra_args)
-            .args(["--mode", "json", "--no-session"])
+        cmd.args(pi_contract::launch_args(&self.extra_args))
+            .envs(&job.env)
             .current_dir(&job.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -395,11 +418,7 @@ impl Runner for PiRunner {
                 );
                 let parser = join_parser(parser_thread)?;
                 let stderr = stderr_thread.join().unwrap_or_default();
-                return Err(RunnerError::new(
-                    "job cancelled",
-                    transcript_from_parser(&parser, &stderr),
-                )
-                .into());
+                return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
             }
             if let Some(status) = child.try_wait()? {
                 emit_runner_event(&events, RunnerEvent::finished(Some(pid), status.code()));
@@ -421,7 +440,7 @@ impl Runner for PiRunner {
             } else {
                 format!("pi exited with {status}: {msg}")
             };
-            return Err(RunnerError::new(message, transcript_from_parser(&parser, &stderr)).into());
+            return Err(RunnerError::new(message, parser.transcript(&stderr)).into());
         }
 
         let text = parser.final_text().trim().to_string();
@@ -435,7 +454,8 @@ impl Runner for PiRunner {
         };
         Ok(ResultData {
             output,
-            usage: parser.usage,
+            usage: parser.usage().clone(),
+            contract_warnings: parser.warnings().to_vec(),
         })
     }
 
@@ -446,31 +466,16 @@ impl Runner for PiRunner {
     fn metadata(&self) -> RunnerMetadata {
         self.metadata.clone()
     }
+
+    fn pi_contract_observation(&self) -> Option<PiContractObservation> {
+        Some(pi_contract::observation(&self.bin, &self.extra_args))
+    }
 }
 
 fn join_parser(parser_thread: thread::JoinHandle<Result<PiParser>>) -> Result<PiParser> {
     parser_thread
         .join()
         .map_err(|_| anyhow::anyhow!("pi stdout parser panicked"))?
-}
-
-fn transcript_from_parser(parser: &PiParser, stderr: &str) -> RunnerTranscript {
-    RunnerTranscript {
-        stdout_tail: parser.raw_tail.clone(),
-        stderr_tail: tail_string(stderr, 12_000),
-        assistant_tail: tail_string(&parser.final_text(), 12_000),
-    }
-}
-
-fn tail_string(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut start = text.len() - max_bytes;
-    while !text.is_char_boundary(start) && start < text.len() {
-        start += 1;
-    }
-    text[start..].to_string()
 }
 
 fn terminate_child(child: &mut std::process::Child, grace: Duration) {
@@ -523,6 +528,7 @@ impl Runner for FakeRunner {
                     json!({ "status": "no-op", "summary": "fake runner: no repair needed" }),
                 ),
                 usage: Usage::default(),
+                contract_warnings: Vec::new(),
             });
         }
         let handoff_path = handoff_path_from_prompt(&job.prompt)?;
@@ -578,6 +584,7 @@ impl Runner for FakeRunner {
                 "acceptance_status": acceptance_status
             })),
             usage: Usage::default(),
+            contract_warnings: Vec::new(),
         })
     }
 
@@ -625,153 +632,6 @@ fn extract_json_object(text: &str) -> Result<Value> {
     serde_json::from_str(candidate).context("invalid JSON object")
 }
 
-#[derive(Debug, Default)]
-struct PiParser {
-    stream_text: BTreeMap<usize, String>,
-    complete_text: BTreeMap<usize, String>,
-    final_assistant: Option<Value>,
-    usage: Usage,
-    raw_tail: String,
-}
-
-impl PiParser {
-    fn parse(
-        &mut self,
-        stdout: impl Read,
-        events: Option<RunnerEventSink>,
-        pid: Option<u32>,
-    ) -> Result<()> {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let line = line?;
-            emit_runner_event(&events, RunnerEvent::stdout(pid, line.clone()));
-            self.remember_raw_line(&line);
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            self.handle(&event);
-        }
-        Ok(())
-    }
-
-    fn remember_raw_line(&mut self, line: &str) {
-        append_bounded(&mut self.raw_tail, line, 12_000);
-        append_bounded(&mut self.raw_tail, "\n", 12_000);
-    }
-
-    fn handle(&mut self, event: &Value) {
-        match event.get("type").and_then(Value::as_str) {
-            Some("message_update") => {
-                self.remember_assistant(event.get("message"));
-                self.handle_assistant_event(event.get("assistantMessageEvent"));
-            }
-            Some("message_end") | Some("turn_end") => self.remember_assistant(event.get("message")),
-            Some("agent_end") => self.remember_last_assistant(event.get("messages")),
-            _ => {}
-        }
-    }
-
-    fn remember_assistant(&mut self, raw: Option<&Value>) {
-        let Some(msg) = raw else { return };
-        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-            return;
-        }
-        self.final_assistant = Some(msg.clone());
-        if let Some(usage) = msg.get("usage") {
-            self.usage = usage_from_value(usage);
-        }
-    }
-
-    fn remember_last_assistant(&mut self, raw: Option<&Value>) {
-        let Some(messages) = raw.and_then(Value::as_array) else {
-            return;
-        };
-        for msg in messages.iter().rev() {
-            if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-                self.remember_assistant(Some(msg));
-                return;
-            }
-        }
-    }
-
-    fn handle_assistant_event(&mut self, raw: Option<&Value>) {
-        let Some(event) = raw else { return };
-        let idx = event
-            .get("contentIndex")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        match event.get("type").and_then(Value::as_str) {
-            Some("text_delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    self.stream_text.entry(idx).or_default().push_str(delta);
-                }
-            }
-            Some("text_complete") => {
-                if let Some(text) = event.get("text").and_then(Value::as_str)
-                    && !text.is_empty()
-                {
-                    self.complete_text.insert(idx, text.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn final_text(&self) -> String {
-        if let Some(msg) = &self.final_assistant
-            && let Some(content) = msg.get("content").and_then(Value::as_array)
-        {
-            let parts: Vec<_> = content
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-                .collect();
-            if !parts.is_empty() {
-                return parts.join("\n");
-            }
-        }
-        if !self.complete_text.is_empty() {
-            return join_indexed(&self.complete_text);
-        }
-        join_indexed(&self.stream_text)
-    }
-}
-
-fn join_indexed(parts: &BTreeMap<usize, String>) -> String {
-    let mut out = String::new();
-    for value in parts.values() {
-        out.push_str(value);
-    }
-    out
-}
-
-fn append_bounded(target: &mut String, text: &str, max_bytes: usize) {
-    target.push_str(text);
-    if target.len() > max_bytes {
-        let mut remove = target.len() - max_bytes;
-        while !target.is_char_boundary(remove) && remove < target.len() {
-            remove += 1;
-        }
-        target.drain(..remove);
-    }
-}
-
-fn usage_from_value(value: &Value) -> Usage {
-    Usage {
-        input_tokens: value
-            .get("inputTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize,
-        output_tokens: value
-            .get("outputTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize,
-    }
-}
-
 fn is_zero(value: &usize) -> bool {
     *value == 0
 }
@@ -782,6 +642,7 @@ mod tests {
         AGENT_AUTH_REQUIRED_FAILURE_KIND, RunnerError, RunnerMetadata, RunnerSpec,
         RunnerTranscript, extract_json_object,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn classifies_pi_auth_failure_only_without_assistant_output() {
@@ -791,9 +652,13 @@ mod tests {
             model: "gpt-5.5".to_string(),
             reasoning: "xhigh".to_string(),
             mode: "fast".to_string(),
+            profile_summary: String::new(),
+            launch_summary: String::new(),
+            fix_commands: Vec::new(),
+            source_attribution: BTreeMap::new(),
         };
         let transcript = RunnerTranscript {
-            stderr_tail: "No API key found for openai.\nUse /login to log into a provider via OAuth or API key.\n".to_string(),
+            stderr_tail: crate::pi_contract::auth_failure_stderr_fixture("openai"),
             ..RunnerTranscript::default()
         };
         let err = RunnerError::new("pi exited with status 1", transcript);
@@ -818,8 +683,9 @@ mod tests {
         let with_assistant = RunnerError::new(
             "worker mentioned auth after starting",
             RunnerTranscript {
-                assistant_tail: "implementation failed after mentioning No API key found for openai".to_string(),
-                stderr_tail: "No API key found for openai.\nUse /login to log into a provider via OAuth or API key.\n".to_string(),
+                assistant_tail: "implementation failed after mentioning an auth problem"
+                    .to_string(),
+                stderr_tail: crate::pi_contract::auth_failure_stderr_fixture("openai"),
                 ..RunnerTranscript::default()
             },
         );

@@ -1,6 +1,7 @@
 mod economics;
 mod gate;
 mod manager;
+mod projection;
 mod prompts;
 mod schema;
 mod shell;
@@ -11,6 +12,7 @@ use std::error::Error;
 use std::fmt;
 
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
+pub(crate) use projection::project_run;
 pub use prompts::{integration_repair_prompt, worker_prompt};
 pub use schema::{REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA};
 

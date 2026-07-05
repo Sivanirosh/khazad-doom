@@ -623,21 +623,21 @@ fn default_agent_profiles_toml() -> &'static str {
 # exempt for deterministic smoke tests.
 
 [profiles.implementer]
-provider = "openai"
+provider = "openai-codex"
 model = "gpt-5.5"
 reasoning = "xhigh"
 mode = "fast"
 required = true
 
 [profiles.planner]
-provider = "openai"
+provider = "openai-codex"
 model = "gpt-5.5"
 reasoning = "high"
 mode = "normal"
 read_only = true
 
 [profiles.verifier]
-provider = "openai"
+provider = "openai-codex"
 model = "gpt-5.5"
 reasoning = "high"
 mode = "fast"
@@ -973,7 +973,7 @@ mod tests {
         assert_eq!(config.parallelism, 3);
         let profiles = store.read_agent_profiles().unwrap();
         let implementer = profiles.profiles.get("implementer").unwrap();
-        assert_eq!(implementer.provider, "openai");
+        assert_eq!(implementer.provider, "openai-codex");
         assert_eq!(implementer.model, "gpt-5.5");
         assert_eq!(implementer.reasoning, "xhigh");
         assert_eq!(implementer.mode, "fast");

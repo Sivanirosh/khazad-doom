@@ -1,0 +1,1045 @@
+use crate::domain::{
+    Event, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus,
+    StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole, WorkerAttemptProgress,
+};
+use chrono::{DateTime, Utc};
+use std::time::Duration;
+
+const FEED_VERSION: u64 = 1;
+const ACTIVITY_LIMIT: usize = 7;
+const OUTPUT_LINES: usize = 4;
+const TODO_ITEMS: usize = 8;
+const LINE_WIDTH: usize = 180;
+
+pub fn project_run(details: &RunDetails) -> StatusFeed {
+    project_run_at(details, Utc::now())
+}
+
+#[allow(dead_code)]
+pub fn project_waiting(repo: &str) -> StatusFeed {
+    StatusFeed {
+        feed_version: FEED_VERSION,
+        summary_line: format!("waiting for active run in {repo}"),
+        attention: Vec::new(),
+        blocks: vec![
+            block(
+                "Run",
+                "waiting",
+                vec![
+                    line(format!("repo {repo}"), StatusFeedRole::Info),
+                    line(
+                        "waiting for the latest active daemon-owned run",
+                        StatusFeedRole::Dim,
+                    ),
+                ],
+            ),
+            block(
+                "Hint",
+                "",
+                vec![line(
+                    "start a run normally; this dashboard will attach when status --latest returns one",
+                    StatusFeedRole::Dim,
+                )],
+            ),
+        ],
+    }
+}
+
+pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
+    let mut blocks = Vec::new();
+    blocks.push(todos_block(details));
+    blocks.push(run_block(details, now));
+    if let Some(progress) = &details.progress
+        && !should_hide_current_progress(details, progress)
+    {
+        blocks.push(progress_block(details, progress, now));
+        if let Some(worker) = &progress.worker
+            && let Some(warning) = worker_quiet_warning(worker, now)
+        {
+            blocks.push(block(
+                "Warn",
+                "",
+                vec![
+                    line(warning, StatusFeedRole::Warning),
+                    line("wait, inspect, or cancel explicitly", StatusFeedRole::Dim),
+                ],
+            ));
+        }
+    }
+    if let Some(economics) = &details.economics {
+        blocks.push(economics_block(economics));
+    }
+    if !details.incidents.is_empty() {
+        blocks.push(incidents_block(&details.incidents));
+    }
+    if let Some(activity) = activity_block(details) {
+        blocks.push(activity);
+    }
+    if let Some(tail) = tail_block(details) {
+        blocks.push(tail);
+    }
+
+    let attention = details
+        .questions
+        .iter()
+        .filter(|question| question.state == "pending")
+        .map(|question| {
+            line(
+                format!(
+                    "{}: {} — answer with: khazad-doom answer {} {} <answer>",
+                    question.slice_id, question.question, question.run_id, question.id
+                ),
+                StatusFeedRole::Attention,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !attention.is_empty() {
+        blocks.insert(0, block("Attention", "", attention.clone()));
+    }
+
+    StatusFeed {
+        feed_version: FEED_VERSION,
+        summary_line: monitor_message(details),
+        attention,
+        blocks,
+    }
+}
+
+fn todos_block(details: &RunDetails) -> StatusFeedBlock {
+    let items = selected_slice_items(details);
+    let item_label = if items.len() == 1 { "item" } else { "items" };
+    let mut lines = Vec::new();
+    if items.is_empty() {
+        lines.push(line("no selected slices recorded", StatusFeedRole::Dim));
+    } else {
+        for slice in items.iter().take(TODO_ITEMS) {
+            lines.push(line(todo_line(slice), role_for_slice_status(slice.status)));
+        }
+        if items.len() > TODO_ITEMS {
+            lines.push(line(
+                format!("… {} more", items.len() - TODO_ITEMS),
+                StatusFeedRole::Dim,
+            ));
+        }
+    }
+    block("Todos", format!("({} {item_label})", items.len()), lines)
+}
+
+fn run_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
+    let progress = details.progress.as_ref();
+    let phase = progress
+        .map(progress_phase_label)
+        .filter(|phase| !phase.trim().is_empty())
+        .unwrap_or_else(|| {
+            if is_terminal_status(details.run.status) {
+                details.run.status.as_str().to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+    let elapsed_start = progress
+        .map(|progress| progress.phase_started_at)
+        .unwrap_or(details.run.started_at);
+    let mut lines = vec![
+        line(
+            format!("phase {phase} • elapsed {}", since_time(elapsed_start, now)),
+            StatusFeedRole::Info,
+        ),
+        line(
+            format!("repo {}", short_path(&details.run.repo_path)),
+            StatusFeedRole::Dim,
+        ),
+    ];
+    let message = monitor_message(details);
+    if !message.trim().is_empty() {
+        lines.push(line(
+            truncate_display(&message, LINE_WIDTH),
+            role_for_status(details.run.status),
+        ));
+    }
+    block(
+        "Run",
+        format!(
+            "{} {} • {}",
+            status_icon(details.run.status),
+            details.run.status,
+            short_run_id(&details.run.id)
+        ),
+        lines,
+    )
+}
+
+fn should_hide_current_progress(details: &RunDetails, progress: &RunProgress) -> bool {
+    is_terminal_status(details.run.status) && is_terminal_phase(&progress.phase)
+}
+
+fn progress_block(
+    details: &RunDetails,
+    progress: &RunProgress,
+    now: DateTime<Utc>,
+) -> StatusFeedBlock {
+    if let Some(worker) = &progress.worker {
+        let mut meta = Vec::new();
+        let slice = monitor_slice_label(details);
+        if slice != "-" {
+            meta.push(slice);
+        }
+        if progress.attempt > 0 {
+            meta.push(format!("attempt {}", progress.attempt));
+        }
+        meta.push("now".to_string());
+        let mut lines = Vec::new();
+        if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+            lines.push(line(
+                format!("Parallel layer: {}", progress.parallel_slices.join(", ")),
+                StatusFeedRole::Info,
+            ));
+        }
+        lines.extend([
+            line(
+                format!("Supervisor: {}", supervisor_label(worker, now)),
+                StatusFeedRole::Info,
+            ),
+            line(
+                format!("Process: {}", worker_process_label(worker)),
+                StatusFeedRole::Info,
+            ),
+            line(
+                format!("Runtime: {}", since_time(worker.attempt_started_at, now)),
+                StatusFeedRole::Info,
+            ),
+            line(
+                format!(
+                    "Last worker event: {}",
+                    last_worker_event_label(worker, now)
+                ),
+                StatusFeedRole::Info,
+            ),
+            line(
+                format!(
+                    "Last semantic progress: {}",
+                    worker
+                        .last_semantic_progress_at
+                        .map(|time| since_time(time, now))
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
+                StatusFeedRole::Info,
+            ),
+            line(
+                format!("Timeout: {}", timeout_label(worker, now)),
+                StatusFeedRole::Dim,
+            ),
+        ]);
+        return block("Worker", format!("({})", meta.join(" • ")), lines);
+    }
+
+    let label = if !progress.command.trim().is_empty() {
+        command_block_label(&progress.phase, &progress.command).to_string()
+    } else {
+        phase_label(&progress.phase).to_string()
+    };
+    let mut meta = Vec::new();
+    if label == "Worker" && !progress.slice_id.trim().is_empty() {
+        meta.push(progress.slice_id.clone());
+    }
+    if label == "Worker" && progress.attempt > 0 {
+        meta.push(format!("attempt {}", progress.attempt));
+    }
+    if label != "Worker" && !progress.command.trim().is_empty() {
+        meta.push(command_meta(&progress.command));
+    }
+    meta.push("now".to_string());
+    let mut lines = Vec::new();
+    if !progress.command.trim().is_empty() && (label != "Worker" || progress.command.trim() != "pi")
+    {
+        lines.push(line(
+            truncate_display(&progress.command, LINE_WIDTH),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+        lines.push(line(
+            format!("Parallel layer: {}", progress.parallel_slices.join(", ")),
+            StatusFeedRole::Info,
+        ));
+    } else if !progress.slice_id.trim().is_empty() {
+        lines.push(line(
+            format!("slice {}", progress.slice_id),
+            StatusFeedRole::Info,
+        ));
+    } else {
+        lines.push(line(monitor_slice_label(details), StatusFeedRole::Info));
+    }
+    if progress.phase_started_at != progress.updated_at {
+        lines.push(line(
+            format!("elapsed {}", since_time(progress.phase_started_at, now)),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if !progress.message.trim().is_empty() {
+        lines.push(line(
+            truncate_display(&progress.message, LINE_WIDTH),
+            StatusFeedRole::Info,
+        ));
+    }
+    lines.push(line(
+        format!("updated {} ago", since_time(progress.updated_at, now)),
+        StatusFeedRole::Dim,
+    ));
+    block(label, format!("({})", meta.join(" • ")), lines)
+}
+
+fn economics_block(economics: &RunEconomics) -> StatusFeedBlock {
+    let mut lines = vec![
+        line(
+            format!(
+                "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
+                economics.agent_call_count,
+                economics.command_execution_count,
+                economics.duplicate_command_count,
+                economics.cache_hits,
+                economics.cache_misses
+            ),
+            StatusFeedRole::Info,
+        ),
+        line(
+            format!(
+                "Repair: policy={} attempts={}/{} | Fail-fast: {}",
+                economics.repair_policy,
+                economics.repair_attempts,
+                economics.repair_max_attempts,
+                economics.gate_fail_fast
+            ),
+            StatusFeedRole::Info,
+        ),
+    ];
+    if !economics.sla_violations.is_empty() {
+        lines.push(line(
+            format!("SLA violations: {}", economics.sla_violations.join("; ")),
+            StatusFeedRole::Warning,
+        ));
+    }
+    block("Economics", "", lines)
+}
+
+fn incidents_block(incidents: &[RunIncident]) -> StatusFeedBlock {
+    let lines = incidents
+        .iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|incident| {
+            line(
+                format!(
+                    "{}: {}",
+                    incident.kind,
+                    truncate_display(&incident.message, LINE_WIDTH)
+                ),
+                if incident.severity == "error" {
+                    StatusFeedRole::Error
+                } else {
+                    StatusFeedRole::Warning
+                },
+            )
+        })
+        .collect();
+    block("Incidents", format!("({})", incidents.len()), lines)
+}
+
+fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {
+    let lines = details
+        .events
+        .iter()
+        .filter_map(|event| activity_line(event, details))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let visible = lines.iter().rev().take(ACTIVITY_LIMIT).collect::<Vec<_>>();
+    Some(block(
+        "Activity",
+        format!("({} recent)", visible.len()),
+        visible
+            .into_iter()
+            .rev()
+            .map(|text| line(text.clone(), StatusFeedRole::Dim))
+            .collect(),
+    ))
+}
+
+fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {
+    let output_tail = details
+        .progress
+        .as_ref()
+        .map(|progress| progress.output_tail.as_str())
+        .unwrap_or_default();
+    if output_tail.trim().is_empty() {
+        return None;
+    }
+    let lines = output_tail
+        .trim_end()
+        .lines()
+        .rev()
+        .take(OUTPUT_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|text| line(truncate_display(text, LINE_WIDTH), StatusFeedRole::Dim))
+        .collect();
+    Some(block("Tail", "", lines))
+}
+
+fn selected_slice_items(details: &RunDetails) -> Vec<SliceRun> {
+    if !details.slice_runs.is_empty() {
+        return details.slice_runs.clone();
+    }
+    details
+        .run
+        .selected_slice_id
+        .split(',')
+        .map(str::trim)
+        .filter(|slice_id| !slice_id.is_empty())
+        .map(|slice_id| SliceRun {
+            run_id: details.run.id.clone(),
+            slice_id: slice_id.to_string(),
+            status: SliceStatus::Pending,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 0,
+            last_error: String::new(),
+        })
+        .collect()
+}
+
+fn todo_line(slice: &SliceRun) -> String {
+    let mut meta = Vec::new();
+    meta.push(slice.status.to_string());
+    if slice.attempts > 0 {
+        meta.push(format!(
+            "{} {}",
+            slice.attempts,
+            if slice.attempts == 1 {
+                "attempt"
+            } else {
+                "attempts"
+            }
+        ));
+    }
+    if !slice.commit_sha.trim().is_empty() {
+        meta.push(short_sha(&slice.commit_sha));
+    }
+    format!(
+        "{} {}{}",
+        slice_checkbox(slice.status),
+        slice.slice_id,
+        if meta.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", meta.join(" • "))
+        }
+    )
+}
+
+fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
+    let payload = event.payload.as_object();
+    match event.typ.as_str() {
+        "run_started" => {
+            let selected = payload
+                .and_then(|payload| payload.get("selected_slices"))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or_else(|| selected_slice_items(details).len());
+            Some(format!(
+                "Run (started): {selected} selected {}",
+                if selected == 1 { "slice" } else { "slices" }
+            ))
+        }
+        "slice_started" => Some(format!(
+            "Worker ({}): slice worker started",
+            payload_text(payload, "slice_id").unwrap_or_else(|| "-".to_string())
+        )),
+        "slice_merged" => {
+            let slice_id = payload_text(payload, "slice_id").unwrap_or_else(|| "slice".to_string());
+            let sha = payload_text(payload, "commit_sha")
+                .filter(|sha| !sha.trim().is_empty())
+                .map(|sha| format!(" • {}", short_sha(&sha)))
+                .unwrap_or_default();
+            Some(format!("Todos ({slice_id}): ☒ {slice_id}  merged{sha}"))
+        }
+        "integration_repair_completed" => {
+            let status = payload_text(payload, "status").unwrap_or_else(|| "-".to_string());
+            let summary = payload_text(payload, "summary")
+                .unwrap_or_else(|| "integration repair completed".to_string());
+            Some(format!("Repair ({status}): {summary}"))
+        }
+        "implementation_summary" => implementation_summary_line(payload),
+        "run_completed" => Some("Run (completed): handoff artifacts are ready".to_string()),
+        "worktrees_cleaned" => Some("Cleanup: worker worktrees cleaned".to_string()),
+        "checkpoint_written" => checkpoint_line(payload),
+        "worker_question_asked" => Some(format!(
+            "Attention: {}",
+            payload_text(payload, "question")
+                .unwrap_or_else(|| "worker question pending".to_string())
+        )),
+        "worker_question_answered" => {
+            Some("Attention: operator answered worker question".to_string())
+        }
+        "progress" => progress_activity_line(event, payload),
+        _ => {
+            let summary = event_summary(event);
+            if summary.is_empty() {
+                Some(event_label(&event.typ))
+            } else {
+                Some(format!("{}: {summary}", event_label(&event.typ)))
+            }
+        }
+    }
+}
+
+fn implementation_summary_line(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let mut parts = Vec::new();
+    if let Some(completed) = payload
+        .get("completed_slices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+    {
+        parts.push(format!(
+            "{completed} completed {}",
+            if completed == 1 { "slice" } else { "slices" }
+        ));
+    }
+    if let Some(gate) = payload
+        .get("integration_gate")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(summary) = gate.get("summary").and_then(serde_json::Value::as_str) {
+            if !summary.trim().is_empty() {
+                parts.push(summary.to_string());
+            }
+        } else if let Some(status) = gate.get("status").and_then(serde_json::Value::as_str) {
+            parts.push(format!("integration gate {status}"));
+        }
+    }
+    if let Some(final_sha) = payload.get("final_sha").and_then(serde_json::Value::as_str)
+        && !final_sha.trim().is_empty()
+    {
+        parts.push(format!("final {}", short_sha(final_sha)));
+    }
+    (!parts.is_empty()).then(|| format!("Summary: {}", parts.join(" • ")))
+}
+
+fn checkpoint_line(payload: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    let payload = payload?;
+    let completed = payload
+        .get("completed_slices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let remaining = payload
+        .get("remaining_slices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    Some(format!(
+        "State: checkpoint written • {completed} done • {remaining} remaining"
+    ))
+}
+
+fn progress_activity_line(
+    event: &Event,
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let phase = payload_text(Some(payload), "phase").unwrap_or_else(|| "activity".to_string());
+    if phase == "completed" {
+        return None;
+    }
+    let label = if let Some(command) = payload_text(Some(payload), "command") {
+        command_block_label(&phase, &command).to_string()
+    } else {
+        phase_label(&phase).to_string()
+    };
+    let mut meta = Vec::new();
+    if let Some(slice_id) = payload_text(Some(payload), "slice_id")
+        && !slice_id.trim().is_empty()
+    {
+        meta.push(slice_id);
+    }
+    if let Some(attempt) = payload.get("attempt").and_then(serde_json::Value::as_u64)
+        && attempt > 0
+    {
+        meta.push(format!("attempt {attempt}"));
+    }
+    if label != "Worker"
+        && let Some(command) = payload_text(Some(payload), "command")
+    {
+        meta.push(command_meta(&command));
+    }
+    let message = payload_text(Some(payload), "message")
+        .unwrap_or_else(|| event_summary(event))
+        .trim()
+        .to_string();
+    let summary = if message.is_empty() {
+        phase.replace('_', " ")
+    } else {
+        message
+    };
+    Some(format!(
+        "{}{}: {}",
+        label,
+        if meta.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", meta.join(" • "))
+        },
+        truncate_display(&summary, LINE_WIDTH)
+    ))
+}
+
+fn payload_text(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    payload
+        .and_then(|payload| payload.get(key))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| (!value.is_null()).then(|| value.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn event_summary(event: &Event) -> String {
+    let Some(map) = event.payload.as_object() else {
+        return truncate_display(&event.payload.to_string(), 120);
+    };
+    let mut parts = Vec::new();
+    for key in [
+        "slice_id", "phase", "status", "message", "summary", "error", "command",
+    ] {
+        let Some(value) = map.get(key) else { continue };
+        let text = value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string());
+        if !text.trim().is_empty() {
+            parts.push(format!("{key}={}", truncate_display(&text, 80)));
+        }
+    }
+    if parts.is_empty() {
+        truncate_display(&event.payload.to_string(), 120)
+    } else {
+        truncate_display(&parts.join(" "), 160)
+    }
+}
+
+fn monitor_message(details: &RunDetails) -> String {
+    if let Some(progress) = &details.progress
+        && !progress.message.trim().is_empty()
+    {
+        return progress.message.clone();
+    }
+    if !details.run.error.trim().is_empty() {
+        return details.run.error.clone();
+    }
+    format!("run is {}", details.run.status)
+}
+
+fn monitor_slice_label(details: &RunDetails) -> String {
+    if let Some(progress) = &details.progress
+        && progress.parallel_layer
+        && !progress.parallel_slices.is_empty()
+    {
+        return format!("parallel layer: {}", progress.parallel_slices.join(", "));
+    }
+    if let Some(progress) = &details.progress
+        && !progress.slice_id.trim().is_empty()
+    {
+        return progress.slice_id.clone();
+    }
+    for status in [
+        SliceStatus::Running,
+        SliceStatus::RepairNeeded,
+        SliceStatus::ReadyToMerge,
+        SliceStatus::Pending,
+    ] {
+        if let Some(slice_run) = details
+            .slice_runs
+            .iter()
+            .find(|slice_run| slice_run.status == status)
+        {
+            return format!("{} ({})", slice_run.slice_id, slice_run.status);
+        }
+    }
+    if details.slice_runs.len() == 1 {
+        let slice_run = &details.slice_runs[0];
+        return format!("{} ({})", slice_run.slice_id, slice_run.status);
+    }
+    display_or_dash(&details.run.selected_slice_id).to_string()
+}
+
+fn progress_phase_label(progress: &RunProgress) -> String {
+    if progress.parallel_layer && progress.phase != "parallel_worker_layer" {
+        format!("parallel_worker_layer ({})", progress.phase)
+    } else {
+        progress.phase.clone()
+    }
+}
+
+fn supervisor_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {
+    match worker.process_observed_at {
+        Some(observed_at) => format!("alive, observed child {} ago", since_time(observed_at, now)),
+        None => "starting, no child observation yet".to_string(),
+    }
+}
+
+fn worker_process_label(worker: &WorkerAttemptProgress) -> String {
+    match worker.pid {
+        Some(pid) => format!("running pid={pid}"),
+        None => "running".to_string(),
+    }
+}
+
+fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {
+    match worker.last_event_at {
+        Some(last_event_at) if worker.last_event_kind.trim().is_empty() => {
+            format!("{} ago", since_time(last_event_at, now))
+        }
+        Some(last_event_at) => format!(
+            "{} ago ({})",
+            since_time(last_event_at, now),
+            worker.last_event_kind
+        ),
+        None => "none".to_string(),
+    }
+}
+
+fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {
+    if worker.attempt_timeout_seconds == 0 {
+        return "disabled".to_string();
+    }
+    let elapsed = now
+        .signed_duration_since(worker.attempt_started_at)
+        .to_std()
+        .unwrap_or_default();
+    let timeout = Duration::from_secs(worker.attempt_timeout_seconds);
+    if elapsed >= timeout {
+        return format!(
+            "{}s, exceeded by {}",
+            worker.attempt_timeout_seconds,
+            format_duration(elapsed.saturating_sub(timeout))
+        );
+    }
+    format!(
+        "{}s, remaining {}",
+        worker.attempt_timeout_seconds,
+        format_duration(timeout.saturating_sub(elapsed))
+    )
+}
+
+fn worker_quiet_warning(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> Option<String> {
+    if worker.no_output_warning_seconds == 0 {
+        return None;
+    }
+    let reference = worker.last_event_at.unwrap_or(worker.attempt_started_at);
+    let quiet_for = now
+        .signed_duration_since(reference)
+        .to_std()
+        .unwrap_or_default();
+    if quiet_for < Duration::from_secs(worker.no_output_warning_seconds) {
+        return None;
+    }
+    let timeout_suffix = if worker.attempt_timeout_seconds == 0 {
+        "; no timeout configured"
+    } else {
+        ""
+    };
+    Some(format!(
+        "worker is quiet for {}; this may be normal{}",
+        format_duration(quiet_for),
+        timeout_suffix
+    ))
+}
+
+fn status_icon(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Completed => "✓",
+        RunStatus::Running => "●",
+        RunStatus::Blocked => "!",
+        RunStatus::Failed => "✗",
+        RunStatus::Cancelled | RunStatus::Interrupted => "×",
+        RunStatus::Pending => "○",
+    }
+}
+
+fn slice_checkbox(status: SliceStatus) -> &'static str {
+    match status {
+        SliceStatus::Merged => "☒",
+        SliceStatus::Running | SliceStatus::ReadyToMerge | SliceStatus::RepairNeeded => "◐",
+        SliceStatus::Failed
+        | SliceStatus::Blocked
+        | SliceStatus::Cancelled
+        | SliceStatus::Interrupted => "✗",
+        SliceStatus::Pending => "☐",
+    }
+}
+
+fn role_for_status(status: RunStatus) -> StatusFeedRole {
+    match status {
+        RunStatus::Completed => StatusFeedRole::Success,
+        RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => {
+            StatusFeedRole::Warning
+        }
+        RunStatus::Failed => StatusFeedRole::Error,
+        RunStatus::Running | RunStatus::Pending => StatusFeedRole::Info,
+    }
+}
+
+fn role_for_slice_status(status: SliceStatus) -> StatusFeedRole {
+    match status {
+        SliceStatus::Merged => StatusFeedRole::Success,
+        SliceStatus::Blocked | SliceStatus::Cancelled | SliceStatus::Interrupted => {
+            StatusFeedRole::Warning
+        }
+        SliceStatus::Failed => StatusFeedRole::Error,
+        _ => StatusFeedRole::Info,
+    }
+}
+
+fn phase_label(phase: &str) -> &'static str {
+    let normalized = phase.to_ascii_lowercase();
+    if normalized.starts_with("worker") || normalized == "awaiting_operator" {
+        if normalized == "worker_verify" {
+            "Shell"
+        } else {
+            "Worker"
+        }
+    } else if normalized.contains("gate") {
+        "Shell"
+    } else if normalized.contains("merge") {
+        "Merge"
+    } else if normalized.contains("repair") {
+        "Repair"
+    } else if normalized == "ready_to_merge" {
+        "Todos"
+    } else if matches!(
+        normalized.as_str(),
+        "completed" | "started" | "integration_setup"
+    ) {
+        "Run"
+    } else {
+        "Activity"
+    }
+}
+
+fn command_block_label(phase: &str, command: &str) -> &'static str {
+    let normalized = phase.to_ascii_lowercase();
+    let text = command.to_ascii_lowercase();
+    if normalized == "worker_running" || text == "pi" {
+        "Worker"
+    } else if normalized.contains("merge") || text.starts_with("git merge") {
+        "Merge"
+    } else if normalized.contains("repair") {
+        "Repair"
+    } else {
+        "Shell"
+    }
+}
+
+fn command_meta(command: &str) -> String {
+    let mut text = command.trim().to_string();
+    while let Some((prefix, rest)) = text.split_once(' ') {
+        if is_env_assignment(prefix) {
+            text = rest.trim_start().to_string();
+        } else {
+            break;
+        }
+    }
+    truncate_display(if text.is_empty() { command } else { &text }, 34)
+}
+
+fn is_env_assignment(value: &str) -> bool {
+    let Some((key, _value)) = value.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+}
+
+fn event_label(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_terminal_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "completed" | "failed" | "blocked" | "cancelled" | "interrupted"
+    )
+}
+
+fn is_terminal_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Blocked
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted
+    )
+}
+
+fn since_time(time: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let duration = now.signed_duration_since(time).to_std().unwrap_or_default();
+    format_duration(duration)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn short_sha(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn short_run_id(value: &str) -> String {
+    if value.chars().count() <= 30 {
+        return display_or_dash(value).to_string();
+    }
+    let prefix = value.chars().take(11).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn short_path(value: &str) -> String {
+    let text = value.trim();
+    if text.is_empty() {
+        return "-".to_string();
+    }
+    let parts = text
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 2 {
+        return text.to_string();
+    }
+    format!("…/{}", parts[parts.len().saturating_sub(2)..].join("/"))
+}
+
+fn display_or_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
+}
+
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn block(
+    label: impl Into<String>,
+    meta: impl Into<String>,
+    lines: Vec<StatusFeedLine>,
+) -> StatusFeedBlock {
+    StatusFeedBlock {
+        label: label.into(),
+        meta: meta.into(),
+        lines,
+    }
+}
+
+fn line(text: impl Into<String>, role: StatusFeedRole) -> StatusFeedLine {
+    StatusFeedLine {
+        text: text.into(),
+        role,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Run;
+
+    #[test]
+    fn projection_has_versioned_blocks_and_raw_safe_roles() {
+        let now = Utc::now();
+        let details = RunDetails {
+            run: Run {
+                id: "kd-test".to_string(),
+                repo_id: "repo".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                status: RunStatus::Running,
+                base_branch: "main".to_string(),
+                base_sha: "base".to_string(),
+                integration_branch: "khazad/kd-test/integration".to_string(),
+                selected_slice_id: "slice-1".to_string(),
+                error: String::new(),
+                started_at: now,
+                updated_at: now,
+            },
+            slice_runs: vec![SliceRun {
+                run_id: "kd-test".to_string(),
+                slice_id: "slice-1".to_string(),
+                status: SliceStatus::Pending,
+                branch: String::new(),
+                commit_sha: String::new(),
+                attempts: 0,
+                last_error: String::new(),
+            }],
+            progress: None,
+            incidents: Vec::new(),
+            questions: Vec::new(),
+            events: Vec::new(),
+            economics: None,
+            feed: None,
+        };
+        let feed = project_run_at(&details, now);
+        assert_eq!(feed.feed_version, 1);
+        assert_eq!(feed.blocks[0].label, "Todos");
+        assert_eq!(feed.blocks[1].label, "Run");
+    }
+}

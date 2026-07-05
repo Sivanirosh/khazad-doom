@@ -9,15 +9,16 @@ use super::{
 };
 use crate::agent::{
     CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerLaunchFailure,
-    RunnerMetadata, RunnerSpec, runner_from_spec,
+    RunnerMetadata, runner_from_spec,
 };
+use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
 use crate::domain::{
-    AgentProfile, BranchHandoff, CheckResult, EvidenceAttestation, Finding, GateResult, Handoff,
-    HandoffActionResult, HandoffDiagnostics, IMPLEMENTER_PROFILE, ImplementationSummary,
-    MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice,
-    SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
-    WorkflowConfig, WorkflowExitStates,
+    AgentProfilesConfig, BranchHandoff, CheckResult, EvidenceAttestation, Finding, GateResult,
+    Handoff, HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
+    RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun,
+    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult, WorkflowConfig,
+    WorkflowExitStates,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -115,6 +116,11 @@ struct IntegrationRepairContext<'a> {
     economics: RunEconomicsRecorder,
 }
 
+struct SupervisedWorkerJobResult {
+    data: crate::agent::ResultData,
+    operator_pause: Duration,
+}
+
 #[derive(Clone)]
 struct WorkerExecutionContext {
     run: Run,
@@ -126,6 +132,7 @@ struct WorkerExecutionContext {
     config: WorkflowConfig,
     economics: RunEconomicsRecorder,
     verification_cache: VerificationCommandCache,
+    worker_token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -239,11 +246,16 @@ impl Manager {
         mut job: Job,
         cancel: &CancellationToken,
         context: WorkerAttemptContext,
-    ) -> Result<crate::agent::ResultData> {
+    ) -> Result<SupervisedWorkerJobResult> {
         job.termination_grace_seconds = context.termination_grace_seconds;
         let events = Some(self.worker_event_sink(&context));
         if context.timeout_seconds == 0 {
-            return runner.run(job, cancel.clone(), events);
+            return runner
+                .run(job, cancel.clone(), events)
+                .map(|data| SupervisedWorkerJobResult {
+                    data,
+                    operator_pause: Duration::ZERO,
+                });
         }
 
         let attempt_cancel = CancellationToken::new();
@@ -254,9 +266,33 @@ impl Manager {
         let timeout_cancel = attempt_cancel.clone();
         let timeout_flag = timed_out.clone();
         let done_flag = done.clone();
+        let state = self.state.clone();
+        let supervisor_context = context.clone();
+        let operator_pause = Arc::new(Mutex::new(Duration::ZERO));
+        let supervisor_operator_pause = operator_pause.clone();
         let supervisor = thread::spawn(move || {
-            let started = Instant::now();
+            let mut active_elapsed = Duration::ZERO;
+            let mut last_tick = Instant::now();
             loop {
+                let now = Instant::now();
+                let delta = now.saturating_duration_since(last_tick);
+                last_tick = now;
+                let paused = state
+                    .get_progress(&supervisor_context.run_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|progress| {
+                        progress.phase == "awaiting_operator"
+                            && progress.slice_id == supervisor_context.slice_id
+                            && progress.attempt == supervisor_context.attempt
+                    });
+                if paused {
+                    if let Ok(mut total) = supervisor_operator_pause.lock() {
+                        *total += delta;
+                    }
+                } else {
+                    active_elapsed += delta;
+                }
                 if done_flag.load(Ordering::SeqCst) {
                     return;
                 }
@@ -264,7 +300,7 @@ impl Manager {
                     timeout_cancel.cancel();
                     return;
                 }
-                if started.elapsed() >= timeout {
+                if active_elapsed >= timeout {
                     timeout_flag.store(true, Ordering::SeqCst);
                     timeout_cancel.cancel();
                     return;
@@ -294,7 +330,14 @@ impl Manager {
             )?;
             bail!(message);
         }
-        result
+        let operator_pause = operator_pause
+            .lock()
+            .map(|duration| *duration)
+            .unwrap_or(Duration::ZERO);
+        result.map(|data| SupervisedWorkerJobResult {
+            data,
+            operator_pause,
+        })
     }
 
     fn run_recorded_agent_job(
@@ -310,8 +353,9 @@ impl Manager {
         let runner_name = runner.name().to_string();
         let runner_metadata = runner.metadata();
         let started_at = Instant::now();
-        match self.run_supervised_worker_job(runner, job, cancel, context) {
+        match self.run_supervised_worker_job(runner, job, cancel, context.clone()) {
             Ok(result) => {
+                let duration = started_at.elapsed().saturating_sub(result.operator_pause);
                 economics.record_agent_call(agent_call(
                     call.phase,
                     call.slice_id,
@@ -320,11 +364,17 @@ impl Manager {
                     runner_name.as_str(),
                     &runner_metadata,
                     "succeeded",
-                    started_at.elapsed(),
-                    Some(&result.usage),
+                    duration,
+                    result.operator_pause,
+                    Some(&result.data.usage),
                     "",
                 ));
-                Ok(result)
+                self.record_contract_warnings(
+                    &context,
+                    &runner_name,
+                    &result.data.contract_warnings,
+                );
+                Ok(result.data)
             }
             Err(err) => {
                 let error = err.to_string();
@@ -337,11 +387,35 @@ impl Manager {
                     &runner_metadata,
                     "failed",
                     started_at.elapsed(),
+                    Duration::ZERO,
                     None,
                     &error,
                 ));
                 Err(err)
             }
+        }
+    }
+
+    fn record_contract_warnings(
+        &self,
+        context: &WorkerAttemptContext,
+        runner_name: &str,
+        warnings: &[crate::pi_contract::PiContractWarning],
+    ) {
+        for warning in warnings {
+            let _ = self.state.record_event(
+                &context.run_id,
+                "run_incident",
+                &json!({
+                    "severity": "warning",
+                    "kind": warning.kind,
+                    "message": warning.message,
+                    "phase": context.phase,
+                    "slice_id": context.slice_id,
+                    "attempt": context.attempt,
+                    "agent": runner_name,
+                }),
+            );
         }
     }
 
@@ -414,21 +488,43 @@ impl Manager {
         if let Some(runner) = &self.runner_override {
             return Ok(runner.clone());
         }
-        let agent = if agent.trim().is_empty() {
-            config.agent.as_str()
+        let requested_agent = if agent.trim().is_empty() {
+            std::env::var("KHAZAD_AGENT").unwrap_or_default()
         } else {
-            agent
+            agent.to_string()
         };
-        let mut spec = RunnerSpec::from_parts(agent, pi_bin.to_string(), pi_args.to_vec())?;
-        if spec.kind == "pi" {
-            let profiles = store.read_agent_profiles()?;
-            let profile = profiles
-                .profiles
-                .get(IMPLEMENTER_PROFILE)
-                .ok_or_else(|| anyhow!("missing required agent profile {IMPLEMENTER_PROFILE:?}"))?;
-            apply_implementer_profile_to_pi_spec(&mut spec, profile)?;
-        }
-        Ok(runner_from_spec(spec))
+        let requested_pi_bin = if pi_bin.trim().is_empty() {
+            std::env::var("KHAZAD_PI_BIN").unwrap_or_default()
+        } else {
+            pi_bin.to_string()
+        };
+        let requested_pi_args = if pi_args.is_empty() {
+            std::env::var("KHAZAD_PI_ARGS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        } else {
+            pi_args.to_vec()
+        };
+        let agent_probe = if requested_agent.trim().is_empty() {
+            config.agent.trim()
+        } else {
+            requested_agent.trim()
+        };
+        let profiles = if agent_probe.eq_ignore_ascii_case("fake") {
+            AgentProfilesConfig::default()
+        } else {
+            store.read_agent_profiles()?
+        };
+        let effective = resolve_effective_worker_profile(ProfileResolveInput {
+            agent: requested_agent,
+            pi_bin: requested_pi_bin,
+            pi_args: requested_pi_args,
+            config: config.clone(),
+            profiles,
+        })?;
+        Ok(runner_from_spec(effective.spec))
     }
 
     pub fn init_repo(&self, repo_path: impl AsRef<Path>) -> Result<Repo> {
@@ -603,9 +699,16 @@ impl Manager {
         };
         self.state.insert_run(&run)?;
         artifact::Store::new(&run.repo_path).ensure_run_dirs(&run.id)?;
+        let runner_metadata = runner.metadata();
+        let pi_contract = runner.pi_contract_observation();
         artifact::write_json(
             artifact::Store::new(&run.repo_path).output_path(&run.id, "preflight.json"),
             &json!({
+                "agent": runner.name(),
+                "profile_summary": runner_metadata.profile_summary(),
+                "launch_summary": runner_metadata.launch_summary(),
+                "profile_source_attribution": &runner_metadata.source_attribution,
+                "pi_contract": pi_contract,
                 "run_id": run.id,
                 "repo_path": run.repo_path,
                 "base_branch": run.base_branch,
@@ -629,7 +732,6 @@ impl Manager {
                 last_error: String::new(),
             })?;
         }
-        let runner_metadata = runner.metadata();
         self.state.record_event(
             &run.id,
             "run_started",
@@ -638,15 +740,20 @@ impl Manager {
                 "selected_slices": selected_ids,
                 "skipped_closed_slices": skipped_closed_slices,
                 "agent": runner.name(),
-                "agent_profile": runner_metadata.profile,
-                "agent_provider": runner_metadata.provider,
-                "agent_model": runner_metadata.model,
-                "agent_reasoning": runner_metadata.reasoning,
-                "agent_mode": runner_metadata.mode,
+                "agent_profile": &runner_metadata.profile,
+                "agent_provider": &runner_metadata.provider,
+                "agent_model": &runner_metadata.model,
+                "agent_reasoning": &runner_metadata.reasoning,
+                "agent_mode": &runner_metadata.mode,
+                "profile_summary": runner_metadata.profile_summary(),
+                "launch_summary": runner_metadata.launch_summary(),
+                "profile_source_attribution": &runner_metadata.source_attribution,
             }),
         )?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
 
+        let worker_token = new_worker_token();
+        self.state.store_worker_token(&run.id, &worker_token)?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
         let manager = self.clone();
@@ -664,6 +771,7 @@ impl Manager {
                 runner,
                 parallelism,
                 IntegrationMode::Fresh,
+                worker_token,
             );
         });
         Ok(run)
@@ -754,6 +862,8 @@ impl Manager {
         let config = store.read_config()?;
         let runner =
             self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config, &store)?;
+        let worker_token = new_worker_token();
+        self.state.store_worker_token(&run.id, &worker_token)?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
         let manager = self.clone();
@@ -772,6 +882,7 @@ impl Manager {
                 runner,
                 parallelism,
                 IntegrationMode::Existing,
+                worker_token,
             );
         });
         self.state
@@ -1025,6 +1136,7 @@ impl Manager {
         runner: Arc<dyn Runner>,
         parallelism: usize,
         integration_mode: IntegrationMode,
+        worker_token: String,
     ) {
         let outcome = self.run_slices(
             &run,
@@ -1034,6 +1146,7 @@ impl Manager {
             runner,
             parallelism,
             integration_mode,
+            worker_token,
         );
         let (terminal_status, terminal_message) = match &outcome {
             Ok(_) => {
@@ -1113,6 +1226,7 @@ impl Manager {
         runner: Arc<dyn Runner>,
         parallelism: usize,
         integration_mode: IntegrationMode,
+        worker_token: String,
     ) -> Result<ImplementationSummary> {
         check_cancelled(cancel)?;
         let store = artifact::Store::new(&run.repo_path);
@@ -1187,6 +1301,7 @@ impl Manager {
                 config: config.clone(),
                 economics: economics.clone(),
                 verification_cache: verification_cache.clone(),
+                worker_token: worker_token.clone(),
             };
             let outcomes = self.run_worker_layer(&layer, &worker_context, parallelism)?;
             worker_phase.finish();
@@ -1711,6 +1826,8 @@ impl Manager {
                 agent_model: runner_metadata.model.clone(),
                 agent_reasoning: runner_metadata.reasoning.clone(),
                 agent_mode: runner_metadata.mode.clone(),
+                profile_summary: runner_metadata.profile_summary(),
+                launch_summary: runner_metadata.launch_summary(),
                 output_path: output_path.to_string_lossy().to_string(),
                 contract: "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
                     .to_string(),
@@ -1732,6 +1849,7 @@ impl Manager {
                     prompt,
                     cwd: worker_worktree.clone(),
                     json_schema: WORKER_RESULT_SCHEMA.to_string(),
+                    env: worker_job_env(&self.paths, run, &slice.id, attempt, &ctx.worker_token),
                     termination_grace_seconds: 0,
                 },
                 cancel,
@@ -2190,6 +2308,7 @@ impl Manager {
                     prompt,
                     cwd: integration_worktree.to_path_buf(),
                     json_schema: REPAIR_RESULT_SCHEMA.to_string(),
+                    env: BTreeMap::new(),
                     termination_grace_seconds: 0,
                 },
                 cancel,
@@ -3017,33 +3136,6 @@ fn effective_parallelism(requested: usize, config: &WorkflowConfig) -> usize {
     }
 }
 
-fn apply_implementer_profile_to_pi_spec(
-    spec: &mut RunnerSpec,
-    profile: &AgentProfile,
-) -> Result<()> {
-    profile.validate_required(IMPLEMENTER_PROFILE)?;
-    let metadata = RunnerMetadata {
-        profile: IMPLEMENTER_PROFILE.to_string(),
-        provider: profile.provider.trim().to_string(),
-        model: profile.model.trim().to_string(),
-        reasoning: profile.reasoning.trim().to_string(),
-        mode: profile.mode.trim().to_string(),
-    };
-    let mut args = spec.pi_args.clone();
-    args.extend([
-        "--provider".to_string(),
-        metadata.provider.clone(),
-        "--model".to_string(),
-        metadata.model.clone(),
-        "--thinking".to_string(),
-        metadata.reasoning.clone(),
-    ]);
-    args.extend(profile.args.iter().cloned());
-    spec.pi_args = args;
-    spec.metadata = metadata;
-    Ok(())
-}
-
 fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
     if line_count == 0 || !path.exists() {
         return Ok(Vec::new());
@@ -3192,6 +3284,31 @@ fn new_run_id() -> String {
     )
 }
 
+fn new_worker_token() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn worker_job_env(
+    paths: &Paths,
+    run: &Run,
+    slice_id: &str,
+    attempt: usize,
+    token: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "KHAZAD_DAEMON_SOCKET".to_string(),
+            paths.socket().to_string_lossy().to_string(),
+        ),
+        ("KHAZAD_RUN_ID".to_string(), run.id.clone()),
+        ("KHAZAD_SLICE_ID".to_string(), slice_id.to_string()),
+        ("KHAZAD_ATTEMPT".to_string(), attempt.to_string()),
+        ("KHAZAD_WORKER_TOKEN".to_string(), token.to_string()),
+    ])
+}
+
 fn classify_run_failure(err: &anyhow::Error) -> RunStatus {
     if err.downcast_ref::<CancelledError>().is_some() {
         RunStatus::Cancelled
@@ -3223,18 +3340,13 @@ impl Error for BlockedError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Manager, StartOptions, apply_implementer_profile_to_pi_spec, validate_repair_result,
-        validate_worker_result,
-    };
-    use crate::agent::{
-        CancellationToken, Job, ResultData, Runner, RunnerEventSink, RunnerSpec, Usage,
-    };
+    use super::{Manager, StartOptions, validate_repair_result, validate_worker_result};
+    use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, AgentProfile, CheckResult, Handoff, ImplementationSummary,
-        RepairResult, Run, RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile,
-        WorkerResult, WorkflowConfig,
+        AcceptanceEvidence, CheckResult, Handoff, ImplementationSummary, RepairResult, Run,
+        RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult,
+        WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -3266,28 +3378,6 @@ mod tests {
             verify: Vec::new(),
             verify_timeout_seconds: 0,
         }
-    }
-
-    #[test]
-    fn pi_runner_spec_appends_required_implementer_profile() {
-        let mut spec =
-            RunnerSpec::from_parts("pi", "pi".to_string(), vec!["--some-user-arg".to_string()])
-                .unwrap();
-        apply_implementer_profile_to_pi_spec(&mut spec, &AgentProfile::implementer()).unwrap();
-
-        assert_eq!(spec.metadata.profile, "implementer");
-        assert_eq!(spec.metadata.provider, "openai");
-        assert_eq!(spec.metadata.model, "gpt-5.5");
-        assert_eq!(spec.metadata.reasoning, "xhigh");
-        assert_eq!(spec.metadata.mode, "fast");
-        assert!(spec.pi_args.ends_with(&[
-            "--provider".to_string(),
-            "openai".to_string(),
-            "--model".to_string(),
-            "gpt-5.5".to_string(),
-            "--thinking".to_string(),
-            "xhigh".to_string(),
-        ]));
     }
 
     #[test]
@@ -4250,6 +4340,7 @@ mod tests {
                 return Ok(ResultData {
                     output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
                     usage: Usage::default(),
+                    contract_warnings: Vec::new(),
                 });
             }
             let handoff_path = handoff_path_from_prompt(&job.prompt)?;
@@ -4275,6 +4366,7 @@ mod tests {
                     "acceptance_status": acceptance_status
                 })),
                 usage: Usage::default(),
+                contract_warnings: Vec::new(),
             })
         }
 
@@ -4299,6 +4391,7 @@ mod tests {
                 return Ok(ResultData {
                     output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
                     usage: Usage::default(),
+                    contract_warnings: Vec::new(),
                 });
             }
             let handoff_path = handoff_path_from_prompt(&job.prompt)?;
@@ -4324,6 +4417,7 @@ mod tests {
                     "acceptance_status": acceptance_status
                 })),
                 usage: Usage::default(),
+                contract_warnings: Vec::new(),
             })
         }
 

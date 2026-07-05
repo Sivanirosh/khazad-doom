@@ -64,10 +64,10 @@ khazad-doom daemon status
 - Pi is the sole real worker harness. `--agent fake` is deterministic and only for local tests/dogfooding; do not present it as portability or a second production harness.
 - Interrupted daemon runs are marked `interrupted` on next startup; lost workers are not silently resumed.
 - Merge conflicts are structured blocked artifacts; do not paper over them.
-- Runtime artifacts under `.workflow/runs/` are gitignored and include preflight snapshots, raw outputs, terminal run summaries, and bounded failed/cancelled attempt diagnostics.
+- Runtime artifacts under `.workflow/runs/` are gitignored and include preflight snapshots, observed Pi contract/profile summaries, raw outputs, terminal run summaries, and bounded failed/cancelled attempt diagnostics.
 - Handoff prints by default; push/PR creation require explicit flags or config, and `--dry-run` suppresses configured actions.
 - Final reports and handoff JSON expose explicit `exit_states` and `evidence_attestation`; treat them as read-only summaries over existing lifecycle state, not extra gates.
-- The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status, monitor output, handoff JSON, and artifact inspection.
+- The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status projection, monitor output, handoff JSON, and artifact inspection.
 - Runs are daemon-owned durable sessions. A Pi tool call must start/control/observe a run, never define its lifetime.
 
 ## Pi chat UX rule: detach after run start
@@ -96,12 +96,12 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 - Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable and an allowed exception above applies.
 - Khazad-Doom does not auto-open external windows by default; a Pi extension is an optional adapter over daemon state, not core workflow state.
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
-- `khazad-doom monitor` and the optional `/khazad-monitor` Pi overlay intentionally share the same activity-feed vocabulary over daemon `status` JSON: Todos, Run, Worker/Shell/Merge/Repair, Warn, Economics, Incidents, Activity, and Tail.
-- If the optional Pi package extension is installed, `/khazad-monitor --latest` or `/khazad-monitor --run <run-id>` may open a centered Pi TUI activity-feed overlay. Closing it with `q` or `Esc` only detaches the overlay; never treat it as run cancellation.
+- `khazad-doom monitor`, `watch`, and the optional `/khazad-monitor` Pi overlay paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording.
+- If the optional Pi package extension is installed, `/khazad-monitor --latest` or `/khazad-monitor --run <run-id>` may open a centered Pi TUI activity-feed overlay. Closing it with `q` or `Esc` only detaches the overlay; never treat it as run cancellation. The same extension also has ambient mode on by default in Pi TUI sessions: it shows a compact widget for active runs and one notification per terminal/attention transition. Set `KHAZAD_MONITOR_AMBIENT=0` to opt out.
 - Do not require the Pi extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 - Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
 - Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.
 - `worker_attempt_timeout_seconds: 0` means no fatal worker-attempt timeout. Any nonzero worker attempt timeout is an explicit repo/operator policy, separate from run lifetime.
 
-If a run blocks with an `ask-user` finding, relay the blocker to the user with exact details and ask for a decision before resuming.
+If status/monitor shows an `Attention` line or pending worker question, ask the user for the answer and then run `khazad-doom answer <run-id> <question-id> "..."` after normal command confirmation. If a run still blocks with an `ask-user` finding, relay the blocker with exact details and ask for a decision before resuming.

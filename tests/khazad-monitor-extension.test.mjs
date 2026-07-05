@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import khazadMonitor from '../extensions/khazad-monitor/index.js';
 
-const { KhazadMonitorOverlay } = khazadMonitor._test;
+const { AmbientRunTracker, KhazadMonitorOverlay, ambientWidgetLines, projectionLines } = khazadMonitor._test;
 
 function plainTheme() {
 	return {
@@ -304,3 +304,100 @@ test('khazad monitor overlay keeps short states compact', () => {
 	assert.match(lines.at(-1), /^╰/);
 	assert.ok(!lines.some((line) => line.includes('┃')), 'short content should not show a scrollbar');
 });
+
+test('khazad monitor paints daemon projection blocks verbatim', () => {
+	const feed = projectionFixture();
+	const lines = projectionLines(feed, plainTheme()).join('\n');
+
+	assert.match(lines, /Run/);
+	assert.match(lines, /Worker needs answer/);
+	assert.match(lines, /khazad-doom answer kd-run q-1 <answer>/);
+});
+
+test('khazad ambient widget uses projection and attention lines', () => {
+	assert.deepEqual(ambientWidgetLines(projectionFixture()).slice(0, 2), [
+		'Run kd-run is running',
+		'slice-001: Worker needs answer — answer with: khazad-doom answer kd-run q-1 <answer>',
+	]);
+});
+
+test('khazad ambient tracker suppresses pre-attach notifications and dedupes terminal transitions', () => {
+	const notifications = [];
+	const widgets = [];
+	const tracker = new AmbientRunTracker({
+		pi: { exec: async () => ({ code: 0, stdout: 'null', stderr: '' }) },
+		ctx: {
+			ui: {
+				setWidget: (id, lines) => widgets.push({ id, lines }),
+				notify: (text, level) => notifications.push({ text, level }),
+			},
+		},
+		repo: '/tmp/repo',
+		intervalMs: 1000,
+		lingerMs: 0,
+	});
+	const details = detailsWithFeed('running', [{ id: 'q-1', state: 'pending', question: 'Old question' }]);
+	tracker.attach(details);
+	tracker.render(details);
+	tracker.notifyTransitions(details);
+
+	const withNewQuestion = detailsWithFeed('running', [
+		{ id: 'q-1', state: 'pending', question: 'Old question' },
+		{ id: 'q-2', state: 'pending', question: 'New question' },
+	]);
+	tracker.notifyTransitions(withNewQuestion);
+	tracker.notifyTransitions(withNewQuestion);
+	const terminal = detailsWithFeed('completed', []);
+	tracker.notifyTransitions(terminal);
+	tracker.notifyTransitions(terminal);
+
+	assert.ok(widgets.some((item) => item.lines.includes('Run kd-run is running')));
+	assert.equal(notifications.length, 2);
+	assert.match(notifications[0].text, /q-2/);
+	assert.equal(notifications[1].text, 'Run kd-run is completed');
+});
+
+function projectionFixture() {
+	return {
+		feed_version: 1,
+		summary_line: 'Run kd-run is running',
+		attention: [
+			{
+				text: 'slice-001: Worker needs answer — answer with: khazad-doom answer kd-run q-1 <answer>',
+				role: 'attention',
+			},
+		],
+		blocks: [
+			{
+				label: 'Attention',
+				meta: '',
+				lines: [
+					{
+						text: 'slice-001: Worker needs answer — answer with: khazad-doom answer kd-run q-1 <answer>',
+						role: 'attention',
+					},
+				],
+			},
+			{ label: 'Run', meta: '(running)', lines: [{ text: 'Run kd-run is running', role: 'info' }] },
+		],
+	};
+}
+
+function detailsWithFeed(status, questions) {
+	const feed = projectionFixture();
+	feed.summary_line = `Run kd-run is ${status}`;
+	if (questions.some((question) => question.id === 'q-2')) {
+		feed.attention = [
+			...feed.attention,
+			{
+				text: 'slice-001: New question — answer with: khazad-doom answer kd-run q-2 <answer>',
+				role: 'attention',
+			},
+		];
+	}
+	return {
+		run: { id: 'kd-run', status },
+		feed,
+		questions,
+	};
+}

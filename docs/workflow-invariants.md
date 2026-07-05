@@ -6,8 +6,8 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 
 - **D1 — Pi-first commitment.** Pi is the only real worker harness. `FakeRunner` stays as the deterministic test double, justified by testing, not portability. Daemon state remains harness-neutral JSON; worker execution is Pi-native.
 - **D2 — Truthful environmental failure.** Deterministic environment/launch failures block immediately with operator guidance. They must not burn retries or masquerade as implementation failures.
-- **D3 — Escalation over termination.** A worker that hits a `must_ask_if` condition should escalate to the operator and continue after an answer. Until the escalation channel exists, the current `ask-user` blocked output is the safe fallback.
-- **D4 — Versioned coupling only.** Khazad-Doom couples to Pi's documented, versioned surfaces such as CLI flags, JSON event streams, and exit codes; it must not depend on Pi internals. A Pi behavior change may degrade observability, but daemon-owned state remains authoritative for correctness. Unknown fields/events from Pi are tolerated.
+- **D3 — Escalation over termination.** A worker that hits a `must_ask_if` condition should call the shipped `ask_operator` Pi tool, pause in `awaiting_operator`, and continue after an answer. If the tool is unavailable or times out, the worker falls back to the existing `ask-user` blocked output.
+- **D4 — Versioned coupling only.** Khazad-Doom couples to Pi's documented, versioned surfaces such as CLI flags, JSON event streams, and exit codes; it must not depend on Pi internals. `src/pi_contract.rs` is the only module that may parse Pi stdout/stderr or recognize Pi event/error strings; the current contract inventory is `docs/design/pi-contract-inventory.md`. A Pi behavior change may degrade observability, but daemon-owned state remains authoritative for correctness. Unknown fields/events from Pi are tolerated and surfaced as bounded warnings.
 - **D5 — Single verification owner.** The daemon owns verification, gates, economics, and attestation. Workers produce evidence claims; daemon checks/gates or human review attest them.
 - **D6 — Feedback comes to the operator.** Operators should not need to open a monitor window to learn that a run needs them. Progress and attention should surface ambiently in the originating Pi session while daemon state stays the source of truth. CLI and Pi renderers must paint the same daemon-side interpretation layer so wording does not diverge.
 
@@ -47,7 +47,10 @@ Standing rejections:
 - Attempt history is append-only evidence. Retries add attempts and preserve previous output/failure context.
 - Deterministic operator-class worker launch failures, such as Pi provider authentication failures detected by a narrow no-assistant-output plus known stderr signature, block after the first attempt and must not consume the remaining worker retries. Unknown or ambiguous launch failures preserve the existing retry behavior.
 - Operator-class launch incidents include `failure_kind`, `retryable`, `operator_action_required`, agent provider/model/profile metadata, and `fix_commands` so status, monitor, reports, and handoffs can surface the same remediation without scraping daemon stderr.
+- The effective worker profile is resolved once by the profile module from CLI/env/config/profile defaults. Pi launch args, `RunnerMetadata`, `profile_summary`, `launch_summary`, source attribution, and auth fix guidance derive from that result; worker surfaces must not assemble provider/model text independently.
 - Worker execution is at-least-once, not exactly-once. A timed-out, cancelled, or retried attempt may have produced files or commits in its isolated worktree.
+- Worker operator questions are durable daemon state. `workerAsk` requires the per-run `KHAZAD_WORKER_TOKEN`; token validation happens in daemon IPC, not only in the Pi extension. `answerQuestion` is operator-side and rejects interrupted/cancelled runs rather than silently storing an answer the worker cannot see.
+- While a worker is paused in `awaiting_operator`, the slice remains `Running`; no `SliceStatus` enum value is added for questions. Fatal worker-attempt timeout accounting excludes the paused interval so a slow operator answer does not consume a retry.
 - Parallel worker cancellation is graceful-first. If a run cancellation or sibling layer failure happens while a parallel batch is active, Khazad-Doom propagates cancellation to active workers and still joins every worker thread before the layer returns.
 - Process liveness and output activity are distinct. `Supervisor: alive` means the daemon still observes the child process, not that semantic progress is guaranteed.
 - Quiet-worker warnings are advisory. Missing output alone is not terminal unless an explicit timeout/policy makes it terminal.
@@ -76,10 +79,11 @@ Standing rejections:
 
 - The daemon/state store is the source of truth for run status, slice states, events, and live progress snapshots.
 - `status`, `watch`, `monitor`, and optional Pi adapters render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
-- Status interpretation should be centralized daemon-side. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently.
+- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths and Pi monitor extension prefer `RunDetails.feed` when present.
 - `monitor --latest` and `/khazad-monitor --latest` must not make terminal runs disappear. When no active run exists, they keep the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
+- Ambient Pi feedback is a read-only adapter over the daemon projection. Notifications are deduplicated per `(run_id, transition)` in the extension session, and a new session must not replay notifications for transitions that predate attachment. Pending-question notifications use projection/question wording and the copy-pasteable `khazad-doom answer …` command.
 
 ## Artifacts, handoffs, and remotes
 

@@ -1,10 +1,12 @@
 use crate::domain::{
     Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptProgress,
+    WorkerQuestion,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -160,6 +162,24 @@ impl Store {
                 phase_started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS run_worker_tokens (
+                run_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worker_questions (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                slice_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                options_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                asked_at TEXT NOT NULL,
+                answered_at TEXT NOT NULL DEFAULT '',
+                answer TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_worker_questions_run_state
+                ON worker_questions(run_id, state);
             "#,
         )?;
         ensure_column(
@@ -318,6 +338,147 @@ impl Store {
             params![run_id, typ, payload_json, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn store_worker_token(&self, run_id: &str, token: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"INSERT INTO run_worker_tokens (run_id, token_hash, created_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(run_id) DO UPDATE SET token_hash=excluded.token_hash"#,
+            params![run_id, token_hash(token), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn validate_worker_token(&self, run_id: &str, token: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT token_hash FROM run_worker_tokens WHERE run_id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hash.is_some_and(|hash| hash == token_hash(token)))
+    }
+
+    pub fn insert_worker_question(
+        &self,
+        id: &str,
+        run_id: &str,
+        slice_id: &str,
+        question: &str,
+        options: &[String],
+    ) -> Result<WorkerQuestion> {
+        let conn = self.conn()?;
+        let now = Utc::now();
+        conn.execute(
+            r#"INSERT INTO worker_questions
+               (id, run_id, slice_id, question, options_json, state, asked_at, answered_at, answer)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, '', '')"#,
+            params![
+                id,
+                run_id,
+                slice_id,
+                question,
+                serde_json::to_string(options)?,
+                now.to_rfc3339()
+            ],
+        )?;
+        Ok(WorkerQuestion {
+            id: id.to_string(),
+            run_id: run_id.to_string(),
+            slice_id: slice_id.to_string(),
+            question: question.to_string(),
+            options: options.to_vec(),
+            state: "pending".to_string(),
+            asked_at: now,
+            answered_at: None,
+            answer: String::new(),
+        })
+    }
+
+    pub fn get_worker_question(&self, id: &str) -> Result<Option<WorkerQuestion>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                r#"SELECT id, run_id, slice_id, question, options_json, state, asked_at, answered_at, answer
+               FROM worker_questions WHERE id=?1"#,
+                params![id],
+                worker_question_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn list_worker_questions(&self, run_id: &str) -> Result<Vec<WorkerQuestion>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT id, run_id, slice_id, question, options_json, state, asked_at, answered_at, answer
+               FROM worker_questions WHERE run_id=?1 ORDER BY asked_at ASC, id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![run_id], worker_question_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_worker_questions_for_repo(&self, repo_path: &str) -> Result<Vec<WorkerQuestion>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT q.id, q.run_id, q.slice_id, q.question, q.options_json, q.state, q.asked_at, q.answered_at, q.answer
+               FROM worker_questions q
+               JOIN runs r ON r.id = q.run_id
+               WHERE r.repo_path=?1
+               ORDER BY q.asked_at ASC, q.id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![repo_path], worker_question_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn answer_worker_question(
+        &self,
+        run_id: &str,
+        question_id: &str,
+        answer: &str,
+    ) -> Result<WorkerQuestion> {
+        let conn = self.conn()?;
+        let existing = conn
+            .query_row(
+                r#"SELECT id, run_id, slice_id, question, options_json, state, asked_at, answered_at, answer
+                   FROM worker_questions WHERE id=?1 AND run_id=?2"#,
+                params![question_id, run_id],
+                worker_question_from_row,
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            anyhow::bail!("question {question_id:?} for run {run_id:?} not found");
+        };
+        if existing.state != "pending" {
+            anyhow::bail!("question {question_id:?} is already {}", existing.state);
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE worker_questions SET state='answered', answered_at=?1, answer=?2 WHERE id=?3",
+            params![now, answer, question_id],
+        )?;
+        self.get_worker_question(question_id)?
+            .ok_or_else(|| anyhow::anyhow!("question disappeared after answer"))
+    }
+
+    pub fn timeout_worker_question(&self, question_id: &str) -> Result<Option<WorkerQuestion>> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE worker_questions SET state='timed_out', answered_at=?1 WHERE id=?2 AND state='pending'",
+            params![Utc::now().to_rfc3339(), question_id],
+        )?;
+        self.get_worker_question(question_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -831,6 +992,38 @@ fn event_from_tuple(row: EventTuple) -> Result<Event> {
     })
 }
 
+fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQuestion> {
+    let options_json: String = row.get(4)?;
+    let asked_at: String = row.get(6)?;
+    let answered_at: String = row.get(7)?;
+    let options = serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default();
+    Ok(WorkerQuestion {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        slice_id: row.get(2)?,
+        question: row.get(3)?,
+        options,
+        state: row.get(5)?,
+        asked_at: DateTime::parse_from_rfc3339(&asked_at)
+            .map(|time| time.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        answered_at: if answered_at.trim().is_empty() {
+            None
+        } else {
+            DateTime::parse_from_rfc3339(&answered_at)
+                .map(|time| time.with_timezone(&Utc))
+                .ok()
+        },
+        answer: row.get(8)?,
+    })
+}
+
+fn token_hash(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
     let (
         run_id,
@@ -976,6 +1169,33 @@ mod tests {
         assert_eq!(tied.id, "run-tie-b");
 
         assert!(store.latest_run_for_repo("/tmp/missing", true)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_questions_are_token_scoped_and_single_answered() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run("run-1", "/tmp/repo", RunStatus::Running, now))?;
+        store.store_worker_token("run-1", "secret-token")?;
+
+        assert!(store.validate_worker_token("run-1", "secret-token")?);
+        assert!(!store.validate_worker_token("run-1", "wrong-token")?);
+        let question = store.insert_worker_question(
+            "q-1",
+            "run-1",
+            "slice-001",
+            "Which path?",
+            &["A".to_string(), "B".to_string()],
+        )?;
+        assert_eq!(question.state, "pending");
+        assert_eq!(store.list_worker_questions("run-1")?.len(), 1);
+
+        let answered = store.answer_worker_question("run-1", "q-1", "A")?;
+        assert_eq!(answered.state, "answered");
+        assert_eq!(answered.answer, "A");
+        assert!(store.answer_worker_question("run-1", "q-1", "B").is_err());
         Ok(())
     }
 }

@@ -705,7 +705,7 @@ fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult
         blocked["run"]["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("Pi is not authenticated for provider openai"),
+            .contains("Pi is not authenticated for provider openai-codex"),
         "blocked run should explain auth failure: {blocked:#}"
     );
 
@@ -732,7 +732,7 @@ fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult
         .expect("agent auth incident");
     assert_eq!(incident["payload"]["operator_action_required"], true);
     assert_eq!(incident["payload"]["retryable"], false);
-    assert_eq!(incident["payload"]["agent_provider"], "openai");
+    assert_eq!(incident["payload"]["agent_provider"], "openai-codex");
     assert_eq!(incident["payload"]["agent_model"], "gpt-5.5");
     assert_eq!(incident["payload"]["agent_profile"], "implementer");
     assert!(

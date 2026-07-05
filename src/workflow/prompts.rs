@@ -15,7 +15,7 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("\n- Work only in the provided worktree.\n");
     prompt.push_str("- Implement only the slice described in the handoff.\n");
     prompt.push_str("- The JSON slice is authoritative. GitHub/PRD text is extra context only.\n");
-    prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, return status=blocked with an ask-user finding.\n");
+    prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, call the ask_operator tool with the question/options when available; return status=blocked with an ask-user finding only if that channel is unavailable or times out.\n");
     prompt.push_str("- Treat acceptance as minimum evidence, not an exhaustive spec: learning is allowed inside the fence; moving the fence requires approval. If TDD or code inspection reveals an additional case directly implied by the slice goal/acceptance and inside declared areas, implement the smallest clear fix and report it in summary/tests/assumptions. If it changes product intent, public API semantics, dependencies, verification policy, or required paths outside areas, return status=blocked with an ask-user finding.\n");
     prompt.push_str("- Preserve unrelated changes.\n");
     prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
@@ -116,6 +116,8 @@ mod tests {
             agent_model: String::new(),
             agent_reasoning: String::new(),
             agent_mode: String::new(),
+            profile_summary: String::new(),
+            launch_summary: String::new(),
             output_path: "/tmp/output.json".to_string(),
             contract: "Return JSON".to_string(),
         };

@@ -1,17 +1,19 @@
 use crate::artifact;
 use crate::domain::{
     BranchHandoff, Event, ImplementationSummary, Run, RunDetails, RunEconomics, RunIncident,
-    RunInspection, RunProgress, SliceRun, SliceStatus, SliceWriteResult,
+    RunInspection, RunProgress, RunStatus, SliceRun, SliceStatus, SliceWriteResult,
 };
 use crate::ipc::{
-    CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
-    InspectRunParams, ListSlicesResult, Request, Response, ResumeRunParams,
-    SliceImportGithubParams, SliceNewParams, SlicesParams, StartRunParams, StartRunResult,
-    StatusParams,
+    AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult, HandoffParams,
+    InitRepoParams, InitRepoResult, InspectRunParams, ListQuestionsParams, ListQuestionsResult,
+    ListSlicesResult, Request, Response, ResumeRunParams, SliceImportGithubParams, SliceNewParams,
+    SlicesParams, StartRunParams, StartRunResult, StatusParams, WorkerAskParams, WorkerAskResult,
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
-use crate::workflow::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
+use crate::workflow::{
+    GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions, project_run,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -22,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
@@ -228,12 +230,16 @@ impl Server {
             }
         };
         let id = request.id.clone();
-        let handled = {
+        let method = request.method.clone();
+        let params = request.params.clone();
+        let handled = if method_allows_concurrent_handling(&method) {
+            self.handle(method.as_str(), params)
+        } else {
             let _request_guard = self
                 .request_lock
                 .lock()
                 .expect("daemon request mutex poisoned");
-            self.handle(request.method.as_str(), request.params.clone())
+            self.handle(method.as_str(), params)
         };
         let mut shutdown = false;
         let response = match handled {
@@ -268,13 +274,126 @@ impl Server {
         }
         let economics = read_run_economics(&run).ok();
         let incidents = run_incidents_from_events(&self.store.get_incident_events(&run_id)?);
-        Ok(RunDetails {
+        let questions = self
+            .store
+            .list_worker_questions(&run_id)
+            .unwrap_or_default();
+        let mut details = RunDetails {
             slice_runs,
             progress,
             incidents,
+            questions,
             events,
             economics,
+            feed: None,
             run,
+        };
+        details.feed = Some(project_run(&details));
+        Ok(details)
+    }
+
+    fn handle_worker_ask(&self, params: WorkerAskParams) -> Result<WorkerAskResult> {
+        if !self
+            .store
+            .validate_worker_token(&params.run_id, &params.token)?
+        {
+            self.store.record_event(
+                &params.run_id,
+                "run_incident",
+                &json!({
+                    "severity": "error",
+                    "kind": "worker_question_token_rejected",
+                    "message": "workerAsk rejected because the worker token did not match the run",
+                    "slice_id": params.slice_id,
+                }),
+            )?;
+            bail!("worker token rejected for run {}", params.run_id);
+        }
+        let question_id = format!("q-{}", request_id());
+        let question = self.store.insert_worker_question(
+            &question_id,
+            &params.run_id,
+            &params.slice_id,
+            &params.question,
+            &params.options,
+        )?;
+        self.store.record_event(
+            &params.run_id,
+            "worker_question_asked",
+            &json!({
+                "question_id": question.id,
+                "slice_id": question.slice_id,
+                "question": question.question,
+                "options": question.options,
+                "answer_command": format!("khazad-doom answer {} {} <answer>", params.run_id, question.id),
+            }),
+        )?;
+        let _ = self.store.update_progress(
+            &params.run_id,
+            "awaiting_operator",
+            &params.slice_id,
+            params.attempt,
+            "ask_operator",
+            &format!("awaiting operator answer: {}", params.question),
+            "",
+        );
+
+        let timeout = Duration::from_secs(if params.timeout_seconds == 0 {
+            1800
+        } else {
+            params.timeout_seconds
+        });
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let Some(current) = self.store.get_worker_question(&question_id)? else {
+                bail!("question {question_id:?} disappeared");
+            };
+            if current.state == "answered" {
+                return Ok(WorkerAskResult {
+                    question_id,
+                    state: "answered".to_string(),
+                    answer: current.answer,
+                    timed_out: false,
+                });
+            }
+            let run = self.store.get_run(&params.run_id)?;
+            if run.as_ref().is_some_and(|run| {
+                matches!(
+                    run.status,
+                    RunStatus::Interrupted
+                        | RunStatus::Cancelled
+                        | RunStatus::Failed
+                        | RunStatus::Blocked
+                        | RunStatus::Completed
+                )
+            }) {
+                bail!(
+                    "run {} reached a terminal state before the question was answered",
+                    params.run_id
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        let question = self
+            .store
+            .timeout_worker_question(&question_id)?
+            .ok_or_else(|| anyhow!("question {question_id:?} disappeared"))?;
+        self.store.record_event(
+            &params.run_id,
+            "run_incident",
+            &json!({
+                "severity": "warning",
+                "kind": "worker_question_timed_out",
+                "message": format!("operator question timed out: {}", question.question),
+                "question_id": question.id,
+                "slice_id": question.slice_id,
+            }),
+        )?;
+        Ok(WorkerAskResult {
+            question_id,
+            state: "timed_out".to_string(),
+            answer: String::new(),
+            timed_out: true,
         })
     }
 
@@ -399,6 +518,55 @@ impl Server {
                     params.dry_run,
                 )?;
                 Ok(HandleOutcome::result(handoff)?)
+            }
+            "workerAsk" => {
+                let params: WorkerAskParams = decode_params(raw)?;
+                let result = self.handle_worker_ask(params)?;
+                Ok(HandleOutcome::result(result)?)
+            }
+            "listQuestions" => {
+                let params: ListQuestionsParams = raw
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                let questions = if !params.run_id.trim().is_empty() {
+                    self.store.list_worker_questions(&params.run_id)?
+                } else if !params.repo_path.trim().is_empty() {
+                    self.store
+                        .list_worker_questions_for_repo(&params.repo_path)?
+                } else {
+                    bail!("listQuestions requires run_id or repo_path");
+                };
+                Ok(HandleOutcome::result(ListQuestionsResult { questions })?)
+            }
+            "answerQuestion" => {
+                let params: AnswerQuestionParams = decode_params(raw)?;
+                let run = self
+                    .store
+                    .get_run(&params.run_id)?
+                    .ok_or_else(|| anyhow!("run {:?} not found", params.run_id))?;
+                if matches!(run.status, RunStatus::Interrupted | RunStatus::Cancelled) {
+                    bail!(
+                        "run {} is {}; resume first before answering",
+                        run.id,
+                        run.status
+                    );
+                }
+                let question = self.store.answer_worker_question(
+                    &params.run_id,
+                    &params.question_id,
+                    &params.answer,
+                )?;
+                self.store.record_event(
+                    &params.run_id,
+                    "worker_question_answered",
+                    &json!({
+                        "question_id": question.id,
+                        "slice_id": question.slice_id,
+                        "answer": question.answer,
+                    }),
+                )?;
+                Ok(HandleOutcome::result(AnswerQuestionResult { question })?)
             }
             "inspectRun" => {
                 let params: InspectRunParams = decode_params(raw)?;
@@ -590,6 +758,10 @@ impl HandleOutcome {
     fn result<T: Serialize>(result: T) -> Result<Self> {
         Ok(Self::value(serde_json::to_value(result)?))
     }
+}
+
+fn method_allows_concurrent_handling(method: &str) -> bool {
+    matches!(method, "workerAsk" | "answerQuestion" | "listQuestions")
 }
 
 fn decode_params<T: DeserializeOwned>(raw: Option<serde_json::Value>) -> Result<T> {

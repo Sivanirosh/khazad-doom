@@ -1,14 +1,15 @@
-use crate::agent::RunnerSpec;
 use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
     BranchHandoff, Event, RunDetails, RunEconomics, RunIncident, RunInspection, RunStatus,
-    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerAttemptProgress,
+    SliceStatus, SliceValidationReport, SliceWriteResult, StatusFeed, StatusFeedRole,
+    WorkerAttemptProgress,
 };
 use crate::ipc::{
-    CancelRunParams, CancelRunResult, HandoffParams, InitRepoParams, InitRepoResult,
-    InspectRunParams, ListSlicesResult, ResumeRunParams, SliceImportGithubParams, SliceNewParams,
-    SlicesParams, StartRunParams, StartRunResult, StatusParams,
+    AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult, HandoffParams,
+    InitRepoParams, InitRepoResult, InspectRunParams, ListQuestionsParams, ListQuestionsResult,
+    ListSlicesResult, ResumeRunParams, SliceImportGithubParams, SliceNewParams, SlicesParams,
+    StartRunParams, StartRunResult, StatusParams,
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
@@ -73,9 +74,15 @@ enum CommandArgs {
         /// Run all open slices in dependency order. This is also the default when no --slice is given.
         #[arg(long)]
         all: bool,
-        /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or pi.
+        /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or repo config.
         #[arg(long, default_value = "")]
         agent: String,
+        /// Pi binary for worker launches. Defaults to KHAZAD_PI_BIN or pi.
+        #[arg(long, default_value = "")]
+        pi_bin: String,
+        /// Extra Pi launch args. Repeat or pass a quoted string; overrides KHAZAD_PI_ARGS.
+        #[arg(long = "pi-args")]
+        pi_args: Vec<String>,
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
@@ -89,9 +96,15 @@ enum CommandArgs {
     Resume {
         #[arg(long)]
         run: String,
-        /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or pi.
+        /// Agent adapter to use: pi or fake. Defaults to KHAZAD_AGENT or repo config.
         #[arg(long, default_value = "")]
         agent: String,
+        /// Pi binary for worker launches. Defaults to KHAZAD_PI_BIN or pi.
+        #[arg(long, default_value = "")]
+        pi_bin: String,
+        /// Extra Pi launch args. Repeat or pass a quoted string; overrides KHAZAD_PI_ARGS.
+        #[arg(long = "pi-args")]
+        pi_args: Vec<String>,
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
@@ -183,6 +196,19 @@ enum CommandArgs {
         #[arg(long, default_value_t = 2000)]
         interval_ms: u64,
     },
+    /// List pending/answered worker questions.
+    Questions {
+        #[arg(long, default_value = "")]
+        run: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Answer a worker operator-escalation question.
+    Answer {
+        run: String,
+        question: String,
+        answer: String,
+    },
     /// Inspect repo-local JSON Issue Slices.
     Slices {
         #[command(subcommand)]
@@ -268,6 +294,8 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             slices,
             all,
             agent,
+            pi_bin,
+            pi_args,
             parallel,
             allow_dirty,
             wait,
@@ -278,6 +306,8 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
                 slices,
                 all,
                 agent,
+                pi_bin,
+                pi_args,
                 parallel,
                 allow_dirty,
                 wait,
@@ -286,9 +316,11 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
         CommandArgs::Resume {
             run,
             agent,
+            pi_bin,
+            pi_args,
             parallel,
             wait,
-        } => run_resume(paths, run, agent, parallel, wait),
+        } => run_resume(paths, run, agent, pi_bin, pi_args, parallel, wait),
         CommandArgs::Cancel { run, reason } => run_cancel(paths, run, reason),
         CommandArgs::Handoff {
             run,
@@ -331,6 +363,12 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             interval_ms,
         } => run_monitor(paths, run, repo, latest, once, events_limit, interval_ms),
         CommandArgs::Watch { run, interval_ms } => run_watch(paths, run, interval_ms),
+        CommandArgs::Questions { run, repo } => run_questions(paths, run, repo),
+        CommandArgs::Answer {
+            run,
+            question,
+            answer,
+        } => run_answer(paths, run, question, answer),
         CommandArgs::Slices { command } => run_slices(paths, command),
         CommandArgs::Daemon { command } => run_daemon(paths, command),
     }
@@ -354,6 +392,8 @@ struct RunStartOptions {
     slices: Vec<String>,
     all: bool,
     agent: String,
+    pi_bin: String,
+    pi_args: Vec<String>,
     parallel: usize,
     allow_dirty: bool,
     wait: bool,
@@ -364,13 +404,9 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
     let config = artifact::Store::new(&repo)
         .read_config()
         .unwrap_or_default();
-    let effective_agent = if opts.agent.trim().is_empty() && std::env::var("KHAZAD_AGENT").is_err()
-    {
-        config.agent.clone()
-    } else {
-        opts.agent
-    };
-    let runner = RunnerSpec::from_agent_and_env(&effective_agent)?;
+    let agent = effective_request_text(opts.agent, "KHAZAD_AGENT");
+    let pi_bin = effective_request_text(opts.pi_bin, "KHAZAD_PI_BIN");
+    let pi_args = effective_request_args(opts.pi_args, "KHAZAD_PI_ARGS");
     let parallel = effective_cli_parallelism(opts.parallel, config.parallelism);
     let repo_path = repo.to_string_lossy().to_string();
     ensure_daemon(&paths)?;
@@ -382,9 +418,9 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
             slice_id: String::new(),
             slice_ids: opts.slices,
             all: opts.all,
-            agent: runner.kind,
-            pi_bin: runner.pi_bin,
-            pi_args: runner.pi_args,
+            agent,
+            pi_bin,
+            pi_args,
             parallelism: parallel,
             allow_dirty: opts.allow_dirty,
         },
@@ -400,38 +436,20 @@ fn run_resume(
     paths: Paths,
     run_id: String,
     agent: String,
+    pi_bin: String,
+    pi_args: Vec<String>,
     parallel: usize,
     wait: bool,
 ) -> Result<()> {
-    let runner = if agent.trim().is_empty() && std::env::var("KHAZAD_AGENT").is_err() {
-        None
-    } else {
-        Some(RunnerSpec::from_agent_and_env(&agent)?)
-    };
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
     let result: StartRunResult = client.call(
         "resumeRun",
         &ResumeRunParams {
             run_id,
-            agent: runner
-                .as_ref()
-                .map(|runner| runner.kind.clone())
-                .unwrap_or_default(),
-            pi_bin: runner
-                .as_ref()
-                .map(|runner| runner.pi_bin.clone())
-                .unwrap_or_else(|| std::env::var("KHAZAD_PI_BIN").unwrap_or_default()),
-            pi_args: runner
-                .as_ref()
-                .map(|runner| runner.pi_args.clone())
-                .unwrap_or_else(|| {
-                    std::env::var("KHAZAD_PI_ARGS")
-                        .unwrap_or_default()
-                        .split_whitespace()
-                        .map(str::to_string)
-                        .collect()
-                }),
+            agent: effective_request_text(agent, "KHAZAD_AGENT"),
+            pi_bin: effective_request_text(pi_bin, "KHAZAD_PI_BIN"),
+            pi_args: effective_request_args(pi_args, "KHAZAD_PI_ARGS"),
             parallelism: parallel,
         },
     )?;
@@ -740,6 +758,36 @@ fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
     }
 }
 
+fn run_questions(paths: Paths, run_id: String, repo: Option<PathBuf>) -> Result<()> {
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths);
+    let repo_path = repo
+        .map(resolve_repo_path)
+        .transpose()?
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if run_id.trim().is_empty() && repo_path.trim().is_empty() {
+        bail!("questions requires --run <run-id> or --repo <path>");
+    }
+    let result: ListQuestionsResult =
+        client.call("listQuestions", &ListQuestionsParams { run_id, repo_path })?;
+    print_json(&result)
+}
+
+fn run_answer(paths: Paths, run_id: String, question_id: String, answer: String) -> Result<()> {
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths);
+    let result: AnswerQuestionResult = client.call(
+        "answerQuestion",
+        &AnswerQuestionParams {
+            run_id,
+            question_id,
+            answer,
+        },
+    )?;
+    print_json(&result)
+}
+
 fn run_slices(paths: Paths, command: SlicesCommand) -> Result<()> {
     match command {
         SlicesCommand::List { repo } => {
@@ -928,6 +976,17 @@ fn serve_daemon(paths: Paths) -> Result<()> {
 }
 
 fn print_watch_snapshot(details: &RunDetails) {
+    if let Some(feed) = &details.feed {
+        let mut out = io::stdout();
+        println!("Run: {}", details.run.id);
+        println!("Status: {}", details.run.status);
+        if let Some(progress) = &details.progress {
+            println!("Phase: {}", progress_phase_label(progress));
+        }
+        let _ = render_feed_plain(&mut out, feed);
+        println!();
+        return;
+    }
     println!("Run: {}", details.run.id);
     println!("Status: {}", details.run.status);
     if let Some(progress) = &details.progress {
@@ -987,6 +1046,41 @@ fn print_watch_snapshot(details: &RunDetails) {
     println!();
 }
 
+fn render_feed_plain(out: &mut impl Write, feed: &StatusFeed) -> Result<()> {
+    writeln!(out, "{}", feed.summary_line)?;
+    for block in &feed.blocks {
+        if !block.meta.trim().is_empty() {
+            writeln!(out, "{} {}", block.label, block.meta)?;
+        } else {
+            writeln!(out, "{}", block.label)?;
+        }
+        for line in &block.lines {
+            writeln!(out, "  - {}", line.text)?;
+        }
+    }
+    Ok(())
+}
+
+fn render_feed_monitor(out: &mut impl Write, feed: &StatusFeed) -> Result<()> {
+    for (index, block) in feed.blocks.iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
+        monitor_heading(out, &block.label, &block.meta)?;
+        if block.lines.is_empty() {
+            monitor_tree_dim(out, "-")?;
+            continue;
+        }
+        for line in &block.lines {
+            match line.role {
+                StatusFeedRole::Dim => monitor_tree_dim(out, &line.text)?,
+                _ => monitor_tree(out, &line.text)?,
+            }
+        }
+    }
+    Ok(())
+}
+
 const MONITOR_ACTIVITY_LIMIT: usize = 7;
 const MONITOR_OUTPUT_LINES: usize = 4;
 const MONITOR_TODO_ITEMS: usize = 8;
@@ -1030,6 +1124,9 @@ fn render_waiting_monitor(out: &mut impl Write, repo: &str) -> Result<()> {
 }
 
 fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+    if let Some(feed) = &details.feed {
+        return render_feed_monitor(out, feed);
+    }
     render_todos(out, details)?;
     writeln!(out)?;
     render_run_summary(out, details)?;
@@ -2060,6 +2157,34 @@ fn shell_quote_arg(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn effective_request_text(value: String, env_key: &str) -> String {
+    if !value.trim().is_empty() {
+        value
+    } else {
+        std::env::var(env_key).unwrap_or_default()
+    }
+}
+
+fn effective_request_args(values: Vec<String>, env_key: &str) -> Vec<String> {
+    if !values.is_empty() {
+        return split_arg_values(values);
+    }
+    split_arg_values(vec![std::env::var(env_key).unwrap_or_default()])
+}
+
+fn split_arg_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|value| !value.trim().is_empty())
+        .collect()
 }
 
 fn effective_cli_parallelism(requested: usize, configured: usize) -> usize {

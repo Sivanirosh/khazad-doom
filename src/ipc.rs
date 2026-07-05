@@ -1,4 +1,4 @@
-use crate::domain::{SliceSummary, SliceValidationIssue};
+use crate::domain::{SliceSummary, SliceValidationIssue, WorkerQuestion};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -67,6 +67,55 @@ pub struct ResumeRunParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartRunResult {
     pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAskParams {
+    pub run_id: String,
+    pub slice_id: String,
+    pub token: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attempt: usize,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAskResult {
+    pub question_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListQuestionsParams {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListQuestionsResult {
+    pub questions: Vec<WorkerQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerQuestionParams {
+    pub run_id: String,
+    pub question_id: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerQuestionResult {
+    pub question: WorkerQuestion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +209,10 @@ pub struct ListSlicesResult {
 }
 
 fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
