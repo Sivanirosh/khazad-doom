@@ -67,10 +67,6 @@ impl Store {
         self.workflow_dir().join("khazad.json")
     }
 
-    pub fn agent_profiles_path(&self) -> PathBuf {
-        self.workflow_dir().join("agents.toml")
-    }
-
     pub fn slice_schema_path(&self) -> PathBuf {
         self.schema_dir().join("slice.schema.json")
     }
@@ -224,14 +220,6 @@ impl Store {
             write_json(path, &WorkflowConfig::default())?;
         }
         Ok(())
-    }
-
-    pub fn read_agent_profiles(&self) -> Result<AgentProfilesConfig> {
-        let path = self.agent_profiles_path();
-        if !path.exists() {
-            return Ok(AgentProfilesConfig::default());
-        }
-        read_agent_profiles_file(&path)
     }
 
     pub fn write_slice_schema(&self) -> Result<PathBuf> {
@@ -965,13 +953,7 @@ mod tests {
 
         let config = store.read_config().unwrap();
         assert_eq!(config.parallelism, 3);
-        assert!(!store.agent_profiles_path().exists());
-        let profiles = store.read_agent_profiles().unwrap();
-        let implementer = profiles.profiles.get("implementer").unwrap();
-        assert_eq!(implementer.provider, "openai-codex");
-        assert_eq!(implementer.model, "gpt-5.5");
-        assert_eq!(implementer.reasoning, "xhigh");
-        assert_eq!(implementer.mode, "fast");
+        assert!(!store.workflow_dir().join("agents.toml").exists());
     }
 
     #[test]

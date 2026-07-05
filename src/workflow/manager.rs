@@ -472,9 +472,8 @@ impl Manager {
         &self,
         opts: &StartOptions,
         config: &WorkflowConfig,
-        store: &artifact::Store,
     ) -> Result<Arc<dyn Runner>> {
-        self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, config, store)
+        self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, config)
     }
 
     fn runner_for_parts(
@@ -483,7 +482,6 @@ impl Manager {
         pi_bin: &str,
         pi_args: &[String],
         config: &WorkflowConfig,
-        store: &artifact::Store,
     ) -> Result<Arc<dyn Runner>> {
         if let Some(runner) = &self.runner_override {
             return Ok(runner.clone());
@@ -515,9 +513,7 @@ impl Manager {
         let profiles = if agent_probe.eq_ignore_ascii_case("fake") {
             AgentProfilesConfig::default()
         } else {
-            let repo_profiles = store.read_agent_profiles()?;
-            let operator_profiles = self.read_operator_agent_profiles()?;
-            repo_profiles.with_operator_overrides(operator_profiles)
+            self.read_operator_agent_profiles()?
         };
         let effective = resolve_effective_worker_profile(ProfileResolveInput {
             agent: requested_agent,
@@ -680,7 +676,7 @@ impl Manager {
                 dirty_status.trim()
             );
         }
-        let runner = self.runner_for_options(&opts, &config, &store)?;
+        let runner = self.runner_for_options(&opts, &config)?;
         let parallelism = effective_parallelism(opts.parallelism, &config);
         let base_branch = if config.base_branch.trim().is_empty() {
             gitutil::current_branch(&repo.path).unwrap_or_default()
@@ -870,8 +866,7 @@ impl Manager {
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let config = store.read_config()?;
-        let runner =
-            self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config, &store)?;
+        let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
         let worker_token = new_worker_token();
         self.state.store_worker_token(&run.id, &worker_token)?;
         let cancel = CancellationToken::new();
@@ -3442,6 +3437,33 @@ mod tests {
             ..RepairResult::default()
         };
         assert!(validate_repair_result(&repair).is_err());
+    }
+
+    #[test]
+    fn repo_local_agents_toml_is_not_a_worker_profile_input() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        fs::write(
+            store.workflow_dir().join("agents.toml"),
+            "this is intentionally not profile toml",
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::new(paths, state);
+
+        let runner = manager.runner_for_parts("pi", "pi", &[], &WorkflowConfig::default())?;
+
+        let metadata = runner.metadata();
+        assert_eq!(metadata.provider, "openai-codex");
+        assert_eq!(metadata.model, "gpt-5.5");
+        assert_eq!(metadata.profile, "implementer");
+        Ok(())
     }
 
     #[test]

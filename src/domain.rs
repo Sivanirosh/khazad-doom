@@ -120,15 +120,6 @@ impl Default for AgentProfilesConfig {
     }
 }
 
-impl AgentProfilesConfig {
-    pub fn with_operator_overrides(mut self, operator: AgentProfilesConfig) -> Self {
-        for (name, profile) in operator.profiles {
-            self.profiles.insert(name, profile);
-        }
-        self
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentProfile {

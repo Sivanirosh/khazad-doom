@@ -219,24 +219,9 @@ mod tests {
     }
 
     #[test]
-    fn operator_profiles_override_stale_repo_profiles() {
-        let mut repo_profiles = AgentProfilesConfig::default();
-        repo_profiles.profiles.insert(
-            IMPLEMENTER_PROFILE.to_string(),
-            AgentProfile {
-                provider: "openai".to_string(),
-                model: "gpt-5.5".to_string(),
-                reasoning: "xhigh".to_string(),
-                mode: "fast".to_string(),
-                required: true,
-                read_only: false,
-                ..AgentProfile::default()
-            },
-        );
-        let profiles = repo_profiles.with_operator_overrides(AgentProfilesConfig::default());
-
+    fn default_operator_profile_is_used_for_pi_workers() {
         let effective = resolve_effective_worker_profile(ProfileResolveInput {
-            profiles,
+            profiles: AgentProfilesConfig::default(),
             config: WorkflowConfig::default(),
             ..ProfileResolveInput::default()
         })

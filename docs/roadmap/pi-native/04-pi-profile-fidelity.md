@@ -7,7 +7,7 @@ Reframes the audit's deferred "WorkerProfile as first-class module": the trigger
 
 One module computes the **effective worker profile** and everything downstream derives from it:
 
-- Precedence chain computed and tested in exactly one place: CLI flags (`--agent`, `--pi-bin`, `--pi-args`) > env (`KHAZAD_AGENT`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) > `.workflow/khazad.json` agent choice + operator-wide `~/.khazad-doom/agents.toml` profiles > optional repo-local `.workflow/agents.toml` profiles > built-in default. Operator-wide profiles intentionally override repo-local profiles so one provider/model fix applies across repositories.
+- Precedence chain computed and tested in exactly one place: CLI flags (`--agent`, `--pi-bin`, `--pi-args`) > env (`KHAZAD_AGENT`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) > `.workflow/khazad.json` agent choice for worker kind > operator-wide `~/.khazad-doom/agents.toml` profile > built-in default profile. Repo-local `.workflow/agents.toml` is not read.
 - Pi launch args (model, provider, reasoning/thinking, mode) generated from the profile in one function.
 - `RunnerMetadata` derived from the profile, never assembled ad hoc; `run_started` events, handoffs, reports, and monitor render one shared `launch_summary` string.
 - Profile carries its own operator fix guidance (auth command, config file path) — consumed by PI-01's incident text so wording lives in one place.
@@ -22,7 +22,7 @@ One module computes the **effective worker profile** and everything downstream d
 
 ## Data model changes
 
-None to SQLite. Possible additive keys in `~/.khazad-doom/agents.toml` or optional `.workflow/agents.toml` (e.g. explicit `thinking`/`mode`) — documented, optional, defaulted.
+None to SQLite. Possible additive keys in `~/.khazad-doom/agents.toml` (e.g. explicit `thinking`/`mode`) are documented, optional, and defaulted.
 
 ## API changes
 
@@ -37,7 +37,7 @@ IPC `StartRunParams`/`ResumeRunParams` unchanged (existing `agent`, `pi_bin`, `p
 
 ## Migration / backward compatibility
 
-Current invocations keep working: same env vars and CLI flags. Intentional divergence: repo-local `.workflow/agents.toml` no longer pins provider/model ahead of the operator-wide setting; this removes cross-repo drift where stale generated repo files point at an unauthenticated provider.
+Current invocations keep working: same env vars and CLI flags. Intentional divergence: repo-local `.workflow/agents.toml` is ignored and may be deleted; this removes cross-repo drift where stale generated repo files point at an unauthenticated provider.
 
 ## Permissions
 
@@ -79,7 +79,7 @@ Integration:
 
 ## Open questions (block `ready`)
 
-1. Current exact precedence between `khazad.json`, operator-wide `agents.toml`, repo-local `agents.toml`, and CLI/env overrides must be captured as the behavior-preservation table before finishing PI-03.
+1. Current exact precedence between `khazad.json`, operator-wide `agents.toml`, built-in defaults, and CLI/env overrides must be captured as the behavior-preservation table before finishing PI-03.
 2. Are reasoning/mode currently expressible in config, or only via raw `pi_args`? If only raw args, decide whether to add typed keys now (additive) or defer.
 
 ## Definition of Done
@@ -91,5 +91,5 @@ Integration:
 - [ ] Behavior-preservation table verified; intentional divergences listed.
 - [ ] Unit tests pass.
 - [ ] Workflow acceptance test passes.
-- [ ] Docs updated: precedence table in docs; operator-wide and repo-local `agents.toml` reference.
+- [ ] Docs updated: precedence table in docs; operator-wide `agents.toml` reference.
 - [ ] Invariants checked: single source of profile truth; no ad-hoc `RunnerMetadata` construction remains (grep check).

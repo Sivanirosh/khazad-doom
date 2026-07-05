@@ -44,8 +44,8 @@ CLI run command
   -> dirty-repo preflight
   -> Manager::runner_for_options
   -> Manager::runner_for_parts
-  -> artifact::Store::read_agent_profiles
-  -> apply_implementer_profile_to_pi_spec
+  -> Manager::read_operator_agent_profiles (`~/.khazad-doom/agents.toml`)
+  -> resolve_effective_worker_profile
   -> runner_from_spec
   -> durable Run + SliceRun rows + preflight.json
   -> background Manager::execute_run
@@ -69,7 +69,6 @@ Relevant files:
 - `src/artifact.rs`
 - `.workflow/khazad.json`
 - `~/.khazad-doom/agents.toml`
-- optional `.workflow/agents.toml`
 - `docs/workflow-invariants.md`
 
 ## What the user-facing interface suggests
@@ -153,7 +152,7 @@ Design smell: terminal status and failure kind are not separated enough. The sta
 
 ### 4. Worker profile and worker adapter are split awkwardly
 
-Operator-wide `~/.khazad-doom/agents.toml` contains provider/model/reasoning profile information applied to every repo; optional repo-local `.workflow/agents.toml` is compatibility/fallback metadata. `RunnerSpec` carries Pi binary and args. `Manager::runner_for_parts` merges them. `PiRunner::run` executes the command. The actual provider readiness requirement is not represented as a module interface.
+Operator-wide `~/.khazad-doom/agents.toml` contains provider/model/reasoning profile information applied to every repo. Repo-local workflow config stays policy-only; `.workflow/agents.toml` is not a runtime input. `RunnerSpec` carries Pi binary and args. `Manager::runner_for_parts` resolves the effective profile. `PiRunner::run` executes the command. The actual provider readiness requirement is not represented as a module interface.
 
 Impact:
 
