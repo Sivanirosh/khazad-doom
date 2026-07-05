@@ -318,14 +318,6 @@ impl PiParser {
                     self.complete_text.insert(idx, text.to_string());
                 }
             }
-            Some("text_complete") => {
-                if let Some(text) = event.get("text").and_then(Value::as_str)
-                    && !text.is_empty()
-                {
-                    self.complete_text.insert(idx, text.to_string());
-                }
-                self.warn_unknown_event("text_complete");
-            }
             Some(event_type) if !KNOWN_ASSISTANT_EVENT_TYPES.contains(&event_type) => {
                 self.warn_unknown_event(event_type);
             }
@@ -366,15 +358,9 @@ fn tail_string(text: &str, max_bytes: usize) -> String {
 
 fn usage_from_value(value: &Value) -> Usage {
     Usage {
-        input_tokens: usage_count(value, &["input", "inputTokens", "input_tokens"]),
-        output_tokens: usage_count(value, &["output", "outputTokens", "output_tokens"]),
+        input_tokens: value.get("input").and_then(Value::as_u64).unwrap_or(0) as usize,
+        output_tokens: value.get("output").and_then(Value::as_u64).unwrap_or(0) as usize,
     }
-}
-
-fn usage_count(value: &Value, keys: &[&str]) -> usize {
-    keys.iter()
-        .find_map(|key| value.get(key).and_then(Value::as_u64))
-        .unwrap_or(0) as usize
 }
 
 #[cfg(test)]

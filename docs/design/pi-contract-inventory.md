@@ -61,7 +61,7 @@ Known `assistantMessageEvent.type` payloads forwarded by Pi's agent loop:
 - `toolcall_delta`
 - `toolcall_end`
 
-Provider stream internals `start`, `done`, and `error` are consumed by Pi's agent loop and are not forwarded as `assistantMessageEvent` values. `text_complete` is not source-defined in local Pi 0.80.3; Khazad-Doom treats it as an unknown legacy/compatibility text-completion alias if encountered.
+Provider stream internals `start`, `done`, and `error` are consumed by Pi's agent loop and are not forwarded as `assistantMessageEvent` values. `text_complete` is not source-defined in local Pi 0.80.3 and is not treated as part of Khazad-Doom's Pi contract.
 
 Unknown event types and extra fields are tolerated. A missing version marker is tolerated. A future contract version produces at most one warning per worker parse, then the run continues.
 
@@ -71,7 +71,7 @@ The contract parser assembles:
 
 - assistant text for worker JSON extraction,
 - bounded stdout/stderr/assistant transcript tails for failure classification,
-- token usage from Pi's source-defined `usage.input` / `usage.output` payloads, with legacy aliases tolerated,
+- token usage from Pi's source-defined `usage.input` / `usage.output` payloads,
 - bounded contract warnings for daemon incidents.
 
 Malformed final worker JSON remains a worker-output error; the parser does not make daemon workflow decisions beyond producing typed parse data.
