@@ -18,7 +18,7 @@ Convert the most frustrating terminal state — a worker dying `blocked` on a `m
 ## Out of scope
 
 - Nested fan-out (workers spawning subagents) — deferred at matrix level.
-- Interactive TUI answering (CLI `answer` command first; overlay later under the deferred monitor track).
+- Interactive TUI answering (CLI `answer` command first; no Pi monitor UI ships in the current package).
 - Multi-question concurrency per slice beyond a simple queue (one open question per slice at a time is acceptable v1).
 - Changing `must_ask_if` slice-schema semantics (the fence stays; this changes only what happens at the fence).
 

@@ -131,7 +131,7 @@ Strict does not mean frozen. Acceptance criteria are minimum evidence, not an ex
 | Evidence separation | Workers produce acceptance evidence claims; daemon checks/gates attest or reject them. Workers do not approve their own evidence. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
-| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `monitor`, `watch`, and the Pi overlay. |
+| Live observability | Every daemon-owned run has a durable progress snapshot for `status`, `monitor`, and `watch`. |
 | Durable checkpoints | `resume` continues remaining work from recorded state instead of pretending nothing happened. |
 | Conflict artifacts | Merge conflicts become structured blocked reports, not half-merged chaos. |
 | Explicit PR control | `handoff` prints commands by default; push and PR creation require explicit flags or config. |
@@ -156,7 +156,7 @@ khazad-doom monitor --repo . --latest
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so whatever started the run can display those commands directly instead of guessing how to launch user-visible progress.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, the terminal `monitor`, and the optional Pi overlay paint that projection instead of independently interpreting run events. The shared vocabulary includes `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch` and the terminal `monitor` paint that projection instead of independently interpreting run events. The shared vocabulary includes `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
 
 During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
 
@@ -199,9 +199,9 @@ khazad-doom answer <run-id> <question-id> "your answer"
 
 The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk`. If no answer arrives before the tool timeout, the worker falls back to the existing blocked contract and the unanswered question remains visible as run evidence.
 
-### The Pi package: skill, overlay, and worker tool
+### The Pi package: skill and worker tool
 
-This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill, the monitor extension at `extensions/khazad-monitor`, and the worker escalation tool at `extensions/khazad-worker`. These are adapters over daemon state; none owns a run.
+This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and the worker escalation tool at `extensions/khazad-worker`; it does not ship a Pi monitor UI extension. Core observability stays in the daemon-owned `status`, `watch`, and `monitor` commands.
 
 Enable it intentionally from a trusted checkout or package source; Khazad-Doom never writes Pi user settings automatically:
 
@@ -211,19 +211,9 @@ pi install /path/to/khazad-doom
 pi -e /path/to/khazad-doom
 ```
 
-The extension registers `/khazad-monitor`:
+The worker extension registers the `ask_operator` tool for daemon-launched Pi workers. It lets a worker pause at a slice `must_ask_if` fence, ask the operator through the daemon, and resume after an answer. The tool is unavailable outside a Khazad-Doom worker environment and degrades to the existing blocked-output contract.
 
-```text
-/khazad-monitor --latest [--repo /path/to/repo]
-/khazad-monitor --run <run-id>
-/khazad-monitor <run-id>
-```
-
-In Pi TUI mode it opens a centered, bordered version of the same daemon projection as `khazad-doom monitor`. When the feed is taller than the overlay, it shows a right-side scrollbar; use ↑/↓ or PgUp/PgDn to scroll. Press `q` or `Esc` to close only the overlay; it never calls `cancel` and never owns the daemon run lifetime. Outside Pi TUI mode, or when `khazad-doom` is unavailable, it shows clear fallback commands instead of stack traces.
-
-Ambient mode is on by default in Pi TUI sessions. The extension polls the current repo for an active run, shows a compact widget when one appears, raises one notification per terminal transition, and raises attention notifications for new pending operator questions. Reattaching to an already-active run shows the widget without replaying old notifications. Set `KHAZAD_MONITOR_AMBIENT=0` to opt out or `KHAZAD_MONITOR_AMBIENT_INTERVAL_MS=<ms>` to tune polling. All widget/notification wording comes from the daemon projection or question records.
-
-To install only the skill without the optional extension, use Pi package filters in settings:
+To install only the skill without the worker extension, use Pi package filters in settings:
 
 ```json
 {

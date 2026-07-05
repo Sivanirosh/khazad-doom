@@ -13,7 +13,7 @@ Every implementation task for this migration must reference a Slice ID from this
 - **D3 — Escalation over termination.** A worker hitting a `must_ask_if` condition escalates to the operator mid-run and continues after an answer, instead of dying `blocked`.
 - **D4 — Versioned coupling only.** Khazad couples to Pi's documented, versioned surfaces (CLI flags, JSON event stream, exit codes). Never to stderr wording, internals, or unversioned behavior. Unknown fields/events are tolerated.
 - **D5 — Single verification owner.** The daemon owns verification, gates, economics, and attestation. No duplicate Pi-side acceptance gates, no silent model failover.
-- **D6 — Feedback comes to the operator.** Operators must not need to open a monitor window to learn a run needs them. Progress and attention surface ambiently in the Pi session that started the work; daemon state remains the single source of truth and the CLI stays the harness-neutral surface. One interpretation layer feeds every renderer.
+- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; daemon state remains the single source of truth and the CLI stays the harness-neutral surface. No Pi monitor UI extension ships in this package.
 
 ## Status state machine
 
@@ -31,8 +31,7 @@ No hidden states: no "mostly done", no "wired later".
 | D4 | Typed, versioned Pi event/CLI contract module | PI-02 | `src/agent.rs` (or new `src/agent/pi_contract.rs`), `docs/workflow-invariants.md`, tests | All Pi wire-format knowledge lives in one module; unknown events/fields ignored; contract inventory documented; actual model/provider captured when Pi reports it | Unit: parser tolerance (unknown fields, new event types, version markers); regression: recorded event-stream fixtures from current Pi | `planned` | Consuming pi-subagents lifecycle artifacts deferred (Khazad drives `pi -p` directly) |
 | D1, D4 | Pi profile fidelity — one effective worker profile | PI-03 | `src/agent.rs`, `src/artifact.rs`, `src/domain.rs`, `src/workflow/manager.rs`, `.workflow/agents.toml`, docs | Config precedence (CLI > env > `khazad.json` > `agents.toml` > default) computed and tested in one module; Pi args generated in one place; identical profile summary in run events, handoffs, reports, monitor | Unit: precedence table, arg generation; Integration: run_started/handoff/report show same profile | `planned` | `fallbackModels` failover rejected (D5); revisit only if provider-outage incidents recur AND attestation records actual model |
 | D3 | Operator escalation channel for `must_ask_if` | PI-04 | `src/ipc.rs`, `src/daemon.rs`, `src/state.rs`, `src/workflow/manager.rs`, `src/workflow/prompts.rs`, `src/cli.rs`, new worker-side Pi extension under `extensions/`, `skills/khazad-doom`, tests | Worker raises question mid-run; daemon persists it; `status`/monitor surface it with the answer command; operator answers via CLI; worker continues; timeout falls back to today's `blocked` | Unit: question lifecycle, token auth, timeout; Integration: scripted worker asks → answer → run completes; daemon-restart edge; workflow test below | `planned` | Nested worker fan-out (worker spawning subagents) deferred; interactive TUI answering deferred (CLI answer first) |
-| D6 | Render-ready status projection — one interpretation layer for all renderers | PI-05 | new `src/workflow/projection.rs`, `src/ipc.rs`, `src/cli.rs`, `src/domain.rs`, `extensions/khazad-monitor/index.js`, tests | All feed interpretation lives in one daemon-side module; CLI monitor and Pi overlay are thin painters of the same versioned projection; behavior-preserving for current output | Unit: projection fixture snapshots; parity: CLI output equivalence on recorded runs; grep check: no event-type strings in painters | `planned` | Push/streaming transport deferred (polling stays); projection for offline `inspect` artifacts deferred |
-| D3, D6 | Ambient Pi feedback: auto-tracking widget + lifecycle/attention notifications | PI-06 | `extensions/khazad-monitor/index.js`, `skills/khazad-doom`, `docs/` | Run started from Pi surfaces a footer widget without user action; completed/failed/blocked notify; PI-04 questions arrive as needs-attention with the answer command; headless contexts no-op | Extension unit tests with fixture projections and a mocked Pi API; lifecycle → notification sequence; session-reattach no-storm test | `planned` | Full-screen overlay visual polish explicitly deferred; rich multi-run UI deferred |
+| D6 | Render-ready status projection — one interpretation layer for CLI renderers and future read-only adapters | PI-05 | new `src/workflow/projection.rs`, `src/ipc.rs`, `src/cli.rs`, `src/domain.rs`, tests | All feed interpretation lives in one daemon-side module; CLI monitor/watch/status are thin painters of the same versioned projection; behavior-preserving for current output | Unit: projection fixture snapshots; parity: CLI output equivalence on recorded runs; grep check: no event-type strings in painters | `planned` | Push/streaming transport deferred (polling stays); projection for offline `inspect` artifacts deferred; Pi monitor UI removed |
 
 ## Dependency order
 
@@ -44,11 +43,9 @@ PI-03 (profile fidelity)  — after PI-00; independent of PI-02
 PI-05 (status projection) — after PI-00; independent of PI-01..03; land before PI-04 so
                             pending questions have a surface to render on
 PI-04 (escalation)        — after PI-01 (blocked semantics) and PI-02 (contract module); largest slice
-PI-06 (ambient feedback)  — after PI-05; lifecycle notifications may ship before PI-04,
-                            attention integration lands together with PI-04
 ```
 
-PI-01 and PI-00 can land in either order or together. PI-04 must not start until its open questions are resolved and its status is `ready`. PI-04 and PI-06 should reach `done` close together: an escalation channel without an ambient surface produces questions that time out unseen.
+PI-01 and PI-00 can land in either order or together. PI-04 must not start until its open questions are resolved and its status is `ready`. An escalation channel must always render pending questions in daemon-owned `status`, `watch`, and `monitor` output; a Pi ambient surface is not part of the current package.
 
 ## Cross-slice workflow acceptance test
 
@@ -60,10 +57,8 @@ Proves the slices connect into one coherent operator path. Run after PI-04 lands
    and prints the fix commands (PI-01, PI-03). No worker attempt artifacts imply implementation work.
 3. Operator authenticates Pi, reruns the same command.
 4. Worker starts; mid-run it hits a must_ask_if condition and calls ask_operator (PI-04).
-5. Run stays active with progress phase awaiting_operator; `khazad-doom status` shows the question
-   and the exact answer command; the originating Pi session receives a needs-attention
-   notification carrying the same question and command without the operator opening any
-   monitor view (PI-06).
+5. Run stays active with progress phase awaiting_operator; `khazad-doom status`, `watch`, and
+   `monitor` show the question and the exact answer command without requiring any Pi UI adapter.
 6. Edge condition: the daemon is restarted while the question is pending. After restart, the
    question is still listed as pending against the interrupted run; answering it is either applied
    on resume or rejected with a clear "run interrupted, resume first" error — never silently lost.
@@ -72,8 +67,8 @@ Proves the slices connect into one coherent operator path. Run after PI-04 lands
    the profile summary in run_started, handoff JSON, and final report is identical (PI-03);
    every event in the run log parses through the typed contract module (PI-02);
    economics report separates awaiting-operator wall time from agent time;
-   the CLI monitor and the Pi widget render identical wording for the same run state,
-   because both paint the same projection (PI-05).
+   CLI status/watch/monitor render identical wording for the same run state,
+   because all paint the same projection (PI-05).
 ```
 
 ## Explicit deferrals and rejections (migration level)
@@ -85,5 +80,5 @@ Proves the slices connect into one coherent operator path. Run after PI-04 lands
 | `fallbackModels` silent failover for workers | Rejected | Handoff attestation must not lie about the model that did the work | Provider-outage incidents recur AND attestation records the actual model per attempt |
 | Consuming pi-subagents for delegation | Deferred | Khazad drives `pi -p` directly; pi-subagents is session-scoped orchestration | Khazad needs nested fan-out inside a worker |
 | Auto-login / credential mutation | Rejected | Out of trust boundary; operator action by design | Never |
-| Full-screen overlay visual polish | Deferred | The overlay becomes a thin painter (PI-05); the ambient track (PI-05/PI-06) absorbs the old "monitor feature expansion" deferral; polishing a detail view belongs after the ambient model proves which detail views operators actually open | Operator feedback after PI-06 |
+| Pi monitor UI and ambient widget | Removed | The optional UI adapter duplicated core daemon monitoring, introduced Pi session-lifecycle crash risk, and is not required for worker execution or operator escalation. Core monitoring remains `status`/`watch`/`monitor`. | Revisit only with concrete demand and a lifecycle-safe Pi UI API contract |
 | Push/streaming status transport | Deferred | Polling over the existing socket/CLI is sufficient at current scale; streaming adds daemon lifecycle complexity | Polling interval becomes a measured UX or load problem |

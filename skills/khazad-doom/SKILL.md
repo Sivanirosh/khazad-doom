@@ -32,9 +32,6 @@ khazad-doom status --run <run-id>
 khazad-doom status --run <run-id> --follow
 khazad-doom monitor --repo . --latest
 khazad-doom monitor --run <run-id>
-# Optional Pi package adapter, when installed/enabled in Pi TUI:
-/khazad-monitor --latest
-/khazad-monitor --run <run-id>
 khazad-doom watch --run <run-id>
 khazad-doom handoff --run <run-id>
 khazad-doom handoff --run <run-id> --dry-run
@@ -94,11 +91,10 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 
 - Do not use blocking `--wait` as the primary Pi UX for real `pi` runs. Start the run without `--wait`, capture the JSON (`run_id`, `repo_path`, `monitor_command`, `run_monitor_command`), report the monitor command, and detach unless an allowed exception above applies.
 - Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable and an allowed exception above applies.
-- Khazad-Doom does not auto-open external windows by default; a Pi extension is an optional adapter over daemon state, not core workflow state.
+- Khazad-Doom does not auto-open external windows by default; core observability is the daemon-owned CLI surface.
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
-- `khazad-doom monitor`, `watch`, and the optional `/khazad-monitor` Pi overlay paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording.
-- If the optional Pi package extension is installed, `/khazad-monitor --latest` or `/khazad-monitor --run <run-id>` may open a centered Pi TUI activity-feed overlay. Closing it with `q` or `Esc` only detaches the overlay; never treat it as run cancellation. The same extension also has ambient mode on by default in Pi TUI sessions: it shows a compact widget for active runs and one notification per terminal/attention transition. Set `KHAZAD_MONITOR_AMBIENT=0` to opt out.
-- Do not require the Pi extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks.
+- `khazad-doom monitor` and `watch` paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording.
+- Do not require a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 - Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
 - Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.

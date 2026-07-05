@@ -9,7 +9,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 - **D3 — Escalation over termination.** A worker that hits a `must_ask_if` condition should call the shipped `ask_operator` Pi tool, pause in `awaiting_operator`, and continue after an answer. If the tool is unavailable or times out, the worker falls back to the existing `ask-user` blocked output.
 - **D4 — Versioned coupling only.** Khazad-Doom couples to Pi's documented, versioned surfaces such as CLI flags, JSON event streams, and exit codes; it must not depend on Pi internals. `src/pi_contract.rs` is the only module that may parse Pi stdout/stderr or recognize Pi event/error strings; the current contract inventory is `docs/design/pi-contract-inventory.md`. A Pi behavior change may degrade observability, but daemon-owned state remains authoritative for correctness. Unknown fields/events from Pi are tolerated and surfaced as bounded warnings.
 - **D5 — Single verification owner.** The daemon owns verification, gates, economics, and attestation. Workers produce evidence claims; daemon checks/gates or human review attest them.
-- **D6 — Feedback comes to the operator.** Operators should not need to open a monitor window to learn that a run needs them. Progress and attention should surface ambiently in the originating Pi session while daemon state stays the source of truth. CLI and Pi renderers must paint the same daemon-side interpretation layer so wording does not diverge.
+- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; those surfaces show the same daemon-side feed projection and answer commands. No Pi monitor UI extension ships in this package.
 
 Standing rejections:
 
@@ -20,7 +20,7 @@ Standing rejections:
 
 ## Run lifetime and ownership
 
-- A run is a durable daemon-owned session keyed by `run_id`. CLI commands, Pi tool calls, and optional Pi UI adapters start, control, or observe that session; they do not define its lifetime.
+- A run is a durable daemon-owned session keyed by `run_id`. CLI commands and Pi worker tools start, control, or observe that session; they do not define its lifetime.
 - No hidden global workflow timeout exists by default. A run continues until it reaches a terminal state, is cancelled, or is marked interrupted/recovered by daemon startup logic.
 - Time limits are explicit policy knobs for specific work: verification/gate command timeouts and, when configured, per-worker-attempt timeouts.
 - The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, progress snapshots, status/monitor output, handoff JSON, and artifact inspection.
@@ -58,7 +58,7 @@ Standing rejections:
 
 ## Cancellation, interruption, and resume
 
-- `cancel` requests cancellation through daemon state and worker process signalling; it is an explicit operator action, not a side effect of closing a monitor, status follower, Pi overlay, or CLI session.
+- `cancel` requests cancellation through daemon state and worker process signalling; it is an explicit operator action, not a side effect of closing a monitor, status follower, or CLI session.
 - If the daemon starts and discovers active runs from a previous process, it marks them `interrupted`, records recovery events, and cleans daemon-managed worktrees where possible.
 - `resume` is explicit. It uses durable checkpoint/run state for remaining work and never claims to resurrect a lost worker process.
 
@@ -78,12 +78,12 @@ Standing rejections:
 ## Progress, status, and monitor state
 
 - The daemon/state store is the source of truth for run status, slice states, events, and live progress snapshots.
-- `status`, `watch`, `monitor`, and optional Pi adapters render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
-- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths and Pi monitor extension prefer `RunDetails.feed` when present.
-- `monitor --latest` and `/khazad-monitor --latest` must not make terminal runs disappear. When no active run exists, they keep the latest terminal run summary visible, including incidents and handoff readiness.
+- `status`, `watch`, and `monitor` render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
+- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths prefer `RunDetails.feed` when present.
+- `monitor --latest` must not make terminal runs disappear. When no active run exists, it keeps the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
-- Ambient Pi feedback is a read-only adapter over the daemon projection. Notifications are deduplicated per `(run_id, transition)` in the extension session, and a new session must not replay notifications for transitions that predate attachment. Pending-question notifications use projection/question wording and the copy-pasteable `khazad-doom answer …` command.
+- If a future Pi monitoring adapter is reintroduced, it must be read-only over the daemon projection, must clean up all session-bound resources on Pi session replacement/reload, and must never become required for core monitoring.
 
 ## Artifacts, handoffs, and remotes
 

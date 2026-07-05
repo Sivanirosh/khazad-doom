@@ -12,7 +12,7 @@
   ],
   "acceptance": [
     "VISION.md states Pi-native worker execution, harness-neutral daemon state, and fake-as-test-seam without implying future multi-harness worker support.",
-    "docs/workflow-invariants.md records product decisions D1-D6, including the Pi documented-surface coupling rule and ambient-feedback doctrine.",
+    "docs/workflow-invariants.md records product decisions D1-D6, including the Pi documented-surface coupling rule and daemon-owned explicit feedback doctrine.",
     "The three standing rejections are recorded with rationale: Pi acceptance gates, fallbackModels silent failover, and auto-login or credential mutation.",
     "README.md positions Khazad-Doom as a project-level workflow daemon for Pi, complementary to session-scoped delegation tools such as pi-subagents.",
     "No doc, prompt, or CLI-facing wording claims harness-agnostic or multi-harness worker execution; harness-neutral daemon state/CLI status wording remains allowed."

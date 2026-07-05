@@ -5,12 +5,7 @@ Depends on: PI-00. Independent of PI-01..PI-03. Should land before PI-04 reaches
 
 ## Problem being removed
 
-Today two full renderers interpret the same status JSON independently: ~800–1000 lines of Rust
-in `src/cli.rs` (`render_todos`, `render_activity`, `render_economics`, `activity_line`, …) and
-~1,350 lines of JS in `extensions/khazad-monitor/index.js` that re-implements the same
-interpretation (its own `statusRole`, feed blocks, economics formatting). Every new event kind,
-incident type, or phase must be interpreted twice, in two languages. The activity-feed
-vocabulary was already aligned by hand once; this slice makes that alignment structural.
+Human-facing CLI paths can drift if status, watch, and monitor each interpret run details independently. Every new event kind, incident type, or phase should be interpreted once, daemon-side, and then painted by terminal surfaces. The activity-feed vocabulary was already aligned by hand once; this slice makes that alignment structural and leaves room for future read-only adapters without shipping a Pi monitor UI extension now.
 
 ## Scope
 
@@ -21,25 +16,23 @@ vocabulary was already aligned by hand once; this slice makes that alignment str
   `success`, `warning`, `error`, `attention`). Top-level fields: `feed_version: 1`,
   `summary_line`, `attention` (empty until PI-04 populates it with pending questions).
 - Projection is computed daemon-side and returned additively in the `status` IPC response and
-  `khazad-doom status --json` output, so both consumers (CLI monitor loop and the Pi extension,
-  which execs the CLI) receive it through existing transports. Polling model unchanged.
+  `khazad-doom status --json` output, so CLI monitor/watch/status receive it through existing
+  transports. Polling model unchanged.
 - CLI monitor (`monitor`, `watch`, `status` human output) becomes a painter: ANSI-colorize
   roles, print blocks. No payload interpretation remains in the painter.
-- `extensions/khazad-monitor/index.js` becomes a painter: theme-colorize roles, render blocks
-  in the overlay. All event-type and payload knowledge deleted from JS.
 - Producer-side compatibility rules mirror D4 from the consumer side: painters must render
   unknown roles as `info` and unknown blocks as plain text — never crash — so daemon and
-  extension can be upgraded independently despite shipping in one repo.
+  future read-only adapters can be upgraded independently.
 - Behavior-preserving: current monitor wording/content is the spec. Divergences must be listed
   in this workpackage before implementation (expected: none beyond incidental whitespace).
 
 ## Out of scope
 
-- New UX features (widget, notifications — PI-06).
+- New UX features or a Pi monitor UI extension.
 - Vocabulary changes or new blocks (additive later, through the projection module only).
 - Streaming/push transport (deferred at matrix level).
 - Projection for offline artifact `inspect` paths (deferred; live `status` only).
-- Removing `/khazad-monitor` or the CLI monitor.
+- Removing the CLI monitor.
 
 ## Data model changes
 
@@ -54,20 +47,18 @@ None to SQLite or slice schema. Additive `feed` object in `status` responses.
 
 ## UI states (CLI/monitor output)
 
-- **Active run:** identical content to today on both surfaces (parity-tested).
-- **Waiting / no runs:** projected waiting block; both surfaces render it.
+- **Active run:** identical content to today on all CLI surfaces (parity-tested).
+- **Waiting / no runs:** projected waiting block; CLI surfaces render it.
 - **Terminal run:** projected terminal summary, including PI-01's blocked-with-guidance wording
-  — fix commands come through the projection so both surfaces show them verbatim.
+  — fix commands come through the projection so surfaces show them verbatim.
 - **Daemon unreachable / exec failure:** the one state painters own locally (there is no
-  projection to paint); each surface keeps its current error hint (`KHAZAD_DOOM_BIN` guidance
-  in the extension). Documented as the only permitted painter-owned wording.
+  projection to paint); surfaces keep their current actionable error hints. Documented as the
+  only permitted painter-owned wording.
 - **Unknown role/block from a newer daemon:** rendered as plain `info` text, never a crash.
 
 ## Migration / backward compatibility
 
-Additive field; old extension builds that still interpret raw fields keep working during the
-transition. Extension and CLI painters switch in the same change since both live in this repo.
-Golden/parity tests pin the CLI output before the refactor and assert equivalence after.
+Additive field; raw fields keep working for any external consumer during the transition. Golden/parity tests pin the CLI output before the refactor and assert equivalence after.
 
 ## Permissions
 
@@ -79,28 +70,26 @@ Unit:
 - Fixture snapshots: recorded `RunDetails` (running, blocked-with-guidance, terminal, waiting,
   incident-bearing, economics-bearing) → projection JSON snapshots.
 - Role/block closed-set validation; `feed_version` present.
-- Painter tolerance: unknown role and unknown block render as plain text (Rust painter unit
-  test; JS painter test with a fixture projection).
+- Painter tolerance: unknown role and unknown block render as plain text in Rust painter tests.
 
 Integration:
 - CLI parity: human `monitor` output on recorded runs is equivalent pre/post refactor.
 - `status --json` contains `feed` and raw fields simultaneously.
-- Grep checks (in a test): `extensions/khazad-monitor/index.js` contains no daemon event-type
-  strings; `src/cli.rs` painter functions contain no payload-key interpretation.
+- Grep checks (in a test): `src/cli.rs` painter functions contain no payload-key interpretation.
 
 ### Workflow acceptance test
 
 ```text
-1. Operator opens `khazad-doom monitor --latest` in a terminal and `/khazad-monitor` in Pi
-   against the same active run.
-2. Both surfaces show the same blocks with the same wording (roles differ only in coloring).
+1. Operator opens `khazad-doom monitor --latest`, `khazad-doom watch --run <run-id>`, and
+   `khazad-doom status --run <run-id>` against the same active run.
+2. All CLI surfaces show the same blocks with the same wording (formatting may differ by surface).
 3. A new incident kind is introduced via a fixture (simulating a future slice's addition);
-   only the projection module is edited; both surfaces show the new incident line without
+   only the projection module is edited; all surfaces show the new incident line without
    any painter change.
 4. Edge condition: the daemon returns a projection containing an unknown role and an unknown
-   block label (future version); both painters render them as plain text and continue
-   polling — no crash, no blank screen.
-5. Invariant: at no point do the two surfaces disagree on wording for the same run state, and
+   block label (future version); painters render them as plain text and continue polling —
+   no crash, no blank screen.
+5. Invariant: at no point do the CLI surfaces disagree on wording for the same run state, and
    no interpretation logic exists outside src/workflow/projection.rs (grep checks pass).
 ```
 
@@ -109,9 +98,8 @@ Integration:
 1. One daemon-side module owns all feed interpretation; painters contain none (grep-verified).
 2. `status` IPC/CLI responses carry the versioned projection additively.
 3. CLI monitor output is behavior-preserving on the recorded-run corpus.
-4. Pi overlay renders exclusively from the projection; its JS interpretation layer is deleted.
-5. Unknown roles/blocks degrade to plain text on both painters.
-6. Projection shape and version rules documented in `docs/workflow-invariants.md`.
+4. Unknown roles/blocks degrade to plain text in painters.
+5. Projection shape and version rules documented in `docs/workflow-invariants.md`.
 
 ## Open questions (block `ready`)
 
@@ -135,4 +123,4 @@ Integration:
 - [ ] Workflow acceptance test passes.
 - [ ] Docs updated: projection shape in `docs/workflow-invariants.md`.
 - [ ] Invariants checked: single interpretation layer (grep), no wording divergence between
-      surfaces, painters never crash on forward-version projections.
+      CLI surfaces, painters never crash on forward-version projections.
