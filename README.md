@@ -273,7 +273,7 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 
 ## Repository config
 
-`khazad-doom init` creates `.workflow/khazad.json`. Commit it when you want shared defaults:
+`khazad-doom init` creates `.workflow/khazad.json`. Commit it when you want shared defaults; for example:
 
 ```json
 {
@@ -285,6 +285,9 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
   "worker_termination_grace_seconds": 30,
   "integration_repair": "auto",
   "gate_fail_fast": true,
+  "worktree_setup": [
+    { "command": "cargo fetch", "timeout_seconds": 300 }
+  ],
   "handoff": { "push": false, "create_pr": false },
   "verify_profiles": {
     "quick": {
@@ -297,13 +300,13 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 }
 ```
 
-A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure. Missing tools, invalid verify cwd, shell spawn failures, and non-executable commands are classified as daemon/operator environment failures instead of worker auto-fix failures.
+A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. `worktree_setup` commands use the same command shape and are daemon-owned bootstrap commands: they run without verification-cache reuse after each worker/integration worktree is created or updated, must leave the git worktree clean except ignored files, and should install repo dependencies such as `npm ci`. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure. Missing tools, invalid verify cwd, shell spawn failures, and non-executable commands are classified as daemon/operator environment failures instead of worker auto-fix failures.
 
 Khazad-Doom stores the single worker launch profile source in `~/.khazad-doom/agents.toml` and applies it to every repository. Real Pi code-writing workers are launched through the required `implementer` profile; the default global profile uses the OpenAI Codex provider with `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. Repo-local workflow config remains policy-only; `.workflow/agents.toml` is not read. CLI/env overrides (`--pi-bin`, `--pi-args`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) still flow through the same effective-profile resolver. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, status projection, and economics snapshots report the same `profile_summary`/`launch_summary`. `preflight.json` also records the observed Pi contract (binary, launch flags, supported event vocabulary) for postmortems.
 
 Run start is clean-by-default: Khazad-Doom rejects a dirty source repo unless `--allow-dirty` is explicit, and every run writes `.workflow/runs/<run>/outputs/preflight.json` with base branch/SHA and dirty status. Worker changes are also checked against slice `areas` when areas are declared; outside-area changes block the slice as a scope violation.
 
-`integration_repair` controls when the repair agent runs: `auto` runs repair only after failed integration-gate evidence, `never` surfaces the failed gate without repair, and `always` runs repair even when the pre-repair gate passed. Repair never bypasses the gate; any repair is followed by a second integration gate.
+`integration_repair` controls when the repair agent runs: `auto` runs repair only after failed integration-gate evidence that is not an operator environment failure, `never` surfaces the failed gate without repair, and `always` runs repair even when the pre-repair gate passed. Operator environment failures block with remediation evidence instead of consuming a repair agent. Repair never bypasses the gate; any repair is followed by a second integration gate.
 
 Status/watch/monitor and final reports include runtime economics for release triage: agent call counts, daemon-owned command execution counts, duplicate command telemetry, cache hits/misses, repair policy/attempts, phase durations, and SLA violations.
 
@@ -321,7 +324,7 @@ Retries preserve attempt history and should be treated as at-least-once executio
 
 | Path | Purpose |
 |---|---|
-| `.workflow/khazad.json` | Shared repo defaults and verification profiles. |
+| `.workflow/khazad.json` | Shared repo defaults, worktree setup commands, and verification profiles. |
 | `~/.khazad-doom/agents.toml` | Operator-wide per-role agent model/settings profiles applied to every repo. |
 | `.workflow/slices/*.json` | Durable machine-readable Issue Slices. |
 | `.workflow/schema/slice.schema.json` | JSON Schema for editor/CI validation. |

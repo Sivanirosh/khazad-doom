@@ -65,6 +65,7 @@ impl WorkflowGate {
                     command: &command,
                     timeout: verify_command_timeout(request.slice, &command, request.config),
                     message: "running slice verification command",
+                    cacheable: true,
                 },
                 cancel,
             )?;
@@ -116,6 +117,7 @@ impl WorkflowGate {
                     command: &command,
                     timeout: verify_command_timeout_for_command(&command, request.config),
                     message: "running integration gate command",
+                    cacheable: true,
                 },
                 cancel,
             )?;
@@ -145,6 +147,87 @@ impl WorkflowGate {
             },
             commands: results,
             findings,
+        })
+    }
+
+    pub(crate) fn run_worktree_setup(
+        &self,
+        request: WorktreeSetupRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<GateResult> {
+        let commands: Vec<_> = request
+            .config
+            .worktree_setup
+            .iter()
+            .filter(|command| !command.command.trim().is_empty())
+            .collect();
+        if commands.is_empty() {
+            return Ok(GateResult {
+                status: "passed".to_string(),
+                summary: "no worktree setup commands configured".to_string(),
+                commands: Vec::new(),
+                findings: Vec::new(),
+            });
+        }
+
+        let mut results = Vec::new();
+        let mut findings = Vec::new();
+        for command in commands {
+            check_cancelled(cancel)?;
+            let outcome = self.run_verify_command(
+                VerifyCommandExecutionRequest {
+                    phase: "worktree_setup",
+                    slice_id: request.slice_id,
+                    attempt: request.attempt,
+                    worktree_root: request.worktree,
+                    command,
+                    timeout: verify_command_timeout_for_command(command, request.config),
+                    message: "running worktree setup command",
+                    cacheable: false,
+                },
+                cancel,
+            )?;
+            if outcome.result.status == "failed" {
+                findings.push(worktree_setup_failure_finding(
+                    &command.command,
+                    &outcome.result,
+                ));
+                results.push(outcome.result);
+                return Ok(GateResult {
+                    status: "failed".to_string(),
+                    summary: "worktree setup command failed".to_string(),
+                    commands: results,
+                    findings,
+                });
+            }
+            results.push(outcome.result);
+        }
+
+        let status = gitutil::status_porcelain(request.worktree)?;
+        if !status.trim().is_empty() {
+            return Ok(GateResult {
+                status: "failed".to_string(),
+                summary: "worktree setup left non-ignored changes".to_string(),
+                commands: results,
+                findings: vec![Finding {
+                    id: "worktree_setup_dirty".to_string(),
+                    severity: "error".to_string(),
+                    action: "operator-fix".to_string(),
+                    file: String::new(),
+                    line: 0,
+                    description: format!(
+                        "worktree setup must leave the git worktree clean except ignored files; git status --porcelain:\n{}",
+                        status.trim()
+                    ),
+                }],
+            });
+        }
+
+        Ok(GateResult {
+            status: "passed".to_string(),
+            summary: "worktree setup passed".to_string(),
+            commands: results,
+            findings: Vec::new(),
         })
     }
 
@@ -193,7 +276,9 @@ impl WorkflowGate {
                 return Ok(VerifyCommandExecutionOutcome { result });
             }
         };
-        if let Some(mut cached) = self.cache.get(&cache_key) {
+        if request.cacheable
+            && let Some(mut cached) = self.cache.get(&cache_key)
+        {
             cached.cache_hit = true;
             cached.duration_ms = 0;
             self.record_command_economics(CommandExecutionEconomics {
@@ -293,7 +378,9 @@ impl WorkflowGate {
             cache_hit: false,
             skip_reason: String::new(),
         });
-        self.cache.insert(cache_key, result.clone());
+        if request.cacheable {
+            self.cache.insert(cache_key, result.clone());
+        }
         Ok(VerifyCommandExecutionOutcome { result })
     }
 
@@ -416,6 +503,13 @@ pub(crate) struct IntegrationGateRequest<'a> {
     pub(crate) config: &'a WorkflowConfig,
 }
 
+pub(crate) struct WorktreeSetupRequest<'a> {
+    pub(crate) worktree: &'a Path,
+    pub(crate) slice_id: &'a str,
+    pub(crate) attempt: usize,
+    pub(crate) config: &'a WorkflowConfig,
+}
+
 #[derive(Debug)]
 struct VerifyCommandExecutionRequest<'a> {
     phase: &'a str,
@@ -425,6 +519,7 @@ struct VerifyCommandExecutionRequest<'a> {
     command: &'a VerifyCommand,
     timeout: Duration,
     message: &'a str,
+    cacheable: bool,
 }
 
 #[derive(Debug)]
@@ -652,6 +747,33 @@ fn integration_gate_failure_description(command: &str, result: &GateCommandResul
     } else {
         format!(
             "integration gate command failed to start or timed out: {command}: {}",
+            result.output
+        )
+    }
+}
+
+fn worktree_setup_failure_finding(command: &str, result: &GateCommandResult) -> Finding {
+    Finding {
+        id: "worktree_setup_failed".to_string(),
+        severity: "error".to_string(),
+        action: "operator-fix".to_string(),
+        file: String::new(),
+        line: 0,
+        description: worktree_setup_failure_description(command, result),
+    }
+}
+
+fn worktree_setup_failure_description(command: &str, result: &GateCommandResult) -> String {
+    if result.failure_kind == "timeout" {
+        format!(
+            "worktree setup command timed out: {command}: {}",
+            result.output
+        )
+    } else if result.output.trim().is_empty() {
+        format!("worktree setup command failed: {command}")
+    } else {
+        format!(
+            "worktree setup command failed: {command}\n{}",
             result.output
         )
     }

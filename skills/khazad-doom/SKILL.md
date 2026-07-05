@@ -47,7 +47,7 @@ khazad-doom daemon status
 - Slices have an issue-style lifecycle: new slices are open by default; successful daemon runs close completed slice JSON with `status: "closed"`, `closed_by_run`, and `closed_at`.
 - Do not rerun closed historical slices. Closed dependencies are treated as satisfied; explicitly requesting a closed slice should be rejected in favor of creating a follow-up slice.
 - `docs/workflow-invariants.md` records daemon workflow invariants that behavior-preserving refactors must keep stable.
-- `.workflow/khazad.json` carries repo defaults and verification profiles.
+- `.workflow/khazad.json` carries repo defaults, daemon-owned `worktree_setup` bootstrap commands, and verification profiles.
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
 - Treat each open slice as bounded intent plus minimum evidence, not a frozen mini-spec: learning is allowed inside the fence; moving the fence requires approval. TDD-discovered cases directly implied by the slice goal or acceptance may be handled inline and reported; discoveries that alter intent or exceed declared `areas` require `ask-user` or a follow-up slice.
 - When authoring slices, include expected test/helper/doc paths in `areas`; narrow `areas` are intentional hard stops, not semantic hints.
@@ -55,7 +55,7 @@ khazad-doom daemon status
 - Worker `acceptance_status` is an evidence claim, not approval. Workers must not approve their own evidence; daemon checks/gates and later human review attest or reject it separately.
 - Worker commits are required before merge.
 - Runs are clean-by-default: starting from a dirty source repo requires explicit `--allow-dirty`, and the daemon writes a preflight snapshot with base branch/SHA and dirty status.
-- Verification/tooling failures such as missing commands, invalid verify cwd, shell spawn failures, and non-executable commands are daemon/operator environment failures, not worker auto-fix requests.
+- Verification/tooling failures such as missing commands, invalid verify cwd, shell spawn failures, and non-executable commands are daemon/operator environment failures, not worker auto-fix requests. Operator environment gate failures block instead of spending an integration-repair worker.
 - Declared slice `areas` are path guardrails: worker changes outside those areas block the slice as scope violations; do not add semantic scope-policing machinery.
 - Multiple open slices run in dependency order; independent open slices can run in parallel, then merge serially.
 - Pi is the sole real worker harness. `--agent fake` is deterministic and only for local tests/dogfooding; do not present it as portability or a second production harness.

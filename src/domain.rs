@@ -56,6 +56,8 @@ pub struct WorkflowConfig {
     pub integration_repair: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub gate_fail_fast: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktree_setup: Vec<VerifyCommand>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_branch: String,
     #[serde(default, skip_serializing_if = "HandoffDefaults::is_empty")]
@@ -75,6 +77,7 @@ impl Default for WorkflowConfig {
             worker_termination_grace_seconds: 30,
             integration_repair: default_integration_repair_policy(),
             gate_fail_fast: true,
+            worktree_setup: Vec::new(),
             base_branch: String::new(),
             handoff: HandoffDefaults::default(),
             verify_profiles: BTreeMap::new(),

@@ -1,7 +1,7 @@
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
-    failure_kind_needs_operator,
+    WorktreeSetupRequest, failure_kind_needs_operator,
 };
 use super::{
     CancelledError, REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, check_cancelled,
@@ -1364,6 +1364,16 @@ impl Manager {
         }
 
         check_cancelled(cancel)?;
+        self.run_worktree_setup(
+            run,
+            "",
+            0,
+            &integration_worktree,
+            &config,
+            economics.clone(),
+            verification_cache.clone(),
+            cancel,
+        )?;
         let gate_phase = economics.start_phase("integration_gate:initial");
         self.mark_progress(
             &run.id,
@@ -1416,6 +1426,16 @@ impl Manager {
             repair_phase.finish();
 
             check_cancelled(cancel)?;
+            self.run_worktree_setup(
+                run,
+                "",
+                0,
+                &integration_worktree,
+                &config,
+                economics.clone(),
+                verification_cache.clone(),
+                cancel,
+            )?;
             self.mark_progress(
                 &run.id,
                 "integration_gate",
@@ -1499,9 +1519,101 @@ impl Manager {
             .record_event(&run.id, "implementation_summary", &summary)?;
 
         if gate.status != "passed" {
+            if gate_needs_operator(&gate) {
+                return Err(BlockedError::new(format!(
+                    "integration gate needs operator environment fix: {}",
+                    gate.summary
+                ))
+                .into());
+            }
             bail!("integration gate failed: {}", gate.summary);
         }
         Ok(summary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_worktree_setup(
+        &self,
+        run: &Run,
+        slice_id: &str,
+        attempt: usize,
+        worktree: &Path,
+        config: &WorkflowConfig,
+        economics: RunEconomicsRecorder,
+        verification_cache: VerificationCommandCache,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if config.worktree_setup.is_empty() {
+            return Ok(());
+        }
+        self.mark_progress(
+            &run.id,
+            "worktree_setup",
+            slice_id,
+            attempt,
+            "",
+            "running worktree setup commands",
+        );
+        let phase_name = if slice_id.is_empty() {
+            "worktree_setup:integration".to_string()
+        } else if attempt == 0 {
+            format!("worktree_setup:{slice_id}:initial")
+        } else {
+            format!("worktree_setup:{slice_id}:attempt-{attempt}")
+        };
+        let setup_phase = economics.start_phase(phase_name);
+        let setup = WorkflowGate::with_economics(
+            self.progress_reporter(&run.id),
+            economics,
+            verification_cache,
+        )
+        .run_worktree_setup(
+            WorktreeSetupRequest {
+                worktree,
+                slice_id,
+                attempt,
+                config,
+            },
+            cancel,
+        )?;
+        setup_phase.finish();
+        if setup.status == "passed" {
+            self.state.record_event(
+                &run.id,
+                "worktree_setup_completed",
+                &json!({
+                    "slice_id": slice_id,
+                    "attempt": attempt,
+                    "worktree": worktree.to_string_lossy(),
+                    "summary": setup.summary,
+                }),
+            )?;
+            return Ok(());
+        }
+
+        let store = artifact::Store::new(&run.repo_path);
+        store.ensure_run_dirs(&run.id)?;
+        let artifact_name = if slice_id.is_empty() {
+            "integration.worktree-setup.json".to_string()
+        } else if attempt == 0 {
+            format!("{slice_id}.worktree-setup.initial.json")
+        } else {
+            format!("{slice_id}.worktree-setup.attempt-{attempt}.json")
+        };
+        artifact::write_json(store.output_path(&run.id, &artifact_name), &setup)?;
+        let blocked_summary = worktree_setup_blocked_summary(slice_id, attempt, &setup);
+        self.state.record_event(
+            &run.id,
+            "worktree_setup_failed",
+            &json!({
+                "slice_id": slice_id,
+                "attempt": attempt,
+                "worktree": worktree.to_string_lossy(),
+                "artifact": artifact_name,
+                "setup": &setup,
+            }),
+        )?;
+        Err(BlockedError::new(blocked_summary).into())
     }
 
     fn run_worker_layer(
@@ -1806,6 +1918,27 @@ impl Manager {
             "",
             "slice worker started",
         );
+        if let Err(err) = self.run_worktree_setup(
+            run,
+            &slice.id,
+            0,
+            &worker_worktree,
+            config,
+            economics.clone(),
+            verification_cache.clone(),
+            cancel,
+        ) {
+            self.state.upsert_slice_run(&SliceRun {
+                run_id: run.id.clone(),
+                slice_id: slice.id.clone(),
+                status: SliceStatus::Blocked,
+                branch: worker_branch.clone(),
+                commit_sha: gitutil::head_sha(&worker_worktree).unwrap_or_default(),
+                attempts: 0,
+                last_error: err.to_string(),
+            })?;
+            return Err(err);
+        }
 
         let mut all_checks = Vec::new();
         let mut last_failure = String::new();
@@ -1964,6 +2097,27 @@ impl Manager {
                 continue;
             }
             artifact::write_json(&output_path, &worker_result)?;
+            if let Err(err) = self.run_worktree_setup(
+                run,
+                &slice.id,
+                attempt,
+                &worker_worktree,
+                config,
+                economics.clone(),
+                verification_cache.clone(),
+                cancel,
+            ) {
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: slice.id.clone(),
+                    status: SliceStatus::Blocked,
+                    branch: worker_branch.clone(),
+                    commit_sha: gitutil::head_sha(&worker_worktree).unwrap_or_default(),
+                    attempts: attempt,
+                    last_error: err.to_string(),
+                })?;
+                return Err(err);
+            }
 
             let check = self.lightweight_check(
                 LightweightCheckContext {
@@ -2040,13 +2194,13 @@ impl Manager {
                 self.state.upsert_slice_run(&SliceRun {
                     run_id: run.id.clone(),
                     slice_id: slice.id.clone(),
-                    status: SliceStatus::Failed,
+                    status: SliceStatus::Blocked,
                     branch: worker_branch.clone(),
                     commit_sha: check.worker_head.clone(),
                     attempts: attempt,
                     last_error: message.clone(),
                 })?;
-                bail!(message);
+                return Err(BlockedError::new(message).into());
             }
             if worker_result.status == "blocked" {
                 self.state.update_slice_status(
@@ -2572,6 +2726,32 @@ fn check_failure_needs_operator(check: &CheckResult) -> bool {
             .any(|finding| finding.action == "operator-fix")
 }
 
+fn gate_needs_operator(gate: &GateResult) -> bool {
+    gate.commands
+        .iter()
+        .any(|command| failure_kind_needs_operator(&command.failure_kind))
+        || gate
+            .findings
+            .iter()
+            .any(|finding| finding.action == "operator-fix")
+}
+
+fn worktree_setup_blocked_summary(slice_id: &str, attempt: usize, setup: &GateResult) -> String {
+    let target = if slice_id.is_empty() {
+        "integration worktree".to_string()
+    } else if attempt == 0 {
+        format!("worker worktree for {slice_id}")
+    } else {
+        format!("worker worktree for {slice_id} attempt {attempt}")
+    };
+    let finding = setup
+        .findings
+        .first()
+        .map(|finding| finding.description.as_str())
+        .unwrap_or(setup.summary.as_str());
+    format!("{target} setup blocked: {finding}")
+}
+
 fn latest_cancel_reason(events: &[crate::domain::Event]) -> String {
     events
         .iter()
@@ -2786,6 +2966,9 @@ impl RepairPolicy {
 }
 
 fn should_run_integration_repair(policy: RepairPolicy, gate: &GateResult) -> bool {
+    if gate.status != "passed" && gate_needs_operator(gate) {
+        return false;
+    }
     match policy {
         RepairPolicy::Auto => gate.status != "passed",
         RepairPolicy::Never => false,
@@ -2810,6 +2993,11 @@ fn skipped_repair_result(policy: RepairPolicy, gate: &GateResult) -> RepairResul
                 policy.as_str()
             ),
         )
+    } else if gate_needs_operator(gate) {
+        (
+            "operator_fix_gate_failed",
+            "integration gate needs an operator environment fix; repair skipped".to_string(),
+        )
     } else {
         (
             "policy_never_gate_failed",
@@ -2827,8 +3015,16 @@ fn skipped_repair_result(policy: RepairPolicy, gate: &GateResult) -> RepairResul
 
 fn final_exit_states(gate: &GateResult, completed_slices: &[WorkerResult]) -> WorkflowExitStates {
     let gate_passed = gate.status == "passed";
+    let gate_blocked = !gate_passed && gate_needs_operator(gate);
     WorkflowExitStates {
-        run: if gate_passed { "completed" } else { "failed" }.to_string(),
+        run: if gate_passed {
+            "completed"
+        } else if gate_blocked {
+            "blocked"
+        } else {
+            "failed"
+        }
+        .to_string(),
         handoff: if gate_passed {
             "ready_for_handoff"
         } else {
@@ -2837,6 +3033,8 @@ fn final_exit_states(gate: &GateResult, completed_slices: &[WorkerResult]) -> Wo
         .to_string(),
         evidence: if gate_passed {
             "daemon_attested"
+        } else if gate_blocked {
+            "daemon_blocked"
         } else {
             "daemon_rejected"
         }
@@ -2854,6 +3052,7 @@ fn final_exit_states(gate: &GateResult, completed_slices: &[WorkerResult]) -> Wo
 
 fn final_evidence_attestation(gate: &GateResult) -> EvidenceAttestation {
     let gate_passed = gate.status == "passed";
+    let gate_blocked = !gate_passed && gate_needs_operator(gate);
     let mut basis = vec![
         "worker acceptance_status is treated as an evidence claim, not approval".to_string(),
         "daemon required a committed clean worktree before merge".to_string(),
@@ -2861,6 +3060,11 @@ fn final_evidence_attestation(gate: &GateResult) -> EvidenceAttestation {
     ];
     if gate_passed {
         basis.push("daemon integration gate passed before handoff".to_string());
+    } else if gate_blocked {
+        basis.push(format!(
+            "daemon integration gate is blocked on an operator environment fix: {}",
+            gate.summary
+        ));
     } else {
         basis.push(format!(
             "daemon integration gate did not attest handoff: {}",
@@ -2870,6 +3074,8 @@ fn final_evidence_attestation(gate: &GateResult) -> EvidenceAttestation {
     EvidenceAttestation {
         status: if gate_passed {
             "daemon_attested"
+        } else if gate_blocked {
+            "daemon_blocked"
         } else {
             "daemon_rejected"
         }
@@ -3805,31 +4011,164 @@ mod tests {
             allow_dirty: false,
         })?;
 
-        let failed = wait_for_run(&state, &run.id)?;
-        assert_eq!(failed.status, RunStatus::Failed);
-        assert!(failed.error.contains("daemon/operator environment"));
+        let blocked = wait_for_run(&state, &run.id)?;
+        assert_eq!(blocked.status, RunStatus::Blocked);
+        assert!(blocked.error.contains("daemon/operator environment"));
         assert!(
-            failed
+            blocked
                 .error
                 .contains("definitely_missing_khazad_tool_for_retry_regression")
         );
-        assert!(!failed.error.contains("nothing to commit"));
+        assert!(!blocked.error.contains("nothing to commit"));
         let slice_runs = state.get_slice_runs(&run.id)?;
         assert_eq!(slice_runs[0].attempts, 1);
-        assert_eq!(slice_runs[0].status, SliceStatus::Failed);
+        assert_eq!(slice_runs[0].status, SliceStatus::Blocked);
         let check: CheckResult =
             artifact::read_json(store.output_path(&run.id, "slice-001.check.attempt-1.json"))?;
         assert_eq!(check.failure_kind, "tool_missing");
         assert_eq!(check.findings[0].action, "operator-fix");
         let run_summary: serde_json::Value =
             artifact::read_json(store.output_path(&run.id, "run-summary.json"))?;
-        assert_eq!(run_summary["status"], "failed");
+        assert_eq!(run_summary["status"], "blocked");
         assert!(
             run_summary["primary_failure"]
                 .as_str()
                 .unwrap()
                 .contains("daemon/operator environment")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worktree_setup_runs_in_worker_and_integration_worktrees() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        fs::write(
+            repo.path().join(".gitignore"),
+            format!(
+                "{}\nnode_modules/\n",
+                fs::read_to_string(repo.path().join(".gitignore"))?
+            ),
+        )?;
+        let config = WorkflowConfig {
+            worktree_setup: vec![VerifyCommand {
+                command: "mkdir -p node_modules/.bin && printf '#!/bin/sh\\nexit 0\\n' > node_modules/.bin/local-tool && chmod +x node_modules/.bin/local-tool".to_string(),
+                timeout_seconds: 30,
+                ..VerifyCommand::default()
+            }],
+            ..WorkflowConfig::default()
+        };
+        artifact::write_json(store.config_path(), &config)?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["./node_modules/.bin/local-tool && test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add setup slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.integration_gate.status, "passed");
+        let setup_commands: Vec<_> = summary
+            .economics
+            .command_executions
+            .iter()
+            .filter(|command| command.phase == "worktree_setup")
+            .collect();
+        assert_eq!(setup_commands.len(), 3);
+        assert!(setup_commands.iter().all(|command| !command.cache_hit));
+        Ok(())
+    }
+
+    #[test]
+    fn integration_gate_operator_environment_failure_blocks_without_repair() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        fs::write(
+            repo.path().join(".gitignore"),
+            format!(
+                "{}\nnode_modules/\n",
+                fs::read_to_string(repo.path().join(".gitignore"))?
+            ),
+        )?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["./node_modules/.bin/local-tool && test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(
+            repo.path(),
+            &["commit", "-m", "add missing integration tool slice"],
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager =
+            Manager::with_runner(paths, state.clone(), Arc::new(DependencyInstallingRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let blocked = wait_for_run(&state, &run.id)?;
+        assert_eq!(blocked.status, RunStatus::Blocked);
+        assert!(blocked.error.contains("operator environment fix"));
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.integration_gate.status, "failed");
+        assert_eq!(
+            summary.integration_gate.commands[0].failure_kind,
+            "tool_missing"
+        );
+        assert_eq!(summary.integration_gate.findings[0].action, "operator-fix");
+        assert_eq!(summary.integration_repair.status, "skipped");
+        assert_eq!(
+            summary.integration_repair.trigger,
+            "operator_fix_gate_failed"
+        );
+        assert_eq!(summary.economics.agent_call_count, 1);
+        assert!(
+            summary
+                .economics
+                .agent_calls
+                .iter()
+                .all(|call| call.phase != "integration_repair")
+        );
+        assert_eq!(summary.exit_states.run, "blocked");
+        assert_eq!(summary.exit_states.evidence, "daemon_blocked");
+        assert_eq!(summary.evidence_attestation.status, "daemon_blocked");
         Ok(())
     }
 
@@ -4193,6 +4532,7 @@ mod tests {
                 worker_termination_grace_seconds: 30,
                 integration_repair: "auto".to_string(),
                 gate_fail_fast: true,
+                worktree_setup: Vec::new(),
                 base_branch: String::new(),
                 handoff: Default::default(),
                 verify_profiles: profiles,
@@ -4404,6 +4744,61 @@ mod tests {
 
         fn name(&self) -> &str {
             "fake"
+        }
+    }
+
+    struct DependencyInstallingRunner;
+
+    impl Runner for DependencyInstallingRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            let bin_dir = job.cwd.join("node_modules/.bin");
+            fs::create_dir_all(&bin_dir)?;
+            let tool = bin_dir.join("local-tool");
+            fs::write(&tool, "#!/bin/sh\nexit 0\n")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(&tool)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&tool, permissions)?;
+            }
+            fs::write(
+                job.cwd.join(format!("{}.txt", handoff.slice.id)),
+                format!("{}\n", handoff.slice.id),
+            )?;
+            gitutil::run(&job.cwd, &["add", "."])?;
+            gitutil::run(
+                &job.cwd,
+                &["commit", "-m", &format!("implement {}", handoff.slice.id)],
+            )?;
+            let sha = gitutil::head_sha(&job.cwd)?;
+            let acceptance_status = acceptance_status_json(&handoff.slice);
+            Ok(ResultData {
+                output: Some(json!({
+                    "slice_id": handoff.slice.id,
+                    "status": "complete",
+                    "summary": "implemented with local tool side effect",
+                    "commit_sha": sha,
+                    "changed_files": [format!("{}.txt", handoff.slice.id)],
+                    "acceptance_status": acceptance_status
+                })),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "dependency-installing-fake"
         }
     }
 

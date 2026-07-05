@@ -1974,7 +1974,7 @@ fn phase_label(phase: &str) -> &'static str {
         } else {
             "Worker"
         }
-    } else if normalized.contains("gate") {
+    } else if normalized.contains("gate") || normalized.contains("setup") {
         "Shell"
     } else if normalized.contains("merge") {
         "Merge"
