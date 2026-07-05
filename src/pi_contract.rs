@@ -124,7 +124,7 @@ pub fn classify_launch_failure(
     Some(RunnerLaunchFailure {
         failure_kind: AGENT_AUTH_REQUIRED_FAILURE_KIND.to_string(),
         summary: format!(
-            "Pi is not authenticated for provider {provider}; run `{}` or update .workflow/agents.toml to a configured provider/model.",
+            "Pi is not authenticated for provider {provider}; run `{}` or update ~/.khazad-doom/agents.toml to a configured provider/model.",
             fix_commands
                 .first()
                 .cloned()

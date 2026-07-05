@@ -10,7 +10,7 @@ Khazad-Doom launches Pi directly from the worker worktree:
 pi <profile args> <operator args> --mode json --no-session
 ```
 
-The effective worker profile resolver supplies profile args from `.workflow/agents.toml` (required `implementer` profile) and appends per-run overrides from CLI/env. The built-in profile emits:
+The effective worker profile resolver supplies profile args from the operator-wide `~/.khazad-doom/agents.toml` (required `implementer` profile) and appends per-run overrides from CLI/env. Repo-local `.workflow/agents.toml` is optional compatibility/fallback metadata and is overridden by the operator-wide file. The built-in operator profile emits:
 
 ```text
 --provider <provider> --model <model> --thinking <reasoning>

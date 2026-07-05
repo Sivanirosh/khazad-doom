@@ -515,7 +515,9 @@ impl Manager {
         let profiles = if agent_probe.eq_ignore_ascii_case("fake") {
             AgentProfilesConfig::default()
         } else {
-            store.read_agent_profiles()?
+            let repo_profiles = store.read_agent_profiles()?;
+            let operator_profiles = self.read_operator_agent_profiles()?;
+            repo_profiles.with_operator_overrides(operator_profiles)
         };
         let effective = resolve_effective_worker_profile(ProfileResolveInput {
             agent: requested_agent,
@@ -525,6 +527,14 @@ impl Manager {
             profiles,
         })?;
         Ok(runner_from_spec(effective.spec))
+    }
+
+    fn read_operator_agent_profiles(&self) -> Result<AgentProfilesConfig> {
+        let path = self.paths.agent_profiles_file();
+        if !path.exists() {
+            return Ok(AgentProfilesConfig::default());
+        }
+        artifact::read_agent_profiles_file(&path)
     }
 
     pub fn init_repo(&self, repo_path: impl AsRef<Path>) -> Result<Repo> {

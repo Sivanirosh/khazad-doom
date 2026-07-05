@@ -10,7 +10,7 @@ Make deterministic environmental launch failures truthful and cheap:
 - Give `RunnerError` (`src/agent.rs:148`) a classified `kind`. First kind: `agent_auth_required`. Add it to the existing `failure_kind` taxonomy and `failure_kind_needs_operator` (`src/workflow/gate.rs:605`).
 - Classification signal is **structural + textual**: the Pi process exited without producing any agent output (`RunnerTranscript.assistant_tail` empty) AND stderr matches a narrow auth signature (e.g. `No API key found for`). Patterns live in one documented place in `src/pi_contract.rs`.
 - In the worker attempt loop (`src/workflow/manager.rs:1647`): an operator-class launch error becomes `BlockedError` immediately — no attempts 2 and 3. The existing error mapping already turns `BlockedError` into slice/run `blocked` and stops later layers (`manager.rs:1468`); rely on it, do not add new abort machinery.
-- Record a `run_incident` carrying `failure_kind`, provider/model/profile from `RunnerMetadata`, and concrete fix guidance: `pi /login` and pointer to `.workflow/agents.toml`.
+- Record a `run_incident` carrying `failure_kind`, provider/model/profile from `RunnerMetadata`, and concrete fix guidance: `pi /login` and pointer to `~/.khazad-doom/agents.toml`.
 - Apply the same classification to the integration **repair** agent call path (the gate itself is shell commands and already classified).
 
 ## Out of scope

@@ -68,7 +68,8 @@ Relevant files:
 - `src/domain.rs`
 - `src/artifact.rs`
 - `.workflow/khazad.json`
-- `.workflow/agents.toml`
+- `~/.khazad-doom/agents.toml`
+- optional `.workflow/agents.toml`
 - `docs/workflow-invariants.md`
 
 ## What the user-facing interface suggests
@@ -94,11 +95,11 @@ The actual informal interface includes hidden requirements:
 - The selected agent must be known (`pi` vs `fake`).
 - The Pi binary must exist and be launchable.
 - The default implementer profile must exist.
-- The implementer profile's provider/model/reasoning/mode must match an authenticated Pi setup.
+- The operator-wide implementer profile's provider/model/reasoning/mode must match an authenticated Pi setup.
 - The Pi provider must be logged in before the run begins.
 - The operator must understand that `failed` may mean "worker never actually ran".
 - The operator must infer whether retries are useful for the failure class.
-- The operator must know which config file to edit if OpenAI is not the intended provider.
+- The operator must know that `~/.khazad-doom/agents.toml` is the cross-repo provider/model setting.
 - The operator must know whether `--agent fake` is valid for smoke testing but not implementation.
 
 This makes the `run` module shallow at the operator seam: the command is short, but its informal interface is large and mostly implicit.
@@ -152,7 +153,7 @@ Design smell: terminal status and failure kind are not separated enough. The sta
 
 ### 4. Worker profile and worker adapter are split awkwardly
 
-`.workflow/agents.toml` contains provider/model/reasoning profile information. `RunnerSpec` carries Pi binary and args. `Manager::runner_for_parts` merges them. `PiRunner::run` executes the command. The actual provider readiness requirement is not represented as a module interface.
+Operator-wide `~/.khazad-doom/agents.toml` contains provider/model/reasoning profile information applied to every repo; optional repo-local `.workflow/agents.toml` is compatibility/fallback metadata. `RunnerSpec` carries Pi binary and args. `Manager::runner_for_parts` merges them. `PiRunner::run` executes the command. The actual provider readiness requirement is not represented as a module interface.
 
 Impact:
 
@@ -236,7 +237,7 @@ Acceptance:
 3. The affected slice/run becomes `blocked`, not generic `failed`.
 4. The worker attempt loop does not consume attempts 2 and 3 for non-retryable operator-class launch failures.
 5. Unknown or ambiguous launch errors fall back to current retry behavior unchanged.
-6. A `run_incident` or terminal summary includes provider/model/profile and concrete fix guidance (`pi /login` or update `.workflow/agents.toml`).
+6. A `run_incident` or terminal summary includes provider/model/profile and concrete fix guidance (`pi /login` or update `~/.khazad-doom/agents.toml`).
 7. The same classification path is usable by integration repair agent calls, so the auth failure does not merely move to a later phase.
 8. A blocked slice in an earlier dependency layer prevents later layers from launching; in the same parallel layer, siblings may each make one doomed launch before the layer records outcomes and blocks.
 9. The fake worker path remains exempt and the deterministic fake end-to-end smoke path still completes.

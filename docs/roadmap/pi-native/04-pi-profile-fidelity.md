@@ -7,7 +7,7 @@ Reframes the audit's deferred "WorkerProfile as first-class module": the trigger
 
 One module computes the **effective worker profile** and everything downstream derives from it:
 
-- Precedence chain computed and tested in exactly one place: CLI flags (`--agent`, `--pi-bin`, `--pi-args`) > env (`KHAZAD_AGENT`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) > `.workflow/khazad.json` > `.workflow/agents.toml` profile > built-in default. Today this is split across `RunnerSpec::from_agent_and_env` (`src/agent.rs:219`), `Manager::runner_for_options`/`runner_for_parts`, and `apply_implementer_profile_to_pi_spec`.
+- Precedence chain computed and tested in exactly one place: CLI flags (`--agent`, `--pi-bin`, `--pi-args`) > env (`KHAZAD_AGENT`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) > `.workflow/khazad.json` agent choice + operator-wide `~/.khazad-doom/agents.toml` profiles > optional repo-local `.workflow/agents.toml` profiles > built-in default. Operator-wide profiles intentionally override repo-local profiles so one provider/model fix applies across repositories.
 - Pi launch args (model, provider, reasoning/thinking, mode) generated from the profile in one function.
 - `RunnerMetadata` derived from the profile, never assembled ad hoc; `run_started` events, handoffs, reports, and monitor render one shared `launch_summary` string.
 - Profile carries its own operator fix guidance (auth command, config file path) — consumed by PI-01's incident text so wording lives in one place.
@@ -22,7 +22,7 @@ One module computes the **effective worker profile** and everything downstream d
 
 ## Data model changes
 
-None to SQLite. Possible additive keys in `.workflow/agents.toml` (e.g. explicit `thinking`/`mode`) — documented, optional, defaulted.
+None to SQLite. Possible additive keys in `~/.khazad-doom/agents.toml` or optional `.workflow/agents.toml` (e.g. explicit `thinking`/`mode`) — documented, optional, defaulted.
 
 ## API changes
 
@@ -32,12 +32,12 @@ IPC `StartRunParams`/`ResumeRunParams` unchanged (existing `agent`, `pi_bin`, `p
 
 - **Success:** `status`, monitor, report, and handoff show the identical profile summary line.
 - **Invalid profile/config:** run admission fails synchronously with the offending file, key, and accepted values; no run row created (config errors are admission errors, matching existing dirty-repo behavior).
-- **Empty/absent `agents.toml`:** built-in default profile used and *said so* in the summary (no silent implicitness).
+- **Empty/absent operator `agents.toml`:** built-in default operator profile used and *said so* in the summary (no silent implicitness).
 - **Conflicting sources:** resolution is not an error — precedence applies — but `inspect` shows which source won for each field.
 
 ## Migration / backward compatibility
 
-All current invocations keep working: same env vars, same CLI flags, same files. The consolidation must be behavior-preserving for every combination in the precedence test table; the table is written first, from current observed behavior, and any *intentional* divergence is listed in the workpackage before implementation.
+Current invocations keep working: same env vars and CLI flags. Intentional divergence: repo-local `.workflow/agents.toml` no longer pins provider/model ahead of the operator-wide setting; this removes cross-repo drift where stale generated repo files point at an unauthenticated provider.
 
 ## Permissions
 
@@ -57,10 +57,10 @@ Integration:
 ### Workflow acceptance test
 
 ```text
-1. Operator sets model X in agents.toml, then overrides with KHAZAD_PI_ARGS for one run.
+1. Operator sets model X in `~/.khazad-doom/agents.toml`, then overrides with KHAZAD_PI_ARGS for one run.
 2. Run starts; status and run_started show the env-derived profile and inspect attributes
    each field to its winning source.
-3. Operator introduces a typo'd profile key in agents.toml and reruns.
+3. Operator introduces a typo'd profile key in the operator-wide agents.toml and reruns.
 4. Edge condition: malformed config → admission fails immediately with file, key, and
    accepted values; no run row, no worker attempt, no incident noise.
 5. Operator fixes the typo; rerun completes; handoff JSON profile summary matches the
@@ -79,7 +79,7 @@ Integration:
 
 ## Open questions (block `ready`)
 
-1. Current exact precedence between `khazad.json` worker settings and `agents.toml` profiles — must be captured as the behavior-preservation table before refactoring (read `runner_for_parts` + `apply_implementer_profile_to_pi_spec` and write the table).
+1. Current exact precedence between `khazad.json`, operator-wide `agents.toml`, repo-local `agents.toml`, and CLI/env overrides must be captured as the behavior-preservation table before finishing PI-03.
 2. Are reasoning/mode currently expressible in config, or only via raw `pi_args`? If only raw args, decide whether to add typed keys now (additive) or defer.
 
 ## Definition of Done
@@ -91,5 +91,5 @@ Integration:
 - [ ] Behavior-preservation table verified; intentional divergences listed.
 - [ ] Unit tests pass.
 - [ ] Workflow acceptance test passes.
-- [ ] Docs updated: precedence table in docs; `agents.toml` reference.
+- [ ] Docs updated: precedence table in docs; operator-wide and repo-local `agents.toml` reference.
 - [ ] Invariants checked: single source of profile truth; no ad-hoc `RunnerMetadata` construction remains (grep check).

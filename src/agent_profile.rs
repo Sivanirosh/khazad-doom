@@ -76,14 +76,14 @@ pub fn resolve_effective_worker_profile(
         .get(IMPLEMENTER_PROFILE)
         .ok_or_else(|| anyhow!("missing required agent profile {IMPLEMENTER_PROFILE:?}"))?;
     profile.validate_required(IMPLEMENTER_PROFILE)?;
-    source_attribution.insert("profile".to_string(), "agents_toml_or_builtin".to_string());
-    source_attribution.insert("provider".to_string(), "agents_toml_or_builtin".to_string());
-    source_attribution.insert("model".to_string(), "agents_toml_or_builtin".to_string());
+    source_attribution.insert("profile".to_string(), "resolved_agent_profile".to_string());
+    source_attribution.insert("provider".to_string(), "resolved_agent_profile".to_string());
+    source_attribution.insert("model".to_string(), "resolved_agent_profile".to_string());
     source_attribution.insert(
         "reasoning".to_string(),
-        "agents_toml_or_builtin".to_string(),
+        "resolved_agent_profile".to_string(),
     );
-    source_attribution.insert("mode".to_string(), "agents_toml_or_builtin".to_string());
+    source_attribution.insert("mode".to_string(), "resolved_agent_profile".to_string());
 
     let mut pi_args = pi_profile_args(profile);
     pi_args.extend(input.pi_args.iter().cloned());
@@ -216,5 +216,33 @@ mod tests {
                 .unwrap(),
             "request"
         );
+    }
+
+    #[test]
+    fn operator_profiles_override_stale_repo_profiles() {
+        let mut repo_profiles = AgentProfilesConfig::default();
+        repo_profiles.profiles.insert(
+            IMPLEMENTER_PROFILE.to_string(),
+            AgentProfile {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning: "xhigh".to_string(),
+                mode: "fast".to_string(),
+                required: true,
+                read_only: false,
+                ..AgentProfile::default()
+            },
+        );
+        let profiles = repo_profiles.with_operator_overrides(AgentProfilesConfig::default());
+
+        let effective = resolve_effective_worker_profile(ProfileResolveInput {
+            profiles,
+            config: WorkflowConfig::default(),
+            ..ProfileResolveInput::default()
+        })
+        .unwrap();
+
+        assert_eq!(effective.spec.pi_args[0..2], ["--provider", "openai-codex"]);
+        assert!(effective.launch_summary.contains("provider=openai-codex"));
     }
 }

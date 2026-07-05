@@ -35,7 +35,6 @@ impl Store {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
         self.ensure_default_config()?;
-        self.ensure_default_agent_profiles()?;
         self.write_slice_schema()?;
         ensure_gitignore(&self.repo_path)
     }
@@ -232,17 +231,7 @@ impl Store {
         if !path.exists() {
             return Ok(AgentProfilesConfig::default());
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        parse_agent_profiles_toml(&text).with_context(|| format!("parse {}", path.display()))
-    }
-
-    pub fn ensure_default_agent_profiles(&self) -> Result<()> {
-        let path = self.agent_profiles_path();
-        if !path.exists() {
-            fs::write(&path, default_agent_profiles_toml())
-                .with_context(|| format!("write {}", path.display()))?;
-        }
-        Ok(())
+        read_agent_profiles_file(&path)
     }
 
     pub fn write_slice_schema(&self) -> Result<PathBuf> {
@@ -616,7 +605,7 @@ pub fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<()>
     Ok(())
 }
 
-fn default_agent_profiles_toml() -> &'static str {
+pub fn default_agent_profiles_toml() -> &'static str {
     r#"# Khazad-Doom agent launch profiles.
 # Code-writing workers must use the implementer profile. The Pi adapter
 # enforces provider/model/reasoning before launching real workers; fake is
@@ -643,6 +632,11 @@ reasoning = "high"
 mode = "fast"
 read_only = true
 "#
+}
+
+pub(crate) fn read_agent_profiles_file(path: &Path) -> Result<AgentProfilesConfig> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    parse_agent_profiles_toml(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 fn parse_agent_profiles_toml(text: &str) -> Result<AgentProfilesConfig> {
@@ -971,6 +965,7 @@ mod tests {
 
         let config = store.read_config().unwrap();
         assert_eq!(config.parallelism, 3);
+        assert!(!store.agent_profiles_path().exists());
         let profiles = store.read_agent_profiles().unwrap();
         let implementer = profiles.profiles.get("implementer").unwrap();
         assert_eq!(implementer.provider, "openai-codex");
