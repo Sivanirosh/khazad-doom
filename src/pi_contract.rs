@@ -22,18 +22,24 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
     "tool_execution_end",
     "turn_end",
     "agent_end",
+    "queue_update",
+    "compaction_start",
+    "compaction_end",
+    "session_info_changed",
+    "thinking_level_changed",
+    "auto_retry_start",
+    "auto_retry_end",
 ];
 const KNOWN_ASSISTANT_EVENT_TYPES: &[&str] = &[
+    "text_start",
+    "text_delta",
+    "text_end",
     "thinking_start",
     "thinking_delta",
     "thinking_end",
     "toolcall_start",
     "toolcall_delta",
     "toolcall_end",
-    "text_start",
-    "text_delta",
-    "text_end",
-    "text_complete",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,12 +311,20 @@ impl PiParser {
                     self.stream_text.entry(idx).or_default().push_str(delta);
                 }
             }
+            Some("text_end") => {
+                if let Some(text) = event.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    self.complete_text.insert(idx, text.to_string());
+                }
+            }
             Some("text_complete") => {
                 if let Some(text) = event.get("text").and_then(Value::as_str)
                     && !text.is_empty()
                 {
                     self.complete_text.insert(idx, text.to_string());
                 }
+                self.warn_unknown_event("text_complete");
             }
             Some(event_type) if !KNOWN_ASSISTANT_EVENT_TYPES.contains(&event_type) => {
                 self.warn_unknown_event(event_type);
@@ -352,15 +366,15 @@ fn tail_string(text: &str, max_bytes: usize) -> String {
 
 fn usage_from_value(value: &Value) -> Usage {
     Usage {
-        input_tokens: value
-            .get("inputTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize,
-        output_tokens: value
-            .get("outputTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize,
+        input_tokens: usage_count(value, &["input", "inputTokens", "input_tokens"]),
+        output_tokens: usage_count(value, &["output", "outputTokens", "output_tokens"]),
     }
+}
+
+fn usage_count(value: &Value, keys: &[&str]) -> usize {
+    keys.iter()
+        .find_map(|key| value.get(key).and_then(Value::as_u64))
+        .unwrap_or(0) as usize
 }
 
 #[cfg(test)]
@@ -388,9 +402,16 @@ mod tests {
 {"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":2,"delta":"{\"status\":"}}
 {"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"\"ok\"}"}}
 {"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"{\"status\":\"ok\"}"}}
-{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"{\"status\":\"ok\"}"}],"usage":{"inputTokens":3,"outputTokens":5}}}
-{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"status\":\"ok\"}"}],"usage":{"inputTokens":3,"outputTokens":5}}}
-{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"text","text":"{\"status\":\"ok\"}"}],"usage":{"inputTokens":3,"outputTokens":5}}]}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"{\"status\":\"ok\"}"}],"usage":{"input":3,"output":5}}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"status\":\"ok\"}"}],"usage":{"input":3,"output":5}}}
+{"type":"queue_update","steering":[],"followUp":[]}
+{"type":"compaction_start","reason":"threshold"}
+{"type":"compaction_end","reason":"threshold","aborted":true,"willRetry":false}
+{"type":"session_info_changed","name":"smoke"}
+{"type":"thinking_level_changed","level":"minimal"}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"temporary"}
+{"type":"auto_retry_end","success":true,"attempt":1}
+{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"text","text":"{\"status\":\"ok\"}"}],"usage":{"input":3,"output":5}}]}
 "#;
         let mut parser = PiParser::default();
         parser.parse(Cursor::new(stdout), None, None).unwrap();
@@ -404,7 +425,7 @@ mod tests {
     fn unknown_future_events_warn_once_and_do_not_block_text() {
         let stdout = r#"{"type":"future_event","contract_version":2,"payload":1}
 {"type":"another_future_event","contract_version":2,"payload":2}
-{"type":"message_update","assistantMessageEvent":{"type":"text_complete","contentIndex":0,"text":"done"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"done"}}
 "#;
         let mut parser = PiParser::default();
         parser.parse(Cursor::new(stdout), None, None).unwrap();

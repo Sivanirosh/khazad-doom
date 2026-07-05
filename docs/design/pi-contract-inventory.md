@@ -20,7 +20,15 @@ The effective worker profile resolver supplies profile args from `.workflow/agen
 
 ## Stdout event vocabulary
 
-`src/pi_contract.rs` is the only module that interprets Pi stdout JSON. Current known event types observed from Pi 0.80.3:
+`src/pi_contract.rs` is the only module that interprets Pi stdout JSON. Source-backed contract facts for local Pi 0.80.3:
+
+- `dist/modes/print-mode.js.map` (`src/modes/print-mode.ts`) shows `--mode json` writes one `session` header, then writes every `session.subscribe(...)` event as JSONL.
+- `dist/core/agent-session.js.map` (`src/core/agent-session.ts`) defines the session event union and session-owned event additions.
+- `@earendil-works/pi-agent-core/dist/types.d.ts` defines the core `AgentEvent` union.
+- `@earendil-works/pi-agent-core/dist/agent-loop.js.map` (`src/agent-loop.ts`) shows only partial assistant stream events are forwarded as `assistantMessageEvent` inside `message_update`.
+- `@earendil-works/pi-ai/dist/types.d.ts` defines the assistant stream event and usage shapes.
+
+Known top-level JSON event types:
 
 - `session`
 - `agent_start`
@@ -33,19 +41,27 @@ The effective worker profile resolver supplies profile args from `.workflow/agen
 - `tool_execution_end`
 - `turn_end`
 - `agent_end`
+- `queue_update`
+- `compaction_start`
+- `compaction_end`
+- `session_info_changed`
+- `thinking_level_changed`
+- `auto_retry_start`
+- `auto_retry_end`
 
-Known assistant payload shapes:
+Known `assistantMessageEvent.type` payloads forwarded by Pi's agent loop:
 
+- `text_start`
+- `text_delta`
+- `text_end`
 - `thinking_start`
 - `thinking_delta`
 - `thinking_end`
 - `toolcall_start`
 - `toolcall_delta`
 - `toolcall_end`
-- `text_start`
-- `text_delta`
-- `text_end`
-- `text_complete`
+
+Provider stream internals `start`, `done`, and `error` are consumed by Pi's agent loop and are not forwarded as `assistantMessageEvent` values. `text_complete` is not source-defined in local Pi 0.80.3; Khazad-Doom treats it as an unknown legacy/compatibility text-completion alias if encountered.
 
 Unknown event types and extra fields are tolerated. A missing version marker is tolerated. A future contract version produces at most one warning per worker parse, then the run continues.
 
@@ -55,7 +71,7 @@ The contract parser assembles:
 
 - assistant text for worker JSON extraction,
 - bounded stdout/stderr/assistant transcript tails for failure classification,
-- token/cost usage from recognized usage payloads,
+- token usage from Pi's source-defined `usage.input` / `usage.output` payloads, with legacy aliases tolerated,
 - bounded contract warnings for daemon incidents.
 
 Malformed final worker JSON remains a worker-output error; the parser does not make daemon workflow decisions beyond producing typed parse data.
