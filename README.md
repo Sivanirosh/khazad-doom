@@ -156,7 +156,9 @@ khazad-doom monitor --repo . --latest
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so whatever started the run can display those commands directly instead of guessing how to launch user-visible progress.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch` and the terminal `monitor` paint that projection instead of independently interpreting run events. The shared vocabulary includes `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. The shared vocabulary includes `Todos`, `Run`, current `Worker`/`Shell`/`Merge`/`Repair`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
+
+Inside Pi, `/khazad-attach <run-id>` explicitly attaches a compact read-only widget to one daemon run feed. `/khazad-detach` clears it. The adapter does not auto-discover runs, own workflow state, or replace `status`/`watch`/`monitor`; it polls daemon `status`, renders `RunDetails.feed`, and cleans up on Pi session shutdown/reload.
 
 During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
 
@@ -201,7 +203,7 @@ The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, 
 
 ### The Pi package: skill and worker tool
 
-This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and the worker escalation tool at `extensions/khazad-worker`; it does not ship a Pi monitor UI extension. Core observability stays in the daemon-owned `status`, `watch`, and `monitor` commands.
+This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and `extensions/khazad-worker`, which provides the worker escalation tool plus explicit `/khazad-attach` and `/khazad-detach` feed-widget commands. It does not ship the old Pi monitor overlay; core observability stays in the daemon-owned `status`, `watch`, and `monitor` commands.
 
 Enable it intentionally from a trusted checkout or package source; Khazad-Doom never writes Pi user settings automatically:
 

@@ -9,7 +9,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 - **D3 — Escalation over termination.** A worker that hits a `must_ask_if` condition should call the shipped `ask_operator` Pi tool, pause in `awaiting_operator`, and continue after an answer. If the tool is unavailable or times out, the worker falls back to the existing `ask-user` blocked output.
 - **D4 — Versioned coupling only.** Khazad-Doom couples to Pi's documented, versioned surfaces such as CLI flags, JSON event streams, and exit codes; it must not depend on Pi internals. `src/pi_contract.rs` is the only module that may parse Pi stdout/stderr or recognize Pi event/error strings; the current contract inventory is `docs/design/pi-contract-inventory.md`. A Pi behavior change may degrade observability, but daemon-owned state remains authoritative for correctness. Unknown fields/events from Pi are tolerated and surfaced as bounded warnings.
 - **D5 — Single verification owner.** The daemon owns verification, gates, economics, and attestation. Workers produce evidence claims; daemon checks/gates or human review attest them.
-- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; those surfaces show the same daemon-side feed projection and answer commands. No Pi monitor UI extension ships in this package.
+- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; those surfaces show the same daemon-side feed projection and answer commands. Any Pi feedback adapter is an explicit, read-only painter over that daemon feed and must not replace core monitoring.
 
 Standing rejections:
 
@@ -79,11 +79,11 @@ Standing rejections:
 
 - The daemon/state store is the source of truth for run status, slice states, events, and live progress snapshots.
 - `status`, `watch`, and `monitor` render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
-- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths prefer `RunDetails.feed` when present.
+- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths and Pi `/khazad-attach` adapter prefer `RunDetails.feed` when present.
 - `monitor --latest` must not make terminal runs disappear. When no active run exists, it keeps the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
-- If a future Pi monitoring adapter is reintroduced, it must be read-only over the daemon projection, must clean up all session-bound resources on Pi session replacement/reload, and must never become required for core monitoring.
+- The Pi feedback adapter is explicit attach only, read-only over the daemon projection, cleans up all session-bound resources on Pi session replacement/reload, and is never required for core monitoring.
 
 ## Artifacts, handoffs, and remotes
 

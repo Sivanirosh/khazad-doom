@@ -93,8 +93,8 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 - Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable and an allowed exception above applies.
 - Khazad-Doom does not auto-open external windows by default; core observability is the daemon-owned CLI surface.
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
-- `khazad-doom monitor` and `watch` paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording.
-- Do not require a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks.
+- `khazad-doom monitor`, `watch`, and the optional Pi `/khazad-attach <run-id>` widget paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording.
+- Do not require a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks. If the operator wants in-Pi feedback, suggest explicit `/khazad-attach <run-id>` and `/khazad-detach`.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 - Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
 - Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.

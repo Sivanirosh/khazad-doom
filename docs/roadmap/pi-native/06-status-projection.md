@@ -5,7 +5,7 @@ Depends on: PI-00. Independent of PI-01..PI-03. Should land before PI-04 reaches
 
 ## Problem being removed
 
-Human-facing CLI paths can drift if status, watch, and monitor each interpret run details independently. Every new event kind, incident type, or phase should be interpreted once, daemon-side, and then painted by terminal surfaces. The activity-feed vocabulary was already aligned by hand once; this slice makes that alignment structural and leaves room for future read-only adapters without shipping a Pi monitor UI extension now.
+Human-facing CLI paths can drift if status, watch, and monitor each interpret run details independently. Every new event kind, incident type, or phase should be interpreted once, daemon-side, and then painted by terminal surfaces. The activity-feed vocabulary was already aligned by hand once; this slice makes that alignment structural and supports read-only adapters without reviving the old Pi monitor overlay.
 
 ## Scope
 
@@ -28,7 +28,7 @@ Human-facing CLI paths can drift if status, watch, and monitor each interpret ru
 
 ## Out of scope
 
-- New UX features or a Pi monitor UI extension.
+- Rich Pi monitor overlay, auto-discovery, multi-run UI, or adapter-owned workflow state.
 - Vocabulary changes or new blocks (additive later, through the projection module only).
 - Streaming/push transport (deferred at matrix level).
 - Projection for offline artifact `inspect` paths (deferred; live `status` only).

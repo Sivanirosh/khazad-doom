@@ -13,7 +13,7 @@ Every implementation task for this migration must reference a Slice ID from this
 - **D3 — Escalation over termination.** A worker hitting a `must_ask_if` condition escalates to the operator mid-run and continues after an answer, instead of dying `blocked`.
 - **D4 — Versioned coupling only.** Khazad couples to Pi's documented, versioned surfaces (CLI flags, JSON event stream, exit codes). Never to stderr wording, internals, or unversioned behavior. Unknown fields/events are tolerated.
 - **D5 — Single verification owner.** The daemon owns verification, gates, economics, and attestation. No duplicate Pi-side acceptance gates, no silent model failover.
-- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; daemon state remains the single source of truth and the CLI stays the harness-neutral surface. No Pi monitor UI extension ships in this package.
+- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; daemon state remains the single source of truth and the CLI stays the harness-neutral surface. Any Pi feedback adapter is explicit attach and read-only over the daemon feed.
 
 ## Status state machine
 
@@ -45,7 +45,7 @@ PI-05 (status projection) — after PI-00; independent of PI-01..03; land before
 PI-04 (escalation)        — after PI-01 (blocked semantics) and PI-02 (contract module); largest slice
 ```
 
-PI-01 and PI-00 can land in either order or together. PI-04 must not start until its open questions are resolved and its status is `ready`. An escalation channel must always render pending questions in daemon-owned `status`, `watch`, and `monitor` output; a Pi ambient surface is not part of the current package.
+PI-01 and PI-00 can land in either order or together. PI-04 must not start until its open questions are resolved and its status is `ready`. An escalation channel must always render pending questions in daemon-owned `status`, `watch`, and `monitor` output; the Pi widget is optional read-only feedback, not the required escalation surface.
 
 ## Cross-slice workflow acceptance test
 
@@ -80,5 +80,5 @@ Proves the slices connect into one coherent operator path. Run after PI-04 lands
 | `fallbackModels` silent failover for workers | Rejected | Handoff attestation must not lie about the model that did the work | Provider-outage incidents recur AND attestation records the actual model per attempt |
 | Consuming pi-subagents for delegation | Deferred | Khazad drives `pi -p` directly; pi-subagents is session-scoped orchestration | Khazad needs nested fan-out inside a worker |
 | Auto-login / credential mutation | Rejected | Out of trust boundary; operator action by design | Never |
-| Pi monitor UI and ambient widget | Removed | The optional UI adapter duplicated core daemon monitoring, introduced Pi session-lifecycle crash risk, and is not required for worker execution or operator escalation. Core monitoring remains `status`/`watch`/`monitor`. | Revisit only with concrete demand and a lifecycle-safe Pi UI API contract |
+| Rich Pi monitor overlay and auto-discovery | Removed | The old optional UI overlay duplicated core daemon monitoring, introduced Pi session-lifecycle crash risk, and is not required for worker execution or operator escalation. Core monitoring remains `status`/`watch`/`monitor`; the package may expose an explicit read-only feed widget. | Revisit richer UI only with concrete demand and a lifecycle-safe Pi UI API contract |
 | Push/streaming status transport | Deferred | Polling over the existing socket/CLI is sufficient at current scale; streaming adds daemon lifecycle complexity | Polling interval becomes a measured UX or load problem |
