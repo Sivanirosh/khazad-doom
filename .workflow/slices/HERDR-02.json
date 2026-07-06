@@ -30,6 +30,7 @@
     "The implementation would allow operator typing in worker panes to be treated as accepted slice evidence without an explicit manual-intervention marker.",
     "The implementation would make Herdr responsible for retry policy, worker authorization, cancellation truth, verification, merge, or handoff.",
     "The implementation would remove the direct Pi fallback path or make Herdr mandatory for headless runs.",
+    "The implementation would let Herdr pane/process liveness diverge from direct-run liveness, quiet-worker, or semantic-progress reporting instead of feeding the same daemon projection signals.",
     "The implementation requires changing the Pi JSON output contract or relaxing worker result validation."
   ],
   "verify_profile": "full",
