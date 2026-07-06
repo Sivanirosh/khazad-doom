@@ -1,0 +1,31 @@
+{
+  "id": "PUB-01A",
+  "title": "Fix publication final_sha to advertise close-record commit",
+  "goal": "Eliminate the evidentiary gap in PUB-01's publication seam: final_sha must point at the post-publication integration HEAD that includes close records and reports, not the pre-publication implementation merge commit.",
+  "areas": [
+    "src/workflow/manager.rs",
+    "src/artifact.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Handoff, final-report, and implementation-summary final_sha all point at the integration branch commit that includes closed slice JSON, final report artifacts, and implementation changes together.",
+    "A regression test asserts final_sha equals git rev-parse INTEGRATION_BRANCH and verifies the commit at that SHA contains status=closed with closed_by_run matching the run ID.",
+    "Branch-level handoff commands remain valid: the integration branch tip still carries implementation + close records + reports together.",
+    "Existing PUB-01 handoff, incident, resume, and close-metadata tests remain green under the full verification profile."
+  ],
+  "must_ask_if": [
+    "The implementation would change the handoff command shape or require operator replan/approval for normal successful publication.",
+    "The implementation would add new run or slice terminal statuses.",
+    "The implementation would move final_sha to a second commit or require post-publication rebase instead of fixing the ordering in one commit."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+    "cargo test untracked_slice_metadata_completes_with_incident_flag_black_box --quiet",
+    "cargo test interrupted_run_resumes_without_duplicate_merges_black_box --quiet",
+    "cargo test resume_after_completion_publication_is_idempotent --quiet"
+  ],
+  "verify_timeout_seconds": 600
+}
