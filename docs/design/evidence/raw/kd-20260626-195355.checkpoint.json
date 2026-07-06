@@ -1,0 +1,11 @@
+{
+  "run_id": "kd-20260626-195355-1aca1453",
+  "integration_branch": "khazad/kd-20260626-195355-1aca1453/integration",
+  "base_sha": "fb023bc7f6c4e602b3b9b1da01a224d723f0b0b5",
+  "current_sha": "85331e0ca0b6cb32921e8203eb79e1e1653ec224",
+  "completed_slices": [
+    "slice-041"
+  ],
+  "remaining_slices": [],
+  "updated_at": "2026-06-26T20:06:40.669027277Z"
+}

@@ -1,0 +1,121 @@
+{
+  "run_id": "kd-20260626-195355-1aca1453",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260626-195355-1aca1453/integration",
+  "base_sha": "fb023bc7f6c4e602b3b9b1da01a224d723f0b0b5",
+  "final_sha": "85331e0ca0b6cb32921e8203eb79e1e1653ec224",
+  "completed_slices": [
+    {
+      "slice_id": "slice-041",
+      "status": "complete",
+      "summary": "Hardened parallel scheduling so batches collect every worker result before returning, cancel active siblings gracefully on layer failure/cancellation, record deterministic layer outcomes, expose parallel layer state in status/monitor output, and document the invariant.",
+      "commit_sha": "ffbe784bef071587be8a1be4a009df98c42c03be",
+      "commit_message": "khazad(slice-041): harden parallel scheduler",
+      "changed_files": [
+        "README.md",
+        "docs/workflow-invariants.md",
+        "src/cli.rs",
+        "src/daemon.rs",
+        "src/domain.rs",
+        "src/state.rs",
+        "src/workflow/manager.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "RunProgress status JSON now includes progress.parallel_layer and progress.parallel_slices for active parallel worker layers.",
+        "monitor/watch output now renders a Parallel layer line when a parallel worker layer is active."
+      ],
+      "tests_run": [
+        "cargo fmt --check",
+        "cargo test --test daemon_integration parallel_layer_failure_joins_records_and_cancels_siblings_black_box -- --nocapture",
+        "cargo test",
+        "cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo ."
+      ],
+      "acceptance_status": [
+        "Parallel batches now receive worker results through a channel and join every spawned thread before returning.",
+        "Parallel layer failure records deterministic per-slice outcomes in state/events before failing or blocking the run.",
+        "Run cancellation and sibling layer failure propagate cancellation to active batch workers before the layer returns.",
+        "Status/monitor/watch expose active parallel layers via progress.parallel_layer, progress.parallel_slices, and rendered Parallel layer text.",
+        "Added daemon integration coverage for a failing worker with a still-running sibling, proving cancellation/join/outcome recording.",
+        "Integration still happens only after run_worker_layer returns all outcomes successfully; failed layers return before any merge."
+      ],
+      "assumptions": [
+        "On sibling failure, still-running parallel workers should be cancelled gracefully and recorded as cancelled; completed siblings remain ready_to_merge but are not integrated unless the whole layer succeeds."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "slice-041",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo ."
+      ],
+      "attempt": 1,
+      "worker_head": "ffbe784bef071587be8a1be4a009df98c42c03be",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "no-op",
+    "summary": "Integration repair pass found no cross-slice or verification breakage; worktree remains clean.",
+    "commit_sha": "85331e0ca0b6cb32921e8203eb79e1e1653ec224",
+    "tests_run": [
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+      "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+      "bash -n scripts/install.sh scripts/package.sh",
+      "khazad-doom slices validate --repo ."
+    ],
+    "findings": [
+      {
+        "severity": "info",
+        "action": "no-op",
+        "description": "All quick integration checks passed; no repair commit needed."
+      }
+    ]
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s"
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 26 tests\ntest artifact::tests::accepts_safe_slice_id ... ok\ntest agent::tests::parses_explicit_runner_specs ... ok\ntest agent::tests::extracts_embedded_json_object ... ok\ntest artifact::tests::rejects_path_or_ref_unsafe_slice_ids ... ok\ntest artifact::tests::dependency_layers_group_independent_slices ... ok\ntest artifact::tests::reports_missing_dependencies ... ok\ntest artifact::tests::topological_order_includes_requested_dependencies_first ... ok\ntest workflow::manager::tests::rejects_worker_result_for_wrong_slice ... ok\ntest workflow::manager::tests::rejects_unknown_worker_and_repair_statuses ... ok\ntest workflow::shell::tests::shell_command_progress_is_bounded_and_preserves_streams ... ok\ntest workflow::shell::tests::shell_command_cancellation_returns_promptly ... ok\ntest workflow::manager::tests::explicitly_requested_closed_slice_is_rejected ... ok\ntest workflow::gate::tests::integration_gate_success_uses_cwd_env_and_dedupes_commands ... ok\ntest workflow::gate::tests::integration_gate_failure_preserves_result_and_finding_text ... ok\ntest workflow::gate::tests::slice_verification_failure_preserves_check_summary_text ... ok\ntest state::tests::latest_run_for_repo_is_deterministic_and_active_scoped ... ok\ntest workflow::manager::tests::recovery_marks_stale_running_runs_interrupted ... ok\ntest workflow::gate::tests::integration_gate_cancellation_returns_promptly ... ok\ntest workflow::shell::tests::shell_command_timeout_returns_promptly ... ok\ntest workflow::gate::tests::integration_gate_timeout_returns_failed_command_result ... ok\ntest workflow::manager::tests::merge_conflicts_are_structured_blocked_artifacts ... ok\ntest workflow::manager::tests::repo_config_verify_profile_runs_with_env_and_cwd ... ok\ntest workflow::manager::tests::closed_dependency_is_satisfied_and_not_rerun ... ok\ntest workflow::manager::tests::fake_runner_parallelizes_independent_slices ... ok\ntest workflow::manager::tests::fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees ... ok\ntest workflow::manager::tests::active_repo_run_blocks_second_run ... ok\n\ntest result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.08s\n\n\nrunning 8 tests\ntest monitor_specific_run_returns_error_for_failed_terminal_status ... ok\ntest schema_import_and_handoff_v2_black_box ... ok\ntest interrupted_run_resumes_without_duplicate_merges_black_box ... ok\ntest daemon_fake_run_handoff_and_inspect_black_box ... ok\ntest monitor_exposes_quiet_pi_worker_supervision_without_default_timeout ... ok\ntest parallel_layer_failure_joins_records_and_cancels_siblings_black_box ... ok\ntest status_and_watch_expose_live_progress_for_long_verification ... ok\ntest status_latest_returns_active_run_for_repo_or_null ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.83s\n\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s\n     Running unittests src/main.rs (target/debug/deps/khazad_doom-5a3ff85b4912457c)\n     Running tests/daemon_integration.rs (target/debug/deps/daemon_integration-060352e879623867)"
+      },
+      {
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "khazad-doom slices validate --repo .",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "{\n  \"valid\": true,\n  \"slices\": [\n    {\n      \"id\": \"slice-021\",\n      \"title\": \"Dogfood slice set\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-022\",\n      \"title\": \"Repo config file\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-021\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-023\",\n      \"title\": \"Resume e2e hardening\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-022\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-024\",\n      \"title\": \"Merge conflict handling\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-023\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-025\",\n      \"title\": \"Slice JSON schema export\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-024\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-026\",\n      \"title\": \"GitHub import v2\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-025\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-027\",\n      \"title\": \"Handoff v2\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-026\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-028\",\n      \"title\": \"Repo/run locking\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-027\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-029\",\n      \"title\": \"Verification profiles\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-028\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-030\",\n      \"title\": \"Release automation\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-029\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-031\",\n      \"title\": \"Pre-release codebase audit\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src\",\n        \"tests\",\n        \"scripts\",\n        \"workflow\",\n        \"docs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-032\",\n      \"title\": \"Deepen live progress implementation\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/state.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-033\",\n      \"title\": \"Latest run lookup for monitors\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/state.rs\",\n        \"src/ipc.rs\",\n        \"src/daemon.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-034\",\n      \"title\": \"Harness-neutral terminal monitor\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-033\"\n      ],\n      \"areas\": [\n        \"src/cli.rs\",\n        \"src/ipc.rs\",\n        \"src/daemon.rs\",\n        \"src/state.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-035\",\n      \"title\": \"Document always-on monitor UX\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-034\"\n      ],\n      \"areas\": [\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"src/cli.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-036\",\n      \"title\": \"Optional Pi monitor overlay adapter\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-035\"\n      ],\n      \"areas\": [\n        \"package.json\",\n        \"extensions/khazad-monitor\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-037\",\n      \"title\": \"Worker attempt supervision\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-036\"\n      ],\n      \"areas\": [\n        \"src/agent.rs\",\n        \"src/domain.rs\",\n        \"src/state.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"extensions/khazad-monitor/index.js\"\n      ],\n      \"acceptance_count\": 8,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-038\",\n      \"title\": \"Document workflow invariants\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"docs/workflow-invariants.md\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-039\",\n      \"title\": \"Extract integration gate seam\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-038\"\n      ],\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/workflow/mod.rs\",\n        \"src/workflow/gate.rs\",\n        \"src/workflow/shell.rs\",\n        \"src/domain.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-040\",\n      \"title\": \"Slice lifecycle safety\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/domain.rs\",\n        \"src/artifact.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/cli.rs\",\n        \"README.md\",\n        \"docs/workflow-invariants.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \".workflow/slices\",\n        \".workflow/schema/slice.schema.json\"\n      ],\n      \"acceptance_count\": 7,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-041\",\n      \"title\": \"Parallel scheduler hardening\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/state.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\",\n        \"README.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 1\n    }\n  ],\n  \"issues\": []\n}"
+      }
+    ]
+  },
+  "created_at": "2026-06-26T20:09:02.927232813Z"
+}

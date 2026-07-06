@@ -1,0 +1,73 @@
+{
+  "slice_id": "slice-031",
+  "status": "complete",
+  "summary": "Completed the pre-release audit, documented scope/module-depth findings/risks/release recommendation, preserved prior low-risk dead-code suppression cleanup, and repaired the previous cargo-not-found verification failure by hardening release workflow cargo commands with $HOME/.cargo/bin.",
+  "commit_sha": "ba87b83b8e4ed1d0441fd2df0926f8ef73f2dc87",
+  "commit_message": "khazad(audit): harden cargo verification profile",
+  "changed_files": [
+    ".workflow/khazad.json",
+    "docs/release-audit.md",
+    "src/agent.rs",
+    "src/gitutil.rs"
+  ],
+  "tests_run": [
+    "jq empty .workflow/khazad.json .workflow/schema/slice.schema.json .workflow/slices/*.json",
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+    "bash -n scripts/install.sh scripts/package.sh",
+    "test -f docs/release-audit.md"
+  ],
+  "acceptance_status": [
+    "docs/release-audit.md exists and records audited scope, findings, fixes made, remaining risks, verification, and release recommendation.",
+    "Module-depth audit explicitly uses module, interface, seam, depth, leverage, and locality vocabulary.",
+    "Dirty/broken/dead/redundant/AI-slop audit completed; stale dead-code suppressions and cargo verification path issue were fixed, remaining risks documented.",
+    "No public CLI behavior, daemon IPC shape, JSON Issue Slice schema/semantics, worker result schema, repair result schema, or runner contract changed.",
+    "Final worktree is clean, committed, and full verification profile passed."
+  ],
+  "findings": [
+    {
+      "id": "cargo-path",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": ".workflow/khazad.json",
+      "line": 13,
+      "description": "Cargo-based quick/full verification commands now prepend $HOME/.cargo/bin, repairing the observed cargo-not-found verification failure in this worker shell."
+    },
+    {
+      "id": "dead-code-suppressions",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": "src/agent.rs",
+      "description": "Prior audit cleanup removed stale dead_code suppressions from used agent/gitutil items."
+    },
+    {
+      "id": "manager-locality",
+      "severity": "warning",
+      "action": "no-op",
+      "file": "docs/release-audit.md",
+      "line": 52,
+      "description": "workflow::manager remains large; documented as release-acceptable but lower-locality internal risk for a future refactor."
+    },
+    {
+      "id": "lint-allowances",
+      "severity": "warning",
+      "action": "no-op",
+      "file": "docs/release-audit.md",
+      "line": 53,
+      "description": "Remaining lint allowances are documented as intentional test seam/private orchestration helper trade-offs; reshaping them would be a broad refactor."
+    },
+    {
+      "id": "telemetry-dead-weight",
+      "severity": "warning",
+      "action": "no-op",
+      "file": "docs/release-audit.md",
+      "line": 54,
+      "description": "ResultData.text and ResultData.usage are retained but not surfaced; documented as low-severity future cleanup."
+    }
+  ],
+  "assumptions": [
+    "Audit scope stayed limited to committed repository code and release workflow assets; build outputs and transient runtime artifacts were excluded.",
+    "Cargo is available under $HOME/.cargo/bin or already on PATH; workflow commands now preserve PATH while prepending that common rustup location."
+  ]
+}
