@@ -100,6 +100,27 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
             .unwrap()
             .contains("gh pr create")
     );
+    let final_sha = handoff["final_sha"].as_str().expect("final sha");
+    let integration_branch = handoff["integration_branch"]
+        .as_str()
+        .expect("integration branch");
+    assert_eq!(
+        final_sha,
+        git(repo.path(), &["rev-parse", integration_branch])?
+    );
+    let final_report_path = PathBuf::from(
+        handoff["final_report_path"]
+            .as_str()
+            .expect("final report path"),
+    );
+    let final_report: Value = serde_json::from_str(&fs::read_to_string(final_report_path)?)?;
+    assert_eq!(final_report["final_sha"].as_str(), Some(final_sha));
+    let closed_slice_ref = format!("{final_sha}:.workflow/slices/slice-001.json");
+    let closed_slice = git(repo.path(), &["show", &closed_slice_ref])?;
+    assert!(closed_slice.contains("\"status\": \"closed\""));
+    assert!(closed_slice.contains(&format!("\"closed_by_run\": \"{}\"", run_id)));
+    let report_ref = format!("{final_sha}:.workflow/reports/{run_id}-final-report.json");
+    git(repo.path(), &["show", &report_ref])?;
 
     let inspection = kd_ok(
         &bin,
@@ -287,6 +308,26 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
         incident["kind"].as_str() == Some("slice_close_skipped")
             && incident["severity"].as_str() == Some("warning")
     }));
+    let close_event = status["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|event| {
+            event["type"].as_str() == Some("run_incident")
+                && event["payload"]["kind"].as_str() == Some("slice_close_skipped")
+        })
+        .expect("slice close skipped event");
+    assert_eq!(close_event["payload"]["slice_id"], "slice-001");
+    assert!(
+        close_event["payload"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with(".workflow/slices/slice-001.json")
+    );
+    assert_eq!(
+        close_event["payload"]["policy"],
+        "preserve_handoff_ready_missing_metadata"
+    );
     let monitor = kd_ok(
         &bin,
         home.path(),

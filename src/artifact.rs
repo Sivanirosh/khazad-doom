@@ -17,6 +17,29 @@ pub struct Store {
     repo_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SliceClosureIncident {
+    pub severity: String,
+    pub kind: String,
+    pub slice_id: String,
+    pub path: String,
+    pub message: String,
+    pub policy: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SliceClosureReport {
+    pub incidents: Vec<SliceClosureIncident>,
+}
+
+impl SliceClosureReport {
+    pub fn blocks_handoff(&self) -> bool {
+        self.incidents
+            .iter()
+            .any(|incident| incident.severity == "error")
+    }
+}
+
 impl Store {
     pub fn new(repo_path: impl AsRef<Path>) -> Self {
         Self {
@@ -202,6 +225,21 @@ impl Store {
         self.output_dir(run_id).join(name)
     }
 
+    pub fn implementation_summary_report_path(&self, run_id: &str) -> PathBuf {
+        self.reports_dir()
+            .join(format!("{run_id}-implementation-summary.json"))
+    }
+
+    pub fn final_report_artifact_path(&self, run_id: &str) -> PathBuf {
+        self.reports_dir()
+            .join(format!("{run_id}-final-report.json"))
+    }
+
+    pub fn publication_reports_exist(&self, run_id: &str) -> bool {
+        self.implementation_summary_report_path(run_id).exists()
+            && self.final_report_artifact_path(run_id).exists()
+    }
+
     pub fn slice_path(&self, slice_id: &str) -> PathBuf {
         self.slices_dir().join(format!("{slice_id}.json"))
     }
@@ -252,26 +290,54 @@ impl Store {
         slice_ids: &[String],
         run_id: &str,
         closed_at: &str,
-    ) -> Result<Vec<String>> {
-        let mut warnings = Vec::new();
+    ) -> SliceClosureReport {
+        let mut report = SliceClosureReport::default();
         for slice_id in slice_ids {
             let path = self.slice_path(slice_id);
             if !path.exists() {
-                warnings.push(format!(
-                    "slice metadata for {slice_id} was not present at {}; closure skipped",
-                    path.display()
-                ));
+                report.incidents.push(SliceClosureIncident {
+                    severity: "warning".to_string(),
+                    kind: "slice_close_skipped".to_string(),
+                    slice_id: slice_id.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    message: format!(
+                        "slice metadata for {slice_id} was not present at {}; closure skipped",
+                        path.display()
+                    ),
+                    policy: "preserve_handoff_ready_missing_metadata".to_string(),
+                });
                 continue;
             }
-            self.close_slice_file(slice_id, run_id, closed_at)?;
+            if let Err(err) = self.close_slice_file(slice_id, run_id, closed_at) {
+                report.incidents.push(SliceClosureIncident {
+                    severity: "error".to_string(),
+                    kind: "slice_close_failed".to_string(),
+                    slice_id: slice_id.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    message: format!(
+                        "failed to close slice {slice_id} at {}: {err:#}",
+                        path.display()
+                    ),
+                    policy: "block_handoff_on_close_failure".to_string(),
+                });
+            }
         }
-        Ok(warnings)
+        report
     }
 
     fn close_slice_file(&self, slice_id: &str, run_id: &str, closed_at: &str) -> Result<()> {
         let path = self.slice_path(slice_id);
         let mut slice: Slice = read_json(&path)
             .with_context(|| format!("read slice {} for closing", path.display()))?;
+        if slice.status == crate::domain::SLICE_STATUS_CLOSED {
+            if slice.closed_by_run == run_id && !slice.closed_at.trim().is_empty() {
+                return Ok(());
+            }
+            bail!(
+                "slice {slice_id} is already closed by run {:?}; refusing to overwrite close metadata for run {run_id:?}",
+                slice.closed_by_run
+            );
+        }
         slice.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
         slice.closed_by_run = run_id.to_string();
         slice.closed_at = closed_at.to_string();
@@ -292,28 +358,23 @@ impl Store {
     }
 
     pub fn write_implementation_summary(&self, summary: &ImplementationSummary) -> Result<PathBuf> {
-        let path = self
-            .reports_dir()
-            .join(format!("{}-implementation-summary.json", summary.run_id));
+        let path = self.implementation_summary_report_path(&summary.run_id);
         write_json(&path, summary)?;
-        gitutil::commit_all(
-            &self.repo_path,
-            &format!("khazad(run): summarize {}", summary.run_id),
-        )?;
         Ok(path)
     }
 
     pub fn write_final_report(&self, summary: &ImplementationSummary) -> Result<PathBuf> {
-        let path = self
-            .reports_dir()
-            .join(format!("{}-final-report.json", summary.run_id));
+        let path = self.final_report_artifact_path(&summary.run_id);
         write_json(&path, summary)
             .with_context(|| format!("write final report {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn commit_completion_publication(&self, run_id: &str) -> Result<()> {
         gitutil::commit_all(
             &self.repo_path,
-            &format!("khazad(run): final report {}", summary.run_id),
-        )?;
-        Ok(path)
+            &format!("khazad(run): publish completion {run_id}"),
+        )
     }
 
     pub fn list_run_artifacts(&self, run_id: &str) -> Result<Vec<ArtifactEntry>> {
