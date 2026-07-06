@@ -32,3 +32,11 @@ The stale daemon-generated publication commits from failed `PUB-01A` runs are no
 2. Install/restart `khazad-doom` so the daemon process uses the new publication code.
 3. Run `PUB-01B` as a validation slice.
 4. Accept the bootstrap only if the fresh run's handoff/final-report/implementation-summary `final_sha` equals the integration branch tip and that commit contains closed slice JSON plus committed `.workflow/reports/*` artifacts.
+
+## PUB-01B validation run evidence
+
+- Validation run: `kd-20260706-222759-58cf471c` on slice `PUB-01B`.
+- Worker scope: evidence-note only; no product code, publication code, daemon lifecycle code, or tests were changed by this validation slice.
+- Bootstrap baseline: `main` contains the manually bootstrapped `PUB-01A` publication fix as `51d324c55c7276cf65b7568b72a3c4e097a73c2b`, preserving the original worker implementation evidence named above.
+- Worker regression check: `cargo test final_sha_advertises_publication_commit_with_close_records --quiet` passed in the validation worktree before daemon finalization.
+- Required post-finalization review: the daemon handoff, `.workflow/reports/kd-20260706-222759-58cf471c-final-report.json`, and `.workflow/reports/kd-20260706-222759-58cf471c-implementation-summary.json` must all advertise the integration branch tip as `final_sha`; that advertised commit must contain closed `.workflow/slices/PUB-01B.json` metadata and both committed report artifacts.
