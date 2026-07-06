@@ -2,6 +2,9 @@
   "id": "PUB-01",
   "title": "Completion publisher and close-record promotion",
   "goal": "Make successful-run publication atomic from the operator's perspective so implementation commits, slice close records, final reports, and handoff SHA cannot be split across hidden integration-branch commits or stale main-branch truth.",
+  "status": "closed",
+  "closed_by_run": "kd-20260706-210609-fcb90df0",
+  "closed_at": "2026-07-06T21:17:39.521614362+00:00",
   "areas": [
     "src/workflow/manager.rs",
     "src/artifact.rs",
