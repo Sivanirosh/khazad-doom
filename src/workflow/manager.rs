@@ -1277,12 +1277,14 @@ impl Manager {
         }
         setup_phase.finish();
 
-        let mut completed_slices = Vec::new();
+        let slice_runs = self.state.get_slice_runs(&run.id)?;
+        let mut completed_slices = self.prior_completed_worker_results(run, &store, &slice_runs);
         let mut checks = Vec::new();
-        let mut dependency_summary = BTreeMap::new();
-        let mut completed_ids: BTreeSet<_> = self
-            .state
-            .get_slice_runs(&run.id)?
+        let mut dependency_summary: BTreeMap<_, _> = completed_slices
+            .iter()
+            .map(|result| (result.slice_id.clone(), result.summary.clone()))
+            .collect();
+        let mut completed_ids: BTreeSet<_> = slice_runs
             .into_iter()
             .filter(|slice_run| slice_run.status == SliceStatus::Merged)
             .map(|slice_run| slice_run.slice_id)
@@ -1464,37 +1466,37 @@ impl Manager {
             skipped_repair_result(repair_policy, &gate)
         };
         let integration_store = artifact::Store::new(&integration_worktree);
-        if gate.status == "passed" {
-            let completed_slice_ids: Vec<_> = completed_slices
-                .iter()
-                .map(|slice| slice.slice_id.clone())
-                .collect();
-            let close_warnings = integration_store.close_slices_if_present(
+        let completed_slice_ids: Vec<_> = completed_slices
+            .iter()
+            .map(|slice| slice.slice_id.clone())
+            .collect();
+        let publication_already_current = gate.status == "passed"
+            && completion_publication_is_current(&integration_store, &run.id, &completed_slice_ids);
+        if gate.status == "passed" && !publication_already_current {
+            let closure_report = integration_store.close_slices_if_present(
                 &completed_slice_ids,
                 &run.id,
                 &Utc::now().to_rfc3339(),
-            )?;
-            for warning in close_warnings {
-                self.state.record_event(
-                    &run.id,
-                    "run_incident",
-                    &json!({
-                        "severity": "warning",
-                        "kind": "slice_close_skipped",
-                        "message": warning,
-                    }),
-                )?;
+            );
+            for incident in &closure_report.incidents {
+                self.state
+                    .record_event(&run.id, "run_incident", &json!(incident))?;
+            }
+            if closure_report.blocks_handoff() {
+                return Err(BlockedError::new(
+                    "slice closure failed after integration gate; handoff is not ready".to_string(),
+                )
+                .into());
             }
         }
-        let final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         let exit_states = final_exit_states(&gate, &completed_slices);
         let evidence_attestation = final_evidence_attestation(&gate);
-        let summary = ImplementationSummary {
+        let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
             repo_path: run.repo_path.clone(),
             integration_branch: run.integration_branch.clone(),
             base_sha: run.base_sha.clone(),
-            final_sha,
+            final_sha: String::new(),
             completed_slices,
             checks,
             integration_repair: repair,
@@ -1506,10 +1508,14 @@ impl Manager {
             created_at: Utc::now(),
         };
 
-        integration_store
-            .write_implementation_summary(&summary)
-            .context("write implementation summary")?;
-        integration_store.write_final_report(&summary)?;
+        if !publication_already_current {
+            integration_store
+                .write_implementation_summary(&summary)
+                .context("write implementation summary")?;
+            integration_store.write_final_report(&summary)?;
+            integration_store.commit_completion_publication(&run.id)?;
+        }
+        summary.final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         artifact::write_json(
             store.output_path(&run.id, "implementation-summary.json"),
             &summary,
@@ -1842,6 +1848,47 @@ impl Manager {
             }));
         }
         Ok(outcomes)
+    }
+
+    fn prior_completed_worker_results(
+        &self,
+        run: &Run,
+        store: &artifact::Store,
+        slice_runs: &[SliceRun],
+    ) -> Vec<WorkerResult> {
+        let mut previous_results = artifact::read_json::<ImplementationSummary>(
+            store.output_path(&run.id, "final-report.json"),
+        )
+        .or_else(|_| {
+            artifact::read_json::<ImplementationSummary>(
+                store.output_path(&run.id, "implementation-summary.json"),
+            )
+        })
+        .map(|summary| {
+            summary
+                .completed_slices
+                .into_iter()
+                .map(|result| (result.slice_id.clone(), result))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+        slice_runs
+            .iter()
+            .filter(|slice_run| slice_run.status == SliceStatus::Merged)
+            .map(|slice_run| {
+                previous_results
+                    .remove(&slice_run.slice_id)
+                    .or_else(|| read_worker_result(store, &run.id, slice_run))
+                    .unwrap_or_else(|| WorkerResult {
+                        slice_id: slice_run.slice_id.clone(),
+                        status: "complete".to_string(),
+                        summary: "slice was merged before this resume".to_string(),
+                        commit_sha: slice_run.commit_sha.clone(),
+                        ..WorkerResult::default()
+                    })
+            })
+            .collect()
     }
 
     fn write_checkpoint(
@@ -3013,6 +3060,47 @@ fn skipped_repair_result(policy: RepairPolicy, gate: &GateResult) -> RepairResul
     }
 }
 
+fn read_worker_result(
+    store: &artifact::Store,
+    run_id: &str,
+    slice_run: &SliceRun,
+) -> Option<WorkerResult> {
+    if slice_run.attempts == 0 {
+        return None;
+    }
+    artifact::read_json(store.output_path(
+        run_id,
+        &format!(
+            "{}.worker.attempt-{}.json",
+            slice_run.slice_id, slice_run.attempts
+        ),
+    ))
+    .ok()
+}
+
+fn completion_publication_is_current(
+    store: &artifact::Store,
+    run_id: &str,
+    completed_slice_ids: &[String],
+) -> bool {
+    store.publication_reports_exist(run_id)
+        && completed_slice_ids
+            .iter()
+            .all(|slice_id| slice_closed_by_run_or_absent(store, slice_id, run_id))
+}
+
+fn slice_closed_by_run_or_absent(store: &artifact::Store, slice_id: &str, run_id: &str) -> bool {
+    let path = store.slice_path(slice_id);
+    if !path.exists() {
+        return true;
+    }
+    artifact::read_json::<Slice>(&path)
+        .map(|slice| {
+            slice.status == crate::domain::SLICE_STATUS_CLOSED && slice.closed_by_run == run_id
+        })
+        .unwrap_or(false)
+}
+
 fn final_exit_states(gate: &GateResult, completed_slices: &[WorkerResult]) -> WorkflowExitStates {
     let gate_passed = gate.status == "passed";
     let gate_blocked = !gate_passed && gate_needs_operator(gate);
@@ -3914,6 +4002,91 @@ mod tests {
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_after_completion_publication_is_idempotent() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let head_before = gitutil::run(repo.path(), &["rev-parse", &completed.integration_branch])?;
+        let slice_ref_before = format!("{head_before}:.workflow/slices/slice-001.json");
+        let closed_before = gitutil::run(repo.path(), &["show", &slice_ref_before])?;
+        assert!(closed_before.contains("\"status\": \"closed\""));
+        assert!(closed_before.contains(&format!("\"closed_by_run\": \"{}\"", run.id)));
+        let subjects_before = gitutil::run(
+            repo.path(),
+            &["log", "--format=%s", &completed.integration_branch],
+        )?;
+        assert_eq!(
+            subjects_before
+                .matches("khazad(run): publish completion")
+                .count(),
+            1
+        );
+
+        state.update_run(
+            &run.id,
+            RunStatus::Interrupted,
+            "simulated interruption after publication",
+        )?;
+        manager.resume_run(super::ResumeOptions {
+            run_id: run.id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let resumed = wait_for_run(&state, &run.id)?;
+        assert_eq!(resumed.status, RunStatus::Completed);
+        let head_after = gitutil::run(repo.path(), &["rev-parse", &resumed.integration_branch])?;
+        assert_eq!(head_after, head_before);
+        let slice_ref_after = format!("{head_after}:.workflow/slices/slice-001.json");
+        let closed_after = gitutil::run(repo.path(), &["show", &slice_ref_after])?;
+        assert_eq!(closed_after, closed_before);
+        let subjects_after = gitutil::run(
+            repo.path(),
+            &["log", "--format=%s", &resumed.integration_branch],
+        )?;
+        assert_eq!(
+            subjects_after
+                .matches("khazad(run): publish completion")
+                .count(),
+            1
+        );
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.final_sha, head_after);
+        assert_eq!(summary.completed_slices.len(), 1);
         Ok(())
     }
 
