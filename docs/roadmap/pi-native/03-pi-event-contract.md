@@ -1,6 +1,6 @@
 # PI-02 — Typed, versioned Pi event/CLI contract
 
-Matrix row: [00-matrix.md](00-matrix.md) → PI-02. Status: `planned` (blocked on discovery, see open questions).
+Matrix row: [00-matrix.md](00-matrix.md) → PI-02. Status: `in_progress` after the 2026-07-06 truth audit: source/unit evidence exists, but preflight contract recording and fixture/workflow acceptance are not proven.
 
 ## Scope
 

@@ -1,6 +1,6 @@
 # PI-05 — Render-ready status projection
 
-Matrix row: [00-matrix.md](00-matrix.md) → PI-05. Status: `planned` (minor open questions below).
+Matrix row: [00-matrix.md](00-matrix.md) → PI-05. Status: `in_progress` after the 2026-07-06 truth audit: projection code exists, but CLI duplication and missing parity/grep tests prevent done-level acceptance.
 Depends on: PI-00. Independent of PI-01..PI-03. Should land before PI-04 reaches `done`.
 
 ## Problem being removed

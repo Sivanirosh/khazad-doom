@@ -1,6 +1,7 @@
 # PI-01 — Classify non-retryable Pi launch failures
 
-Matrix row: [00-matrix.md](00-matrix.md) → PI-01. Status: `ready`.
+Matrix row: [00-matrix.md](00-matrix.md) → PI-01. Status: `in_progress` after the 2026-07-06 truth audit: source, tests, and current installed-binary smoke pass, but slice acceptance/closure has not been dogfooded.
+
 Supersedes the preflight-first proposal in the worker-run complexity audit; the audit's review addendum is the normative design.
 
 ## Scope

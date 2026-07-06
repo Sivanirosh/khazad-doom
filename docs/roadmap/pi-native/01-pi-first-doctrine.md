@@ -1,6 +1,6 @@
 # PI-00 — Pi-first doctrine
 
-Matrix row: [00-matrix.md](00-matrix.md) → PI-00. Status: `ready`.
+Matrix row: [00-matrix.md](00-matrix.md) → PI-00. Status: `in_progress` after the 2026-07-06 truth audit: doc criteria pass, but slice acceptance/closure has not been dogfooded.
 
 ## Scope
 
