@@ -1,0 +1,65 @@
+{
+  "slice_id": "slice-031",
+  "status": "complete",
+  "summary": "Completed the v0.1.0 pre-release audit, documented scope/findings/fixes/risks/recommendation in docs/release-audit.md, removed low-risk redundant dead-code suppressions, and hardened Cargo verification commands by prepending $HOME/.cargo/bin. Full verification passed and the worktree is clean.",
+  "commit_sha": "ba87b83b8e4ed1d0441fd2df0926f8ef73f2dc87",
+  "commit_message": "khazad(audit): harden cargo verification profile",
+  "changed_files": [
+    ".workflow/khazad.json",
+    "docs/release-audit.md",
+    "src/agent.rs",
+    "src/gitutil.rs"
+  ],
+  "tests_run": [
+    "jq empty .workflow/khazad.json .workflow/schema/slice.schema.json .workflow/slices/*.json",
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+    "bash -n scripts/install.sh scripts/package.sh && test -f docs/release-audit.md"
+  ],
+  "acceptance_status": [
+    "docs/release-audit.md exists and records audited scope, findings, fixes made, remaining risks, and release recommendation.",
+    "Module depth audit uses module, interface, seam, depth, leverage, and locality vocabulary.",
+    "Dirty/broken/dead/redundant/slop checks were performed; low-risk redundant allowances were removed and remaining risks documented.",
+    "No public CLI, daemon IPC, JSON Issue Slice, worker result schema, or runner contract changes were made.",
+    "Full verification profile passed; changes are committed and worktree is clean."
+  ],
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": "src/agent.rs",
+      "line": 38,
+      "description": "Removed redundant dead-code suppressions from live agent interfaces while preserving behavior."
+    },
+    {
+      "id": "F-002",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": "src/gitutil.rs",
+      "line": 79,
+      "description": "Removed redundant dead-code suppression from the worktree cleanup helper; the cleanup path uses it."
+    },
+    {
+      "id": "F-003",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": ".workflow/khazad.json",
+      "line": 13,
+      "description": "Prepended $HOME/.cargo/bin to Cargo verification commands to repair local worker shells where cargo is not on PATH."
+    },
+    {
+      "id": "F-004",
+      "severity": "warning",
+      "action": "no-op",
+      "file": "docs/release-audit.md",
+      "line": 52,
+      "description": "workflow::manager.rs remains large; deeper internal locality would require a separate architectural refactor, so it is documented as a non-blocking release risk."
+    }
+  ],
+  "assumptions": [
+    "Scope was limited to committed repository code and release workflow assets as required by the JSON slice.",
+    "Build outputs, runtime state, daemon worktrees, and transient .workflow/runs artifacts were excluded from the audit."
+  ]
+}

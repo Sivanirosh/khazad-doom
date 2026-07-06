@@ -1,6 +1,7 @@
 # PI-03 — Pi profile fidelity: one effective worker profile
 
-Matrix row: [00-matrix.md](00-matrix.md) → PI-03. Status: `planned`.
+Matrix row: [00-matrix.md](00-matrix.md) → PI-03. Status: `in_progress` after the 2026-07-06 truth audit: profile resolution tests pass, but dedicated integration proof across run/handoff/report/status surfaces is missing.
+
 Reframes the audit's deferred "WorkerProfile as first-class module": the trigger is no longer hypothetical multi-provider support but Pi profile fidelity under the PI-00 commitment.
 
 ## Scope

@@ -1,0 +1,19 @@
+{
+  "slice_id": "slice-031",
+  "status": "failed",
+  "summary": "verify command failed: cargo fmt --check\nsh: 1: cargo: not found",
+  "tests_run": [
+    "cargo fmt --check"
+  ],
+  "findings": [
+    {
+      "severity": "error",
+      "action": "auto-fix",
+      "description": "verify command failed: cargo fmt --check\nsh: 1: cargo: not found"
+    }
+  ],
+  "attempt": 3,
+  "worker_head": "ba87b83b8e4ed1d0441fd2df0926f8ef73f2dc87",
+  "worktree_clean": true,
+  "commit_found": true
+}

@@ -1,0 +1,182 @@
+{
+  "run_id": "kd-20260626-183452-51f144a0",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260626-183452-51f144a0/integration",
+  "base_sha": "2cfa8d08aa9bf0977ec280136ed17923d3ff72eb",
+  "final_sha": "f3d4099216af13f77a8277449214195a44604ebd",
+  "completed_slices": [
+    {
+      "slice_id": "slice-033",
+      "status": "complete",
+      "summary": "fake runner completed deterministic slice implementation",
+      "commit_sha": "b0d1b2b3afc49f2a07d9b25123febc8f3188f023",
+      "changed_files": [
+        "slice-033.txt",
+        ".khazad-fake/slice-033.txt"
+      ]
+    },
+    {
+      "slice_id": "slice-034",
+      "status": "complete",
+      "summary": "fake runner completed deterministic slice implementation",
+      "commit_sha": "e7d1ea6b49b4f9918e98684ae86d152b3bede44c",
+      "changed_files": [
+        "slice-034.txt",
+        ".khazad-fake/slice-034.txt"
+      ]
+    },
+    {
+      "slice_id": "slice-035",
+      "status": "complete",
+      "summary": "fake runner completed deterministic slice implementation",
+      "commit_sha": "1cec71ecb5d656c4aa93e185268d70987fbc6b20",
+      "changed_files": [
+        "slice-035.txt",
+        ".khazad-fake/slice-035.txt"
+      ]
+    },
+    {
+      "slice_id": "slice-036",
+      "status": "complete",
+      "summary": "fake runner completed deterministic slice implementation",
+      "commit_sha": "28ede2a1c9b86644b419c433505004dced432d58",
+      "changed_files": [
+        "slice-036.txt",
+        ".khazad-fake/slice-036.txt"
+      ],
+      "tests_run": [
+        "node --check extensions/khazad-monitor/index.js"
+      ]
+    },
+    {
+      "slice_id": "slice-037",
+      "status": "complete",
+      "summary": "fake runner completed deterministic slice implementation",
+      "commit_sha": "bfa4ac87a13a84413f277dbda90b73fb73a48665",
+      "changed_files": [
+        "slice-037.txt",
+        ".khazad-fake/slice-037.txt"
+      ],
+      "tests_run": [
+        "khazad-doom slices validate --repo ."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "slice-033",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test"
+      ],
+      "attempt": 1,
+      "worker_head": "b0d1b2b3afc49f2a07d9b25123febc8f3188f023",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-034",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test"
+      ],
+      "attempt": 1,
+      "worker_head": "e7d1ea6b49b4f9918e98684ae86d152b3bede44c",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-035",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test"
+      ],
+      "attempt": 1,
+      "worker_head": "1cec71ecb5d656c4aa93e185268d70987fbc6b20",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-036",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "node --check extensions/khazad-monitor/index.js"
+      ],
+      "attempt": 1,
+      "worker_head": "28ede2a1c9b86644b419c433505004dced432d58",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "slice-037",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo ."
+      ],
+      "attempt": 1,
+      "worker_head": "bfa4ac87a13a84413f277dbda90b73fb73a48665",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "no-op",
+    "summary": "fake runner: no repair needed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Compiling version_check v0.9.5\n    Checking cfg-if v1.0.4\n   Compiling zerocopy v0.8.52\n   Compiling proc-macro2 v1.0.106\n   Compiling unicode-ident v1.0.24\n   Compiling libc v0.2.186\n   Compiling quote v1.0.46\n    Checking once_cell v1.21.4\n   Compiling shlex v2.0.1\n    Checking typenum v1.20.1\n   Compiling find-msvc-tools v0.1.9\n   Compiling serde_core v1.0.228\n   Compiling pkg-config v0.3.33\n    Checking utf8parse v0.2.2\n   Compiling autocfg v1.5.1\n   Compiling vcpkg v0.2.15\n    Checking anstyle-query v1.1.5\n    Checking bitflags v2.13.0\n    Checking is_terminal_polyfill v1.70.2\n   Compiling zmij v1.0.21\n    Checking anstyle v1.0.14\n   Compiling serde v1.0.228\n    Checking colorchoice v1.0.5\n   Compiling getrandom v0.4.3\n   Compiling rustix v1.1.4\n    Checking strsim v0.11.1\n   Compiling serde_json v1.0.150\n    Checking clap_lex v1.1.0\n   Compiling heck v0.5.0\n   Compiling anyhow v1.0.103\n    Checking cpufeatures v0.2.17\n    Checking itoa v1.0.18\n    Checking smallvec v1.15.2\n    Checking fallible-streaming-iterator v0.1.9\n    Checking anstyle-parse v1.0.0\n    Checking linux-raw-sys v0.12.1\n    Checking iana-time-zone v0.1.65\n    Checking fallible-iterator v0.3.0\n    Checking memchr v2.8.2\n   Compiling cc v1.2.65\n    Checking fastrand v2.4.1\n    Checking hex v0.4.3\n    Checking anstream v1.0.0\n   Compiling generic-array v0.14.7\n   Compiling ahash v0.8.12\n   Compiling num-traits v0.2.19\n    Checking clap_builder v4.6.0\n   Compiling syn v2.0.118\n   Compiling libsqlite3-sys v0.30.1\n    Checking getrandom v0.2.17\n    Checking rand_core v0.6.4\n    Checking crypto-common v0.1.7\n    Checking block-buffer v0.10.4\n    Checking digest v0.10.7\n    Checking sha2 v0.10.9\n    Checking tempfile v3.27.0\n   Compiling serde_derive v1.0.228\n   Compiling clap_derive v4.6.1\n    Checking ppv-lite86 v0.2.21\n    Checking hashbrown v0.14.5\n    Checking rand_chacha v0.3.1\n    Checking rand v0.8.6\n    Checking hashlink v0.9.1\n    Checking clap v4.6.1\n    Checking chrono v0.4.45\n    Checking rusqlite v0.32.1\n    Checking khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260626-183452-51f144a0/integration)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.01s"
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 19 tests\ntest artifact::tests::accepts_safe_slice_id ... ok\ntest agent::tests::extracts_embedded_json_object ... ok\ntest agent::tests::parses_explicit_runner_specs ... ok\ntest artifact::tests::dependency_layers_group_independent_slices ... ok\ntest artifact::tests::rejects_path_or_ref_unsafe_slice_ids ... ok\ntest artifact::tests::reports_missing_dependencies ... ok\ntest artifact::tests::topological_order_includes_requested_dependencies_first ... ok\ntest workflow::manager::tests::rejects_unknown_worker_and_repair_statuses ... ok\ntest workflow::manager::tests::rejects_worker_result_for_wrong_slice ... ok\ntest workflow::manager::tests::shell_command_progress_is_bounded_and_preserves_streams ... ok\ntest workflow::manager::tests::shell_command_cancellation_returns_promptly ... ok\ntest state::tests::latest_run_for_repo_is_deterministic_and_active_scoped ... ok\ntest workflow::manager::tests::recovery_marks_stale_running_runs_interrupted ... ok\ntest workflow::manager::tests::shell_command_timeout_returns_promptly ... ok\ntest workflow::manager::tests::merge_conflicts_are_structured_blocked_artifacts ... ok\ntest workflow::manager::tests::repo_config_verify_profile_runs_with_env_and_cwd ... ok\ntest workflow::manager::tests::fake_runner_parallelizes_independent_slices ... ok\ntest workflow::manager::tests::fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees ... ok\ntest workflow::manager::tests::active_repo_run_blocks_second_run ... ok\n\ntest result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s\n\n\nrunning 7 tests\ntest monitor_specific_run_returns_error_for_failed_terminal_status ... ok\ntest schema_import_and_handoff_v2_black_box ... ok\ntest interrupted_run_resumes_without_duplicate_merges_black_box ... ok\ntest daemon_fake_run_handoff_and_inspect_black_box ... ok\ntest monitor_exposes_quiet_pi_worker_supervision_without_default_timeout ... ok\ntest status_and_watch_expose_live_progress_for_long_verification ... ok\ntest status_latest_returns_active_run_for_repo_or_null ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.71s\n\n   Compiling cfg-if v1.0.4\n   Compiling typenum v1.20.1\n   Compiling once_cell v1.21.4\n   Compiling utf8parse v0.2.2\n   Compiling colorchoice v1.0.5\n   Compiling is_terminal_polyfill v1.70.2\n   Compiling bitflags v2.13.0\n   Compiling anstyle-query v1.1.5\n   Compiling anstyle v1.0.14\n   Compiling clap_lex v1.1.0\n   Compiling strsim v0.11.1\n   Compiling itoa v1.0.18\n   Compiling iana-time-zone v0.1.65\n   Compiling memchr v2.8.2\n   Compiling linux-raw-sys v0.12.1\n   Compiling fallible-streaming-iterator v0.1.9\n   Compiling cpufeatures v0.2.17\n   Compiling zerocopy v0.8.52\n   Compiling libc v0.2.186\n   Compiling serde_core v1.0.228\n   Compiling zmij v1.0.21\n   Compiling fallible-iterator v0.3.0\n   Compiling smallvec v1.15.2\n   Compiling anyhow v1.0.103\n   Compiling hex v0.4.3\n   Compiling fastrand v2.4.1\n   Compiling anstyle-parse v1.0.0\n   Compiling num-traits v0.2.19\n   Compiling libsqlite3-sys v0.30.1\n   Compiling anstream v1.0.0\n   Compiling rustix v1.1.4\n   Compiling clap_builder v4.6.0\n   Compiling generic-array v0.14.7\n   Compiling getrandom v0.2.17\n   Compiling getrandom v0.4.3\n   Compiling rand_core v0.6.4\n   Compiling block-buffer v0.10.4\n   Compiling crypto-common v0.1.7\n   Compiling digest v0.10.7\n   Compiling sha2 v0.10.9\n   Compiling tempfile v3.27.0\n   Compiling serde v1.0.228\n   Compiling serde_json v1.0.150\n   Compiling clap v4.6.1\n   Compiling chrono v0.4.45\n   Compiling ahash v0.8.12\n   Compiling ppv-lite86 v0.2.21\n   Compiling hashbrown v0.14.5\n   Compiling rand_chacha v0.3.1\n   Compiling rand v0.8.6\n   Compiling hashlink v0.9.1\n   Compiling rusqlite v0.32.1\n   Compiling khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260626-183452-51f144a0/integration)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.68s\n     Running unittests src/main.rs (target/debug/deps/khazad_doom-5a3ff85b4912457c)\n     Running tests/daemon_integration.rs (target/debug/deps/daemon_integration-060352e879623867)"
+      },
+      {
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "status": "passed",
+        "exit_code": 0
+      },
+      {
+        "command": "khazad-doom slices validate --repo .",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "{\n  \"valid\": true,\n  \"slices\": [\n    {\n      \"id\": \"slice-021\",\n      \"title\": \"Dogfood slice set\",\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-022\",\n      \"title\": \"Repo config file\",\n      \"depends_on\": [\n        \"slice-021\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-023\",\n      \"title\": \"Resume e2e hardening\",\n      \"depends_on\": [\n        \"slice-022\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-024\",\n      \"title\": \"Merge conflict handling\",\n      \"depends_on\": [\n        \"slice-023\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-025\",\n      \"title\": \"Slice JSON schema export\",\n      \"depends_on\": [\n        \"slice-024\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-026\",\n      \"title\": \"GitHub import v2\",\n      \"depends_on\": [\n        \"slice-025\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-027\",\n      \"title\": \"Handoff v2\",\n      \"depends_on\": [\n        \"slice-026\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-028\",\n      \"title\": \"Repo/run locking\",\n      \"depends_on\": [\n        \"slice-027\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-029\",\n      \"title\": \"Verification profiles\",\n      \"depends_on\": [\n        \"slice-028\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-030\",\n      \"title\": \"Release automation\",\n      \"depends_on\": [\n        \"slice-029\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-031\",\n      \"title\": \"Pre-release codebase audit\",\n      \"areas\": [\n        \"src\",\n        \"tests\",\n        \"scripts\",\n        \"workflow\",\n        \"docs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-032\",\n      \"title\": \"Deepen live progress implementation\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/state.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-033\",\n      \"title\": \"Latest run lookup for monitors\",\n      \"areas\": [\n        \"src/state.rs\",\n        \"src/ipc.rs\",\n        \"src/daemon.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-034\",\n      \"title\": \"Harness-neutral terminal monitor\",\n      \"depends_on\": [\n        \"slice-033\"\n      ],\n      \"areas\": [\n        \"src/cli.rs\",\n        \"src/ipc.rs\",\n        \"src/daemon.rs\",\n        \"src/state.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-035\",\n      \"title\": \"Document always-on monitor UX\",\n      \"depends_on\": [\n        \"slice-034\"\n      ],\n      \"areas\": [\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"src/cli.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-036\",\n      \"title\": \"Optional Pi monitor overlay adapter\",\n      \"depends_on\": [\n        \"slice-035\"\n      ],\n      \"areas\": [\n        \"package.json\",\n        \"extensions/khazad-monitor\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-037\",\n      \"title\": \"Worker attempt supervision\",\n      \"depends_on\": [\n        \"slice-036\"\n      ],\n      \"areas\": [\n        \"src/agent.rs\",\n        \"src/domain.rs\",\n        \"src/state.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"extensions/khazad-monitor/index.js\"\n      ],\n      \"acceptance_count\": 8,\n      \"verify_count\": 1\n    }\n  ],\n  \"issues\": []\n}"
+      },
+      {
+        "command": "node --check extensions/khazad-monitor/index.js",
+        "status": "passed",
+        "exit_code": 0
+      }
+    ]
+  },
+  "created_at": "2026-06-26T18:37:41.855185177Z"
+}

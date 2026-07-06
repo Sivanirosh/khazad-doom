@@ -1,0 +1,66 @@
+{
+  "slice_id": "slice-031",
+  "status": "complete",
+  "summary": "Completed the v0.1.0 pre-release audit, documented scope/findings/module-depth review/release recommendation in docs/release-audit.md, and removed stale dead_code suppressions without changing behavior.",
+  "commit_sha": "0e51d675bca7eeb2d1fc1e8ce41692385d6201e3",
+  "commit_message": "khazad(audit): document v0.1.0 release audit",
+  "changed_files": [
+    "docs/release-audit.md",
+    "src/agent.rs",
+    "src/gitutil.rs"
+  ],
+  "tests_run": [
+    "jq empty .workflow/khazad.json .workflow/schema/slice.schema.json .workflow/slices/*.json",
+    "cargo fmt --check",
+    "cargo test",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "bash -n scripts/install.sh scripts/package.sh",
+    "test -f docs/release-audit.md"
+  ],
+  "acceptance_status": [
+    "docs/release-audit.md exists and records audited scope, findings, fixes made, remaining risks, and release recommendation.",
+    "Module-depth audit explicitly uses module, interface, seam, depth, leverage, and locality vocabulary.",
+    "Dirty/broken/dead/redundant/slop scan is documented; stale lint suppressions were fixed and remaining risks are justified.",
+    "No public CLI, daemon IPC, JSON Issue Slice, or runner contract behavior/schema changes were made.",
+    "Full verification profile passed and the worktree is clean after commit."
+  ],
+  "findings": [
+    {
+      "id": "audit-001",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": "src/agent.rs",
+      "line": 39,
+      "description": "Removed stale dead_code suppressions from Job.kind and Runner; both are used."
+    },
+    {
+      "id": "audit-002",
+      "severity": "info",
+      "action": "auto-fix",
+      "file": "src/gitutil.rs",
+      "line": 79,
+      "description": "Removed stale dead_code suppression from worktree_remove; cleanup code calls it."
+    },
+    {
+      "id": "audit-003",
+      "severity": "warning",
+      "action": "no-op",
+      "file": "src/workflow/manager.rs",
+      "line": 1,
+      "description": "workflow::Manager is large; documented as an internal locality risk requiring a separate architectural slice, not a release blocker."
+    },
+    {
+      "id": "audit-004",
+      "severity": "info",
+      "action": "no-op",
+      "file": "src/agent.rs",
+      "line": 46,
+      "description": "ResultData text/usage are retained but not surfaced; documented as low-severity telemetry dead weight."
+    }
+  ],
+  "assumptions": [
+    "Committed repository code and release workflow assets are the authorized audit scope; runtime/build artifacts are excluded.",
+    "Cargo was invoked with $HOME/.cargo/bin on PATH because cargo was not on the default worker PATH.",
+    "Attribute-only cleanup is non-behavioral and does not change public contracts."
+  ]
+}

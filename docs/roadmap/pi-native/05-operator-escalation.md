@@ -1,6 +1,6 @@
 # PI-04 — Operator escalation channel for `must_ask_if`
 
-Matrix row: [00-matrix.md](00-matrix.md) → PI-04. Status: `planned` (open questions block `ready`).
+Matrix row: [00-matrix.md](00-matrix.md) → PI-04. Status: `in_progress` after the 2026-07-06 truth audit: code and extension tests exist despite unresolved workpackage questions; black-box ask/answer/timeout/restart proof is missing.
 Depends on: PI-01 (blocked semantics, incident vocabulary), PI-02 (contract module).
 
 ## Scope

@@ -1,0 +1,32 @@
+{
+  "run_id": "kd-20260626-184008-a6301dab",
+  "role": "slice-worker",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "worktree_path": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260626-184008-a6301dab/slice-033",
+  "branch": "khazad/kd-20260626-184008-a6301dab/slice-033",
+  "slice": {
+    "id": "slice-033",
+    "title": "Latest run lookup for monitors",
+    "goal": "Expose a harness-neutral daemon/status lookup for the latest run in a repository so monitors can attach without knowing a run id.",
+    "areas": [
+      "src/state.rs",
+      "src/ipc.rs",
+      "src/daemon.rs",
+      "src/cli.rs",
+      "tests/daemon_integration.rs"
+    ],
+    "acceptance": [
+      "State has a deterministic latest-run query scoped to repo path, with an active-only mode for pending/running runs.",
+      "The daemon exposes latest run details through the same RunDetails shape used by status --run, including progress and recent events.",
+      "The CLI exposes JSON lookup via khazad-doom status --repo <path> --latest, returning a null/empty result when no matching run exists.",
+      "Existing status --run and daemon-wide status behavior remain backward compatible.",
+      "Tests cover latest active selection, repo scoping, and empty-result behavior."
+    ],
+    "must_ask_if": [
+      "The implementation would remove or rename existing status fields or commands."
+    ],
+    "verify_profile": "quick"
+  },
+  "output_path": "/home/sivanirosh/git_repos/khazad-doom/.workflow/runs/kd-20260626-184008-a6301dab/outputs/slice-033.worker.attempt-1.json",
+  "contract": "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
+}
