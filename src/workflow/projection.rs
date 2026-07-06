@@ -1,6 +1,7 @@
 use crate::domain::{
     Event, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus,
-    StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole, WorkerAttemptProgress,
+    StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole, TerminalReason,
+    WorkerAttemptProgress,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -20,6 +21,8 @@ pub fn project_waiting(repo: &str) -> StatusFeed {
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: format!("waiting for active run in {repo}"),
+        terminal_reason: None,
+        operator_commands: Vec::new(),
         attention: Vec::new(),
         blocks: vec![
             block(
@@ -49,6 +52,9 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
     let mut blocks = Vec::new();
     blocks.push(todos_block(details));
     blocks.push(run_block(details, now));
+    if let Some(reason) = &details.primary_terminal_reason {
+        blocks.push(terminal_reason_block(reason));
+    }
     if let Some(progress) = &details.progress
         && !should_hide_current_progress(details, progress)
     {
@@ -79,6 +85,7 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
         blocks.push(tail);
     }
 
+    let question_commands = pending_question_commands(details);
     let attention = details
         .questions
         .iter()
@@ -93,15 +100,114 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
             )
         })
         .collect::<Vec<_>>();
+    let operator_commands = operator_commands(details, &question_commands);
     if !attention.is_empty() {
         blocks.insert(0, block("Attention", "", attention.clone()));
+    }
+    if !operator_commands.is_empty() {
+        let index = if attention.is_empty() { 0 } else { 1 };
+        blocks.insert(index, commands_block(&operator_commands));
     }
 
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: monitor_message(details),
+        terminal_reason: details.primary_terminal_reason.clone(),
+        operator_commands,
         attention,
         blocks,
+    }
+}
+
+fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {
+    let mut lines = vec![
+        line(
+            format!(
+                "kind={} • owner={} • retryable={} • operator_action_required={}",
+                display_or_dash(&reason.kind),
+                display_or_dash(&reason.resolution_owner),
+                reason.retryable,
+                reason.operator_action_required
+            ),
+            if reason.operator_action_required {
+                StatusFeedRole::Attention
+            } else {
+                StatusFeedRole::Warning
+            },
+        ),
+        line(
+            truncate_display(&reason.summary, LINE_WIDTH),
+            StatusFeedRole::Warning,
+        ),
+    ];
+    if !reason.remediation.trim().is_empty() {
+        lines.push(line(
+            format!(
+                "Remediation: {}",
+                truncate_display(&reason.remediation, LINE_WIDTH)
+            ),
+            StatusFeedRole::Info,
+        ));
+    }
+    if !reason.disposition.trim().is_empty() {
+        lines.push(line(
+            format!(
+                "Disposition: {}",
+                truncate_display(&reason.disposition, LINE_WIDTH)
+            ),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if !reason.evidence_links.is_empty() {
+        lines.push(line(
+            format!("Evidence: {}", reason.evidence_links.join(", ")),
+            StatusFeedRole::Dim,
+        ));
+    }
+    block("Terminal", display_or_dash(&reason.kind), lines)
+}
+
+fn pending_question_commands(details: &RunDetails) -> Vec<String> {
+    details
+        .questions
+        .iter()
+        .filter(|question| question.state == "pending")
+        .map(|question| {
+            format!(
+                "khazad-doom answer {} {} <answer>",
+                question.run_id, question.id
+            )
+        })
+        .collect()
+}
+
+fn operator_commands(details: &RunDetails, question_commands: &[String]) -> Vec<String> {
+    let mut commands = Vec::new();
+    for command in question_commands {
+        push_unique(&mut commands, command.clone());
+    }
+    if let Some(reason) = &details.primary_terminal_reason {
+        for command in &reason.operator_commands {
+            push_unique(&mut commands, command.clone());
+        }
+    }
+    commands
+}
+
+fn commands_block(commands: &[String]) -> StatusFeedBlock {
+    block(
+        "Commands",
+        "",
+        commands
+            .iter()
+            .map(|command| line(command.clone(), StatusFeedRole::Attention))
+            .collect(),
+    )
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
 }
 
@@ -1035,11 +1141,79 @@ mod tests {
             questions: Vec::new(),
             events: Vec::new(),
             economics: None,
+            primary_terminal_reason: None,
             feed: None,
         };
         let feed = project_run_at(&details, now);
         assert_eq!(feed.feed_version, 1);
         assert_eq!(feed.blocks[0].label, "Todos");
         assert_eq!(feed.blocks[1].label, "Run");
+    }
+
+    #[test]
+    fn terminal_reason_projection_carries_reason_and_operator_commands() {
+        let now = Utc::now();
+        let mut details = RunDetails {
+            run: Run {
+                id: "kd-test".to_string(),
+                repo_id: "repo".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                status: RunStatus::Blocked,
+                base_branch: "main".to_string(),
+                base_sha: "base".to_string(),
+                integration_branch: "khazad/kd-test/integration".to_string(),
+                selected_slice_id: "slice-1".to_string(),
+                error: "Pi login required".to_string(),
+                started_at: now,
+                updated_at: now,
+            },
+            slice_runs: Vec::new(),
+            progress: None,
+            incidents: Vec::new(),
+            questions: Vec::new(),
+            events: Vec::new(),
+            economics: None,
+            primary_terminal_reason: Some(TerminalReason {
+                kind: "agent_auth_required".to_string(),
+                resolution_owner: "operator".to_string(),
+                retryable: false,
+                operator_action_required: true,
+                summary: "Pi login required".to_string(),
+                evidence_links: vec!["event:7:run_incident".to_string()],
+                remediation: "run pi /login".to_string(),
+                disposition: "blocked; handoff is not ready".to_string(),
+                operator_commands: vec![
+                    "pi /login".to_string(),
+                    "khazad-doom resume --run kd-test".to_string(),
+                ],
+            }),
+            feed: None,
+        };
+        let feed = project_run_at(&details, now);
+        details.feed = Some(feed.clone());
+
+        assert_eq!(feed.feed_version, 1);
+        assert_eq!(
+            feed.terminal_reason.as_ref().unwrap().kind,
+            "agent_auth_required"
+        );
+        assert!(
+            feed.operator_commands
+                .iter()
+                .any(|command| command == "pi /login")
+        );
+        let terminal = feed
+            .blocks
+            .iter()
+            .find(|block| block.label == "Terminal")
+            .expect("terminal block");
+        assert_eq!(terminal.meta, "agent_auth_required");
+        assert!(
+            terminal
+                .lines
+                .iter()
+                .any(|line| line.text.contains("owner=operator"))
+        );
+        assert!(feed.blocks.iter().any(|block| block.label == "Commands"));
     }
 }

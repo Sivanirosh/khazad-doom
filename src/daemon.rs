@@ -1,7 +1,8 @@
 use crate::artifact;
 use crate::domain::{
     BranchHandoff, Event, ImplementationSummary, Run, RunDetails, RunEconomics, RunIncident,
-    RunInspection, RunProgress, RunStatus, SliceRun, SliceStatus, SliceWriteResult,
+    RunInspection, RunProgress, RunStatus, SliceRun, SliceStatus, SliceWriteResult, TerminalReason,
+    WorkerQuestion,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult, HandoffParams,
@@ -273,11 +274,20 @@ impl Server {
             annotate_parallel_progress(progress, &slice_runs, &events);
         }
         let economics = read_run_economics(&run).ok();
-        let incidents = run_incidents_from_events(&self.store.get_incident_events(&run_id)?);
+        let incident_events = self.store.get_incident_events(&run_id)?;
+        let incidents = run_incidents_from_events(&incident_events);
         let questions = self
             .store
             .list_worker_questions(&run_id)
             .unwrap_or_default();
+        let primary_terminal_reason = primary_terminal_reason(
+            &run,
+            &slice_runs,
+            progress.as_ref(),
+            &events,
+            &incident_events,
+            &questions,
+        );
         let mut details = RunDetails {
             slice_runs,
             progress,
@@ -285,6 +295,7 @@ impl Server {
             questions,
             events,
             economics,
+            primary_terminal_reason,
             feed: None,
             run,
         };
@@ -598,6 +609,299 @@ impl Server {
     }
 }
 
+fn primary_terminal_reason(
+    run: &Run,
+    slice_runs: &[SliceRun],
+    progress: Option<&RunProgress>,
+    recent_events: &[Event],
+    incident_events: &[Event],
+    questions: &[WorkerQuestion],
+) -> Option<TerminalReason> {
+    if !matches!(
+        run.status,
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted
+    ) {
+        return None;
+    }
+
+    let source = terminal_reason_source(run, slice_runs, progress, recent_events, incident_events);
+    let mut commands = Vec::new();
+    for question in questions
+        .iter()
+        .filter(|question| question.state == "pending")
+    {
+        push_unique_command(
+            &mut commands,
+            format!(
+                "khazad-doom answer {} {} <answer>",
+                question.run_id, question.id
+            ),
+        );
+    }
+    for command in source.fix_commands {
+        push_unique_command(&mut commands, command);
+    }
+    for command in terminal_inspection_commands(run) {
+        push_unique_command(&mut commands, command);
+    }
+
+    Some(TerminalReason {
+        kind: source.kind,
+        resolution_owner: source.resolution_owner,
+        retryable: source.retryable,
+        operator_action_required: source.operator_action_required,
+        summary: source.summary,
+        evidence_links: source.evidence_links,
+        remediation: source.remediation,
+        disposition: source.disposition,
+        operator_commands: commands,
+    })
+}
+
+struct TerminalReasonSource {
+    kind: String,
+    resolution_owner: String,
+    retryable: bool,
+    operator_action_required: bool,
+    summary: String,
+    evidence_links: Vec<String>,
+    remediation: String,
+    disposition: String,
+    fix_commands: Vec<String>,
+}
+
+fn terminal_reason_source(
+    run: &Run,
+    slice_runs: &[SliceRun],
+    progress: Option<&RunProgress>,
+    recent_events: &[Event],
+    incident_events: &[Event],
+) -> TerminalReasonSource {
+    if let Some(event) = terminal_incident_event(incident_events) {
+        return terminal_reason_from_event(run, event);
+    }
+    if let Some(event) = terminal_run_error_event(incident_events)
+        .or_else(|| terminal_run_error_event(recent_events))
+    {
+        return terminal_reason_from_event(run, event);
+    }
+
+    let summary = terminal_summary_text(run, slice_runs, progress);
+    let kind = match run.status {
+        RunStatus::Blocked => "blocked",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::Interrupted => "interrupted",
+        RunStatus::Pending | RunStatus::Running | RunStatus::Completed => "terminal",
+    }
+    .to_string();
+    TerminalReasonSource {
+        kind,
+        resolution_owner: default_resolution_owner(run.status),
+        retryable: default_retryable(run.status),
+        operator_action_required: default_operator_action_required(run.status),
+        summary,
+        evidence_links: default_evidence_links(run),
+        remediation: default_remediation(run.status),
+        disposition: default_disposition(run.status),
+        fix_commands: Vec::new(),
+    }
+}
+
+fn terminal_incident_event(events: &[Event]) -> Option<&Event> {
+    events.iter().rev().find(|event| {
+        event.typ == "run_incident"
+            && (event.payload.get("failure_kind").is_some()
+                || event.payload.get("operator_action_required").is_some()
+                || payload_string(&event.payload, "severity") == Some("error".to_string()))
+    })
+}
+
+fn terminal_run_error_event(events: &[Event]) -> Option<&Event> {
+    events.iter().rev().find(|event| event.typ == "run_error")
+}
+
+fn terminal_reason_from_event(run: &Run, event: &Event) -> TerminalReasonSource {
+    let payload = &event.payload;
+    let kind = payload_string(payload, "failure_kind")
+        .or_else(|| payload_string(payload, "kind"))
+        .unwrap_or_else(|| match event.typ.as_str() {
+            "run_error" => run.status.as_str().to_string(),
+            other => other.to_string(),
+        });
+    let operator_action_required = payload
+        .get("operator_action_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| default_operator_action_required(run.status));
+    let retryable = payload
+        .get("retryable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| default_retryable(run.status));
+    let summary = payload_string(payload, "message")
+        .or_else(|| payload_string(payload, "error"))
+        .or_else(|| payload_string(payload, "summary"))
+        .unwrap_or_else(|| fallback_run_error(run));
+    let resolution_owner = payload_string(payload, "resolution_owner").unwrap_or_else(|| {
+        if operator_action_required {
+            "operator".to_string()
+        } else {
+            default_resolution_owner(run.status)
+        }
+    });
+    let mut evidence_links = default_evidence_links(run);
+    push_unique_command(
+        &mut evidence_links,
+        format!("event:{}:{}", event.id, event.typ),
+    );
+    TerminalReasonSource {
+        kind,
+        resolution_owner,
+        retryable,
+        operator_action_required,
+        summary,
+        evidence_links,
+        remediation: remediation_for(run.status, operator_action_required, retryable),
+        disposition: default_disposition(run.status),
+        fix_commands: string_array(payload, "fix_commands"),
+    }
+}
+
+fn terminal_summary_text(
+    run: &Run,
+    slice_runs: &[SliceRun],
+    progress: Option<&RunProgress>,
+) -> String {
+    if !run.error.trim().is_empty() {
+        return run.error.clone();
+    }
+    if let Some(slice_run) = slice_runs
+        .iter()
+        .find(|slice_run| !slice_run.last_error.trim().is_empty())
+    {
+        return slice_run.last_error.clone();
+    }
+    if let Some(progress) = progress
+        && !progress.message.trim().is_empty()
+    {
+        return progress.message.clone();
+    }
+    fallback_run_error(run)
+}
+
+fn fallback_run_error(run: &Run) -> String {
+    format!("run ended with status {}", run.status)
+}
+
+fn default_resolution_owner(status: RunStatus) -> String {
+    match status {
+        RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => "operator",
+        RunStatus::Failed => "daemon",
+        RunStatus::Pending | RunStatus::Running | RunStatus::Completed => "daemon",
+    }
+    .to_string()
+}
+
+fn default_retryable(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted
+    )
+}
+
+fn default_operator_action_required(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted
+    )
+}
+
+fn default_remediation(status: RunStatus) -> String {
+    remediation_for(
+        status,
+        default_operator_action_required(status),
+        default_retryable(status),
+    )
+}
+
+fn remediation_for(status: RunStatus, operator_action_required: bool, retryable: bool) -> String {
+    if operator_action_required {
+        return "complete the listed operator action, then resume the run".to_string();
+    }
+    if retryable {
+        return "inspect artifacts, fix the underlying failure, then resume the run".to_string();
+    }
+    match status {
+        RunStatus::Failed => "inspect artifacts and create a follow-up slice if needed".to_string(),
+        _ => "inspect artifacts before taking further action".to_string(),
+    }
+}
+
+fn default_disposition(status: RunStatus) -> String {
+    match status {
+        RunStatus::Blocked => "blocked; handoff is not ready until the operator action is resolved",
+        RunStatus::Failed => "failed; handoff is not ready until the failure is resolved",
+        RunStatus::Cancelled => "cancelled by request; handoff is not ready",
+        RunStatus::Interrupted => "interrupted; resume from checkpoint before handoff",
+        RunStatus::Pending | RunStatus::Running | RunStatus::Completed => {
+            "terminal disposition unavailable"
+        }
+    }
+    .to_string()
+}
+
+fn default_evidence_links(run: &Run) -> Vec<String> {
+    let store = artifact::Store::new(&run.repo_path);
+    let summary_path = store.output_path(&run.id, "run-summary.json");
+    if summary_path.exists() {
+        vec![summary_path.to_string_lossy().to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn terminal_inspection_commands(run: &Run) -> Vec<String> {
+    match run.status {
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted => {
+            vec![
+                format!("khazad-doom inspect --run {}", run.id),
+                format!("khazad-doom resume --run {}", run.id),
+            ]
+        }
+        RunStatus::Pending | RunStatus::Running | RunStatus::Completed => Vec::new(),
+    }
+}
+
+fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn string_array(payload: &serde_json::Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn push_unique_command(commands: &mut Vec<String>, command: String) {
+    if !command.trim().is_empty() && !commands.iter().any(|existing| existing == &command) {
+        commands.push(command);
+    }
+}
+
 fn run_incidents_from_events(events: &[Event]) -> Vec<RunIncident> {
     events
         .iter()
@@ -812,4 +1116,92 @@ fn request_id() -> String {
         .unwrap_or_default()
         .as_nanos()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn terminal_reason_prefers_structured_incident_payload() {
+        let now = Utc::now();
+        let run = run_with_status(RunStatus::Blocked, "Pi is not authenticated");
+        let event = Event {
+            id: 7,
+            run_id: run.id.clone(),
+            typ: "run_incident".to_string(),
+            payload: json!({
+                "severity": "error",
+                "kind": "agent_auth_required",
+                "failure_kind": "agent_auth_required",
+                "message": "Pi is not authenticated",
+                "operator_action_required": true,
+                "retryable": false,
+                "fix_commands": ["pi /login"]
+            }),
+            created_at: now,
+        };
+
+        let reason = primary_terminal_reason(&run, &[], None, &[], &[event], &[]).expect("reason");
+
+        assert_eq!(reason.kind, "agent_auth_required");
+        assert_eq!(reason.resolution_owner, "operator");
+        assert!(!reason.retryable);
+        assert!(reason.operator_action_required);
+        assert!(
+            reason
+                .evidence_links
+                .iter()
+                .any(|link| link == "event:7:run_incident")
+        );
+        assert!(
+            reason
+                .operator_commands
+                .iter()
+                .any(|command| command == "pi /login")
+        );
+        assert!(
+            reason
+                .operator_commands
+                .iter()
+                .any(|command| command == "khazad-doom resume --run kd-test")
+        );
+    }
+
+    #[test]
+    fn terminal_reason_failed_run_falls_back_to_run_error() {
+        let run = run_with_status(RunStatus::Failed, "integration gate failed");
+
+        let reason = primary_terminal_reason(&run, &[], None, &[], &[], &[]).expect("reason");
+
+        assert_eq!(reason.kind, "failed");
+        assert_eq!(reason.resolution_owner, "daemon");
+        assert!(reason.retryable);
+        assert!(!reason.operator_action_required);
+        assert_eq!(reason.summary, "integration gate failed");
+        assert!(
+            reason
+                .operator_commands
+                .iter()
+                .any(|command| command == "khazad-doom inspect --run kd-test")
+        );
+    }
+
+    fn run_with_status(status: RunStatus, error: &str) -> Run {
+        let now = Utc::now();
+        Run {
+            id: "kd-test".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            status,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "khazad/kd-test/integration".to_string(),
+            selected_slice_id: "slice-1".to_string(),
+            error: error.to_string(),
+            started_at: now,
+            updated_at: now,
+        }
+    }
 }
