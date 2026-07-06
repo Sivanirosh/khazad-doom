@@ -168,7 +168,7 @@ No new terminal run status is introduced. `awaiting_replan` is a progress phase/
 
 Rejection is a terminal disposition for the proposal, not erasure. The daemon records the rationale and blocks reusing the same proposal id. If the operator rejects a proposal that was necessary to continue safely, the run remains blocked with primary reason `replan_rejected` or the original structured reason.
 
-Deferral is also terminal for the current proposal. It must name a revisit condition such as "after Phase 4 architecture review" or "if this slice family repeats the same close-record failure". A deferred proposal may be copied into a new proposal only with a new id and new evidence.
+Deferral is also terminal for the current proposal. It must name a revisit condition such as "after Phase 4 architecture review" or "if this slice family repeats the same close-record failure". A deferred proposal may be copied into a new proposal only with a new id, citing either new evidence or the fired revisit condition.
 
 ## Resume and daemon restart behavior
 
