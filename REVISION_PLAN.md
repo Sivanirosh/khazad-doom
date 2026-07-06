@@ -286,6 +286,45 @@ Done when:
 - run artifacts and commits make the workflow visible again;
 - the dogfooding gap is closed by observed behavior, not by promise.
 
+## Phase 5 scope extension — Herdr cockpit
+
+After PUB-01/PUB-01A/PUB-01B proved publication truth, the live-observability scope is expanded from a Pi attach/feed workaround to a Herdr cockpit model.
+
+Evidence basis: F-013 and the Phase 1 PI-05 audit show status/monitor drift and Pi UI churn. This admits Herdr work as evidence-backed, not speculative dashboard building, but only if it reduces duplicated interpretation and preserves daemon ownership.
+
+Target responsibility split:
+
+```text
+Pi:
+  start, shape, explain, answer blockers, summarize handoff
+
+Khazad-Doom:
+  own run truth, slices, worker authorization, gates, blockers, merge, handoff
+
+Herdr:
+  show/focus live agents and run workspaces
+```
+
+Accepted scope decisions:
+
+- Herdr is the optional-default live cockpit when `herdr` is available; direct Pi execution remains the default fallback when Herdr is missing or cockpit startup fails.
+- Khazad-Doom launches workers via Herdr, not vice versa: KD resolves the slice, prompt, profile, env, token, and command; Herdr provides visible panes.
+- Worker results are captured through KD-owned wrapper artifacts under the run directory, not by parsing Herdr terminal scrollback or Herdr agent-status metadata.
+- Operator control in Herdr means observe, focus, and request KD-owned cancel/answer actions. Normal worker panes are not an interactive authority channel.
+- The gate/repair pane is read-only initially; KD continues to execute gate/repair commands and project their status through the daemon feed.
+- The Planner Pi pane is deferred until RPL slices define planner proposal authority.
+- The existing Pi extension becomes a thin bridge: start/explain/answer/summarize/open Herdr cockpit; it does not emulate a live multi-agent dashboard.
+- Real Herdr smoke/e2e evidence is required for Herdr slices, but normal `cargo test` must remain portable when Herdr is not installed; Herdr-specific checks are explicitly gated.
+
+Revised Phase 5 order after publication truth:
+
+1. FEED-01 — terminal reason and projection authority.
+2. HERDR-01 — cockpit contract, config, default workspace, read-only feed/phase panes.
+3. HERDR-02 — Herdr worker panes with KD-owned wrapper/result capture and direct fallback.
+4. HERDR-03 — Pi bridge opens/focuses Herdr cockpit and stays a painter/explainer.
+5. RPL-01, RPL-02, RPL-03 — replan proposal/store/disposition/history.
+6. PI-PROOF-01 — Pi-native acceptance evidence closure.
+
 ## Plan-level completion criteria
 
 The revision plan is complete when:

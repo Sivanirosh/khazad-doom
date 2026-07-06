@@ -1,0 +1,42 @@
+{
+  "id": "HERDR-01",
+  "title": "Herdr cockpit contract and default workspace",
+  "goal": "Introduce Herdr as the optional-default live observability cockpit for Khazad-Doom runs through a small daemon-owned cockpit seam: Khazad-Doom opens/focuses Herdr workspaces and read-only feed/phase panes when available, but direct Pi execution remains the fallback and source of truth stays in daemon state.",
+  "depends_on": [
+    "FEED-01"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/cli.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/mod.rs",
+    "src/workflow/cockpit.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "A small Cockpit/CockpitAdapter seam exists for opening or focusing a run workspace and creating named read-only panes; callers do not learn Herdr command details, pane ids beyond opaque references, or terminal-layout mechanics.",
+    "The default cockpit mode is auto: when a usable herdr binary is found, a run attempts to create or focus a workspace named for the run and opens a Run Status / Event Feed pane plus a read-only Integration Gate / Repair phase pane; when Herdr is unavailable or fails, the run falls back to current direct execution.",
+    "Operators can override cockpit behavior through durable config and per-run CLI flag values equivalent to auto, herdr, or direct.",
+    "Herdr cockpit failures are recorded as non-fatal cockpit-unavailable incidents or feed entries with remediation, and they never change slice selection, worker authorization, verification, merge, handoff, or terminal run status by themselves.",
+    "The Planner Pi pane is explicitly deferred until RPL planner behavior exists; HERDR-01 does not launch a planner agent.",
+    "Real-Herdr smoke evidence proves workspace creation/focus and feed/phase pane creation on an installed Herdr, while the normal full test suite remains portable when Herdr is absent."
+  ],
+  "must_ask_if": [
+    "The implementation would block normal runs solely because Herdr is missing or a workspace cannot be created.",
+    "The implementation would make Herdr own workflow truth, cancellation, authorization, verification, merge, or handoff decisions.",
+    "The implementation would parse terminal text or Herdr UI state as the source of daemon truth.",
+    "The implementation would add a planner Pi session before RPL slices define planner authority.",
+    "The implementation would add a broad UI framework or full Pi monitor replacement instead of a small cockpit adapter seam."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test cockpit --quiet",
+    "HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+    "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet"
+  ],
+  "verify_timeout_seconds": 900
+}

@@ -1,0 +1,42 @@
+{
+  "id": "FEED-01",
+  "title": "Terminal reason and projection authority",
+  "goal": "Make the daemon status feed the single interpretation seam for terminal reasons and live progress so CLI, Pi adapters, and later Herdr cockpit panes paint the same daemon-owned truth instead of reclassifying raw events independently.",
+  "areas": [
+    "src/domain.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md",
+    "extensions/khazad-monitor"
+  ],
+  "acceptance": [
+    "Blocked and failed runs expose a structured primary terminal reason with kind, resolution owner, retryability or operator-action flags where applicable, evidence links, and remediation or disposition text.",
+    "RunDetails/status JSON includes one versioned daemon-side feed projection that carries terminal reasons, progress, incidents, economics summary, and exact operator commands needed for questions or replan decisions.",
+    "CLI status, watch, and monitor render feed blocks as painters and no longer match raw daemon event-type strings to decide human wording.",
+    "The Pi feedback adapter consumes the same feed projection and does not independently infer workflow state from raw events or process/session lifecycle.",
+    "Existing monitor behavior remains equivalent on the recorded-run corpus except for deliberate wording changes documented in the slice result.",
+    "No new run or slice status values are introduced."
+  ],
+  "must_ask_if": [
+    "The implementation would add a new run status or slice status instead of using structured terminal reasons.",
+    "The implementation would make a UI adapter authoritative for workflow state, cancellation, terminal reasons, or handoff readiness.",
+    "The implementation would require Herdr-specific concepts in the core feed projection before HERDR-01.",
+    "The grep/parity guard cannot be satisfied without leaving raw event-type interpretation in CLI painters."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test terminal_reason --quiet",
+    "cargo test projection --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+    "cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+    "npm test",
+    "bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'"
+  ],
+  "verify_timeout_seconds": 900
+}

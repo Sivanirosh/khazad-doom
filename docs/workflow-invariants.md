@@ -9,7 +9,7 @@ These invariants define the daemon-owned workflow behavior that v0.1.0 release-p
 - **D3 — Escalation over termination.** A worker that hits a `must_ask_if` condition should call the shipped `ask_operator` Pi tool, pause in `awaiting_operator`, and continue after an answer. If the tool is unavailable or times out, the worker falls back to the existing `ask-user` blocked output.
 - **D4 — Versioned coupling only.** Khazad-Doom couples to Pi's documented, versioned surfaces such as CLI flags, JSON event streams, and exit codes; it must not depend on Pi internals. `src/pi_contract.rs` is the only module that may parse Pi stdout/stderr or recognize Pi event/error strings; the current contract inventory is `docs/design/pi-contract-inventory.md`. A Pi behavior change may degrade observability, but daemon-owned state remains authoritative for correctness. Unknown fields/events from Pi are tolerated and surfaced as bounded warnings.
 - **D5 — Single verification owner.** The daemon owns verification, gates, economics, and attestation. Workers produce evidence claims; daemon checks/gates or human review attest them.
-- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; those surfaces show the same daemon-side feed projection and answer commands. Any Pi feedback adapter is an explicit, read-only painter over that daemon feed and must not replace core monitoring.
+- **D6 — Feedback stays daemon-owned and explicit.** Operators must be able to discover progress and needs-attention states through `status`, `watch`, and `monitor`; those surfaces show the same daemon-side feed projection and answer commands. Herdr may be the optional-default live cockpit for visible workspaces/panes when available, but it is a painter/launcher over daemon-owned state, not a workflow owner. Any Pi feedback adapter is a thin bridge over daemon feed and Herdr focus/open actions; it must not emulate a full live cockpit or replace core monitoring.
 
 Standing rejections:
 
@@ -92,7 +92,9 @@ Standing rejections:
 - `monitor --latest` must not make terminal runs disappear. When no active run exists, it keeps the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
-- The Pi feedback adapter is explicit attach only, read-only over the daemon projection, cleans up all session-bound resources on Pi session replacement/reload, and is never required for core monitoring.
+- The Herdr cockpit adapter, when enabled, may open/focus run workspaces and named panes for feed, phase, and worker visibility. Herdr absence or cockpit startup failure falls back to direct execution by default and records non-fatal evidence; it must not by itself change run/slice status, worker authorization, verification, merge, or handoff readiness.
+- Worker panes shown through Herdr are not an interactive authority channel. Normal operator control means observe, focus, and request daemon-owned actions such as cancel or answer; any manual takeover must be explicit evidence, not silent accepted worker output.
+- The Pi feedback adapter is a thin bridge over the daemon projection and Herdr open/focus actions, cleans up all session-bound resources on Pi session replacement/reload, and is never required for core monitoring.
 
 ## Artifacts, handoffs, and remotes
 
@@ -100,6 +102,15 @@ Standing rejections:
 - Worker handoff JSON is generated before the worker starts and records the exact slice contract, worktree path, branch, run id, and output path the worker must use.
 - `inspect` and blocked/failed artifacts expose bounded diagnostics without requiring maintainers to scrape daemon internals.
 - `khazad-doom handoff` prints branch, summary, and suggested push/PR commands by default. It must not mutate remotes unless `--push`, `--create-pr`, or explicit repository configuration requests that behavior; `--dry-run` suppresses configured actions.
+
+## Phase 5 scope amendment record
+
+- **Herdr is the optional-default live cockpit, not a workflow owner.**
+  - Proposed invariant text: Herdr may open/focus visible run workspaces and panes when available, but daemon state remains authoritative; direct Pi execution remains fallback; Pi becomes a thin bridge/explainer rather than a rich live dashboard.
+  - Ledger entries: F-013; Phase 1 PI-05 status/monitor drift; rich Pi monitor overlay/feed-widget churn; PUB-01B-era operator scope decision.
+  - Enforcement mechanism: FEED-01 projection authority, HERDR-01 cockpit config/fallback, HERDR-02 KD-owned wrapper/result capture, HERDR-03 Pi bridge only.
+  - Violation-detecting tests: real-Herdr gated workspace/pane smoke; fallback incident test; worker wrapper artifact-capture e2e; grep/parity guard that prevents Pi adapter raw-event interpretation.
+  - Status: accepted for Phase 5 slices.
 
 ## Phase 2 invariant amendment record
 

@@ -173,8 +173,8 @@ Bounded evidence scope for this ledger:
 - **Root-cause class:** design complexity.
 - **Invariant involved:** D6 requires daemon-owned explicit feedback and one shared feed projection. The desired invariant exists; roadmap/status implementation truth is unclear.
 - **Current regression coverage:** `src/workflow/projection.rs` and feed adapter tests exist, but PI-05 declared tests/status must be audited.
-- **Remaining design gap:** Ensure renderers are painters and roadmap docs do not claim stale state.
-- **Disposition:** Phase 1 truth audit for PI-05 and out-of-matrix UI work; Phase 4 only if tests reveal remaining drift.
+- **Remaining design gap:** Ensure renderers are painters and roadmap docs do not claim stale state. Post-PUB-01B scope decision adds Herdr as the optional-default live cockpit because Pi is not the right persistent multi-agent monitoring surface; this is admitted only through the FEED-01/HERDR-01..03 sequence so daemon feed truth remains central.
+- **Disposition:** FEED-01 for projection authority; HERDR-01..03 for optional Herdr cockpit, KD-owned worker result capture, and a thin Pi bridge. Rich Pi monitor overlay remains rejected.
 
 ### F-014 — Pi-native matrix drifted from implementation reality
 

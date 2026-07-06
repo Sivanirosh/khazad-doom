@@ -1,0 +1,41 @@
+{
+  "id": "HERDR-03",
+  "title": "Pi bridge opens Herdr cockpit",
+  "goal": "Reduce the Khazad-Doom Pi extension to the jobs Pi is good at: starting/shaping/explaining workflows, answering blockers, summarizing handoffs, and opening or focusing the Herdr cockpit; remove any expectation that Pi emulates a full live multi-agent dashboard.",
+  "depends_on": [
+    "HERDR-02"
+  ],
+  "areas": [
+    "extensions/khazad-monitor",
+    "package.json",
+    "README.md",
+    "skills/khazad-doom/SKILL.md",
+    "docs/workflow-invariants.md",
+    "src/cli.rs",
+    "tests/daemon_integration.rs"
+  ],
+  "acceptance": [
+    "The Pi adapter surface is documented and implemented as a thin bridge: start or shape a run, explain current run state from daemon feed/handoff data, answer operator blockers through daemon commands, summarize handoff, and open or focus the Herdr cockpit for a run.",
+    "The Pi adapter does not render or emulate a full live multi-agent cockpit, does not own process/session lifecycle, and does not infer workflow state from Pi session lifecycle.",
+    "An explicit command or adapter action can open/focus the Herdr workspace for the latest or specified run and reports a clear fallback/remediation message when Herdr is unavailable.",
+    "All live status text shown through Pi comes from the daemon-owned feed projection added by FEED-01; no raw event-type interpretation is duplicated in the Pi adapter.",
+    "README, package metadata, and skill docs present the intended model: Pi starts/shapes/explains, Khazad-Doom owns run truth, Herdr shows and focuses live agents.",
+    "Existing operator escalation behavior remains intact: answering blockers goes through daemon state and token-scoped worker questions, not through manual typing in Herdr worker panes."
+  ],
+  "must_ask_if": [
+    "The implementation would restore a rich Pi monitor overlay or make Pi a peer cockpit to Herdr.",
+    "The implementation would let Pi or Herdr mutate run truth directly instead of calling daemon commands/interfaces.",
+    "The implementation would duplicate status/progress interpretation in JavaScript instead of consuming the daemon feed projection.",
+    "The implementation would require Herdr for blocker answers, handoff summaries, or headless CLI operation.",
+    "The implementation would remove existing explicit CLI status/watch/monitor fallback surfaces."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "npm test",
+    "node --check extensions/khazad-monitor/index.js",
+    "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet"
+  ],
+  "verify_timeout_seconds": 900
+}

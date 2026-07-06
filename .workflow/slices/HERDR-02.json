@@ -1,0 +1,45 @@
+{
+  "id": "HERDR-02",
+  "title": "Herdr worker panes with KD-owned result capture",
+  "goal": "Run authorized Pi workers inside named Herdr panes while preserving Khazad-Doom as the process-contract owner: KD builds the exact worker command, uses a KD-owned wrapper to capture stdout/stderr/exit/result artifacts, parses the same Pi contract output, and falls back to direct Pi execution when cockpit launch is unavailable.",
+  "depends_on": [
+    "HERDR-01"
+  ],
+  "areas": [
+    "src/agent.rs",
+    "src/pi_contract.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/mod.rs",
+    "src/domain.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "For Herdr-backed runs, each active slice worker is visible in a deterministically named Herdr pane tied to the run id and slice id, but Khazad-Doom still decides which slice is active and which worker command is authorized.",
+    "Herdr worker panes execute a KD-owned wrapper that launches Pi with the same resolved provider/model/profile/env/prompt/schema as the direct Pi runner and writes stdout, stderr, exit status, and result files under the run artifact directory.",
+    "Khazad-Doom parses worker results from KD-owned artifact files using the same Pi contract parser and JSON-only result validation as direct Pi execution; Herdr terminal rendering, pane scrollback, and agent-status metadata are never correctness inputs.",
+    "Cancellation remains daemon-owned: cancelling a run requests termination of the wrapped Pi process and records the same terminal/cancellation evidence as the direct runner path.",
+    "If Herdr pane startup or wrapper handoff fails before a worker is launched, the run falls back to the existing direct Pi runner and records a non-fatal cockpit fallback incident; if the wrapped Pi worker itself fails, the failure is treated like a normal worker failure, not hidden as a cockpit fallback.",
+    "Real-Herdr evidence proves a worker pane can run the wrapper and return a valid worker JSON result through artifact capture; normal cargo test remains portable unless the explicit Herdr e2e test is requested."
+  ],
+  "must_ask_if": [
+    "The implementation would read worker JSON from Herdr pane text, terminal scrollback, or Herdr agent-status metadata instead of KD-owned artifact files.",
+    "The implementation would allow operator typing in worker panes to be treated as accepted slice evidence without an explicit manual-intervention marker.",
+    "The implementation would make Herdr responsible for retry policy, worker authorization, cancellation truth, verification, merge, or handoff.",
+    "The implementation would remove the direct Pi fallback path or make Herdr mandatory for headless runs.",
+    "The implementation requires changing the Pi JSON output contract or relaxing worker result validation."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test cockpit --quiet",
+    "cargo test pi_contract --quiet",
+    "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+    "cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+    "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet"
+  ],
+  "verify_timeout_seconds": 1200
+}
