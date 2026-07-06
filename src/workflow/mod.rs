@@ -1,3 +1,4 @@
+mod cockpit;
 mod economics;
 mod gate;
 mod manager;
@@ -11,6 +12,7 @@ use anyhow::Result;
 use std::error::Error;
 use std::fmt;
 
+pub(crate) use cockpit::cockpit_mode_transport_arg;
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
 pub(crate) use projection::project_run;
 pub use prompts::{integration_repair_prompt, worker_prompt};

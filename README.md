@@ -152,11 +152,13 @@ Live progress is daemon-owned, so you can watch a run from any terminal, with or
 khazad-doom monitor --repo . --latest
 ```
 
-`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while runs are started from Pi, a script, or another terminal. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. `Ctrl-C` exits only the terminal monitor; the daemon is detached from the monitor process group and keeps owning any run. Khazad-Doom does not auto-open external windows by default.
+`monitor` is a dashboard TUI (terminal user interface). With `--latest`, it waits for the latest active run in the selected repository, attaches when one appears, and can stay open while runs are started from Pi, a script, or another terminal. If no active run exists, it keeps the latest terminal run visible instead of dropping important completion/failure context. `Ctrl-C` exits only the terminal monitor; the daemon is detached from the monitor process group and keeps owning any run.
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so whatever started the run can display those commands directly instead of guessing how to launch user-visible progress.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and exact `operator_commands`. The shared vocabulary includes `Todos`, `Run`, `Terminal`, current `Worker`/`Shell`/`Merge`/`Repair`, `Commands`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
+The default cockpit mode is `auto`: if a usable `herdr` binary is on `PATH`, run start asks Herdr to create or focus a `Khazad-Doom <run-id>` workspace with read-only `Run Status / Event Feed` and `Integration Gate / Repair` panes backed by daemon `monitor`/`status` commands. If Herdr is missing or a cockpit command fails, Khazad-Doom records a non-fatal `cockpit_unavailable` incident with remediation and continues direct execution. Override per run with `--cockpit auto|herdr|direct`, or set durable repo policy with `"cockpit": "auto"`, `"herdr"`, or `"direct"` in `.workflow/khazad.json`. Herdr never owns workflow truth, cancellation, authorization, verification, merge, or handoff. The Planner Pi pane is explicitly deferred until RPL planner authority exists.
+
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI or Herdr cockpit is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, Herdr cockpit panes, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and exact `operator_commands`. The shared vocabulary includes `Todos`, `Run`, `Terminal`, current `Worker`/`Shell`/`Merge`/`Repair`, `Commands`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
 
 Inside Pi, `/khazad-attach <run-id>` explicitly attaches a compact read-only widget to one daemon run feed. `/khazad-detach` clears it. The adapter does not auto-discover runs, own workflow state, or replace `status`/`watch`/`monitor`; it polls daemon `status`, renders `RunDetails.feed`, and cleans up on Pi session shutdown/reload.
 
@@ -239,6 +241,7 @@ To install only the skill without the worker extension, use Pi package filters i
 | `khazad-doom run --slice <id>` | Run one open slice plus open dependencies; closed dependencies are treated as satisfied. |
 | `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently, then integrate only after the whole parallel layer succeeds. |
 | `khazad-doom run --allow-dirty ...` | Explicitly allow a dirty source repo; the preflight artifact records the dirty snapshot. |
+| `khazad-doom run --cockpit auto|herdr|direct ...` | Override the live cockpit for one run; Herdr failures remain non-fatal. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |
@@ -278,6 +281,7 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 ```json
 {
   "agent": "pi",
+  "cockpit": "auto",
   "parallelism": 3,
   "verify_timeout_seconds": 600,
   "worker_attempt_timeout_seconds": 0,
@@ -301,6 +305,8 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
 ```
 
 A slice can reference `"verify_profile": "quick"` and still add inline `verify` commands. Profile commands support repo-relative `cwd`, `env`, and per-command timeouts. `worktree_setup` commands use the same command shape and are daemon-owned bootstrap commands: they run without verification-cache reuse after each worker/integration worktree is created or updated, must leave the git worktree clean except ignored files, and should install repo dependencies such as `npm ci`. Integration gate command order follows profile/inline order, exact duplicates are merged within a gate, and `gate_fail_fast` skips later gate commands after the first failure. Missing tools, invalid verify cwd, shell spawn failures, and non-executable commands are classified as daemon/operator environment failures instead of worker auto-fix failures.
+
+`cockpit` accepts `auto`, `herdr`, or `direct`. `auto` is the default: use Herdr when it is available and fall back to direct daemon execution when it is not. `herdr` forces an attempt but still records failures as non-fatal incidents; `direct` suppresses cockpit launch.
 
 Khazad-Doom stores the single worker launch profile source in `~/.khazad-doom/agents.toml` and applies it to every repository. Real Pi code-writing workers are launched through the required `implementer` profile; the default global profile uses the OpenAI Codex provider with `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. Repo-local workflow config remains policy-only; `.workflow/agents.toml` is not read. CLI/env overrides (`--pi-bin`, `--pi-args`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) still flow through the same effective-profile resolver. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, status projection, and economics snapshots report the same `profile_summary`/`launch_summary`. `preflight.json` also records the observed Pi contract (binary, launch flags, supported event vocabulary) for postmortems.
 

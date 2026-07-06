@@ -12,6 +12,7 @@ use crate::ipc::{
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
+use crate::workflow::cockpit_mode_transport_arg;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -81,6 +82,9 @@ enum CommandArgs {
         /// Extra Pi launch args. Repeat or pass a quoted string; overrides KHAZAD_PI_ARGS.
         #[arg(long = "pi-args")]
         pi_args: Vec<String>,
+        /// Live cockpit mode for this run: auto, herdr, or direct. Defaults to repo config.
+        #[arg(long, value_parser = ["auto", "herdr", "direct"])]
+        cockpit: Option<String>,
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
@@ -103,6 +107,9 @@ enum CommandArgs {
         /// Extra Pi launch args. Repeat or pass a quoted string; overrides KHAZAD_PI_ARGS.
         #[arg(long = "pi-args")]
         pi_args: Vec<String>,
+        /// Live cockpit mode for resumed execution: auto, herdr, or direct. Defaults to repo config.
+        #[arg(long, value_parser = ["auto", "herdr", "direct"])]
+        cockpit: Option<String>,
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
@@ -294,6 +301,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             agent,
             pi_bin,
             pi_args,
+            cockpit,
             parallel,
             allow_dirty,
             wait,
@@ -306,6 +314,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
                 agent,
                 pi_bin,
                 pi_args,
+                cockpit,
                 parallel,
                 allow_dirty,
                 wait,
@@ -316,9 +325,21 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             agent,
             pi_bin,
             pi_args,
+            cockpit,
             parallel,
             wait,
-        } => run_resume(paths, run, agent, pi_bin, pi_args, parallel, wait),
+        } => run_resume(
+            paths,
+            ResumeCliOptions {
+                run_id: run,
+                agent,
+                pi_bin,
+                pi_args,
+                cockpit,
+                parallel,
+                wait,
+            },
+        ),
         CommandArgs::Cancel { run, reason } => run_cancel(paths, run, reason),
         CommandArgs::Handoff {
             run,
@@ -392,6 +413,7 @@ struct RunStartOptions {
     agent: String,
     pi_bin: String,
     pi_args: Vec<String>,
+    cockpit: Option<String>,
     parallel: usize,
     allow_dirty: bool,
     wait: bool,
@@ -404,7 +426,10 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
         .unwrap_or_default();
     let agent = effective_request_text(opts.agent, "KHAZAD_AGENT");
     let pi_bin = effective_request_text(opts.pi_bin, "KHAZAD_PI_BIN");
-    let pi_args = effective_request_args(opts.pi_args, "KHAZAD_PI_ARGS");
+    let mut pi_args = effective_request_args(opts.pi_args, "KHAZAD_PI_ARGS");
+    if let Some(cockpit) = &opts.cockpit {
+        pi_args.push(cockpit_mode_transport_arg(cockpit)?);
+    }
     let parallel = effective_cli_parallelism(opts.parallel, config.parallelism);
     let repo_path = repo.to_string_lossy().to_string();
     ensure_daemon(&paths)?;
@@ -430,28 +455,30 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
     wait_run(&client, &output.run_id)
 }
 
-fn run_resume(
-    paths: Paths,
+struct ResumeCliOptions {
     run_id: String,
     agent: String,
     pi_bin: String,
     pi_args: Vec<String>,
+    cockpit: Option<String>,
     parallel: usize,
     wait: bool,
-) -> Result<()> {
+}
+
+fn run_resume(paths: Paths, opts: ResumeCliOptions) -> Result<()> {
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
     let result: StartRunResult = client.call(
         "resumeRun",
         &ResumeRunParams {
-            run_id,
-            agent: effective_request_text(agent, "KHAZAD_AGENT"),
-            pi_bin: effective_request_text(pi_bin, "KHAZAD_PI_BIN"),
-            pi_args: effective_request_args(pi_args, "KHAZAD_PI_ARGS"),
-            parallelism: parallel,
+            run_id: opts.run_id,
+            agent: effective_request_text(opts.agent, "KHAZAD_AGENT"),
+            pi_bin: effective_request_text(opts.pi_bin, "KHAZAD_PI_BIN"),
+            pi_args: effective_request_args_with_cockpit(opts.pi_args, opts.cockpit.as_deref())?,
+            parallelism: opts.parallel,
         },
     )?;
-    if !wait {
+    if !opts.wait {
         return print_json(&result);
     }
     wait_run(&client, &result.run_id)
@@ -1206,6 +1233,17 @@ fn effective_request_args(values: Vec<String>, env_key: &str) -> Vec<String> {
         return split_arg_values(values);
     }
     split_arg_values(vec![std::env::var(env_key).unwrap_or_default()])
+}
+
+fn effective_request_args_with_cockpit(
+    values: Vec<String>,
+    cockpit: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut args = effective_request_args(values, "KHAZAD_PI_ARGS");
+    if let Some(cockpit) = cockpit {
+        args.push(cockpit_mode_transport_arg(cockpit)?);
+    }
+    Ok(args)
 }
 
 fn split_arg_values(values: Vec<String>) -> Vec<String> {

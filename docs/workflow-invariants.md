@@ -93,8 +93,8 @@ Standing rejections:
 - `monitor --latest` must not make terminal runs disappear. When no active run exists, it keeps the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
-- The Herdr cockpit adapter, when enabled, may open/focus run workspaces and named panes for feed, phase, and worker visibility. Herdr absence or cockpit startup failure falls back to direct execution by default and records non-fatal evidence; it must not by itself change run/slice status, worker authorization, verification, merge, or handoff readiness.
-- Worker panes shown through Herdr are not an interactive authority channel. Normal operator control means observe, focus, and request daemon-owned actions such as cancel or answer; any manual takeover must be explicit evidence, not silent accepted worker output.
+- The Herdr cockpit adapter, when enabled, may open/focus run workspaces and named read-only panes for daemon feed and integration gate/repair phase visibility. Herdr absence or cockpit startup failure falls back to direct execution by default and records non-fatal evidence; it must not by itself change run/slice status, worker authorization, verification, merge, or handoff readiness. The Planner Pi pane remains explicitly deferred until RPL planner authority exists.
+- Future worker panes shown through Herdr are not an interactive authority channel. Normal operator control means observe, focus, and request daemon-owned actions such as cancel or answer; any manual takeover must be explicit evidence, not silent accepted worker output.
 - The Pi feedback adapter is a thin bridge over the daemon projection and Herdr open/focus actions, cleans up all session-bound resources on Pi session replacement/reload, and is never required for core monitoring.
 
 ## Artifacts, handoffs, and remotes
@@ -107,7 +107,7 @@ Standing rejections:
 ## Phase 5 scope amendment record
 
 - **Herdr is the optional-default live cockpit, not a workflow owner.**
-  - Proposed invariant text: Herdr may open/focus visible run workspaces and panes when available, but daemon state remains authoritative; direct Pi execution remains fallback; Pi becomes a thin bridge/explainer rather than a rich live dashboard.
+  - Proposed invariant text: Herdr may open/focus visible run workspaces and read-only feed/phase panes when available, but daemon state remains authoritative; direct execution remains fallback; Pi becomes a thin bridge/explainer rather than a rich live dashboard, and planner panes wait for RPL planner authority.
   - Ledger entries: F-013; Phase 1 PI-05 status/monitor drift; rich Pi monitor overlay/feed-widget churn; PUB-01B-era operator scope decision.
   - Enforcement mechanism: FEED-01 projection authority, HERDR-01 cockpit config/fallback, HERDR-02 KD-owned wrapper/result capture, HERDR-03 Pi bridge only.
   - Violation-detecting tests: real-Herdr gated workspace/pane smoke; fallback incident test; worker wrapper artifact-capture e2e; grep/parity guard that prevents Pi adapter raw-event interpretation.
