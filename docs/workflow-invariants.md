@@ -18,6 +18,13 @@ Standing rejections:
 - `fallbackModels` or other silent worker-model failover is rejected unless provider-outage incidents recur and attestation records the actual model per attempt.
 - Auto-login and credential mutation are rejected as outside Khazad-Doom's trust boundary; remediation is explicit operator action.
 
+## Roadmap, plan, and finding truth
+
+- Slice JSON plus daemon/run state are the live source of truth for workflow status. Roadmap documents, matrices, and workpackages may summarize or reference that state, but they must not become a competing acceptance or closure ledger. Any roadmap status that cannot be derived from slice/run evidence must be labeled as a planning/audit note rather than accepted workflow truth.
+- Implementation work that lands outside Khazad-Doom during normal operation must receive an explicit disposition: Khazad-run, legitimate exemption, freeze or operational exception, or bypass/failure evidence. A silent hand-made product commit is itself workflow-governance evidence until disposed.
+- Plan and queue revisions are durable workflow facts, not silent edits. Any accepted change to remaining slice set, order, dependencies, areas, acceptance, verification, or close state records what changed, why, who/what proposed it, who authorized it, and which evidence caused it. Silent `.workflow/slices/` edits during an active run are not a valid replan mechanism.
+- Findings that ask for operator intent or propose changes to scope, verification, queue, or workflow policy must reach exactly one terminal disposition: answered, folded into a slice or plan revision, explicitly deferred with revisit condition, or rejected with rationale. Handoffs and reports must not leave such findings as ambient unowned text.
+
 ## Run lifetime and ownership
 
 - A run is a durable daemon-owned session keyed by `run_id`. CLI commands and Pi worker tools start, control, or observe that session; they do not define its lifetime.
@@ -40,6 +47,7 @@ Standing rejections:
 - Merge conflicts, `ask-user` findings, invalid worker output, dirty worktrees, scope violations, and verification failures become structured blocked/failed artifacts rather than silent best-effort integration.
 - The integration gate runs before integration repair. With `integration_repair: "auto"`, repair is only launched after failed gate evidence that is not an operator environment failure; with `"never"`, failed gate evidence is surfaced without repair; with `"always"`, repair may run even after a passing gate for explicit policy reasons. Operator environment failures block with evidence instead of launching repair.
 - Repair never bypasses or weakens the gate: whenever repair runs, the daemon reruns the integration gate and only treats the run as successful after the post-repair gate passes.
+- Repair workers are not privileged policy mutators. Integration repair may work only inside the already-authorized slice set and gate evidence: changing workflow policy, worker profiles, verification commands, slice contracts, dependencies, or paths outside the authorized areas requires an operator-approved plan revision or follow-up slice.
 - After a run passes the integration gate, the daemon closes completed slice JSON in the integration branch with `status: "closed"`, `closed_by_run`, and `closed_at` before writing final reports.
 
 ## Worker attempt supervision
@@ -69,6 +77,7 @@ Standing rejections:
 - The workflow manager owns lifecycle ordering, retries, repair decisions, checkpointing, and state transitions; the workflow gate/shell seam owns only command resolution/execution details and returns typed check/gate results.
 - Verification and gate timeouts are per-command hang protection. They are not global workflow timeouts and must not be reused to cap total run lifetime.
 - Gate failures are reported with command evidence and must be repaired or surfaced as blocked/failed before handoff.
+- Terminal `blocked` and `failed` states must include structured primary-reason data, not only prose: reason kind, resolution owner, retryability/operator-action flags where applicable, evidence links, and remediation or disposition links. Status, monitor, reports, and handoffs render that data through the shared projection instead of reclassifying raw text.
 - Final reports and handoff JSON expose explicit `exit_states` and `evidence_attestation` as read-only summaries of existing lifecycle state. They must not introduce hidden gates, extra worker turns, or a second source of truth.
 - Status/watch/monitor snapshots and final reports include runtime economics: agent calls, daemon-owned command executions, cache hit/miss counts, repair policy/attempts, phase durations, duplicate-command telemetry, and SLA violations.
 - Completed runs may still have incidents. Resume events, prior run errors, cleanup issues, integration repairs, and non-fatal lifecycle warnings must remain visible as run incidents instead of being hidden by a final `completed` status.
@@ -91,6 +100,56 @@ Standing rejections:
 - Worker handoff JSON is generated before the worker starts and records the exact slice contract, worktree path, branch, run id, and output path the worker must use.
 - `inspect` and blocked/failed artifacts expose bounded diagnostics without requiring maintainers to scrape daemon internals.
 - `khazad-doom handoff` prints branch, summary, and suggested push/PR commands by default. It must not mutate remotes unless `--push`, `--create-pr`, or explicit repository configuration requests that behavior; `--dry-run` suppresses configured actions.
+
+## Phase 2 invariant amendment record
+
+This section is the Phase 2 doctrine diff from `REVISION_PLAN.md`; it records why the new or sharpened invariants above exist. It is not a parallel doctrine document.
+
+### Accepted amendments
+
+- **Live roadmap status has one source of truth.**
+  - Proposed invariant text: slice JSON plus daemon/run state are the live source of truth; roadmap docs may summarize but must not become a competing acceptance or closure ledger.
+  - Ledger entries: F-001, F-004, F-014; Phase 1 roadmap truth audit.
+  - Enforcement mechanism: generated or linted matrix status from `.workflow/slices/*.json` plus run/close metadata, or a slice-close check that validates the matrix row before handoff.
+  - Violation-detecting test: a fixture where a matrix/workpackage status disagrees with slice JSON or named run evidence must fail the roadmap-status lint/check.
+  - Status: accepted.
+- **Work outside Khazad-Doom needs explicit disposition.**
+  - Proposed invariant text: implementation work that bypasses Khazad-Doom is classified as Khazad-run, legitimate exemption, freeze/operational exception, or bypass/failure evidence.
+  - Ledger entries: F-001, F-014.
+  - Enforcement mechanism: release/revision checklist or commit-audit lint comparing product commits to run evidence and recorded exceptions.
+  - Violation-detecting test: a product commit after the last Khazad-run closure with no recorded disposition is reported by the audit/lint.
+  - Status: accepted.
+- **Plan and queue revisions are durable facts.**
+  - Proposed invariant text: accepted changes to slice set, order, dependencies, areas, acceptance, verification, or close state record change, rationale, proposer, authorizer, and evidence; silent active-run slice edits are invalid.
+  - Ledger entries: F-004, F-008, F-009.
+  - Enforcement mechanism: Phase 3 replan checkpoint model with daemon-recorded revision events/artifacts and status/handoff rendering.
+  - Violation-detecting test: a queue mutation without a revision record is rejected or surfaced as an invariant failure; accepted/rejected revisions appear in status and handoff fixtures.
+  - Status: accepted; concrete mechanism deferred to the Phase 3 RFC.
+- **Actionable findings need terminal disposition.**
+  - Proposed invariant text: findings that ask for intent or propose scope/verification/queue/policy changes end as answered, folded into a slice/revision, explicitly deferred, or rejected.
+  - Ledger entries: F-003, F-006, F-008.
+  - Enforcement mechanism: worker-output/replan schemas plus final-report and handoff validation for unresolved actionable findings.
+  - Violation-detecting test: a worker or repair output with an actionable finding and no disposition fails validation or marks the run/handoff as unresolved.
+  - Status: accepted.
+- **Repair authority is bounded by existing authorization.**
+  - Proposed invariant text: repair workers may not mutate workflow policy, profiles, verification, slice contracts, dependencies, or paths outside authorized areas without an operator-approved revision/follow-up.
+  - Ledger entries: F-003.
+  - Enforcement mechanism: repair prompt contract, repair change-scope checks against authorized slice areas and protected workflow paths, and operator-approved revision records for exceptions.
+  - Violation-detecting test: an integration repair fixture that changes `.workflow/khazad.json`, profiles, slice JSON, or out-of-area files is blocked unless paired with an approved revision.
+  - Status: accepted.
+- **Terminal blocked/failed states carry structured reason data.**
+  - Proposed invariant text: `blocked`/`failed` are not enough; terminal artifacts include primary reason kind, resolution owner, retryability/operator-action flags where applicable, evidence links, and remediation/disposition links.
+  - Ledger entries: F-004, F-006, F-009.
+  - Enforcement mechanism: terminal summary/report/handoff schema plus status projection rendering from the structured reason.
+  - Violation-detecting test: blocked/failed run fixtures missing `primary_reason.kind` or equivalent structured data fail schema/projection tests.
+  - Status: accepted.
+
+### Explicit deferrals tested against evidence
+
+- **Runtime mission object.** Status: explicitly_deferred. Current evidence shows slice/queue/status truth gaps, not a need for a new runtime mission abstraction. Reconsider only if the Phase 3 RFC proves that recorded slice revisions cannot express the operator's durable intent.
+- **Daemon-internal autonomous replan engine.** Status: explicitly_deferred. F-008 proves operators need trustworthy queue visibility and recorded revision points; it does not prove the daemon should generate plans. Reconsider only after repeated recorded findings show a mechanical replan pattern that humans approve unchanged.
+- **Automated planner authority to mutate queues.** Status: explicitly_deferred. Queue mutation changes intent and remains operator-authorized unless Phase 3 defines a narrow auto-approvable tier with evidence and rollback semantics. Reconsider only with production evidence that manual approval is the bottleneck and accepted changes are mechanically safe.
+- **Auto-blocking complexity telemetry.** Status: explicitly_deferred. Complexity signals may be advisory report context in a future slice, but no ledger entry proves a metric that should block work automatically. Reconsider only if repeated failures correlate with a daemon-computable threshold and false-positive cost is understood.
 
 ## Release and tag safety
 
