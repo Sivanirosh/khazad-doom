@@ -711,10 +711,31 @@ pub struct RunIncident {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TerminalReason {
+    pub kind: String,
+    pub resolution_owner: String,
+    pub retryable: bool,
+    pub operator_action_required: bool,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_links: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remediation: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub disposition: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_commands: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusFeed {
     pub feed_version: u64,
     pub summary_line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<TerminalReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attention: Vec<StatusFeedLine>,
     pub blocks: Vec<StatusFeedBlock>,
@@ -780,6 +801,8 @@ pub struct RunDetails {
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economics: Option<RunEconomics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_terminal_reason: Option<TerminalReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed: Option<StatusFeed>,
 }

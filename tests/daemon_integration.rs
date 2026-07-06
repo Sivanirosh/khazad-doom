@@ -895,6 +895,47 @@ fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult
             .any(|command| command.as_str() == Some("pi /login"))
     );
 
+    let reason = &blocked["primary_terminal_reason"];
+    assert_eq!(reason["kind"], "agent_auth_required");
+    assert_eq!(reason["resolution_owner"], "operator");
+    assert_eq!(reason["operator_action_required"], true);
+    assert_eq!(reason["retryable"], false);
+    assert!(
+        reason["evidence_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| { link.as_str().unwrap_or_default().contains("run_incident") })
+    );
+    assert!(
+        reason["operator_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| { command.as_str() == Some("pi /login") })
+    );
+    assert_eq!(
+        blocked["feed"]["terminal_reason"]["kind"],
+        "agent_auth_required"
+    );
+    assert!(
+        blocked["feed"]["operator_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| { command.as_str() == Some("pi /login") })
+    );
+    assert!(
+        blocked["feed"]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| {
+                block["label"].as_str() == Some("Terminal")
+                    && block["meta"].as_str() == Some("agent_auth_required")
+            })
+    );
+
     guard.stop();
     Ok(())
 }
@@ -1171,7 +1212,22 @@ fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult
     let stderr = String::from_utf8_lossy(&monitored.stderr);
     assert!(stdout.contains(&run_id));
     assert!(stdout.contains("Run ✗ failed"));
+    assert!(stdout.contains("Terminal failed"));
     assert!(stderr.contains("run ended with status failed"));
+
+    let failed = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
+    let failed = json_stdout(&failed)?;
+    assert_eq!(failed["primary_terminal_reason"]["kind"], "failed");
+    assert_eq!(
+        failed["primary_terminal_reason"]["resolution_owner"],
+        "daemon"
+    );
+    assert_eq!(failed["primary_terminal_reason"]["retryable"], true);
+    assert_eq!(
+        failed["primary_terminal_reason"]["operator_action_required"],
+        false
+    );
+    assert_eq!(failed["feed"]["terminal_reason"]["kind"], "failed");
 
     guard.stop();
     Ok(())
