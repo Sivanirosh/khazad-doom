@@ -10,18 +10,21 @@
   ],
   "acceptance": [
     "Handoff, final-report, and implementation-summary final_sha all point at the integration branch commit that includes closed slice JSON, final report artifacts, and implementation changes together.",
-    "A regression test asserts final_sha equals git rev-parse INTEGRATION_BRANCH and verifies the commit at that SHA contains status=closed with closed_by_run matching the run ID.",
+    "The failed run kd-20260706-215228-0f3bba96 is covered as a regression shape: final_sha 9a0eb84594c7c26edbcd648c8f807c249bf4ce08 was unacceptable because the integration branch tip was 1d3f90c544a783e627faa83b25efce7333f967dc and only the tip contained PUB-01A closed metadata plus run reports.",
+    "A regression test asserts final_sha equals git rev-parse INTEGRATION_BRANCH and verifies the commit at that SHA contains status=closed with closed_by_run matching the run ID plus the run's committed final-report and implementation-summary files under .workflow/reports/.",
     "Branch-level handoff commands remain valid: the integration branch tip still carries implementation + close records + reports together.",
     "Existing PUB-01 handoff, incident, resume, and close-metadata tests remain green under the full verification profile."
   ],
   "must_ask_if": [
     "The implementation would change the handoff command shape or require operator replan/approval for normal successful publication.",
     "The implementation would add new run or slice terminal statuses.",
-    "The implementation would move final_sha to a second commit or require post-publication rebase instead of fixing the ordering in one commit."
+    "The implementation would move final_sha to a second commit or require post-publication rebase instead of fixing the ordering in one commit.",
+    "The implementation cannot satisfy the final_sha contract without introducing a distinct publication_sha field or changing which report artifacts are committed."
   ],
   "verify_profile": "full",
   "verify": [
     "khazad-doom slices validate --repo .",
+    "cargo test final_sha_advertises_publication_commit_with_close_records --quiet",
     "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
     "cargo test untracked_slice_metadata_completes_with_incident_flag_black_box --quiet",
     "cargo test interrupted_run_resumes_without_duplicate_merges_black_box --quiet",
