@@ -2,6 +2,9 @@
   "id": "PUB-01B",
   "title": "Validate restarted-daemon publication SHA",
   "goal": "Validate the PUB-01A bootstrap exception with a fresh daemon process: after the fixed binary is installed and restarted, a successful run must advertise a final_sha that is the integration branch tip containing implementation evidence, closed slice metadata, and committed run reports.",
+  "status": "closed",
+  "closed_by_run": "kd-20260706-222759-58cf471c",
+  "closed_at": "2026-07-06T22:31:27.535268722+00:00",
   "areas": [
     "docs/design/evidence/pub-01a-bootstrap-exception-2026-07-06.md"
   ],
