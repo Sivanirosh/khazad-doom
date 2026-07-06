@@ -952,11 +952,15 @@ impl Manager {
         let summary_path = store.output_path(&run.id, "implementation-summary.json");
         let final_report_path = store.output_path(&run.id, "final-report.json");
         let summary = artifact::read_json::<ImplementationSummary>(&summary_path).ok();
-        let final_sha = summary
-            .as_ref()
-            .map(|summary| summary.final_sha.clone())
+        let final_sha = gitutil::run(&run.repo_path, &["rev-parse", &run.integration_branch])
+            .ok()
             .filter(|sha| !sha.is_empty())
-            .or_else(|| gitutil::run(&run.repo_path, &["rev-parse", &run.integration_branch]).ok())
+            .or_else(|| {
+                summary
+                    .as_ref()
+                    .map(|summary| summary.final_sha.clone())
+                    .filter(|sha| !sha.is_empty())
+            })
             .unwrap_or_default();
         let completed_slices: Vec<String> = summary
             .as_ref()

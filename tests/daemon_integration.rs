@@ -165,6 +165,117 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
 }
 
 #[test]
+fn final_sha_advertises_publication_commit_with_close_records() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PUB-01A",
+            "title": "Publication SHA regression",
+            "goal": "Create deterministic publication evidence.",
+            "depends_on": [],
+            "acceptance": ["PUB-01A.txt exists"],
+            "verify": ["test -f PUB-01A.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add publication regression slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PUB-01A",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+
+    let handoff = kd_ok(&bin, home.path(), &["handoff", "--run", &run_id])?;
+    let handoff = json_stdout(&handoff)?;
+    let final_sha = handoff["final_sha"].as_str().expect("final sha");
+    let integration_branch = handoff["integration_branch"]
+        .as_str()
+        .expect("integration branch");
+    let integration_tip = git(repo.path(), &["rev-parse", integration_branch])?;
+    assert_eq!(
+        final_sha, integration_tip,
+        "regression kd-20260706-215228-0f3bba96 advertised 9a0eb84594c7c26edbcd648c8f807c249bf4ce08 while the integration tip was 1d3f90c544a783e627faa83b25efce7333f967dc"
+    );
+
+    let final_report_path = PathBuf::from(
+        handoff["final_report_path"]
+            .as_str()
+            .expect("final report path"),
+    );
+    let final_report: Value = serde_json::from_str(&fs::read_to_string(final_report_path)?)?;
+    assert_eq!(final_report["final_sha"].as_str(), Some(final_sha));
+    let summary_path = PathBuf::from(handoff["summary_path"].as_str().expect("summary path"));
+    let implementation_summary: Value = serde_json::from_str(&fs::read_to_string(summary_path)?)?;
+    assert_eq!(
+        implementation_summary["final_sha"].as_str(),
+        Some(final_sha)
+    );
+
+    let closed_slice_ref = format!("{final_sha}:.workflow/slices/PUB-01A.json");
+    let closed_slice: Value =
+        serde_json::from_str(&git(repo.path(), &["show", &closed_slice_ref])?)?;
+    assert_eq!(closed_slice["status"].as_str(), Some("closed"));
+    assert_eq!(
+        closed_slice["closed_by_run"].as_str(),
+        Some(run_id.as_str())
+    );
+    git(repo.path(), &["show", &format!("{final_sha}:PUB-01A.txt")])?;
+    git(
+        repo.path(),
+        &[
+            "show",
+            &format!("{final_sha}:.workflow/reports/{run_id}-final-report.json"),
+        ],
+    )?;
+    git(
+        repo.path(),
+        &[
+            "show",
+            &format!("{final_sha}:.workflow/reports/{run_id}-implementation-summary.json"),
+        ],
+    )?;
+    assert!(
+        handoff["push_command"]
+            .as_str()
+            .unwrap()
+            .contains(integration_branch)
+    );
+    assert!(
+        handoff["pr_command"]
+            .as_str()
+            .unwrap()
+            .contains(integration_branch)
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn daemon_status_responds_while_raw_socket_client_is_idle_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
