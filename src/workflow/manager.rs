@@ -1,3 +1,4 @@
+use super::cockpit::{CockpitLaunch, open_default_run_cockpit, take_cockpit_mode_transport_arg};
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
@@ -14,11 +15,11 @@ use crate::agent::{
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
 use crate::domain::{
-    AgentProfilesConfig, BranchHandoff, CheckResult, EvidenceAttestation, Finding, GateResult,
-    Handoff, HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
-    RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun,
-    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult, WorkflowConfig,
-    WorkflowExitStates,
+    AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
+    GateResult, Handoff, HandoffActionResult, HandoffDiagnostics, ImplementationSummary,
+    MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice,
+    SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
+    WorkflowConfig, WorkflowExitStates,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -221,6 +222,38 @@ impl Manager {
         self.progress_reporter(run_id).mark(&ProgressScope::new(
             phase, slice_id, attempt, command, message,
         ));
+    }
+
+    fn record_cockpit_launch(&self, run: &Run, mode: CockpitMode) -> Result<()> {
+        match open_default_run_cockpit(run, mode, &self.paths.root) {
+            Ok(CockpitLaunch::Opened(opened)) => self.state.record_event(
+                &run.id,
+                "cockpit_ready",
+                &json!({
+                    "adapter": opened.adapter,
+                    "mode": opened.mode.as_str(),
+                    "workspace": opened.workspace_label,
+                    "panes": opened.pane_labels,
+                    "source_of_truth": "daemon_state",
+                    "planner": "deferred_until_rpl_planner_authority",
+                }),
+            ),
+            Ok(CockpitLaunch::SkippedDirect) => Ok(()),
+            Err(unavailable) => self.state.record_event(
+                &run.id,
+                "run_incident",
+                &json!({
+                    "severity": "warning",
+                    "kind": "cockpit_unavailable",
+                    "adapter": unavailable.adapter,
+                    "mode": unavailable.mode.as_str(),
+                    "message": unavailable.message,
+                    "remediation": unavailable.remediation,
+                    "fallback": "direct",
+                    "source_of_truth": "daemon_state",
+                }),
+            ),
+        }
     }
 
     fn worker_event_sink(&self, context: &WorkerAttemptContext) -> RunnerEventSink {
@@ -631,10 +664,11 @@ impl Manager {
         store.write_slice(&slice, opts.overwrite)
     }
 
-    pub fn start_run(&self, opts: StartOptions) -> Result<Run> {
+    pub fn start_run(&self, mut opts: StartOptions) -> Result<Run> {
         let repo = self.init_repo(&opts.repo_path)?;
         let store = artifact::Store::new(&repo.path);
         let config = store.read_config()?;
+        let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
         self.ensure_repo_run_available(&repo.id, None)?;
         let slices = store.load_slices()?;
         if slices.is_empty() {
@@ -756,6 +790,7 @@ impl Manager {
                 "profile_source_attribution": &runner_metadata.source_attribution,
             }),
         )?;
+        self.record_cockpit_launch(&run, cockpit_mode)?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
 
         let worker_token = new_worker_token();
@@ -809,7 +844,7 @@ impl Manager {
         Ok(active)
     }
 
-    pub fn resume_run(&self, opts: ResumeOptions) -> Result<Run> {
+    pub fn resume_run(&self, mut opts: ResumeOptions) -> Result<Run> {
         let run = self
             .state
             .get_run(&opts.run_id)?
@@ -866,7 +901,9 @@ impl Manager {
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let config = store.read_config()?;
+        let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
         let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
+        self.record_cockpit_launch(&run, cockpit_mode)?;
         let worker_token = new_worker_token();
         self.state.store_worker_token(&run.id, &worker_token)?;
         let cancel = CancellationToken::new();
@@ -3429,6 +3466,13 @@ fn handoff_diagnostics(repo_path: &str) -> HandoffDiagnostics {
     }
 }
 
+fn effective_cockpit_mode(
+    pi_args: &mut Vec<String>,
+    config: &WorkflowConfig,
+) -> Result<CockpitMode> {
+    Ok(take_cockpit_mode_transport_arg(pi_args)?.unwrap_or(config.cockpit))
+}
+
 fn effective_parallelism(requested: usize, config: &WorkflowConfig) -> usize {
     if requested > 1 {
         requested
@@ -3647,8 +3691,8 @@ mod tests {
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, CheckResult, Handoff, ImplementationSummary, RepairResult, Run,
-        RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult,
+        AcceptanceEvidence, CheckResult, CockpitMode, Handoff, ImplementationSummary, RepairResult,
+        Run, RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult,
         WorkflowConfig,
     };
     use crate::gitutil;
@@ -4702,6 +4746,7 @@ mod tests {
             store.config_path(),
             &WorkflowConfig {
                 agent: "fake".to_string(),
+                cockpit: CockpitMode::Auto,
                 parallelism: 1,
                 verify_timeout_seconds: 30,
                 worker_attempt_timeout_seconds: 0,

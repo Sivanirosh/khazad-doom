@@ -26,6 +26,7 @@ khazad-doom slices schema --write
 khazad-doom run --slice <slice-id>
 khazad-doom run --all --parallel <n>
 khazad-doom run --allow-dirty --slice <slice-id>
+khazad-doom run --cockpit direct --all
 khazad-doom run --agent fake --all
 khazad-doom resume --run <run-id>
 khazad-doom status --run <run-id>
@@ -47,7 +48,7 @@ khazad-doom daemon status
 - Slices have an issue-style lifecycle: new slices are open by default; successful daemon runs close completed slice JSON with `status: "closed"`, `closed_by_run`, and `closed_at`.
 - Do not rerun closed historical slices. Closed dependencies are treated as satisfied; explicitly requesting a closed slice should be rejected in favor of creating a follow-up slice.
 - `docs/workflow-invariants.md` records daemon workflow invariants that behavior-preserving refactors must keep stable.
-- `.workflow/khazad.json` carries repo defaults, daemon-owned `worktree_setup` bootstrap commands, and verification profiles.
+- `.workflow/khazad.json` carries repo defaults, durable `cockpit` policy (`auto`, `herdr`, or `direct`), daemon-owned `worktree_setup` bootstrap commands, and verification profiles.
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
 - Treat each open slice as bounded intent plus minimum evidence, not a frozen mini-spec: learning is allowed inside the fence; moving the fence requires approval. TDD-discovered cases directly implied by the slice goal or acceptance may be handled inline and reported; discoveries that alter intent or exceed declared `areas` require `ask-user` or a follow-up slice.
 - When authoring slices, include expected test/helper/doc paths in `areas`; narrow `areas` are intentional hard stops, not semantic hints.
@@ -64,7 +65,7 @@ khazad-doom daemon status
 - Runtime artifacts under `.workflow/runs/` are gitignored and include preflight snapshots, observed Pi contract/profile summaries, raw outputs, terminal run summaries, and bounded failed/cancelled attempt diagnostics.
 - Handoff prints by default; push/PR creation require explicit flags or config, and `--dry-run` suppresses configured actions.
 - Final reports and handoff JSON expose explicit `exit_states` and `evidence_attestation`; treat them as read-only summaries over existing lifecycle state, not extra gates.
-- The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status projection, monitor output, handoff JSON, and artifact inspection.
+- The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status projection, Herdr cockpit launch/fallback decisions, monitor output, handoff JSON, and artifact inspection.
 - Runs are daemon-owned durable sessions. A Pi tool call must start/control/observe a run, never define its lifetime.
 
 ## Pi chat UX rule: detach after run start
@@ -91,10 +92,12 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 
 - Do not use blocking `--wait` as the primary Pi UX for real `pi` runs. Start the run without `--wait`, capture the JSON (`run_id`, `repo_path`, `monitor_command`, `run_monitor_command`), report the monitor command, and detach unless an allowed exception above applies.
 - Use `khazad-doom watch --run <run-id>` or short `status --run` checks only as plain fallbacks when the monitor dashboard is not suitable and an allowed exception above applies.
-- Khazad-Doom does not auto-open external windows by default; core observability is the daemon-owned CLI surface.
+- Cockpit mode defaults to `auto`: when `herdr` is usable, Khazad-Doom may create/focus a `Khazad-Doom <run-id>` workspace with read-only `Run Status / Event Feed` and `Integration Gate / Repair` panes; `--cockpit direct` or config `"cockpit": "direct"` suppresses this.
+- Herdr cockpit failures are non-fatal `cockpit_unavailable` incidents/feed evidence with remediation; they must not change slice selection, worker authorization, verification, merge, handoff, or terminal run status by themselves.
+- The Planner Pi pane is deferred until RPL planner authority exists; do not launch a planner agent for cockpit setup.
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
-- `khazad-doom monitor`, `watch`, and the optional Pi `/khazad-attach <run-id>` widget paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording; terminal reasons and operator commands come from `primary_terminal_reason`, `feed.terminal_reason`, and `feed.operator_commands`.
-- Do not require a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks. If the operator wants in-Pi feedback, suggest explicit `/khazad-attach <run-id>` and `/khazad-detach`.
+- `khazad-doom monitor`, `watch`, Herdr cockpit panes, and the optional Pi `/khazad-attach <run-id>` widget paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording; terminal reasons and operator commands come from `primary_terminal_reason`, `feed.terminal_reason`, and `feed.operator_commands`.
+- Do not require Herdr or a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks. If the operator wants in-Pi feedback, suggest explicit `/khazad-attach <run-id>` and `/khazad-detach`.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 - Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
 - Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.

@@ -59,6 +59,8 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
             path(repo.path()),
             "--agent",
             "fake",
+            "--cockpit",
+            "direct",
             "--all",
         ],
     )?;
@@ -149,7 +151,14 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
         &bin,
         home.path(),
         &[("KHAZAD_AGENT", "fake")],
-        &["run", "--repo", path(repo.path()), "--all"],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
     )?;
     let env_run_id = json_stdout(&env_started)?["run_id"]
         .as_str()
@@ -159,6 +168,214 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
 
     let missing_cancel = kd(&bin, home.path(), &["cancel", "--run", "does-not-exist"])?;
     assert!(!missing_cancel.status.success());
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn cockpit_direct_cli_override_beats_durable_herdr_config() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    fs::write(
+        repo.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "fake",
+                "cockpit": "herdr",
+                "parallelism": 1
+            }))?
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "COCKPIT-DIRECT",
+            "title": "Cockpit direct override",
+            "goal": "Prove direct cockpit override does not affect fake execution.",
+            "acceptance": ["COCKPIT-DIRECT.txt exists"],
+            "verify": ["test -f COCKPIT-DIRECT.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add cockpit override slice"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let events = completed["events"].as_array().expect("events");
+    assert!(events.iter().all(|event| {
+        event["type"].as_str() != Some("cockpit_ready")
+            && event["payload"]["kind"].as_str() != Some("cockpit_unavailable")
+    }));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn cockpit_herdr_failure_is_nonfatal_incident() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    write_failing_herdr(fake_bin.path())?;
+    let fake_path = prepend_path(fake_bin.path());
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("PATH", fake_path.as_str())],
+        &["init", "--repo", path(repo.path())],
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "COCKPIT-FALLBACK",
+            "title": "Cockpit fallback",
+            "goal": "Complete fake work even when Herdr cockpit launch fails.",
+            "acceptance": ["COCKPIT-FALLBACK.txt exists"],
+            "verify": ["test -f COCKPIT-FALLBACK.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add cockpit fallback slice"])?;
+
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("PATH", fake_path.as_str())],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--cockpit",
+            "herdr",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let completed = kd_ok(
+        &bin,
+        home.path(),
+        &["status", "--run", &run_id, "--events-limit", "200"],
+    )?;
+    let completed = json_stdout(&completed)?;
+    assert_eq!(completed["run"]["status"].as_str(), Some("completed"));
+    assert!(completed["events"].as_array().unwrap().iter().any(|event| {
+        event["type"].as_str() == Some("run_incident")
+            && event["payload"]["kind"].as_str() == Some("cockpit_unavailable")
+            && event["payload"]["fallback"].as_str() == Some("direct")
+            && event["payload"]["remediation"].as_str().is_some()
+    }));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn herdr_cockpit_workspace_real() -> TestResult {
+    if std::env::var("HERDR_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping real Herdr cockpit smoke; set HERDR_E2E=1 to enable");
+        return Ok(());
+    }
+    if !herdr_available() {
+        eprintln!("skipping real Herdr cockpit smoke; herdr binary is not on PATH");
+        return Ok(());
+    }
+
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "HERDR-SMOKE",
+            "title": "Herdr cockpit smoke",
+            "goal": "Create fake output while Herdr cockpit panes are opened.",
+            "acceptance": ["HERDR-SMOKE.txt exists"],
+            "verify": ["test -f HERDR-SMOKE.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add Herdr cockpit smoke slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let workspace_label = format!("Khazad-Doom {run_id}");
+    let workspace_id = wait_for_herdr_workspace(&workspace_label)?;
+    let _workspace_guard = HerdrWorkspaceGuard::new(workspace_id.clone());
+    let panes = herdr_json(&["pane", "list", "--workspace", &workspace_id])?;
+    let empty_panes = Vec::new();
+    let labels = panes["result"]["panes"]
+        .as_array()
+        .unwrap_or(&empty_panes)
+        .iter()
+        .filter_map(|pane| pane["label"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        labels.contains(&"Run Status / Event Feed"),
+        "Herdr panes should include Run Status / Event Feed, got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"Integration Gate / Repair"),
+        "Herdr panes should include Integration Gate / Repair, got {labels:?}"
+    );
+
+    let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    assert!(completed["events"].as_array().unwrap().iter().any(|event| {
+        event["type"].as_str() == Some("cockpit_ready")
+            && event["payload"]["workspace"].as_str() == Some(workspace_label.as_str())
+    }));
 
     guard.stop();
     Ok(())
@@ -1469,6 +1686,101 @@ fn interrupted_run_resumes_without_duplicate_merges_black_box() -> TestResult {
     Ok(())
 }
 
+fn herdr_available() -> bool {
+    herdr_output(&["--version"], Duration::from_secs(2))
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn herdr_json(args: &[&str]) -> TestResult<Value> {
+    let output = herdr_output(args, Duration::from_secs(3))?;
+    if !output.status.success() {
+        panic!(
+            "herdr {} failed\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn wait_for_herdr_workspace(label: &str) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let workspaces = herdr_json(&["workspace", "list"])?;
+        if let Some(workspace_id) =
+            workspaces["result"]["workspaces"]
+                .as_array()
+                .and_then(|items| {
+                    items.iter().find_map(|workspace| {
+                        (workspace["label"].as_str() == Some(label))
+                            .then(|| workspace["workspace_id"].as_str())
+                            .flatten()
+                    })
+                })
+        {
+            return Ok(workspace_id.to_string());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Herdr workspace {label:?}; workspaces: {workspaces:#}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn herdr_output(args: &[&str], timeout: Duration) -> TestResult<Output> {
+    let mut child = Command::new("herdr")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output()?;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "herdr {} did not finish within {:?}\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            timeout,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+    .into())
+}
+
+struct HerdrWorkspaceGuard {
+    workspace_id: Option<String>,
+}
+
+impl HerdrWorkspaceGuard {
+    fn new(workspace_id: String) -> Self {
+        Self {
+            workspace_id: Some(workspace_id),
+        }
+    }
+}
+
+impl Drop for HerdrWorkspaceGuard {
+    fn drop(&mut self) {
+        if let Some(workspace_id) = self.workspace_id.take() {
+            let _ = herdr_output(
+                &["workspace", "close", &workspace_id],
+                Duration::from_secs(3),
+            );
+        }
+    }
+}
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_khazad-doom"))
 }
@@ -1723,6 +2035,22 @@ fn kill_daemon(home: &Path) -> TestResult {
         );
     }
     thread::sleep(Duration::from_millis(300));
+    Ok(())
+}
+
+fn write_failing_herdr(dir: &Path) -> TestResult {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("herdr");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env sh
+printf 'fake herdr failure for %s\n' "$*" >&2
+exit 42
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
     Ok(())
 }
 
@@ -2025,8 +2353,9 @@ fn kd_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> TestResult<Output> {
+    let effective_args = test_command_args(args);
     let mut child = Command::new(bin)
-        .args(args)
+        .args(&effective_args)
         .env("KHAZAD_HOME", home)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2059,12 +2388,32 @@ fn kd_with_env(
     extra_env: &[(&str, &str)],
     args: &[&str],
 ) -> TestResult<Output> {
+    let effective_args = test_command_args(args);
     let mut command = Command::new(bin);
-    command.args(args).env("KHAZAD_HOME", home);
+    command.args(&effective_args).env("KHAZAD_HOME", home);
     for (key, value) in extra_env {
         command.env(key, value);
     }
     Ok(command.output()?)
+}
+
+fn test_command_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    if should_force_direct_cockpit(args) {
+        let mut effective = Vec::with_capacity(args.len() + 2);
+        effective.push(args[0]);
+        effective.push("--cockpit");
+        effective.push("direct");
+        effective.extend_from_slice(&args[1..]);
+        effective
+    } else {
+        args.to_vec()
+    }
+}
+
+fn should_force_direct_cockpit(args: &[&str]) -> bool {
+    matches!(args.first().copied(), Some("run" | "resume"))
+        && !args.contains(&"--cockpit")
+        && std::env::var("HERDR_E2E").ok().as_deref() != Some("1")
 }
 
 fn json_stdout(output: &Output) -> TestResult<Value> {

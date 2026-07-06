@@ -39,6 +39,8 @@ pub struct Slice {
 pub struct WorkflowConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent: String,
+    #[serde(default, skip_serializing_if = "is_default_cockpit_mode")]
+    pub cockpit: CockpitMode,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub parallelism: usize,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -70,6 +72,7 @@ impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             agent: "pi".to_string(),
+            cockpit: CockpitMode::Auto,
             parallelism: 3,
             verify_timeout_seconds: 600,
             worker_attempt_timeout_seconds: 0,
@@ -81,6 +84,36 @@ impl Default for WorkflowConfig {
             base_branch: String::new(),
             handoff: HandoffDefaults::default(),
             verify_profiles: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CockpitMode {
+    #[default]
+    Auto,
+    Herdr,
+    Direct,
+}
+
+impl CockpitMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Herdr => "herdr",
+            Self::Direct => "direct",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "" | "auto" => Ok(Self::Auto),
+            "herdr" => Ok(Self::Herdr),
+            "direct" => Ok(Self::Direct),
+            other => {
+                anyhow::bail!("unknown cockpit mode {other:?}; expected auto, herdr, or direct")
+            }
         }
     }
 }
@@ -964,6 +997,10 @@ pub fn default_integration_repair_policy() -> String {
 
 fn is_default_integration_repair_policy(value: &str) -> bool {
     value.is_empty() || value == "auto"
+}
+
+fn is_default_cockpit_mode(value: &CockpitMode) -> bool {
+    *value == CockpitMode::Auto
 }
 
 fn default_true() -> bool {
