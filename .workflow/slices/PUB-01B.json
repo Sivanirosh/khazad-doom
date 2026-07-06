@@ -1,0 +1,27 @@
+{
+  "id": "PUB-01B",
+  "title": "Validate restarted-daemon publication SHA",
+  "goal": "Validate the PUB-01A bootstrap exception with a fresh daemon process: after the fixed binary is installed and restarted, a successful run must advertise a final_sha that is the integration branch tip containing implementation evidence, closed slice metadata, and committed run reports.",
+  "areas": [
+    "docs/design/evidence/pub-01a-bootstrap-exception-2026-07-06.md"
+  ],
+  "acceptance": [
+    "The worker makes only an evidence-note change in docs/design/evidence/pub-01a-bootstrap-exception-2026-07-06.md; no product code changes are made by this validation slice.",
+    "The existing regression test final_sha_advertises_publication_commit_with_close_records passes under slice verification and the full integration gate.",
+    "After daemon finalization, operator review verifies handoff final_sha, final-report final_sha, and implementation-summary final_sha all equal git rev-parse of the run's integration branch.",
+    "At the advertised final_sha, git show can read .workflow/slices/PUB-01B.json with status=closed and closed_by_run equal to the validation run id.",
+    "At the advertised final_sha, git show can read the validation run's committed .workflow/reports/<run>-final-report.json and .workflow/reports/<run>-implementation-summary.json artifacts."
+  ],
+  "must_ask_if": [
+    "The worker would change product code, publication code, daemon lifecycle code, or tests instead of keeping this as validation evidence.",
+    "The final_sha regression test is missing or fails before daemon finalization.",
+    "The validation cannot be performed with a restarted installed daemon.",
+    "A separate publication_sha field appears necessary to make the acceptance true."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test final_sha_advertises_publication_commit_with_close_records --quiet"
+  ],
+  "verify_timeout_seconds": 600
+}
