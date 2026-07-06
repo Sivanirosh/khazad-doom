@@ -1,0 +1,38 @@
+{
+  "id": "PUB-01",
+  "title": "Completion publisher and close-record promotion",
+  "goal": "Make successful-run publication atomic from the operator's perspective so implementation commits, slice close records, final reports, and handoff SHA cannot be split across hidden integration-branch commits or stale main-branch truth.",
+  "areas": [
+    "src/workflow/manager.rs",
+    "src/artifact.rs",
+    "src/domain.rs",
+    "src/gitutil.rs",
+    "src/state.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "A successful run advertises one final handoff SHA/branch state that contains both worker implementation changes and daemon-owned publication changes such as closed slice JSON and final report artifacts; close/report truth is not stranded on an unadvertised integration-branch commit.",
+    "A regression test covers the R8 failure shape: after gate success and slice closure, handoff/final report evidence points at a commit that includes the close records instead of only the implementation commit.",
+    "If slice metadata needed for closure is absent or unwritable, Khazad-Doom records a structured incident naming the affected slice/path and preserves or blocks handoff readiness according to explicit policy; it must not silently drop close-record truth.",
+    "Successful-run publication is resume-safe and idempotent: resuming after publication does not duplicate close/report commits, lose final SHA truth, or re-close already published slices incorrectly.",
+    "Handoff and final-report exit states remain read-only summaries over daemon lifecycle state; this slice must not introduce remote push/PR mutation or a second source of workflow truth.",
+    "Existing fake-runner end-to-end, handoff, incident, and resume tests remain green under the full verification profile."
+  ],
+  "must_ask_if": [
+    "The implementation would make roadmap docs, reports, or handoff JSON authoritative over slice JSON plus daemon/run state.",
+    "The implementation would auto-push, create PRs, or mutate remotes as part of default publication.",
+    "The implementation would require an operator replan/approval step for normal successful publication instead of fixing the daemon-owned promotion path.",
+    "The implementation would add new run or slice terminal statuses for publication rather than preserving existing lifecycle states with better evidence.",
+    "The implementation would weaken slice-close invariants, ignore close failures without structured incidents, or treat missing close metadata as invisible success.",
+    "The implementation would broadly split or rewrite workflow::manager outside the completion-publication seam without evidence from the architecture review."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+    "cargo test untracked_slice_metadata_completes_with_incident_flag_black_box --quiet",
+    "cargo test interrupted_run_resumes_without_duplicate_merges_black_box --quiet"
+  ],
+  "verify_timeout_seconds": 600
+}
