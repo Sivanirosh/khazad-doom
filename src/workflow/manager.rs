@@ -8,6 +8,7 @@ use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
     WorktreeSetupRequest, failure_kind_needs_operator,
 };
+use super::projection::project_run;
 use super::{
     CancelledError, REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA, check_cancelled,
     integration_repair_prompt, worker_prompt,
@@ -26,9 +27,10 @@ use crate::domain::{
     ImplementationSummary, MergeConflictReport, OriginNotificationTarget,
     PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions, RepairResult,
     ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run,
-    RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun, SliceStatus,
-    SliceValidationReport, SliceWriteResult, TerminalNotificationRecord, WorkerProfileEvidence,
-    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
+    RunCheckpoint, RunDetails, RunInspection, RunStatus, Slice, SliceExitState, SliceRun,
+    SliceStatus, SliceValidationReport, SliceWriteResult, TerminalNotificationRecord,
+    WorkerProfileEvidence, WorkerResult, WorkflowConfig, WorkflowExitStates,
+    replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -391,6 +393,7 @@ impl Manager {
                 context.attempt,
                 event.pid,
                 event.kind.as_str(),
+                &event.text,
                 context.timeout_seconds,
                 context.no_output_warning_seconds,
             );
@@ -1551,6 +1554,26 @@ impl Manager {
         let plan_revisions = self.plan_revisions_for_run(run)?;
         let cancel_reason = latest_cancel_reason(&events);
         let primary_failure = primary_failure_for_terminal_summary(message, &slice_runs, &events);
+        let mut feed_run = run.clone();
+        feed_run.status = status;
+        feed_run.error = message.to_string();
+        feed_run.updated_at = Utc::now();
+        let feed = project_run(&RunDetails {
+            run: feed_run,
+            worker_profile: worker_profile.clone(),
+            slice_runs: slice_runs.clone(),
+            progress: progress.clone(),
+            incidents: Vec::new(),
+            questions: self
+                .state
+                .list_worker_questions(&run.id)
+                .unwrap_or_default(),
+            replan: Default::default(),
+            events: events.clone(),
+            economics: economics.clone(),
+            primary_terminal_reason: None,
+            feed: None,
+        });
         let summary = json!({
             "run_id": run.id,
             "repo_path": run.repo_path,
@@ -1566,6 +1589,7 @@ impl Manager {
             "slice_runs": slice_runs,
             "progress": progress,
             "economics": economics,
+            "feed": feed,
             "plan_revisions": plan_revisions,
             "worktree_snapshots": self.run_worktree_snapshots(run),
             "next_commands": terminal_next_commands(run, status),
@@ -4015,6 +4039,17 @@ fn terminal_feedback_payload(
     .flatten()
     .map(|path| path.to_string_lossy().to_string())
     .collect::<Vec<_>>();
+    let feed = summary.get("feed").cloned().unwrap_or(Value::Null);
+    let feed_summary = feed
+        .get("summary_line")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            summary
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        });
     json!({
         "kind": "khazad_terminal_feedback",
         "run_id": run.id,
@@ -4022,7 +4057,9 @@ fn terminal_feedback_payload(
         "repo_path": run.repo_path,
         "integration_branch": run.integration_branch,
         "selected_slice_id": run.selected_slice_id,
-        "message": summary.get("message").and_then(Value::as_str).unwrap_or_default(),
+        "message": feed_summary,
+        "feed_summary_line": feed_summary,
+        "feed": feed,
         "primary_failure": summary.get("primary_failure").and_then(Value::as_str).unwrap_or_default(),
         "cancel_reason": summary.get("cancel_reason").and_then(Value::as_str).unwrap_or_default(),
         "final_sha": final_sha,
@@ -5623,6 +5660,19 @@ mod tests {
         assert_eq!(record.origin_target, "agent-1");
         assert_eq!(record.payload["kind"], "khazad_terminal_feedback");
         assert_eq!(record.payload["terminal_status"], "completed");
+        assert_eq!(
+            record.payload["feed_summary_line"].as_str(),
+            Some("run completed; handoff artifacts are ready")
+        );
+        assert_eq!(
+            record.payload["message"].as_str(),
+            record.payload["feed"]["summary_line"].as_str()
+        );
+        assert!(
+            record.payload["feed"]["blocks"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["label"] == "Run"))
+        );
         assert!(
             record.payload["next_commands"]
                 .as_array()

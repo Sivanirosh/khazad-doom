@@ -107,6 +107,28 @@ pub fn observation(binary: &str, extra_args: &[String]) -> PiContractObservation
 const ACTIVITY_DELTA_FLUSH_EVENTS: usize = 100;
 const ACTIVITY_SNIPPET_CHARS: usize = 160;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiSemanticProgress {
+    pub summary: String,
+}
+
+pub fn semantic_progress_from_stdout_line(line: &str) -> Option<PiSemanticProgress> {
+    let event = serde_json::from_str::<Value>(line).ok()?;
+    semantic_progress_from_event(&event)
+}
+
+fn semantic_progress_from_event(event: &Value) -> Option<PiSemanticProgress> {
+    let action = match event.get("type").and_then(Value::as_str)? {
+        "tool_execution_start" => "started",
+        "tool_execution_update" => "running",
+        "tool_execution_end" => "finished",
+        _ => return None,
+    };
+    Some(PiSemanticProgress {
+        summary: format!("tool {} {action}", tool_label(event)),
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct PiActivityFormatter {
     text_delta_events: usize,
@@ -804,6 +826,26 @@ mod tests {
         assert!(joined.contains("[pi] unknown event ignored: future_activity_event"));
         assert!(joined.contains("[pi] turn ended (7 in/11 out)"));
         assert!(joined.contains("[pi] agent finished"));
+    }
+
+    #[test]
+    fn semantic_progress_from_wrapper_stdout_fixture_tracks_tool_events() {
+        let fixture =
+            include_str!("../tests/fixtures/projection_information_wrapper_stdout.ndjson");
+        let summaries = fixture
+            .lines()
+            .filter_map(semantic_progress_from_stdout_line)
+            .map(|progress| progress.summary)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            summaries,
+            vec![
+                "tool bash started".to_string(),
+                "tool bash running".to_string(),
+                "tool bash finished".to_string(),
+            ]
+        );
     }
 
     #[test]

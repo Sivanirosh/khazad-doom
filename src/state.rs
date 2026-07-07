@@ -3,6 +3,7 @@ use crate::domain::{
     ReplanProposalState, ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus,
     WorkerAttemptProgress, WorkerQuestion,
 };
+use crate::pi_contract;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -229,6 +230,12 @@ impl Store {
             "run_progress",
             "worker_last_semantic_progress_at",
             "worker_last_semantic_progress_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "run_progress",
+            "worker_last_semantic_progress_summary",
+            "worker_last_semantic_progress_summary TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(
             &conn,
@@ -739,8 +746,9 @@ impl Store {
                (run_id, phase, slice_id, attempt, command, message, output_tail, phase_started_at,
                 updated_at, worker_attempt_started_at, worker_pid, worker_process_observed_at,
                 worker_last_event_at, worker_last_event_kind, worker_last_semantic_progress_at,
-                worker_attempt_timeout_seconds, worker_no_output_warning_seconds)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', NULL, '', '', '', '', 0, 0)
+                worker_last_semantic_progress_summary, worker_attempt_timeout_seconds,
+                worker_no_output_warning_seconds)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', NULL, '', '', '', '', '', 0, 0)
                ON CONFLICT(run_id) DO UPDATE SET
                  phase=excluded.phase,
                  slice_id=excluded.slice_id,
@@ -756,6 +764,7 @@ impl Store {
                  worker_last_event_at=excluded.worker_last_event_at,
                  worker_last_event_kind=excluded.worker_last_event_kind,
                  worker_last_semantic_progress_at=excluded.worker_last_semantic_progress_at,
+                 worker_last_semantic_progress_summary=excluded.worker_last_semantic_progress_summary,
                  worker_attempt_timeout_seconds=excluded.worker_attempt_timeout_seconds,
                  worker_no_output_warning_seconds=excluded.worker_no_output_warning_seconds"#,
             params![
@@ -795,6 +804,7 @@ impl Store {
         attempt: usize,
         pid: Option<u32>,
         event_kind: &str,
+        event_text: &str,
         attempt_timeout_seconds: u64,
         no_output_warning_seconds: u64,
     ) -> Result<Option<RunProgress>> {
@@ -803,6 +813,16 @@ impl Store {
         let now_text = now.to_rfc3339();
         let is_process_observation = matches!(event_kind, "started" | "process_observed");
         let is_worker_event = matches!(event_kind, "stdout" | "stderr");
+        let semantic_progress = if event_kind == "stdout" {
+            pi_contract::semantic_progress_from_stdout_line(event_text)
+        } else {
+            None
+        };
+        let has_semantic_progress = semantic_progress.is_some();
+        let semantic_progress_summary = semantic_progress
+            .as_ref()
+            .map(|progress| progress.summary.as_str())
+            .unwrap_or_default();
         conn.execute(
             r#"UPDATE run_progress SET
                  updated_at=?1,
@@ -823,15 +843,25 @@ impl Store {
                    WHEN ?4 THEN ?5
                    ELSE worker_last_event_kind
                  END,
-                 worker_attempt_timeout_seconds=?6,
-                 worker_no_output_warning_seconds=?7
-               WHERE run_id=?8 AND phase=?9 AND slice_id=?10 AND attempt=?11"#,
+                 worker_last_semantic_progress_at=CASE
+                   WHEN ?6 THEN ?1
+                   ELSE worker_last_semantic_progress_at
+                 END,
+                 worker_last_semantic_progress_summary=CASE
+                   WHEN ?6 THEN ?7
+                   ELSE worker_last_semantic_progress_summary
+                 END,
+                 worker_attempt_timeout_seconds=?8,
+                 worker_no_output_warning_seconds=?9
+               WHERE run_id=?10 AND phase=?11 AND slice_id=?12 AND attempt=?13"#,
             params![
                 now_text,
                 pid.map(|pid| pid as i64),
                 is_process_observation,
                 is_worker_event,
                 event_kind,
+                has_semantic_progress,
+                semantic_progress_summary,
                 attempt_timeout_seconds as i64,
                 no_output_warning_seconds as i64,
                 run_id,
@@ -850,8 +880,8 @@ impl Store {
                 r#"SELECT run_id, phase, slice_id, attempt, command, message, output_tail,
                           phase_started_at, updated_at, worker_attempt_started_at, worker_pid,
                           worker_process_observed_at, worker_last_event_at, worker_last_event_kind,
-                          worker_last_semantic_progress_at, worker_attempt_timeout_seconds,
-                          worker_no_output_warning_seconds
+                          worker_last_semantic_progress_at, worker_last_semantic_progress_summary,
+                          worker_attempt_timeout_seconds, worker_no_output_warning_seconds
                    FROM run_progress WHERE run_id=?1"#,
                 params![run_id],
                 run_progress_tuple_from_row,
@@ -1104,6 +1134,7 @@ type RunProgressTuple = (
     String,
     String,
     String,
+    String,
     i64,
     i64,
 );
@@ -1183,6 +1214,7 @@ fn run_progress_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunP
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
     ))
 }
 
@@ -1371,6 +1403,7 @@ fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
         worker_last_event_at,
         worker_last_event_kind,
         worker_last_semantic_progress_at,
+        worker_last_semantic_progress_summary,
         worker_attempt_timeout_seconds,
         worker_no_output_warning_seconds,
     ) = row;
@@ -1393,6 +1426,7 @@ fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
                 "worker_last_semantic_progress_at",
                 &worker_last_semantic_progress_at,
             )?,
+            last_semantic_progress_summary: worker_last_semantic_progress_summary,
             attempt_timeout_seconds: worker_attempt_timeout_seconds as u64,
             no_output_warning_seconds: worker_no_output_warning_seconds as u64,
         })
@@ -1445,6 +1479,53 @@ mod tests {
             started_at,
             updated_at: started_at,
         }
+    }
+
+    #[test]
+    fn semantic_progress_from_wrapper_stdout_path_updates_worker_progress() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        let run = run(
+            "run-semantic",
+            "/tmp/repo-semantic",
+            RunStatus::Running,
+            now,
+        );
+        store.insert_run(&run)?;
+        store.update_progress(
+            &run.id,
+            "worker_running",
+            "slice-001",
+            1,
+            "pi",
+            "slice worker is running",
+            "",
+        )?;
+        let line = include_str!("../tests/fixtures/projection_information_wrapper_stdout.ndjson")
+            .lines()
+            .find(|line| line.contains("tool_execution_end"))
+            .expect("tool execution fixture line");
+
+        store.observe_worker_attempt(
+            &run.id,
+            "worker_running",
+            "slice-001",
+            1,
+            Some(123),
+            "stdout",
+            line,
+            0,
+            0,
+        )?;
+
+        let progress = store.get_progress(&run.id)?.expect("progress");
+        let worker = progress.worker.expect("worker progress");
+        assert!(worker.last_event_at.is_some());
+        assert_eq!(worker.last_event_kind, "stdout");
+        assert!(worker.last_semantic_progress_at.is_some());
+        assert_eq!(worker.last_semantic_progress_summary, "tool bash finished");
+        Ok(())
     }
 
     #[test]

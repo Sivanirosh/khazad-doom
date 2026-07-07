@@ -1,0 +1,21 @@
+{
+  "required_block_order": [
+    "Attention",
+    "Commands",
+    "Run",
+    "Todos",
+    "Worker",
+    "Progress",
+    "Activity",
+    "Economics"
+  ],
+  "semantic_progress_substring": "tool read finished",
+  "required_activity_substrings": [
+    "Cockpit: herdr workspace ready",
+    "Terminal: summary written",
+    "Opaque Event"
+  ],
+  "forbidden_activity_substrings": ["{", "}"],
+  "dedup_activity_substring": "slice worker is running",
+  "economics_substring": "0 completed + 1 in flight"
+}

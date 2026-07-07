@@ -162,7 +162,7 @@ The default cockpit mode is `auto`: if a usable `herdr` binary is on `PATH`, run
 
 To focus Herdr after a run already exists, use `khazad-doom cockpit open --run <run-id>` or `khazad-doom cockpit open --latest --repo .`. The command reads daemon status to identify the run, opens or focuses the Herdr workspace, and returns JSON with a clear `fallback`, `remediation`, and `operator_commands` list when Herdr is unavailable; headless `status`, `watch`, `monitor`, `answer`, and `handoff` flows do not require Herdr.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI or Herdr cockpit is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, Herdr feed/status panes, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. The Herdr gate/repair pane may additionally display bounded `status` progress tails for the active gate or repair command. Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and exact `operator_commands`. The shared vocabulary includes `Todos`, `Run`, `Terminal`, current `Worker`/`Shell`/`Merge`/`Repair`, `Commands`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI or Herdr cockpit is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, Herdr feed/status panes, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. The Herdr gate/repair pane may additionally display bounded `status` progress tails for the active gate or repair command. Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and exact `operator_commands`. The shared vocabulary includes `Todos`, `Run`, `Progress`, `Terminal`, current `Worker`/`Shell`/`Merge`/`Repair`, `Commands`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
 
 Inside Pi, the shipped adapter is a thin bridge, not a second cockpit. `/khazad-attach <run-id>` attaches a compact read-only widget to one daemon run feed, `/khazad-explain <run-id>` (or explicit `/khazad-explain --latest`) paints one daemon `feed` snapshot, `/khazad-open <run-id>` (or explicit `/khazad-open --latest`) delegates Herdr open/focus to `khazad-doom cockpit open`, `/khazad-handoff <run-id>` summarizes daemon handoff JSON, `/khazad-answer <run-id> <question-id> <answer>` answers through daemon state, and `/khazad-detach` clears the widget. The adapter does not implicitly auto-discover runs, own workflow state, infer lifecycle from the Pi session, or replace `status`/`watch`/`monitor`; all live wording comes from `RunDetails.feed`, and session shutdown/reload only cleans up Pi UI resources.
 
@@ -184,8 +184,11 @@ Worker (parallel layer: slice-001, slice-002 • attempt 1 • now)
 └ Process: running pid=12345
 └ Runtime: 22m14s
 └ Last worker event: none
-└ Last semantic progress: unknown
 └ Timeout: disabled
+
+Progress semantic
+└ Last semantic progress: unknown
+└ Last worker event: none
 
 Warn
 └ worker is quiet for 15m00s; this may be normal; no timeout configured
