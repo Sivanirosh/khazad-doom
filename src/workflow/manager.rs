@@ -7,6 +7,7 @@ use super::cockpit::{
     open_default_worker_pane, take_cockpit_mode_transport_arg, worker_activity_pane_command,
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
+use super::events as workflow_events;
 use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
     WorktreeSetupRequest, failure_kind_needs_operator,
@@ -310,12 +311,12 @@ impl Manager {
         self.state.record_event(
             &run.id,
             "replan_checkpoint_blocked",
-            &json!({
-                "proposal_ids": pending.iter().map(|proposal| proposal.id.clone()).collect::<Vec<_>>(),
-                "checkpoint": checkpoint,
-                "message": message,
-                "decision_commands": commands,
-            }),
+            &workflow_events::ReplanCheckpointBlockedPayload::new(
+                pending.iter().map(|proposal| proposal.id.clone()).collect(),
+                checkpoint,
+                &message,
+                commands.clone(),
+            ),
         )?;
         for proposal in &pending {
             self.notify_attention_for_replan(run, proposal);
@@ -382,30 +383,29 @@ impl Manager {
         match open_default_run_cockpit(run, mode, &self.paths.root) {
             Ok(CockpitLaunch::Opened(opened)) => self.state.record_event(
                 &run.id,
-                "cockpit_ready",
-                &json!({
-                    "adapter": opened.adapter,
-                    "mode": opened.mode.as_str(),
-                    "workspace": opened.workspace_label,
-                    "panes": opened.pane_labels,
-                    "source_of_truth": "daemon_state",
-                    "planner": "deferred_until_rpl_planner_authority",
-                }),
+                workflow_events::COCKPIT_READY,
+                &workflow_events::CockpitReadyPayload {
+                    adapter: opened.adapter,
+                    mode: opened.mode.as_str().to_string(),
+                    workspace: opened.workspace_label,
+                    panes: opened.pane_labels,
+                    source_of_truth: "daemon_state".to_string(),
+                    planner: "deferred_until_rpl_planner_authority".to_string(),
+                },
             ),
             Ok(CockpitLaunch::SkippedDirect) => Ok(()),
             Err(unavailable) => self.state.record_event(
                 &run.id,
-                "run_incident",
-                &json!({
-                    "severity": "warning",
-                    "kind": "cockpit_unavailable",
-                    "adapter": unavailable.adapter,
-                    "mode": unavailable.mode.as_str(),
-                    "message": unavailable.message,
-                    "remediation": unavailable.remediation,
-                    "fallback": "direct",
-                    "source_of_truth": "daemon_state",
-                }),
+                workflow_events::RUN_INCIDENT,
+                &workflow_events::RunIncidentPayload::warning(
+                    "cockpit_unavailable",
+                    unavailable.message,
+                )
+                .with_extra("adapter", unavailable.adapter)
+                .with_extra("mode", unavailable.mode.as_str())
+                .with_extra("remediation", unavailable.remediation)
+                .with_extra("fallback", "direct")
+                .with_extra("source_of_truth", "daemon_state"),
             ),
         }
     }
@@ -525,13 +525,13 @@ impl Manager {
             self.state.record_event(
                 &context.run_id,
                 "worker_attempt_timeout",
-                &json!({
-                    "phase": context.phase,
-                    "slice_id": context.slice_id,
-                    "attempt": context.attempt,
-                    "timeout_seconds": context.timeout_seconds,
-                    "message": message,
-                }),
+                &workflow_events::WorkerAttemptTimeoutPayload::new(
+                    &context.phase,
+                    &context.slice_id,
+                    context.attempt,
+                    context.timeout_seconds,
+                    &message,
+                ),
             )?;
             bail!(message);
         }
@@ -775,17 +775,17 @@ impl Manager {
         self.state
             .record_event(
                 &run.id,
-                "cockpit_worker_ready",
-                &json!({
-                    "adapter": opened.adapter,
-                    "mode": opened.mode.as_str(),
-                    "workspace": opened.workspace_label,
-                    "pane": opened.pane_label,
-                    "pane_id": opened.pane_id,
-                    "slice_id": context.slice_id,
-                    "attempt": context.attempt,
-                    "source_of_truth": "kd_artifact_files",
-                }),
+                workflow_events::COCKPIT_WORKER_READY,
+                &workflow_events::CockpitWorkerReadyPayload {
+                    adapter: opened.adapter,
+                    mode: opened.mode.as_str().to_string(),
+                    workspace: opened.workspace_label,
+                    pane: opened.pane_label,
+                    pane_id: opened.pane_id,
+                    slice_id: context.slice_id.clone(),
+                    attempt: context.attempt,
+                    source_of_truth: "kd_artifact_files".to_string(),
+                },
             )
             .map_err(CockpitWorkerJobError::Worker)?;
         let pid = match wait_for_pi_wrapper_launch(&artifacts, Duration::from_secs(5), &events) {
@@ -806,18 +806,14 @@ impl Manager {
     ) -> Result<()> {
         self.state.record_event(
             &run.id,
-            "run_incident",
-            &json!({
-                "severity": "warning",
-                "kind": "cockpit_worker_fallback",
-                "adapter": "herdr",
-                "mode": mode.as_str(),
-                "slice_id": context.slice_id,
-                "attempt": context.attempt,
-                "message": message,
-                "fallback": "direct",
-                "source_of_truth": "kd_artifact_files",
-            }),
+            workflow_events::RUN_INCIDENT,
+            &workflow_events::RunIncidentPayload::warning("cockpit_worker_fallback", message)
+                .with_extra("adapter", "herdr")
+                .with_extra("mode", mode.as_str())
+                .with_extra("slice_id", &context.slice_id)
+                .with_extra("attempt", context.attempt)
+                .with_extra("fallback", "direct")
+                .with_extra("source_of_truth", "kd_artifact_files"),
         )
     }
 
@@ -830,16 +826,12 @@ impl Manager {
         for warning in warnings {
             let _ = self.state.record_event(
                 &context.run_id,
-                "run_incident",
-                &json!({
-                    "severity": "warning",
-                    "kind": warning.kind,
-                    "message": warning.message,
-                    "phase": context.phase,
-                    "slice_id": context.slice_id,
-                    "attempt": context.attempt,
-                    "agent": runner_name,
-                }),
+                workflow_events::RUN_INCIDENT,
+                &workflow_events::RunIncidentPayload::warning(&warning.kind, &warning.message)
+                    .with_extra("phase", &context.phase)
+                    .with_extra("slice_id", &context.slice_id)
+                    .with_extra("attempt", context.attempt)
+                    .with_extra("agent", runner_name),
             );
         }
     }
@@ -860,25 +852,21 @@ impl Manager {
     ) -> Result<()> {
         self.state.record_event(
             &context.run.id,
-            "run_incident",
-            &json!({
-                "severity": "error",
-                "kind": &failure.failure_kind,
-                "failure_kind": &failure.failure_kind,
-                "message": &failure.summary,
-                "phase": context.phase,
-                "slice_id": context.slice_id,
-                "attempt": context.attempt,
-                "agent": context.runner_name,
-                "agent_profile": &context.metadata.profile,
-                "agent_provider": &context.metadata.provider,
-                "agent_model": &context.metadata.model,
-                "agent_reasoning": &context.metadata.reasoning,
-                "agent_mode": &context.metadata.mode,
-                "operator_action_required": failure.operator_action_required,
-                "retryable": failure.retryable,
-                "fix_commands": &failure.fix_commands,
-            }),
+            workflow_events::RUN_INCIDENT,
+            &workflow_events::RunIncidentPayload::error(&failure.failure_kind, &failure.summary)
+                .with_failure_kind(&failure.failure_kind)
+                .with_extra("phase", context.phase)
+                .with_extra("slice_id", context.slice_id)
+                .with_extra("attempt", context.attempt)
+                .with_extra("agent", context.runner_name)
+                .with_extra("agent_profile", &context.metadata.profile)
+                .with_extra("agent_provider", &context.metadata.provider)
+                .with_extra("agent_model", &context.metadata.model)
+                .with_extra("agent_reasoning", &context.metadata.reasoning)
+                .with_extra("agent_mode", &context.metadata.mode)
+                .with_operator_action_required(failure.operator_action_required)
+                .with_retryable(failure.retryable)
+                .with_fix_commands(failure.fix_commands.clone()),
         )
     }
 
@@ -1188,26 +1176,24 @@ impl Manager {
         let verify_profile = verify_profiles.join(", ");
         self.state.record_event(
             &run.id,
-            "run_started",
-            &json!({
-                "run": run,
-                "selected_slices": selected_ids,
-                "skipped_closed_slices": skipped_closed_slices,
-                "verify_profile": verify_profile,
-                "verify_profiles": verify_profiles,
-                "agent": runner.name(),
-                "agent_profile": &runner_metadata.profile,
-                "agent_provider": &runner_metadata.provider,
-                "agent_model": &runner_metadata.model,
-                "agent_reasoning": &runner_metadata.reasoning,
-                "agent_mode": &runner_metadata.mode,
-                "worker_profile": &worker_profile,
-                "worker_evidence_kind": &worker_profile.worker_evidence_kind,
-                "worker_evidence_label": &worker_profile.worker_evidence_label,
-                "profile_summary": runner_metadata.profile_summary(),
-                "launch_summary": runner_metadata.launch_summary(),
-                "profile_source_attribution": &runner_metadata.source_attribution,
-            }),
+            workflow_events::RUN_STARTED,
+            &workflow_events::RunStartedPayload::new(
+                &run,
+                selected_ids,
+                skipped_closed_slices,
+                verify_profile,
+                verify_profiles,
+                runner.name(),
+                &runner_metadata.profile,
+                &runner_metadata.provider,
+                &runner_metadata.model,
+                &runner_metadata.reasoning,
+                &runner_metadata.mode,
+                worker_profile.clone(),
+                runner_metadata.profile_summary(),
+                runner_metadata.launch_summary(),
+                runner_metadata.source_attribution.clone(),
+            ),
         )?;
         self.record_cockpit_launch(&run, cockpit_mode)?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
@@ -1251,15 +1237,18 @@ impl Manager {
         let active = self.active.cancel(run_id);
         self.state.record_event(
             run_id,
-            "run_cancel_requested",
-            &json!({ "reason": reason, "active": active }),
+            workflow_events::RUN_CANCEL_REQUESTED,
+            &workflow_events::RunCancelRequestedPayload::new(reason, active),
         )?;
         if !active && matches!(run.status, RunStatus::Running | RunStatus::Pending) {
             self.state
                 .update_run(run_id, RunStatus::Cancelled, reason)?;
             self.state.cancel_active_slice_runs(run_id, reason)?;
-            self.state
-                .record_event(run_id, "run_cancelled", &json!({ "reason": reason }))?;
+            self.state.record_event(
+                run_id,
+                workflow_events::RUN_CANCELLED,
+                &workflow_events::RunCancelledPayload::new(reason),
+            )?;
         }
         Ok(active)
     }
@@ -1386,7 +1375,7 @@ impl Manager {
                 Err(err) => self.state.record_event(
                     &run.id,
                     "daemon_recovery_cleanup_error",
-                    &json!({ "error": err.to_string() }),
+                    &workflow_events::RunErrorPayload::new(err.to_string()),
                 )?,
             }
             self.state.interrupt_active_slice_runs(&run.id, reason)?;
@@ -1633,8 +1622,8 @@ impl Manager {
         artifact::write_json(&summary_path, &summary)?;
         self.state.record_event(
             &run.id,
-            "terminal_summary_written",
-            &json!({ "path": summary_path }),
+            workflow_events::TERMINAL_SUMMARY_WRITTEN,
+            &workflow_events::TerminalSummaryWrittenPayload::new(&summary_path),
         )?;
         let attention = OperatorAttention::new(self.state.clone());
         attention.worker_pane_terminal_rename(WorkerPaneTerminalRename {
@@ -1700,9 +1689,11 @@ impl Manager {
             Ok(_) => {
                 let message = "run completed; handoff artifacts are ready".to_string();
                 self.mark_progress(&run.id, "completed", "", 0, "", &message);
-                let _ =
-                    self.state
-                        .record_event(&run.id, "run_completed", &json!({ "run_id": run.id }));
+                let _ = self.state.record_event(
+                    &run.id,
+                    workflow_events::RUN_COMPLETED,
+                    &workflow_events::RunCompletedPayload::new(&run.id),
+                );
                 (RunStatus::Completed, String::new())
             }
             Err(err) => {
@@ -1725,8 +1716,8 @@ impl Manager {
                     self.mark_progress(&run.id, "cancelled", "", 0, "", &message);
                     let _ = self.state.record_event(
                         &run.id,
-                        "run_cancelled",
-                        &json!({ "reason": message }),
+                        workflow_events::RUN_CANCELLED,
+                        &workflow_events::RunCancelledPayload::new(&message),
                     );
                 } else {
                     let phase = if status == RunStatus::Blocked {
@@ -1735,9 +1726,11 @@ impl Manager {
                         "failed"
                     };
                     self.mark_progress(&run.id, phase, "", 0, "", &message);
-                    let _ =
-                        self.state
-                            .record_event(&run.id, "run_error", &json!({ "error": message }));
+                    let _ = self.state.record_event(
+                        &run.id,
+                        workflow_events::RUN_ERROR,
+                        &workflow_events::RunErrorPayload::new(&message),
+                    );
                 }
                 (status, message)
             }
@@ -1750,15 +1743,15 @@ impl Manager {
             Ok(()) => {
                 let _ = self.state.record_event(
                     &run.id,
-                    "worktrees_cleaned",
-                    &json!({ "run_id": run.id }),
+                    workflow_events::WORKTREES_CLEANED,
+                    &workflow_events::RunCompletedPayload::new(&run.id),
                 );
             }
             Err(err) => {
                 let _ = self.state.record_event(
                     &run.id,
                     "worktree_cleanup_error",
-                    &json!({ "error": err.to_string() }),
+                    &workflow_events::RunErrorPayload::new(err.to_string()),
                 );
             }
         }
@@ -1900,8 +1893,8 @@ impl Manager {
                 })?;
                 self.state.record_event(
                     &run.id,
-                    "slice_merged",
-                    &json!({ "slice_id": slice.id, "commit_sha": worker.result.commit_sha }),
+                    workflow_events::SLICE_MERGED,
+                    &workflow_events::SliceMergedPayload::new(&slice.id, &worker.result.commit_sha),
                 )?;
                 dependency_summary.insert(slice.id.clone(), worker.result.summary.clone());
                 completed_ids.insert(slice.id.clone());
@@ -2027,8 +2020,18 @@ impl Manager {
                 &Utc::now().to_rfc3339(),
             );
             for incident in &closure_report.incidents {
-                self.state
-                    .record_event(&run.id, "run_incident", &json!(incident))?;
+                self.state.record_event(
+                    &run.id,
+                    workflow_events::RUN_INCIDENT,
+                    &workflow_events::RunIncidentPayload::warning(
+                        &incident.kind,
+                        &incident.message,
+                    )
+                    .with_severity(&incident.severity)
+                    .with_extra("slice_id", &incident.slice_id)
+                    .with_extra("path", &incident.path)
+                    .with_extra("policy", &incident.policy),
+                )?;
             }
             if closure_report.blocks_handoff() {
                 return Err(BlockedError::new(
@@ -2075,7 +2078,7 @@ impl Manager {
         )?;
         artifact::write_json(store.output_path(&run.id, "final-report.json"), &summary)?;
         self.state
-            .record_event(&run.id, "implementation_summary", &summary)?;
+            .record_event(&run.id, workflow_events::IMPLEMENTATION_SUMMARY, &summary)?;
 
         if gate.status != "passed" {
             if gate_needs_operator(&gate) {
@@ -2217,8 +2220,8 @@ impl Manager {
         );
         self.state.record_event(
             &ctx.run.id,
-            "parallel_layer_started",
-            &json!({ "slices": batch_ids }),
+            workflow_events::PARALLEL_LAYER_STARTED,
+            &workflow_events::ParallelLayerPayload::started(batch_ids.clone()),
         )?;
 
         let batch_cancel = CancellationToken::new();
@@ -2297,8 +2300,12 @@ impl Manager {
             let summary = parallel_layer_failure_summary(&outcomes);
             self.state.record_event(
                 &ctx.run.id,
-                "parallel_layer_failed",
-                &json!({ "slices": batch_ids, "outcomes": outcomes, "summary": summary }),
+                workflow_events::PARALLEL_LAYER_FAILED,
+                &workflow_events::ParallelLayerPayload::failed(
+                    batch_ids.clone(),
+                    outcomes,
+                    &summary,
+                ),
             )?;
             if parent_cancelled || parallel_results_all_cancelled(&results) {
                 return Err(CancelledError::new("run cancelled").into());
@@ -2312,8 +2319,8 @@ impl Manager {
         let outcomes = parallel_layer_success_outcomes(&results);
         self.state.record_event(
             &ctx.run.id,
-            "parallel_layer_completed",
-            &json!({ "slices": batch_ids, "outcomes": outcomes }),
+            workflow_events::PARALLEL_LAYER_COMPLETED,
+            &workflow_events::ParallelLayerPayload::completed(batch_ids, outcomes),
         )?;
         results.into_values().collect()
     }
@@ -2468,7 +2475,7 @@ impl Manager {
         };
         artifact::Store::new(&run.repo_path).write_checkpoint(&checkpoint)?;
         self.state
-            .record_event(&run.id, "checkpoint_written", &checkpoint)?;
+            .record_event(&run.id, workflow_events::CHECKPOINT_WRITTEN, &checkpoint)?;
         Ok(())
     }
 
@@ -2508,8 +2515,11 @@ impl Manager {
             attempts: 0,
             last_error: String::new(),
         })?;
-        self.state
-            .record_event(&run.id, "slice_started", &json!({ "slice_id": slice.id }))?;
+        self.state.record_event(
+            &run.id,
+            workflow_events::SLICE_STARTED,
+            &workflow_events::SliceStartedPayload::new(&slice.id),
+        )?;
         self.mark_progress(
             &run.id,
             "worker_started",
@@ -2660,16 +2670,21 @@ impl Manager {
                     self.state.record_event(
                         &run.id,
                         "worker_error",
-                        &json!({
-                            "slice_id": slice.id,
-                            "attempt": attempt,
-                            "error": last_failure,
-                            "primary_failure": &primary_failure,
-                            "secondary_failures": &secondary_failures,
-                            "failure_kind": launch_failure.as_ref().map(|failure| failure.failure_kind.as_str()).unwrap_or_default(),
-                            "retryable": launch_failure.as_ref().map(|failure| failure.retryable),
-                            "operator_action_required": launch_failure.as_ref().map(|failure| failure.operator_action_required),
-                        }),
+                        &workflow_events::WorkerErrorPayload {
+                            slice_id: slice.id.clone(),
+                            attempt,
+                            error: last_failure.clone(),
+                            primary_failure: primary_failure.clone(),
+                            secondary_failures: secondary_failures.clone(),
+                            failure_kind: launch_failure
+                                .as_ref()
+                                .map(|failure| failure.failure_kind.clone())
+                                .unwrap_or_default(),
+                            retryable: launch_failure.as_ref().map(|failure| failure.retryable),
+                            operator_action_required: launch_failure
+                                .as_ref()
+                                .map(|failure| failure.operator_action_required),
+                        },
                     )?;
                     if let Some(launch_failure) = launch_failure {
                         self.record_agent_launch_incident(
@@ -3603,8 +3618,11 @@ impl Manager {
             artifact::write_json(&output_path, &result)?;
             self.state.record_event(
                 &run.id,
-                "integration_repair_completed",
-                &json!({ "status": result.status, "summary": result.summary }),
+                workflow_events::INTEGRATION_REPAIR_COMPLETED,
+                &workflow_events::IntegrationRepairCompletedPayload::new(
+                    &result.status,
+                    &result.summary,
+                ),
             )?;
             return Ok(result);
         }
@@ -3666,12 +3684,14 @@ impl Manager {
         let _ = gitutil::worktree_prune(&run.repo_path);
         self.state.record_event(
             &run.id,
-            "run_incident",
-            &json!({
-                "severity": "warning",
-                "kind": "stale_worktree_removed_before_resume",
-                "message": format!("removed stale run worktree directory before resume: {}", root.display()),
-            }),
+            workflow_events::RUN_INCIDENT,
+            &workflow_events::RunIncidentPayload::warning(
+                "stale_worktree_removed_before_resume",
+                format!(
+                    "removed stale run worktree directory before resume: {}",
+                    root.display()
+                ),
+            ),
         )?;
         Ok(())
     }
@@ -3808,11 +3828,9 @@ fn latest_cancel_reason(events: &[crate::domain::Event]) -> String {
     events
         .iter()
         .rev()
-        .find(|event| event.typ == "run_cancel_requested")
-        .and_then(|event| event.payload.get("reason"))
-        .and_then(serde_json::Value::as_str)
+        .find(|event| event.typ == workflow_events::RUN_CANCEL_REQUESTED)
+        .map(|event| workflow_events::RunCancelRequestedPayload::from_value(&event.payload).reason)
         .unwrap_or_default()
-        .to_string()
 }
 
 fn primary_failure_for_terminal_summary(
@@ -3831,10 +3849,8 @@ fn primary_failure_for_terminal_summary(
             events
                 .iter()
                 .rev()
-                .find(|event| event.typ == "run_error")
-                .and_then(|event| event.payload.get("error"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
+                .find(|event| event.typ == workflow_events::RUN_ERROR)
+                .map(|event| workflow_events::RunErrorPayload::from_value(&event.payload).error)
         })
         .unwrap_or_default()
 }

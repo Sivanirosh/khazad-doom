@@ -14,9 +14,9 @@ use crate::ipc::{
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
 use crate::workflow::attention::{
-    OperatorAttention, WorkerQuestionPending, worker_question_answer_command,
-    worker_question_deadline,
+    OperatorAttention, WorkerQuestionPending, worker_question_deadline,
 };
+use crate::workflow::events as workflow_events;
 use crate::workflow::read_model::{enrich_replan_proposal, replan_status_from_proposals};
 use crate::workflow::{
     GithubImportOptions, Manager, ResumeOptions, RunReadModelBuilder, RunReadModelOptions,
@@ -285,13 +285,12 @@ impl Server {
         {
             self.store.record_event(
                 &params.run_id,
-                "run_incident",
-                &json!({
-                    "severity": "error",
-                    "kind": "worker_question_token_rejected",
-                    "message": "workerAsk rejected because the worker token did not match the run",
-                    "slice_id": params.slice_id,
-                }),
+                workflow_events::RUN_INCIDENT,
+                &workflow_events::RunIncidentPayload::error(
+                    "worker_question_token_rejected",
+                    "workerAsk rejected because the worker token did not match the run",
+                )
+                .with_extra("slice_id", &params.slice_id),
             )?;
             bail!("worker token rejected for run {}", params.run_id);
         }
@@ -309,17 +308,8 @@ impl Server {
         let deadline_at = worker_question_deadline(&question);
         self.store.record_event(
             &params.run_id,
-            "worker_question_asked",
-            &json!({
-                "question_id": question.id,
-                "slice_id": question.slice_id,
-                "attempt": question.attempt,
-                "question": question.question,
-                "options": question.options,
-                "timeout_seconds": question.timeout_seconds,
-                "deadline_at": deadline_at,
-                "answer_command": worker_question_answer_command(&question),
-            }),
+            workflow_events::WORKER_QUESTION_ASKED,
+            &workflow_events::WorkerQuestionAskedPayload::from_question(&question, deadline_at),
         )?;
         let _ = self.store.update_progress(
             &params.run_id,
@@ -374,14 +364,13 @@ impl Server {
             .ok_or_else(|| anyhow!("question {question_id:?} disappeared"))?;
         self.store.record_event(
             &params.run_id,
-            "run_incident",
-            &json!({
-                "severity": "warning",
-                "kind": "worker_question_timed_out",
-                "message": format!("operator question timed out: {}", question.question),
-                "question_id": question.id,
-                "slice_id": question.slice_id,
-            }),
+            workflow_events::RUN_INCIDENT,
+            &workflow_events::RunIncidentPayload::warning(
+                "worker_question_timed_out",
+                format!("operator question timed out: {}", question.question),
+            )
+            .with_extra("question_id", &question.id)
+            .with_extra("slice_id", &question.slice_id),
         )?;
         Ok(WorkerAskResult {
             question_id,
@@ -605,12 +594,12 @@ impl Server {
                 )?;
                 self.store.record_event(
                     &params.run_id,
-                    "worker_question_answered",
-                    &json!({
-                        "question_id": question.id,
-                        "slice_id": question.slice_id,
-                        "answer": question.answer,
-                    }),
+                    workflow_events::WORKER_QUESTION_ANSWERED,
+                    &workflow_events::WorkerQuestionAnsweredPayload::new(
+                        &question.id,
+                        &question.slice_id,
+                        &question.answer,
+                    ),
                 )?;
                 Ok(HandleOutcome::result(AnswerQuestionResult { question })?)
             }

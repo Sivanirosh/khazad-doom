@@ -1,7 +1,19 @@
+use super::events::{
+    CHECKPOINT_WRITTEN, COCKPIT_READY, COCKPIT_WORKER_READY, CheckpointWrittenPayload,
+    CockpitReadyPayload, CockpitWorkerReadyPayload, IMPLEMENTATION_SUMMARY,
+    INTEGRATION_REPAIR_COMPLETED, ImplementationSummaryPayload, IntegrationRepairCompletedPayload,
+    PARALLEL_LAYER_COMPLETED, PARALLEL_LAYER_FAILED, PARALLEL_LAYER_STARTED, PROGRESS,
+    ParallelLayerPayload, ProgressEventPayload, RUN_COMPLETED, RUN_INCIDENT, RUN_STARTED,
+    RunIncidentPayload, SLICE_MERGED, SLICE_STARTED, SliceMergedPayload, SliceStartedPayload,
+    TERMINAL_NOTIFICATION_SENT, TERMINAL_NOTIFICATION_SKIPPED, TERMINAL_SUMMARY_WRITTEN,
+    TerminalNotificationPayload, TerminalSummaryWrittenPayload, WORKER_QUESTION_ANSWERED,
+    WORKER_QUESTION_ASKED, WORKTREES_CLEANED, WorkerQuestionAskedPayload,
+};
 use crate::domain::{
-    Event, ReplanProposalState, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus,
-    SliceRun, SliceStatus, StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole,
-    TerminalReason, WorkerAttemptProgress,
+    Event, GateCommandResult, GateResult, RepairResult, ReplanProposalState, RunDetails,
+    RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus, StatusFeed,
+    StatusFeedBlock, StatusFeedLine, StatusFeedRole, TerminalReason, WorkerAttemptProgress,
+    WorkflowExitStates,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -11,6 +23,736 @@ const ACTIVITY_LIMIT: usize = 7;
 const OUTPUT_LINES: usize = 4;
 const TODO_ITEMS: usize = 8;
 const LINE_WIDTH: usize = 180;
+
+const GATE_PANE_LINE_WIDTH: usize = 180;
+const GATE_PANE_TAIL_LINES: usize = 6;
+
+pub(crate) struct GatePaneProjection {
+    pub active: bool,
+    pub feed: StatusFeed,
+}
+
+pub(crate) fn project_gate_pane(details: &RunDetails, now: DateTime<Utc>) -> GatePaneProjection {
+    if let Some(progress) = gate_pane_active_progress(details) {
+        return GatePaneProjection {
+            active: true,
+            feed: active_gate_pane_feed(details, progress, now),
+        };
+    }
+    GatePaneProjection {
+        active: false,
+        feed: idle_gate_pane_feed(details),
+    }
+}
+
+fn active_gate_pane_feed(
+    details: &RunDetails,
+    progress: &RunProgress,
+    now: DateTime<Utc>,
+) -> StatusFeed {
+    let terminal_reason = gate_pane_terminal_reason(details);
+    let operator_commands = gate_pane_operator_commands(details, terminal_reason.as_ref());
+    let mut blocks = vec![gate_pane_block(
+        "Run",
+        format!(
+            "{} {} • {}",
+            gate_pane_status_icon(details.run.status),
+            details.run.status,
+            gate_pane_short_run_id(&details.run.id)
+        ),
+        vec![gate_pane_line(
+            "Source: daemon status feed / shell progress; gate results and artifacts remain authoritative",
+            StatusFeedRole::Dim,
+        )],
+    )];
+
+    let mut activity_lines = vec![
+        gate_pane_line(
+            format!(
+                "command: {}",
+                gate_pane_truncate(&progress.command, GATE_PANE_LINE_WIDTH)
+            ),
+            StatusFeedRole::Info,
+        ),
+        gate_pane_line("state: running", StatusFeedRole::Info),
+    ];
+    if !progress.message.trim().is_empty() {
+        activity_lines.push(gate_pane_line(
+            format!(
+                "message: {}",
+                gate_pane_truncate(&progress.message, GATE_PANE_LINE_WIDTH)
+            ),
+            StatusFeedRole::Info,
+        ));
+    }
+    if !progress.slice_id.trim().is_empty() {
+        activity_lines.push(gate_pane_line(
+            format!("slice: {}", progress.slice_id),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if progress.attempt > 0 {
+        activity_lines.push(gate_pane_line(
+            format!("attempt: {}", progress.attempt),
+            StatusFeedRole::Dim,
+        ));
+    }
+    activity_lines.push(gate_pane_line(
+        format!("updated {} ago", gate_pane_since(progress.updated_at, now)),
+        StatusFeedRole::Dim,
+    ));
+    if let Some(worker) = &progress.worker {
+        activity_lines.push(gate_pane_line(
+            format!(
+                "supervisor: {}",
+                match worker.process_observed_at {
+                    Some(observed_at) => format!(
+                        "alive, observed child {} ago",
+                        gate_pane_since(observed_at, now)
+                    ),
+                    None => "starting, no child observation yet".to_string(),
+                }
+            ),
+            StatusFeedRole::Dim,
+        ));
+    }
+    blocks.push(gate_pane_block(
+        gate_pane_activity_label(&progress.phase),
+        format!(
+            "(running • elapsed {})",
+            gate_pane_since(progress.phase_started_at, now)
+        ),
+        activity_lines,
+    ));
+
+    let tail = gate_pane_compact_tail(&progress.output_tail);
+    if tail.is_empty() {
+        blocks.push(gate_pane_block(
+            "Tail",
+            "",
+            vec![gate_pane_line(
+                "waiting for daemon-owned command output",
+                StatusFeedRole::Dim,
+            )],
+        ));
+    } else {
+        blocks.push(gate_pane_block(
+            "Tail",
+            format!("(last {} compact lines)", tail.len()),
+            tail.into_iter()
+                .map(|text| gate_pane_line(text, StatusFeedRole::Dim))
+                .collect(),
+        ));
+    }
+
+    StatusFeed {
+        feed_version: 1,
+        summary_line: "Khazad-Doom gate/repair activity painter (read-only)".to_string(),
+        terminal_reason,
+        operator_commands,
+        attention: Vec::new(),
+        blocks,
+    }
+}
+
+fn idle_gate_pane_feed(details: &RunDetails) -> StatusFeed {
+    let summary = gate_pane_latest_implementation_summary(details);
+    let latest_gate = summary
+        .as_ref()
+        .and_then(|summary| summary.integration_gate.clone())
+        .or_else(|| gate_pane_gate_result_from_economics(details));
+    let pre_repair_gate = summary
+        .as_ref()
+        .and_then(|summary| summary.pre_repair_integration_gate.clone());
+    let repair = summary
+        .as_ref()
+        .and_then(|summary| summary.integration_repair.clone());
+    let exit_states = summary
+        .as_ref()
+        .and_then(|summary| summary.exit_states.clone());
+    let terminal_reason = gate_pane_terminal_reason(details);
+    let operator_commands = gate_pane_operator_commands(details, terminal_reason.as_ref());
+
+    let blocks = vec![
+        gate_pane_gate_block(
+            details,
+            latest_gate.as_ref(),
+            pre_repair_gate.as_ref(),
+            summary.as_ref(),
+        ),
+        gate_pane_repair_block(details, latest_gate.as_ref(), repair.as_ref()),
+        gate_pane_handoff_block(
+            details,
+            latest_gate.as_ref(),
+            exit_states.as_ref(),
+            terminal_reason.as_ref(),
+        ),
+        gate_pane_next_block(details, &operator_commands),
+    ];
+
+    StatusFeed {
+        feed_version: 1,
+        summary_line: "Khazad-Doom gate/repair status (idle)".to_string(),
+        terminal_reason,
+        operator_commands,
+        attention: Vec::new(),
+        blocks,
+    }
+}
+
+fn gate_pane_gate_block(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    pre_repair_gate: Option<&GateResult>,
+    summary: Option<&ImplementationSummaryPayload>,
+) -> StatusFeedBlock {
+    let mut lines = vec![gate_pane_line(
+        format!(
+            "Verification profile: {}",
+            gate_pane_verification_profile(details, summary)
+        ),
+        StatusFeedRole::Info,
+    )];
+    match latest_gate {
+        Some(gate) => lines.push(gate_pane_line(
+            format!(
+                "Latest gate: {}{}",
+                gate_pane_display_or_dash(&gate.status),
+                gate_pane_summary_suffix(&gate.summary)
+            ),
+            gate_pane_role_for_gate_status(&gate.status),
+        )),
+        None => lines.push(gate_pane_line(
+            "Latest gate: not run yet",
+            StatusFeedRole::Dim,
+        )),
+    }
+    let last_failure = gate_pane_last_failure(pre_repair_gate, latest_gate);
+    lines.push(gate_pane_line(
+        format!(
+            "Last failure: {}",
+            last_failure.clone().unwrap_or_else(|| "none".to_string())
+        ),
+        if last_failure.is_some() {
+            StatusFeedRole::Warning
+        } else {
+            StatusFeedRole::Dim
+        },
+    ));
+    gate_pane_block(
+        "Gate",
+        format!(
+            "({})",
+            latest_gate
+                .map(|gate| gate_pane_display_or_dash(&gate.status))
+                .unwrap_or("not run")
+        ),
+        lines,
+    )
+}
+
+fn gate_pane_repair_block(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    repair: Option<&RepairResult>,
+) -> StatusFeedBlock {
+    let policy = gate_pane_repair_policy(details);
+    let (state, role) = gate_pane_repair_state(policy.as_str(), latest_gate, repair);
+    let mut lines = vec![gate_pane_line(state, role)];
+    if let Some(attempts) = gate_pane_repair_attempts(details, repair) {
+        lines.push(gate_pane_line(attempts, StatusFeedRole::Dim));
+    }
+    gate_pane_block("Repair", format!("({policy})"), lines)
+}
+
+fn gate_pane_handoff_block(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    exit_states: Option<&WorkflowExitStates>,
+    terminal_reason: Option<&TerminalReason>,
+) -> StatusFeedBlock {
+    let (meta, mut lines) = gate_pane_handoff_lines(details, latest_gate, exit_states);
+    if let Some(reason) = terminal_reason {
+        lines.push(gate_pane_line(
+            format!(
+                "Terminal reason: {}{}",
+                gate_pane_display_or_dash(&reason.kind),
+                gate_pane_summary_suffix(&reason.summary)
+            ),
+            if reason.operator_action_required {
+                StatusFeedRole::Attention
+            } else {
+                StatusFeedRole::Warning
+            },
+        ));
+    }
+    lines.push(gate_pane_line(
+        format!("Run: {}", details.run.status),
+        StatusFeedRole::Dim,
+    ));
+    gate_pane_block("Handoff", format!("({meta})"), lines)
+}
+
+fn gate_pane_next_block(details: &RunDetails, operator_commands: &[String]) -> StatusFeedBlock {
+    let mut commands = operator_commands.to_vec();
+    match details.run.status {
+        RunStatus::Completed => gate_pane_push_unique(
+            &mut commands,
+            format!("khazad-doom handoff --run {}", details.run.id),
+        ),
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted => {
+            gate_pane_push_unique(
+                &mut commands,
+                format!("khazad-doom inspect --run {}", details.run.id),
+            );
+            gate_pane_push_unique(
+                &mut commands,
+                format!("khazad-doom resume --run {}", details.run.id),
+            );
+        }
+        RunStatus::Pending | RunStatus::Running => {}
+    }
+    let lines = if commands.is_empty() {
+        vec![gate_pane_line(
+            "No operator gate/repair command is currently needed.",
+            StatusFeedRole::Dim,
+        )]
+    } else {
+        commands
+            .into_iter()
+            .map(|command| gate_pane_line(command, StatusFeedRole::Attention))
+            .collect()
+    };
+    gate_pane_block("Next", "", lines)
+}
+
+fn gate_pane_active_progress(details: &RunDetails) -> Option<&RunProgress> {
+    let progress = details.progress.as_ref()?;
+    if gate_pane_terminal_status(details.run.status) || progress.command.trim().is_empty() {
+        return None;
+    }
+    gate_pane_is_gate_or_repair_phase(&progress.phase).then_some(progress)
+}
+
+fn gate_pane_is_gate_or_repair_phase(phase: &str) -> bool {
+    let normalized = phase.to_ascii_lowercase();
+    normalized.contains("integration_gate") || normalized.contains("integration_repair")
+}
+
+fn gate_pane_activity_label(phase: &str) -> &'static str {
+    if phase.to_ascii_lowercase().contains("repair") {
+        "Repair"
+    } else {
+        "Integration Gate"
+    }
+}
+
+fn gate_pane_compact_tail(output_tail: &str) -> Vec<String> {
+    output_tail
+        .trim_end()
+        .lines()
+        .rev()
+        .take(GATE_PANE_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| gate_pane_truncate(line, GATE_PANE_LINE_WIDTH))
+        .collect()
+}
+
+fn gate_pane_terminal_reason(details: &RunDetails) -> Option<TerminalReason> {
+    details
+        .feed
+        .as_ref()
+        .and_then(|feed| feed.terminal_reason.clone())
+        .or_else(|| details.primary_terminal_reason.clone())
+}
+
+fn gate_pane_operator_commands(
+    details: &RunDetails,
+    terminal_reason: Option<&TerminalReason>,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    if let Some(feed) = &details.feed {
+        for command in &feed.operator_commands {
+            gate_pane_push_unique(&mut commands, command.clone());
+        }
+    }
+    if let Some(reason) = terminal_reason {
+        for command in &reason.operator_commands {
+            gate_pane_push_unique(&mut commands, command.clone());
+        }
+    }
+    commands
+}
+
+fn gate_pane_latest_implementation_summary(
+    details: &RunDetails,
+) -> Option<ImplementationSummaryPayload> {
+    details
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.typ == IMPLEMENTATION_SUMMARY)
+        .map(|event| ImplementationSummaryPayload::from_value(&event.payload))
+}
+
+fn gate_pane_gate_result_from_economics(details: &RunDetails) -> Option<GateResult> {
+    let economics = details.economics.as_ref()?;
+    let commands = economics
+        .command_executions
+        .iter()
+        .filter(|command| command.phase == "integration_gate")
+        .map(|command| GateCommandResult {
+            command: command.command.clone(),
+            status: command.status.clone(),
+            exit_code: command.exit_code,
+            output: String::new(),
+            cwd: command.cwd.clone(),
+            dedupe_key: command.dedupe_key.clone(),
+            duration_ms: command.duration_ms,
+            cache_hit: command.cache_hit,
+            skip_reason: command.skip_reason.clone(),
+            failure_kind: String::new(),
+        })
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        return None;
+    }
+    let status = if commands.iter().any(|command| command.status == "failed") {
+        "failed"
+    } else if commands.iter().all(|command| command.status == "skipped") {
+        "skipped"
+    } else if commands
+        .iter()
+        .all(|command| command.status == "passed" || command.status == "skipped")
+    {
+        "passed"
+    } else {
+        "unknown"
+    };
+    let summary = match status {
+        "passed" => "integration gate passed",
+        "failed" => "one or more integration gate commands failed",
+        "skipped" => "integration gate commands skipped",
+        _ => "integration gate status is unknown",
+    };
+    Some(GateResult {
+        status: status.to_string(),
+        summary: summary.to_string(),
+        commands,
+        findings: Vec::new(),
+    })
+}
+
+fn gate_pane_verification_profile(
+    details: &RunDetails,
+    summary: Option<&ImplementationSummaryPayload>,
+) -> String {
+    if let Some(profile) = summary
+        .map(|summary| summary.verify_profile.trim())
+        .filter(|profile| !profile.is_empty())
+    {
+        return profile.to_string();
+    }
+    for event in details.events.iter().rev() {
+        if event.typ != RUN_STARTED {
+            continue;
+        }
+        let payload = super::events::RunStartedPayload::from_value(&event.payload);
+        if !payload.verify_profile.trim().is_empty() {
+            return payload.verify_profile;
+        }
+        let joined = payload
+            .verify_profiles
+            .iter()
+            .map(|profile| profile.trim())
+            .filter(|profile| !profile.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !joined.trim().is_empty() {
+            return joined;
+        }
+    }
+    "unknown".to_string()
+}
+
+fn gate_pane_repair_policy(details: &RunDetails) -> String {
+    details
+        .economics
+        .as_ref()
+        .map(|economics| economics.repair_policy.trim())
+        .filter(|policy| !policy.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn gate_pane_repair_attempts(
+    details: &RunDetails,
+    repair: Option<&RepairResult>,
+) -> Option<String> {
+    if let Some(economics) = &details.economics {
+        return Some(format!(
+            "Attempts: {}/{}",
+            economics.repair_attempts, economics.repair_max_attempts
+        ));
+    }
+    repair
+        .filter(|repair| repair.attempts > 0)
+        .map(|repair| format!("Attempts: {}", repair.attempts))
+}
+
+fn gate_pane_repair_state(
+    policy: &str,
+    latest_gate: Option<&GateResult>,
+    repair: Option<&RepairResult>,
+) -> (String, StatusFeedRole) {
+    if let Some(repair) = repair {
+        let mut text = format!("State: {}", gate_pane_display_or_dash(&repair.status));
+        if !repair.summary.trim().is_empty() {
+            text.push_str(&gate_pane_summary_suffix(&repair.summary));
+        }
+        if !repair.trigger.trim().is_empty() {
+            text.push_str(&format!(" ({})", repair.trigger));
+        }
+        return (text, gate_pane_role_for_repair_status(&repair.status));
+    }
+    match latest_gate.map(|gate| gate.status.as_str()) {
+        None => (
+            "State: waiting for gate result".to_string(),
+            StatusFeedRole::Dim,
+        ),
+        Some("passed") => (
+            "State: not needed; latest gate passed".to_string(),
+            StatusFeedRole::Success,
+        ),
+        Some("failed") if matches!(policy, "auto" | "always") => (
+            "State: repairable: daemon policy can run integration repair".to_string(),
+            StatusFeedRole::Warning,
+        ),
+        Some("failed") if policy == "never" => (
+            "State: disabled by policy after failed gate".to_string(),
+            StatusFeedRole::Warning,
+        ),
+        Some("failed") => (
+            "State: unresolved after failed gate".to_string(),
+            StatusFeedRole::Warning,
+        ),
+        Some(status) => (
+            format!("State: waiting after gate {status}"),
+            StatusFeedRole::Dim,
+        ),
+    }
+}
+
+fn gate_pane_handoff_lines(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    exit_states: Option<&WorkflowExitStates>,
+) -> (String, Vec<StatusFeedLine>) {
+    if let Some(exit_states) = exit_states {
+        let meta = gate_pane_display_or_dash(&exit_states.handoff).to_string();
+        let mut lines = vec![gate_pane_line(
+            format!("Handoff: {meta}"),
+            StatusFeedRole::Info,
+        )];
+        if !exit_states.evidence.trim().is_empty() {
+            lines.push(gate_pane_line(
+                format!("Evidence: {}", exit_states.evidence),
+                StatusFeedRole::Dim,
+            ));
+        }
+        return (meta, lines);
+    }
+    match details.run.status {
+        RunStatus::Completed => (
+            "ready".to_string(),
+            vec![gate_pane_line("Handoff: ready", StatusFeedRole::Success)],
+        ),
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted => (
+            "not_ready".to_string(),
+            vec![gate_pane_line(
+                format!("Handoff: not ready — run is {}", details.run.status),
+                StatusFeedRole::Warning,
+            )],
+        ),
+        RunStatus::Pending | RunStatus::Running => {
+            if latest_gate.is_some_and(|gate| gate.status == "failed") {
+                (
+                    "not_ready".to_string(),
+                    vec![gate_pane_line(
+                        "Handoff: not ready — latest gate failed",
+                        StatusFeedRole::Warning,
+                    )],
+                )
+            } else {
+                (
+                    "unknown".to_string(),
+                    vec![gate_pane_line(
+                        "Handoff: unknown until integration gate finishes",
+                        StatusFeedRole::Dim,
+                    )],
+                )
+            }
+        }
+    }
+}
+
+fn gate_pane_last_failure(
+    pre_repair_gate: Option<&GateResult>,
+    latest_gate: Option<&GateResult>,
+) -> Option<String> {
+    pre_repair_gate
+        .and_then(gate_pane_failure_line)
+        .map(|failure| format!("{failure} (pre-repair)"))
+        .or_else(|| latest_gate.and_then(gate_pane_failure_line))
+}
+
+fn gate_pane_failure_line(gate: &GateResult) -> Option<String> {
+    gate.commands
+        .iter()
+        .find(|command| command.status == "failed")
+        .map(|command| {
+            let output = command
+                .output
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim();
+            if !output.is_empty() {
+                format!(
+                    "{} — {}",
+                    gate_pane_truncate(&command.command, 80),
+                    gate_pane_truncate(output, 90)
+                )
+            } else if let Some(exit_code) = command.exit_code {
+                format!(
+                    "{} (exit {exit_code})",
+                    gate_pane_truncate(&command.command, 120)
+                )
+            } else {
+                gate_pane_truncate(&command.command, 120)
+            }
+        })
+}
+
+fn gate_pane_role_for_gate_status(status: &str) -> StatusFeedRole {
+    match status {
+        "passed" => StatusFeedRole::Success,
+        "failed" => StatusFeedRole::Error,
+        "skipped" => StatusFeedRole::Dim,
+        _ => StatusFeedRole::Info,
+    }
+}
+
+fn gate_pane_role_for_repair_status(status: &str) -> StatusFeedRole {
+    match status {
+        "completed" | "fixed" | "no-op" => StatusFeedRole::Success,
+        "failed" | "blocked" => StatusFeedRole::Error,
+        "skipped" => StatusFeedRole::Dim,
+        _ => StatusFeedRole::Info,
+    }
+}
+
+fn gate_pane_summary_suffix(summary: &str) -> String {
+    if summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", gate_pane_truncate(summary, GATE_PANE_LINE_WIDTH))
+    }
+}
+
+fn gate_pane_status_icon(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Completed => "✓",
+        RunStatus::Running => "●",
+        RunStatus::Blocked => "!",
+        RunStatus::Failed => "✗",
+        RunStatus::Cancelled | RunStatus::Interrupted => "×",
+        RunStatus::Pending => "○",
+    }
+}
+
+fn gate_pane_terminal_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Blocked
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted
+    )
+}
+
+fn gate_pane_since(time: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(time).num_seconds().max(0) as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn gate_pane_short_run_id(value: &str) -> String {
+    if value.chars().count() <= 30 {
+        return gate_pane_display_or_dash(value).to_string();
+    }
+    let prefix = value.chars().take(11).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn gate_pane_truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn gate_pane_display_or_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
+}
+
+fn gate_pane_push_unique(values: &mut Vec<String>, value: String) {
+    if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn gate_pane_block(
+    label: impl Into<String>,
+    meta: impl Into<String>,
+    lines: Vec<StatusFeedLine>,
+) -> StatusFeedBlock {
+    StatusFeedBlock {
+        label: label.into(),
+        meta: meta.into(),
+        lines,
+    }
+}
+
+fn gate_pane_line(text: impl Into<String>, role: StatusFeedRole) -> StatusFeedLine {
+    StatusFeedLine {
+        text: text.into(),
+        role,
+    }
+}
 
 pub fn project_run(details: &RunDetails) -> StatusFeed {
     project_run_at(details, Utc::now())
@@ -853,55 +1595,84 @@ fn todo_line(slice: &SliceRun) -> String {
 }
 
 fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
-    let payload = event.payload.as_object();
     match event.typ.as_str() {
-        "run_started" => {
-            let selected = payload
-                .and_then(|payload| payload.get("selected_slices"))
-                .and_then(serde_json::Value::as_array)
-                .map(|items| items.len())
-                .unwrap_or_else(|| selected_slice_items(details).len());
+        typ if typ == RUN_STARTED => {
+            let payload = super::events::RunStartedPayload::from_value(&event.payload);
+            let selected = if payload.selected_slices.is_empty() {
+                selected_slice_items(details).len()
+            } else {
+                payload.selected_slices.len()
+            };
             Some(format!(
                 "Run (started): {selected} selected {}",
                 if selected == 1 { "slice" } else { "slices" }
             ))
         }
-        "slice_started" => Some(format!(
-            "Worker ({}): slice worker started",
-            payload_text(payload, "slice_id").unwrap_or_else(|| "-".to_string())
-        )),
-        "slice_merged" => {
-            let slice_id = payload_text(payload, "slice_id").unwrap_or_else(|| "slice".to_string());
-            let sha = payload_text(payload, "commit_sha")
-                .filter(|sha| !sha.trim().is_empty())
-                .map(|sha| format!(" • {}", short_sha(&sha)))
-                .unwrap_or_default();
+        typ if typ == SLICE_STARTED => {
+            let payload = SliceStartedPayload::from_value(&event.payload);
+            Some(format!(
+                "Worker ({}): slice worker started",
+                display_or_dash(&payload.slice_id)
+            ))
+        }
+        typ if typ == SLICE_MERGED => {
+            let payload = SliceMergedPayload::from_value(&event.payload);
+            let slice_id = if payload.slice_id.trim().is_empty() {
+                "slice".to_string()
+            } else {
+                payload.slice_id
+            };
+            let sha = if !payload.commit_sha.trim().is_empty() {
+                format!(" • {}", short_sha(&payload.commit_sha))
+            } else {
+                String::new()
+            };
             Some(format!("Todos ({slice_id}): ☒ {slice_id}  merged{sha}"))
         }
-        "integration_repair_completed" => {
-            let status = payload_text(payload, "status").unwrap_or_else(|| "-".to_string());
-            let summary = payload_text(payload, "summary")
-                .unwrap_or_else(|| "integration repair completed".to_string());
-            Some(format!("Repair ({status}): {summary}"))
+        typ if typ == PARALLEL_LAYER_STARTED => {
+            parallel_layer_activity_line(&event.payload, "started")
         }
-        "implementation_summary" => implementation_summary_line(payload),
-        "run_completed" => Some("Run (completed): handoff artifacts are ready".to_string()),
-        "worktrees_cleaned" => Some("Cleanup: worker worktrees cleaned".to_string()),
-        "cockpit_ready" => cockpit_ready_line(payload),
-        "cockpit_worker_ready" => cockpit_worker_ready_line(payload),
-        "terminal_summary_written" => terminal_summary_line(payload),
-        "terminal_notification_sent" => terminal_notification_line(payload, "sent"),
-        "terminal_notification_skipped" => terminal_notification_line(payload, "skipped"),
-        "checkpoint_written" => checkpoint_line(payload),
-        "worker_question_asked" => Some(format!(
-            "Attention: {}",
-            payload_text(payload, "question")
-                .unwrap_or_else(|| "worker question pending".to_string())
-        )),
-        "worker_question_answered" => {
+        typ if typ == PARALLEL_LAYER_COMPLETED => {
+            parallel_layer_activity_line(&event.payload, "completed")
+        }
+        typ if typ == PARALLEL_LAYER_FAILED => {
+            parallel_layer_activity_line(&event.payload, "failed")
+        }
+        typ if typ == INTEGRATION_REPAIR_COMPLETED => {
+            let payload = IntegrationRepairCompletedPayload::from_value(&event.payload);
+            Some(format!("Repair ({}): {}", payload.status, payload.summary))
+        }
+        typ if typ == IMPLEMENTATION_SUMMARY => implementation_summary_line(&event.payload),
+        typ if typ == RUN_COMPLETED => {
+            Some("Run (completed): handoff artifacts are ready".to_string())
+        }
+        typ if typ == RUN_INCIDENT => run_incident_line(&event.payload),
+        typ if typ == WORKTREES_CLEANED => Some("Cleanup: worker worktrees cleaned".to_string()),
+        typ if typ == COCKPIT_READY => cockpit_ready_line(&event.payload),
+        typ if typ == COCKPIT_WORKER_READY => cockpit_worker_ready_line(&event.payload),
+        typ if typ == TERMINAL_SUMMARY_WRITTEN => terminal_summary_line(&event.payload),
+        typ if typ == TERMINAL_NOTIFICATION_SENT => {
+            terminal_notification_line(&event.payload, "sent")
+        }
+        typ if typ == TERMINAL_NOTIFICATION_SKIPPED => {
+            terminal_notification_line(&event.payload, "skipped")
+        }
+        typ if typ == CHECKPOINT_WRITTEN => checkpoint_line(&event.payload),
+        typ if typ == WORKER_QUESTION_ASKED => {
+            let payload = WorkerQuestionAskedPayload::from_value(&event.payload);
+            Some(format!(
+                "Attention: {}",
+                if payload.question.trim().is_empty() {
+                    "worker question pending"
+                } else {
+                    payload.question.as_str()
+                }
+            ))
+        }
+        typ if typ == WORKER_QUESTION_ANSWERED => {
             Some("Attention: operator answered worker question".to_string())
         }
-        "progress" => progress_activity_line(event, payload),
+        typ if typ == PROGRESS => progress_activity_line(event),
         _ => {
             let summary = event_summary(event);
             if summary.is_empty() {
@@ -913,142 +1684,151 @@ fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
     }
 }
 
-fn implementation_summary_line(
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<String> {
-    let payload = payload?;
-    let mut parts = Vec::new();
-    if let Some(completed) = payload
+fn run_incident_line(payload: &serde_json::Value) -> Option<String> {
+    let payload = RunIncidentPayload::from_value(payload);
+    let label = if payload.terminal_relevant() {
+        "Incident"
+    } else {
+        "Warning"
+    };
+    Some(format!(
+        "{label} ({}): {}",
+        payload.kind_or_failure_kind(),
+        payload.message_or_summary()
+    ))
+}
+
+fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {
+    let has_completed_slices = payload
         .get("completed_slices")
         .and_then(serde_json::Value::as_array)
-        .map(|items| items.len())
-    {
+        .is_some();
+    let payload = ImplementationSummaryPayload::from_value(payload);
+    let mut parts = Vec::new();
+    if has_completed_slices || !payload.completed_slices.is_empty() {
+        let completed = payload.completed_slices.len();
         parts.push(format!(
             "{completed} completed {}",
             if completed == 1 { "slice" } else { "slices" }
         ));
     }
-    if let Some(gate) = payload
-        .get("integration_gate")
-        .and_then(serde_json::Value::as_object)
-    {
-        if let Some(summary) = gate.get("summary").and_then(serde_json::Value::as_str) {
-            if !summary.trim().is_empty() {
-                parts.push(summary.to_string());
-            }
-        } else if let Some(status) = gate.get("status").and_then(serde_json::Value::as_str) {
-            parts.push(format!("integration gate {status}"));
+    if let Some(gate) = payload.integration_gate {
+        if !gate.summary.trim().is_empty() {
+            parts.push(gate.summary);
+        } else if !gate.status.trim().is_empty() {
+            parts.push(format!("integration gate {}", gate.status));
         }
     }
-    if let Some(final_sha) = payload.get("final_sha").and_then(serde_json::Value::as_str)
-        && !final_sha.trim().is_empty()
-    {
-        parts.push(format!("final {}", short_sha(final_sha)));
+    if !payload.final_sha.trim().is_empty() {
+        parts.push(format!("final {}", short_sha(&payload.final_sha)));
     }
     (!parts.is_empty()).then(|| format!("Summary: {}", parts.join(" • ")))
 }
 
-fn cockpit_ready_line(
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<String> {
-    let payload = payload?;
-    let workspace = payload_text(Some(payload), "workspace")
-        .or_else(|| payload_text(Some(payload), "workspace_label"))
-        .unwrap_or_else(|| "workspace".to_string());
-    let adapter = payload_text(Some(payload), "adapter").unwrap_or_else(|| "cockpit".to_string());
-    Some(format!("Cockpit: {adapter} workspace ready ({workspace})"))
-}
-
-fn cockpit_worker_ready_line(
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<String> {
-    let payload = payload?;
-    let slice_id = payload_text(Some(payload), "slice_id").unwrap_or_else(|| "slice".to_string());
-    let attempt = payload_text(Some(payload), "attempt")
-        .map(|attempt| format!(" attempt {attempt}"))
-        .unwrap_or_default();
+fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {
+    let payload = CockpitReadyPayload::from_value(payload);
     Some(format!(
-        "Cockpit: worker pane ready for {slice_id}{attempt}"
+        "Cockpit: {} workspace ready ({})",
+        payload.adapter, payload.workspace
     ))
 }
 
-fn terminal_summary_line(
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<String> {
-    let payload = payload?;
-    let name = payload_text(Some(payload), "path")
-        .and_then(|path| path.rsplit('/').next().map(str::to_string))
+fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {
+    let payload = CockpitWorkerReadyPayload::from_value(payload);
+    let attempt = if payload.attempt > 0 {
+        format!(" attempt {}", payload.attempt)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Cockpit: worker pane ready for {}{}",
+        payload.slice_id, attempt
+    ))
+}
+
+fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {
+    let payload = TerminalSummaryWrittenPayload::from_value(payload);
+    let name = payload
+        .path
+        .rsplit('/')
+        .next()
+        .map(str::to_string)
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "run-summary.json".to_string());
     Some(format!("Terminal: summary written ({name})"))
 }
 
-fn terminal_notification_line(
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-    verb: &str,
-) -> Option<String> {
-    let payload = payload?;
-    let status = payload_text(Some(payload), "terminal_status")
-        .or_else(|| payload_text(Some(payload), "status"))
-        .unwrap_or_else(|| "terminal status".to_string());
-    Some(format!("Terminal: notification {verb} for {status}"))
-}
-
-fn checkpoint_line(payload: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
-    let payload = payload?;
-    let completed = payload
-        .get("completed_slices")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| items.len())
-        .unwrap_or(0);
-    let remaining = payload
-        .get("remaining_slices")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| items.len())
-        .unwrap_or(0);
+fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {
+    let payload = TerminalNotificationPayload::from_value(payload);
     Some(format!(
-        "State: checkpoint written • {completed} done • {remaining} remaining"
+        "Terminal: notification {verb} for {}",
+        payload.display_status()
     ))
 }
 
-fn progress_activity_line(
-    event: &Event,
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<String> {
-    let payload = payload?;
-    let phase = payload_text(Some(payload), "phase").unwrap_or_else(|| "activity".to_string());
+fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {
+    let payload = ParallelLayerPayload::from_value(payload);
+    let count = payload.slices.len();
+    let label = if count == 1 { "slice" } else { "slices" };
+    let slice_list = if payload.slices.is_empty() {
+        "slice set".to_string()
+    } else {
+        payload.slices.join(",")
+    };
+    if status == "failed" && !payload.summary.trim().is_empty() {
+        return Some(format!(
+            "Worker: parallel layer failed for {count} {label} ({})",
+            payload.summary
+        ));
+    }
+    Some(format!(
+        "Worker: parallel layer {status} for {count} {label} ({slice_list})"
+    ))
+}
+
+fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {
+    let payload = CheckpointWrittenPayload::from_value(payload);
+    Some(format!(
+        "State: checkpoint written • {} done • {} remaining",
+        payload.completed_slices.len(),
+        payload.remaining_slices.len()
+    ))
+}
+
+fn progress_activity_line(event: &Event) -> Option<String> {
+    let payload = ProgressEventPayload::from_value(&event.payload);
+    let phase = if payload.phase.trim().is_empty() {
+        "activity".to_string()
+    } else {
+        payload.phase
+    };
     if phase == "completed" {
         return None;
     }
-    let label = if let Some(command) = payload_text(Some(payload), "command") {
-        command_block_label(&phase, &command).to_string()
-    } else {
+    let label = if payload.command.trim().is_empty() {
         phase_label(&phase).to_string()
+    } else {
+        command_block_label(&phase, &payload.command).to_string()
     };
     let mut meta = Vec::new();
-    if let Some(slice_id) = payload_text(Some(payload), "slice_id")
-        && !slice_id.trim().is_empty()
-    {
-        meta.push(slice_id);
+    if !payload.slice_id.trim().is_empty() {
+        meta.push(payload.slice_id);
     }
-    if let Some(attempt) = payload.get("attempt").and_then(serde_json::Value::as_u64)
-        && attempt > 0
-    {
-        meta.push(format!("attempt {attempt}"));
+    if payload.attempt > 0 {
+        meta.push(format!("attempt {}", payload.attempt));
     }
-    if label != "Worker"
-        && let Some(command) = payload_text(Some(payload), "command")
-    {
-        meta.push(command_meta(&command));
+    if label != "Worker" && !payload.command.trim().is_empty() {
+        meta.push(command_meta(&payload.command));
     }
-    let message = payload_text(Some(payload), "message")
-        .unwrap_or_else(|| event_summary(event))
-        .trim()
-        .to_string();
-    let summary = if message.is_empty() {
+    let message = if payload.message.trim().is_empty() {
+        event_summary(event)
+    } else {
+        payload.message
+    };
+    let summary = if message.trim().is_empty() {
         phase.replace('_', " ")
     } else {
-        message
+        message.trim().to_string()
     };
     Some(format!(
         "{}{}: {}",
@@ -1060,16 +1840,6 @@ fn progress_activity_line(
         },
         truncate_display(&summary, LINE_WIDTH)
     ))
-}
-
-fn payload_text(
-    payload: Option<&serde_json::Map<String, serde_json::Value>>,
-    key: &str,
-) -> Option<String> {
-    payload
-        .and_then(|payload| payload.get(key))
-        .and_then(primitive_payload_text)
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {

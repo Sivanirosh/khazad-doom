@@ -1,6 +1,7 @@
 pub(crate) mod attention;
 mod cockpit;
 mod economics;
+pub(crate) mod events;
 mod gate;
 mod manager;
 mod projection;
@@ -19,6 +20,7 @@ pub(crate) use cockpit::{
     workspace_label_for_run as cockpit_workspace_label_for_run,
 };
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
+pub(crate) use projection::project_gate_pane;
 pub use prompts::{integration_repair_prompt, worker_prompt};
 pub(crate) use read_model::{RunReadModel, RunReadModelBuilder, RunReadModelOptions};
 pub use schema::{REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA};

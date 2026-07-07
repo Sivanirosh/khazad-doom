@@ -1,6 +1,7 @@
 use super::cockpit::{
     focus_default_agent_target, rename_default_agent_target, send_default_agent_message,
 };
+use super::events as workflow_events;
 use crate::artifact;
 use crate::domain::{
     Event, ImplementationSummary, ReplanProposal, Run, RunProgress, RunStatus, SliceRun,
@@ -93,17 +94,15 @@ impl OperatorAttention {
             return;
         };
         let commands = replan_decision_commands(&intent.run.id, &intent.proposal.id);
-        let payload = json!({
-            "schema_version": ATTENTION_PAYLOAD_SCHEMA_VERSION,
-            "kind": "replan_decision_pending",
-            "run_id": intent.run.id,
-            "proposal_id": intent.proposal.id,
-            "source": intent.proposal.source,
-            "risk": intent.proposal.risk,
-            "proposed_changes": intent.proposal.proposed_changes,
-            "decision_commands": commands,
-            "source_of_truth": "daemon_replan_proposals",
-        });
+        let payload = serde_json::to_value(workflow_events::ReplanNotificationPayload::new(
+            &intent.run.id,
+            &intent.proposal.id,
+            intent.proposal.source.clone(),
+            &intent.proposal.risk,
+            intent.proposal.proposed_changes.clone(),
+            commands,
+        ))
+        .unwrap_or(Value::Null);
         self.send_and_focus_attention(
             intent.run,
             &origin,
@@ -165,12 +164,12 @@ impl OperatorAttention {
                 );
                 let _ = self.state.record_event(
                     &intent.run.id,
-                    "terminal_notification_skipped",
-                    &json!({
-                        "status": terminal_status,
-                        "transition_key": transition_key,
-                        "reason": "missing_origin_target",
-                    }),
+                    workflow_events::TERMINAL_NOTIFICATION_SKIPPED,
+                    &workflow_events::TerminalNotificationPayload::skipped(
+                        terminal_status,
+                        &transition_key,
+                        "missing_origin_target",
+                    ),
                 );
                 return;
             }
@@ -226,14 +225,14 @@ impl OperatorAttention {
                 );
                 let _ = self.state.record_event(
                     &intent.run.id,
-                    "terminal_notification_sent",
-                    &json!({
-                        "status": terminal_status,
-                        "transition_key": transition_key,
-                        "adapter": sent.adapter,
-                        "surface": sent.surface,
-                        "target_kind": origin.target_kind,
-                    }),
+                    workflow_events::TERMINAL_NOTIFICATION_SENT,
+                    &workflow_events::TerminalNotificationPayload::sent(
+                        terminal_status,
+                        &transition_key,
+                        sent.adapter,
+                        sent.surface,
+                        origin.target_kind,
+                    ),
                 );
             }
             Err(err) => {
@@ -269,18 +268,11 @@ impl OperatorAttention {
         for event in intent
             .events
             .iter()
-            .filter(|event| event.typ == "cockpit_worker_ready")
+            .filter(|event| event.typ == workflow_events::COCKPIT_WORKER_READY)
+            .map(|event| workflow_events::CockpitWorkerReadyPayload::from_value(&event.payload))
         {
-            let pane_id = event
-                .payload
-                .get("pane_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let slice_id = event
-                .payload
-                .get("slice_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let pane_id = event.pane_id.as_str();
+            let slice_id = event.slice_id.as_str();
             if pane_id.is_empty() || slice_id.is_empty() || !seen.insert(pane_id.to_string()) {
                 continue;
             }
@@ -313,15 +305,14 @@ impl OperatorAttention {
                 Err(err) => {
                     let _ = self.state.record_event(
                         &intent.run.id,
-                        "run_incident",
-                        &json!({
-                            "severity": "warning",
-                            "kind": "cockpit_worker_rename_failed",
-                            "message": format!("worker pane rename failed for {slice_id}: {}", err.message),
-                            "pane_id": pane_id,
-                            "slice_id": slice_id,
-                            "source_of_truth": "daemon_terminal_summary",
-                        }),
+                        workflow_events::RUN_INCIDENT,
+                        &workflow_events::RunIncidentPayload::warning(
+                            "cockpit_worker_rename_failed",
+                            format!("worker pane rename failed for {slice_id}: {}", err.message),
+                        )
+                        .with_extra("pane_id", pane_id)
+                        .with_extra("slice_id", slice_id)
+                        .with_extra("source_of_truth", "daemon_terminal_summary"),
                     );
                 }
             }
@@ -347,68 +338,54 @@ impl OperatorAttention {
         let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
         match send_default_agent_message(&origin.target, &text) {
             Ok(sent) => {
-                let mut event_payload = context.payload_fields.clone();
-                merge_attention_event_fields(
-                    &mut event_payload,
-                    json!({
-                        "kind": kind,
-                        "adapter": sent.adapter,
-                        "surface": sent.surface,
-                        "target_kind": origin.target_kind,
-                    }),
+                let event_payload = context.delivery_payload(
+                    kind,
+                    sent.adapter,
+                    sent.surface,
+                    origin.target_kind.clone(),
                 );
-                let _ =
-                    self.state
-                        .record_event(&run.id, "attention_notification_sent", &event_payload);
+                let _ = self.state.record_event(
+                    &run.id,
+                    workflow_events::ATTENTION_NOTIFICATION_SENT,
+                    &event_payload,
+                );
             }
             Err(err) => {
-                let mut event_payload = context.payload_fields.clone();
-                merge_attention_event_fields(
-                    &mut event_payload,
-                    json!({
-                        "severity": "warning",
-                        "kind": "attention_notification_failed",
-                        "visibility_kind": "delivery_failed",
-                        "message": format!("{}: {}", context.delivery_message, err.message),
-                        "source_of_truth": context.source_of_truth,
-                    }),
+                let _ = self.state.record_event(
+                    &run.id,
+                    workflow_events::RUN_INCIDENT,
+                    &context.failure_payload(
+                        "attention_notification_failed",
+                        "delivery_failed",
+                        format!("{}: {}", context.delivery_message, err.message),
+                    ),
                 );
-                let _ = self
-                    .state
-                    .record_event(&run.id, "run_incident", &event_payload);
             }
         }
         match focus_default_agent_target(&origin.target) {
             Ok(focused) => {
-                let mut event_payload = context.payload_fields.clone();
-                merge_attention_event_fields(
-                    &mut event_payload,
-                    json!({
-                        "kind": kind,
-                        "adapter": focused.adapter,
-                        "surface": focused.surface,
-                        "target_kind": origin.target_kind,
-                    }),
+                let event_payload = context.delivery_payload(
+                    kind,
+                    focused.adapter,
+                    focused.surface,
+                    origin.target_kind.clone(),
                 );
-                let _ = self
-                    .state
-                    .record_event(&run.id, "attention_focus_sent", &event_payload);
+                let _ = self.state.record_event(
+                    &run.id,
+                    workflow_events::ATTENTION_FOCUS_SENT,
+                    &event_payload,
+                );
             }
             Err(err) => {
-                let mut event_payload = context.payload_fields.clone();
-                merge_attention_event_fields(
-                    &mut event_payload,
-                    json!({
-                        "severity": "warning",
-                        "kind": "attention_focus_failed",
-                        "visibility_kind": "focus_failed",
-                        "message": format!("{}: {}", context.focus_message, err.message),
-                        "source_of_truth": context.source_of_truth,
-                    }),
+                let _ = self.state.record_event(
+                    &run.id,
+                    workflow_events::RUN_INCIDENT,
+                    &context.failure_payload(
+                        "attention_focus_failed",
+                        "focus_failed",
+                        format!("{}: {}", context.focus_message, err.message),
+                    ),
                 );
-                let _ = self
-                    .state
-                    .record_event(&run.id, "run_incident", &event_payload);
             }
         }
     }
@@ -463,16 +440,15 @@ impl OperatorAttention {
     ) {
         let _ = self.state.record_event(
             &run.id,
-            "run_incident",
-            &json!({
-                "severity": "warning",
-                "kind": "terminal_notification_failed",
-                "visibility_kind": failure_kind,
-                "message": format!("terminal notification for {terminal_status} was not delivered: {message}"),
-                "terminal_status": terminal_status,
-                "transition_key": transition_key,
-                "source_of_truth": "daemon_terminal_summary",
-            }),
+            workflow_events::RUN_INCIDENT,
+            &workflow_events::RunIncidentPayload::warning(
+                "terminal_notification_failed",
+                format!("terminal notification for {terminal_status} was not delivered: {message}"),
+            )
+            .with_extra("visibility_kind", failure_kind)
+            .with_extra("terminal_status", terminal_status)
+            .with_extra("transition_key", transition_key)
+            .with_extra("source_of_truth", "daemon_terminal_summary"),
         );
     }
 }
@@ -484,12 +460,53 @@ struct AttentionFailureContext {
     payload_fields: Value,
 }
 
-fn merge_attention_event_fields(target: &mut Value, fields: Value) {
-    let (Some(target), Some(fields)) = (target.as_object_mut(), fields.as_object()) else {
-        return;
-    };
-    for (key, value) in fields {
-        target.insert(key.clone(), value.clone());
+impl AttentionFailureContext {
+    fn delivery_payload(
+        &self,
+        kind: &str,
+        adapter: String,
+        surface: String,
+        target_kind: String,
+    ) -> workflow_events::AttentionDeliveryPayload {
+        workflow_events::AttentionDeliveryPayload {
+            kind: kind.to_string(),
+            question_id: self.payload_field("question_id"),
+            slice_id: self.payload_field("slice_id"),
+            proposal_id: self.payload_field("proposal_id"),
+            adapter,
+            surface,
+            target_kind,
+        }
+    }
+
+    fn failure_payload(
+        &self,
+        kind: &str,
+        visibility_kind: &str,
+        message: String,
+    ) -> workflow_events::RunIncidentPayload {
+        let mut payload = workflow_events::RunIncidentPayload::warning(kind, message)
+            .with_extra("visibility_kind", visibility_kind)
+            .with_extra("source_of_truth", self.source_of_truth);
+        for key in ["question_id", "slice_id", "proposal_id"] {
+            let value = self.payload_field(key);
+            if !value.trim().is_empty() {
+                payload = payload.with_extra(key, value);
+            }
+        }
+        payload
+    }
+
+    fn payload_field(&self, key: &str) -> String {
+        self.payload_fields
+            .get(key)
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| value.as_u64().map(|number| number.to_string()))
+            })
+            .unwrap_or_default()
     }
 }
 

@@ -3,7 +3,7 @@ use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
     BranchHandoff, ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState,
     ReplanProposedChange, RunDetails, RunInspection, RunStatus, SliceValidationReport,
-    SliceWriteResult, StatusFeed, StatusFeedRole, project_gate_pane,
+    SliceWriteResult, StatusFeed, StatusFeedRole,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -18,7 +18,7 @@ use crate::pi_contract::PiActivityFormatter;
 use crate::state::Store as StateStore;
 use crate::workflow::{
     CockpitOpenFocus, cockpit_mode_transport_arg, cockpit_workspace_label_for_run,
-    open_default_run_cockpit_for_operator,
+    open_default_run_cockpit_for_operator, project_gate_pane,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
