@@ -1,0 +1,47 @@
+{
+  "id": "CPLX-05",
+  "title": "Post-read-model locality cleanup",
+  "goal": "After the read-model, attention, and projection ownership refactors, remeasure the remaining locality hotspots and perform the low-risk cleanup that still pays for itself: centralize Pi wrapper artifact paths, split daemon integration tests by domain, and extract the worker-attempt executor only if it remains the dominant manager complexity hotspot.",
+  "status": "open",
+  "depends_on": [
+    "CPLX-03",
+    "CPLX-04"
+  ],
+  "areas": [
+    "src/agent.rs",
+    "src/artifact.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/mod.rs",
+    "src/workflow/worker_attempt.rs",
+    "src/domain.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/common",
+    "docs/design/evidence",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "All existing projection snapshots, parity fixtures, and golden output tests remain behavior-preserving unless an intentional divergence is explicitly documented in this slice output.",
+    "A short complexity evidence note records manager.rs line count and remaining hotspots after CPLX-02 through CPLX-04, including whether run_slice_worker remains worth extracting now or should be deferred.",
+    "PiWrapperArtifacts or its equivalent no longer hand-builds .herdr.* output paths outside artifact::Store; wrapper artifact path construction has one owner.",
+    "tests/daemon_integration.rs is split or reduced by domain-oriented modules/helpers for at least publication, attention, cockpit, and replan tests without weakening black-box coverage.",
+    "If worker-attempt extraction is performed, Manager keeps the lifecycle facade while attempt-local setup/handoff/launch/result-validation/status-transition behavior moves behind a typed AttemptOutcome interface; if deferred, the evidence note explains why after remeasurement.",
+    "No new shallow pass-through modules are introduced solely to reduce line counts; every new module has a small interface and demonstrable locality/depth benefit."
+  ],
+  "must_ask_if": [
+    "The implementation would change worker execution semantics, retry policy, commit/merge policy, or integration gate ordering as part of locality cleanup.",
+    "The implementation would delete or skip black-box daemon integration scenarios instead of moving/splitting them.",
+    "The implementation would hide .workflow runtime layout behind an abstraction that makes legitimate external command paths harder to inspect.",
+    "The implementation would extract many shallow modules without a clear interface/depth justification."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test daemon_integration --test daemon_integration --quiet",
+    "cargo test worker --quiet",
+    "cargo test projection --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

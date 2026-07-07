@@ -1,0 +1,48 @@
+{
+  "id": "CPLX-04",
+  "title": "Projection ownership and typed events",
+  "goal": "Restore projection ownership by moving gate/dashboard projection logic out of domain data types and replacing projection-relevant json! event payload coupling with typed event payload constructors/readers.",
+  "status": "open",
+  "depends_on": [
+    "CPLX-02"
+  ],
+  "areas": [
+    "src/workflow/events.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/mod.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/cockpit.rs",
+    "src/daemon.rs",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/fixtures",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "All existing projection snapshots, parity fixtures, and golden output tests remain behavior-preserving unless an intentional divergence is explicitly documented in this slice output.",
+    "project_gate_pane and gate/dashboard projection helpers move out of src/domain.rs and into the workflow projection layer or a projection submodule; domain.rs no longer constructs StatusFeed presentation output.",
+    "Projection-relevant event payloads used for cockpit readiness, incidents, worker observations, terminal reasons, gate/repair activity, and attention are emitted through typed constructors or typed payload structs rather than ad-hoc json! blobs at call sites.",
+    "Projection parses those event payloads through the same typed definitions, with explicit unknown/legacy fallback only where needed for compatibility with old run artifacts.",
+    "CLI renderers remain painters over StatusFeed/GatePaneProjection and do not reintroduce raw event-payload interpretation.",
+    "The previous 'Cockpit Ready: {raw JSON}' class of leakage is covered by tests that assert human-readable projection text rather than raw payload dumps."
+  ],
+  "must_ask_if": [
+    "The implementation would change stored event compatibility so existing run artifacts can no longer be inspected or summarized.",
+    "The implementation would move presentation logic from projection into CLI, daemon, state, or domain instead of centralizing it.",
+    "The implementation would delete event evidence rather than type the payloads.",
+    "The implementation would need to rewrite broad golden fixtures for wording unrelated to projection ownership."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test projection --quiet",
+    "cargo test cockpit --quiet",
+    "cargo test gate_activity --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

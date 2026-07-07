@@ -1,0 +1,38 @@
+{
+  "id": "CPLX-01",
+  "title": "Durable confinement tests",
+  "goal": "Promote the slice-local grep/confinement guards that protect Pi wire strings and painter event-name boundaries into ordinary Rust tests that run under every cargo test/gate/CI invocation, and record the manual-integration disposition from the superseded blocked run.",
+  "status": "open",
+  "areas": [
+    "tests/confinement.rs",
+    "src/pi_contract.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "src/domain.rs",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "All existing projection snapshots, parity fixtures, and golden output tests remain behavior-preserving unless an intentional divergence is explicitly documented in this slice output.",
+    "Durable Rust confinement tests under tests/confinement.rs scan src/ for the existing Pi wire-string and painter interpretation boundaries that were previously enforced only by slice-local grep verify commands.",
+    "The tests make the allowed owners explicit, especially that Pi event wire vocabulary remains owned by the Pi contract layer and renderers/painters do not grow ad-hoc raw event interpretation.",
+    "The confinement tests fail with actionable messages that name the violated boundary and the unexpected file/path match.",
+    "The manual-integration disposition is documented in a durable project doc or invariant note: commits from the kd-20260707-112420-7f061d72 turbulence were manually integrated because that run was superseded by attention/read-model authority defects and was intentionally not resumed.",
+    "The new tests run as part of plain cargo test; no separate slice-specific grep command is required to preserve these boundaries."
+  ],
+  "must_ask_if": [
+    "A guard would require forbidding legitimate Pi contract constants or test fixtures rather than checking ownership boundaries.",
+    "The implementation needs to weaken, delete, or mark ignored any existing projection/golden/parity test to pass.",
+    "The disposition text would claim the blocked KD run completed or was resumed.",
+    "The implementation would add a new external linter or CI dependency instead of using ordinary Rust tests."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test confinement --quiet",
+    "cargo test projection --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

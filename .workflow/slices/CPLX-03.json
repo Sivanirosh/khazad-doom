@@ -1,0 +1,47 @@
+{
+  "id": "CPLX-03",
+  "title": "Deep operator attention module",
+  "goal": "Extract a workflow::attention module that owns operator-attention delivery and dedupe semantics for worker questions, replan decisions, terminal transitions, and cockpit pane hygiene, so daemon and manager callers only emit typed attention intents.",
+  "status": "open",
+  "depends_on": [
+    "CPLX-02"
+  ],
+  "areas": [
+    "src/workflow/attention.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/mod.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/cockpit.rs",
+    "src/daemon.rs",
+    "src/domain.rs",
+    "src/artifact.rs",
+    "src/state.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "All existing projection snapshots, parity fixtures, and golden output tests remain behavior-preserving unless an intentional divergence is explicitly documented in this slice output.",
+    "A workflow::attention module exposes a small typed interface for worker-question pending, replan-decision pending, terminal transition notification, and worker-pane terminal rename intents.",
+    "Origin target lookup, payload schema versioning, Herdr send/focus/rename calls through the cockpit seam, transition-keyed terminal dedupe, and non-fatal visibility incident recording live behind the attention module interface.",
+    "daemon.rs no longer has its own inline worker-question Herdr origin lookup/send/focus implementation; workflow/manager.rs no longer has separate replan/terminal/pane attention delivery logic duplicated by kind.",
+    "Attention failures remain warning/visibility incidents only and do not affect run status, slice status, question/proposal state, verification, merge, handoff readiness, or final SHA.",
+    "Tests cover no-origin no-op, delivery failure incident, dedupe by concrete attention key/terminal transition, and both worker-question and replan attention paths through the shared module."
+  ],
+  "must_ask_if": [
+    "The implementation would auto-answer a worker question, auto-accept/reject/defer a proposal, or make a notification authoritative.",
+    "The implementation would introduce a second Herdr/Pi delivery path instead of the cockpit seam and origin target artifact.",
+    "The implementation would require Herdr for headless status, answer, replan, handoff, or completion.",
+    "The implementation would remove durable terminal notification records or broaden dedupe so later resumed transitions cannot notify."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test attention --quiet",
+    "cargo test terminal_notification --quiet",
+    "cargo test ask_operator --quiet",
+    "cargo test replan --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

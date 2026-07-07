@@ -1,0 +1,47 @@
+{
+  "id": "CPLX-02",
+  "title": "Shared run read model",
+  "goal": "Introduce a shared daemon-owned RunReadModel/read-model builder so status, terminal run summaries, and handoff/report paths consume the same authoritative run snapshot instead of hand-assembling parallel views of run truth.",
+  "status": "open",
+  "depends_on": [
+    "CPLX-01"
+  ],
+  "areas": [
+    "src/workflow/read_model.rs",
+    "src/workflow/mod.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/daemon.rs",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/fixtures",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "All existing projection snapshots, parity fixtures, and golden output tests remain behavior-preserving unless an intentional divergence is explicitly documented in this slice output.",
+    "A single read-model builder constructs RunDetails/feed inputs for daemon status/latest status, terminal run-summary generation, and handoff/report readiness paths that need run truth.",
+    "write_terminal_run_summary no longer hand-builds a partial RunDetails with empty incidents, default replan status, or missing primary_terminal_reason when the shared read model can supply those fields.",
+    "The read model supports explicit terminal status/error overrides for pre-advertisement summaries without diverging from live status semantics for incidents, questions, replan, economics, profile, plan revisions, and feed projection.",
+    "Status JSON and run-summary.json agree on terminal reason/feed/operator command semantics for blocked/failed/completed/cancelled transitions in covered tests.",
+    "The read-model interface is deep: callers request a run snapshot with clear options rather than coordinating Store/Event/Artifact/Profile/Projection details themselves."
+  ],
+  "must_ask_if": [
+    "The implementation would change public status JSON fields incompatibly rather than adding or preserving fields.",
+    "Terminal summaries would stop being written before terminal notification delivery.",
+    "The implementation would make handoff depend on Herdr, pane text, or monitor output.",
+    "Existing tests or snapshots would need broad wording changes unrelated to eliminating read-model drift."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test projection --quiet",
+    "cargo test terminal_notification --quiet",
+    "cargo test handoff --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}
