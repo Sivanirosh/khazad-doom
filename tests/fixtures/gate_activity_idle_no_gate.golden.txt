@@ -1,0 +1,13 @@
+Khazad-Doom gate/repair status (idle)
+Gate (not run)
+  - Verification profile: full
+  - Latest gate: not run yet
+  - Last failure: none
+Repair (auto)
+  - State: waiting for gate result
+  - Attempts: 0/1
+Handoff (unknown)
+  - Handoff: unknown until integration gate finishes
+  - Run: running
+Next
+  - No operator gate/repair command is currently needed.

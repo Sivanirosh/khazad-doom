@@ -1047,6 +1047,768 @@ fn default_status_feed_role() -> StatusFeedRole {
     StatusFeedRole::Info
 }
 
+const GATE_PANE_LINE_WIDTH: usize = 180;
+const GATE_PANE_TAIL_LINES: usize = 6;
+
+pub(crate) struct GatePaneProjection {
+    pub active: bool,
+    pub feed: StatusFeed,
+}
+
+pub(crate) fn project_gate_pane(details: &RunDetails, now: DateTime<Utc>) -> GatePaneProjection {
+    if let Some(progress) = gate_pane_active_progress(details) {
+        return GatePaneProjection {
+            active: true,
+            feed: active_gate_pane_feed(details, progress, now),
+        };
+    }
+    GatePaneProjection {
+        active: false,
+        feed: idle_gate_pane_feed(details),
+    }
+}
+
+fn active_gate_pane_feed(
+    details: &RunDetails,
+    progress: &RunProgress,
+    now: DateTime<Utc>,
+) -> StatusFeed {
+    let terminal_reason = gate_pane_terminal_reason(details);
+    let operator_commands = gate_pane_operator_commands(details, terminal_reason.as_ref());
+    let mut blocks = vec![gate_pane_block(
+        "Run",
+        format!(
+            "{} {} • {}",
+            gate_pane_status_icon(details.run.status),
+            details.run.status,
+            gate_pane_short_run_id(&details.run.id)
+        ),
+        vec![gate_pane_line(
+            "Source: daemon status feed / shell progress; gate results and artifacts remain authoritative",
+            StatusFeedRole::Dim,
+        )],
+    )];
+
+    let mut activity_lines = vec![
+        gate_pane_line(
+            format!(
+                "command: {}",
+                gate_pane_truncate(&progress.command, GATE_PANE_LINE_WIDTH)
+            ),
+            StatusFeedRole::Info,
+        ),
+        gate_pane_line("state: running", StatusFeedRole::Info),
+    ];
+    if !progress.message.trim().is_empty() {
+        activity_lines.push(gate_pane_line(
+            format!(
+                "message: {}",
+                gate_pane_truncate(&progress.message, GATE_PANE_LINE_WIDTH)
+            ),
+            StatusFeedRole::Info,
+        ));
+    }
+    if !progress.slice_id.trim().is_empty() {
+        activity_lines.push(gate_pane_line(
+            format!("slice: {}", progress.slice_id),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if progress.attempt > 0 {
+        activity_lines.push(gate_pane_line(
+            format!("attempt: {}", progress.attempt),
+            StatusFeedRole::Dim,
+        ));
+    }
+    activity_lines.push(gate_pane_line(
+        format!("updated {} ago", gate_pane_since(progress.updated_at, now)),
+        StatusFeedRole::Dim,
+    ));
+    if let Some(worker) = &progress.worker {
+        activity_lines.push(gate_pane_line(
+            format!(
+                "supervisor: {}",
+                match worker.process_observed_at {
+                    Some(observed_at) => format!(
+                        "alive, observed child {} ago",
+                        gate_pane_since(observed_at, now)
+                    ),
+                    None => "starting, no child observation yet".to_string(),
+                }
+            ),
+            StatusFeedRole::Dim,
+        ));
+    }
+    blocks.push(gate_pane_block(
+        gate_pane_activity_label(&progress.phase),
+        format!(
+            "(running • elapsed {})",
+            gate_pane_since(progress.phase_started_at, now)
+        ),
+        activity_lines,
+    ));
+
+    let tail = gate_pane_compact_tail(&progress.output_tail);
+    if tail.is_empty() {
+        blocks.push(gate_pane_block(
+            "Tail",
+            "",
+            vec![gate_pane_line(
+                "waiting for daemon-owned command output",
+                StatusFeedRole::Dim,
+            )],
+        ));
+    } else {
+        blocks.push(gate_pane_block(
+            "Tail",
+            format!("(last {} compact lines)", tail.len()),
+            tail.into_iter()
+                .map(|text| gate_pane_line(text, StatusFeedRole::Dim))
+                .collect(),
+        ));
+    }
+
+    StatusFeed {
+        feed_version: 1,
+        summary_line: "Khazad-Doom gate/repair activity painter (read-only)".to_string(),
+        terminal_reason,
+        operator_commands,
+        attention: Vec::new(),
+        blocks,
+    }
+}
+
+fn idle_gate_pane_feed(details: &RunDetails) -> StatusFeed {
+    let summary = gate_pane_latest_implementation_summary(details);
+    let latest_gate = summary
+        .and_then(|summary| gate_pane_gate_result_field(summary, "integration_gate"))
+        .or_else(|| gate_pane_gate_result_from_economics(details));
+    let pre_repair_gate = summary
+        .and_then(|summary| gate_pane_gate_result_field(summary, "pre_repair_integration_gate"));
+    let repair = summary.and_then(gate_pane_repair_result_field);
+    let exit_states = summary.and_then(gate_pane_exit_states_field);
+    let terminal_reason = gate_pane_terminal_reason(details);
+    let operator_commands = gate_pane_operator_commands(details, terminal_reason.as_ref());
+
+    let blocks = vec![
+        gate_pane_gate_block(
+            details,
+            latest_gate.as_ref(),
+            pre_repair_gate.as_ref(),
+            summary,
+        ),
+        gate_pane_repair_block(details, latest_gate.as_ref(), repair.as_ref()),
+        gate_pane_handoff_block(
+            details,
+            latest_gate.as_ref(),
+            exit_states.as_ref(),
+            terminal_reason.as_ref(),
+        ),
+        gate_pane_next_block(details, &operator_commands),
+    ];
+
+    StatusFeed {
+        feed_version: 1,
+        summary_line: "Khazad-Doom gate/repair status (idle)".to_string(),
+        terminal_reason,
+        operator_commands,
+        attention: Vec::new(),
+        blocks,
+    }
+}
+
+fn gate_pane_gate_block(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    pre_repair_gate: Option<&GateResult>,
+    summary: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> StatusFeedBlock {
+    let mut lines = vec![gate_pane_line(
+        format!(
+            "Verification profile: {}",
+            gate_pane_verification_profile(details, summary)
+        ),
+        StatusFeedRole::Info,
+    )];
+    match latest_gate {
+        Some(gate) => lines.push(gate_pane_line(
+            format!(
+                "Latest gate: {}{}",
+                gate_pane_display_or_dash(&gate.status),
+                gate_pane_summary_suffix(&gate.summary)
+            ),
+            gate_pane_role_for_gate_status(&gate.status),
+        )),
+        None => lines.push(gate_pane_line(
+            "Latest gate: not run yet",
+            StatusFeedRole::Dim,
+        )),
+    }
+    let last_failure = gate_pane_last_failure(pre_repair_gate, latest_gate);
+    lines.push(gate_pane_line(
+        format!(
+            "Last failure: {}",
+            last_failure.clone().unwrap_or_else(|| "none".to_string())
+        ),
+        if last_failure.is_some() {
+            StatusFeedRole::Warning
+        } else {
+            StatusFeedRole::Dim
+        },
+    ));
+    gate_pane_block(
+        "Gate",
+        format!(
+            "({})",
+            latest_gate
+                .map(|gate| gate_pane_display_or_dash(&gate.status))
+                .unwrap_or("not run")
+        ),
+        lines,
+    )
+}
+
+fn gate_pane_repair_block(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    repair: Option<&RepairResult>,
+) -> StatusFeedBlock {
+    let policy = gate_pane_repair_policy(details);
+    let (state, role) = gate_pane_repair_state(policy.as_str(), latest_gate, repair);
+    let mut lines = vec![gate_pane_line(state, role)];
+    if let Some(attempts) = gate_pane_repair_attempts(details, repair) {
+        lines.push(gate_pane_line(attempts, StatusFeedRole::Dim));
+    }
+    gate_pane_block("Repair", format!("({policy})"), lines)
+}
+
+fn gate_pane_handoff_block(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    exit_states: Option<&WorkflowExitStates>,
+    terminal_reason: Option<&TerminalReason>,
+) -> StatusFeedBlock {
+    let (meta, mut lines) = gate_pane_handoff_lines(details, latest_gate, exit_states);
+    if let Some(reason) = terminal_reason {
+        lines.push(gate_pane_line(
+            format!(
+                "Terminal reason: {}{}",
+                gate_pane_display_or_dash(&reason.kind),
+                gate_pane_summary_suffix(&reason.summary)
+            ),
+            if reason.operator_action_required {
+                StatusFeedRole::Attention
+            } else {
+                StatusFeedRole::Warning
+            },
+        ));
+    }
+    lines.push(gate_pane_line(
+        format!("Run: {}", details.run.status),
+        StatusFeedRole::Dim,
+    ));
+    gate_pane_block("Handoff", format!("({meta})"), lines)
+}
+
+fn gate_pane_next_block(details: &RunDetails, operator_commands: &[String]) -> StatusFeedBlock {
+    let mut commands = operator_commands.to_vec();
+    match details.run.status {
+        RunStatus::Completed => gate_pane_push_unique(
+            &mut commands,
+            format!("khazad-doom handoff --run {}", details.run.id),
+        ),
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted => {
+            gate_pane_push_unique(
+                &mut commands,
+                format!("khazad-doom inspect --run {}", details.run.id),
+            );
+            gate_pane_push_unique(
+                &mut commands,
+                format!("khazad-doom resume --run {}", details.run.id),
+            );
+        }
+        RunStatus::Pending | RunStatus::Running => {}
+    }
+    let lines = if commands.is_empty() {
+        vec![gate_pane_line(
+            "No operator gate/repair command is currently needed.",
+            StatusFeedRole::Dim,
+        )]
+    } else {
+        commands
+            .into_iter()
+            .map(|command| gate_pane_line(command, StatusFeedRole::Attention))
+            .collect()
+    };
+    gate_pane_block("Next", "", lines)
+}
+
+fn gate_pane_active_progress(details: &RunDetails) -> Option<&RunProgress> {
+    let progress = details.progress.as_ref()?;
+    if gate_pane_terminal_status(details.run.status) || progress.command.trim().is_empty() {
+        return None;
+    }
+    gate_pane_is_gate_or_repair_phase(&progress.phase).then_some(progress)
+}
+
+fn gate_pane_is_gate_or_repair_phase(phase: &str) -> bool {
+    let normalized = phase.to_ascii_lowercase();
+    normalized.contains("integration_gate") || normalized.contains("integration_repair")
+}
+
+fn gate_pane_activity_label(phase: &str) -> &'static str {
+    if phase.to_ascii_lowercase().contains("repair") {
+        "Repair"
+    } else {
+        "Integration Gate"
+    }
+}
+
+fn gate_pane_compact_tail(output_tail: &str) -> Vec<String> {
+    output_tail
+        .trim_end()
+        .lines()
+        .rev()
+        .take(GATE_PANE_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| gate_pane_truncate(line, GATE_PANE_LINE_WIDTH))
+        .collect()
+}
+
+fn gate_pane_terminal_reason(details: &RunDetails) -> Option<TerminalReason> {
+    details
+        .feed
+        .as_ref()
+        .and_then(|feed| feed.terminal_reason.clone())
+        .or_else(|| details.primary_terminal_reason.clone())
+}
+
+fn gate_pane_operator_commands(
+    details: &RunDetails,
+    terminal_reason: Option<&TerminalReason>,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    if let Some(feed) = &details.feed {
+        for command in &feed.operator_commands {
+            gate_pane_push_unique(&mut commands, command.clone());
+        }
+    }
+    if let Some(reason) = terminal_reason {
+        for command in &reason.operator_commands {
+            gate_pane_push_unique(&mut commands, command.clone());
+        }
+    }
+    commands
+}
+
+fn gate_pane_latest_implementation_summary(
+    details: &RunDetails,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    details
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.typ == "implementation_summary")
+        .and_then(|event| event.payload.as_object())
+}
+
+fn gate_pane_gate_result_field(
+    summary: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<GateResult> {
+    let value = summary.get(key)?;
+    if value.is_null() {
+        return None;
+    }
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn gate_pane_repair_result_field(
+    summary: &serde_json::Map<String, serde_json::Value>,
+) -> Option<RepairResult> {
+    summary
+        .get("integration_repair")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+fn gate_pane_exit_states_field(
+    summary: &serde_json::Map<String, serde_json::Value>,
+) -> Option<WorkflowExitStates> {
+    summary
+        .get("exit_states")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+fn gate_pane_gate_result_from_economics(details: &RunDetails) -> Option<GateResult> {
+    let economics = details.economics.as_ref()?;
+    let commands = economics
+        .command_executions
+        .iter()
+        .filter(|command| command.phase == "integration_gate")
+        .map(|command| GateCommandResult {
+            command: command.command.clone(),
+            status: command.status.clone(),
+            exit_code: command.exit_code,
+            output: String::new(),
+            cwd: command.cwd.clone(),
+            dedupe_key: command.dedupe_key.clone(),
+            duration_ms: command.duration_ms,
+            cache_hit: command.cache_hit,
+            skip_reason: command.skip_reason.clone(),
+            failure_kind: String::new(),
+        })
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        return None;
+    }
+    let status = if commands.iter().any(|command| command.status == "failed") {
+        "failed"
+    } else if commands.iter().all(|command| command.status == "skipped") {
+        "skipped"
+    } else if commands
+        .iter()
+        .all(|command| command.status == "passed" || command.status == "skipped")
+    {
+        "passed"
+    } else {
+        "unknown"
+    };
+    let summary = match status {
+        "passed" => "integration gate passed",
+        "failed" => "one or more integration gate commands failed",
+        "skipped" => "integration gate commands skipped",
+        _ => "integration gate status is unknown",
+    };
+    Some(GateResult {
+        status: status.to_string(),
+        summary: summary.to_string(),
+        commands,
+        findings: Vec::new(),
+    })
+}
+
+fn gate_pane_verification_profile(
+    details: &RunDetails,
+    summary: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> String {
+    if let Some(profile) = summary
+        .and_then(|summary| summary.get("verify_profile"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|profile| !profile.trim().is_empty())
+    {
+        return profile.to_string();
+    }
+    for event in details.events.iter().rev() {
+        if event.typ != "run_started" {
+            continue;
+        }
+        let Some(payload) = event.payload.as_object() else {
+            continue;
+        };
+        if let Some(profile) = payload
+            .get("verify_profile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|profile| !profile.trim().is_empty())
+        {
+            return profile.to_string();
+        }
+        if let Some(profiles) = payload
+            .get("verify_profiles")
+            .and_then(serde_json::Value::as_array)
+        {
+            let joined = profiles
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|profile| !profile.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !joined.trim().is_empty() {
+                return joined;
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn gate_pane_repair_policy(details: &RunDetails) -> String {
+    details
+        .economics
+        .as_ref()
+        .map(|economics| economics.repair_policy.trim())
+        .filter(|policy| !policy.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn gate_pane_repair_attempts(
+    details: &RunDetails,
+    repair: Option<&RepairResult>,
+) -> Option<String> {
+    if let Some(economics) = &details.economics {
+        return Some(format!(
+            "Attempts: {}/{}",
+            economics.repair_attempts, economics.repair_max_attempts
+        ));
+    }
+    repair
+        .filter(|repair| repair.attempts > 0)
+        .map(|repair| format!("Attempts: {}", repair.attempts))
+}
+
+fn gate_pane_repair_state(
+    policy: &str,
+    latest_gate: Option<&GateResult>,
+    repair: Option<&RepairResult>,
+) -> (String, StatusFeedRole) {
+    if let Some(repair) = repair {
+        let mut text = format!("State: {}", gate_pane_display_or_dash(&repair.status));
+        if !repair.summary.trim().is_empty() {
+            text.push_str(&gate_pane_summary_suffix(&repair.summary));
+        }
+        if !repair.trigger.trim().is_empty() {
+            text.push_str(&format!(" ({})", repair.trigger));
+        }
+        return (text, gate_pane_role_for_repair_status(&repair.status));
+    }
+    match latest_gate.map(|gate| gate.status.as_str()) {
+        None => (
+            "State: waiting for gate result".to_string(),
+            StatusFeedRole::Dim,
+        ),
+        Some("passed") => (
+            "State: not needed; latest gate passed".to_string(),
+            StatusFeedRole::Success,
+        ),
+        Some("failed") if matches!(policy, "auto" | "always") => (
+            "State: repairable: daemon policy can run integration repair".to_string(),
+            StatusFeedRole::Warning,
+        ),
+        Some("failed") if policy == "never" => (
+            "State: disabled by policy after failed gate".to_string(),
+            StatusFeedRole::Warning,
+        ),
+        Some("failed") => (
+            "State: unresolved after failed gate".to_string(),
+            StatusFeedRole::Warning,
+        ),
+        Some(status) => (
+            format!("State: waiting after gate {status}"),
+            StatusFeedRole::Dim,
+        ),
+    }
+}
+
+fn gate_pane_handoff_lines(
+    details: &RunDetails,
+    latest_gate: Option<&GateResult>,
+    exit_states: Option<&WorkflowExitStates>,
+) -> (String, Vec<StatusFeedLine>) {
+    if let Some(exit_states) = exit_states {
+        let meta = gate_pane_display_or_dash(&exit_states.handoff).to_string();
+        let mut lines = vec![gate_pane_line(
+            format!("Handoff: {meta}"),
+            StatusFeedRole::Info,
+        )];
+        if !exit_states.evidence.trim().is_empty() {
+            lines.push(gate_pane_line(
+                format!("Evidence: {}", exit_states.evidence),
+                StatusFeedRole::Dim,
+            ));
+        }
+        return (meta, lines);
+    }
+    match details.run.status {
+        RunStatus::Completed => (
+            "ready".to_string(),
+            vec![gate_pane_line("Handoff: ready", StatusFeedRole::Success)],
+        ),
+        RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Interrupted => (
+            "not_ready".to_string(),
+            vec![gate_pane_line(
+                format!("Handoff: not ready — run is {}", details.run.status),
+                StatusFeedRole::Warning,
+            )],
+        ),
+        RunStatus::Pending | RunStatus::Running => {
+            if latest_gate.is_some_and(|gate| gate.status == "failed") {
+                (
+                    "not_ready".to_string(),
+                    vec![gate_pane_line(
+                        "Handoff: not ready — latest gate failed",
+                        StatusFeedRole::Warning,
+                    )],
+                )
+            } else {
+                (
+                    "unknown".to_string(),
+                    vec![gate_pane_line(
+                        "Handoff: unknown until integration gate finishes",
+                        StatusFeedRole::Dim,
+                    )],
+                )
+            }
+        }
+    }
+}
+
+fn gate_pane_last_failure(
+    pre_repair_gate: Option<&GateResult>,
+    latest_gate: Option<&GateResult>,
+) -> Option<String> {
+    pre_repair_gate
+        .and_then(gate_pane_failure_line)
+        .map(|failure| format!("{failure} (pre-repair)"))
+        .or_else(|| latest_gate.and_then(gate_pane_failure_line))
+}
+
+fn gate_pane_failure_line(gate: &GateResult) -> Option<String> {
+    gate.commands
+        .iter()
+        .find(|command| command.status == "failed")
+        .map(|command| {
+            let output = command
+                .output
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim();
+            if !output.is_empty() {
+                format!(
+                    "{} — {}",
+                    gate_pane_truncate(&command.command, 80),
+                    gate_pane_truncate(output, 90)
+                )
+            } else if let Some(exit_code) = command.exit_code {
+                format!(
+                    "{} (exit {exit_code})",
+                    gate_pane_truncate(&command.command, 120)
+                )
+            } else {
+                gate_pane_truncate(&command.command, 120)
+            }
+        })
+}
+
+fn gate_pane_role_for_gate_status(status: &str) -> StatusFeedRole {
+    match status {
+        "passed" => StatusFeedRole::Success,
+        "failed" => StatusFeedRole::Error,
+        "skipped" => StatusFeedRole::Dim,
+        _ => StatusFeedRole::Info,
+    }
+}
+
+fn gate_pane_role_for_repair_status(status: &str) -> StatusFeedRole {
+    match status {
+        "completed" | "fixed" | "no-op" => StatusFeedRole::Success,
+        "failed" | "blocked" => StatusFeedRole::Error,
+        "skipped" => StatusFeedRole::Dim,
+        _ => StatusFeedRole::Info,
+    }
+}
+
+fn gate_pane_summary_suffix(summary: &str) -> String {
+    if summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", gate_pane_truncate(summary, GATE_PANE_LINE_WIDTH))
+    }
+}
+
+fn gate_pane_status_icon(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Completed => "✓",
+        RunStatus::Running => "●",
+        RunStatus::Blocked => "!",
+        RunStatus::Failed => "✗",
+        RunStatus::Cancelled | RunStatus::Interrupted => "×",
+        RunStatus::Pending => "○",
+    }
+}
+
+fn gate_pane_terminal_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Blocked
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted
+    )
+}
+
+fn gate_pane_since(time: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(time).num_seconds().max(0) as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn gate_pane_short_run_id(value: &str) -> String {
+    if value.chars().count() <= 30 {
+        return gate_pane_display_or_dash(value).to_string();
+    }
+    let prefix = value.chars().take(11).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn gate_pane_truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn gate_pane_display_or_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
+}
+
+fn gate_pane_push_unique(values: &mut Vec<String>, value: String) {
+    if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn gate_pane_block(
+    label: impl Into<String>,
+    meta: impl Into<String>,
+    lines: Vec<StatusFeedLine>,
+) -> StatusFeedBlock {
+    StatusFeedBlock {
+        label: label.into(),
+        meta: meta.into(),
+        lines,
+    }
+}
+
+fn gate_pane_line(text: impl Into<String>, role: StatusFeedRole) -> StatusFeedLine {
+    StatusFeedLine {
+        text: text.into(),
+        role,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerQuestion {
     pub id: String,

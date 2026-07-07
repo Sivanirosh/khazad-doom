@@ -2,8 +2,8 @@ use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
     BranchHandoff, ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState,
-    ReplanProposedChange, RunDetails, RunInspection, RunProgress, RunStatus, SliceValidationReport,
-    SliceWriteResult, StatusFeed, StatusFeedRole,
+    ReplanProposedChange, RunDetails, RunInspection, RunStatus, SliceValidationReport,
+    SliceWriteResult, StatusFeed, StatusFeedRole, project_gate_pane,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -1047,103 +1047,17 @@ fn run_cockpit_paint_gate_activity(paths: Paths, run_id: String, interval_ms: u6
 }
 
 fn paint_gate_activity_snapshot(details: &RunDetails, out: &mut impl Write) -> Result<bool> {
-    let Some(progress) = active_gate_or_repair_progress(details) else {
-        writeln!(out, "Khazad-Doom gate/repair status (idle)")?;
-        writeln!(out, "Run: {}", details.run.id)?;
-        writeln!(out, "Status: {}", details.run.status)?;
-        writeln!(
-            out,
-            "Source: daemon status feed; no active gate/repair command"
-        )?;
-        match &details.feed {
-            Some(feed) => render_feed_plain(out, feed)?,
-            None => writeln!(out, "daemon status feed unavailable")?,
-        }
-        return Ok(false);
-    };
-
-    writeln!(out, "Khazad-Doom gate/repair activity painter (read-only)")?;
-    writeln!(out, "Run: {}", details.run.id)?;
-    writeln!(out, "Status: {}", details.run.status)?;
-    writeln!(
-        out,
-        "Source: daemon status feed / shell progress; gate results and artifacts remain authoritative"
-    )?;
-    writeln!(out, "{}", gate_activity_label(&progress.phase))?;
-    writeln!(
-        out,
-        "  command: {}",
-        truncate_display(&progress.command, MONITOR_LINE_WIDTH)
-    )?;
-    if progress.attempt > 0 {
-        writeln!(out, "  attempt: {}", progress.attempt)?;
-    }
-    if !progress.message.trim().is_empty() {
-        writeln!(
-            out,
-            "  status: {}",
-            truncate_display(&progress.message, MONITOR_LINE_WIDTH)
-        )?;
-    }
-    if let Some(worker) = &progress.worker {
-        let supervisor = if worker.process_observed_at.is_some() {
-            "observed"
-        } else {
-            "starting"
-        };
-        writeln!(out, "  supervisor: {supervisor}")?;
-        if !worker.last_event_kind.trim().is_empty() {
-            writeln!(out, "  last worker event: {}", worker.last_event_kind)?;
-        }
-    }
-    let tail = compact_gate_activity_tail(&progress.output_tail);
-    if tail.is_empty() {
-        writeln!(out, "Tail: waiting for daemon-owned command output")?;
-    } else {
-        writeln!(out, "Tail (last {} compact lines):", tail.len())?;
-        for line in tail {
-            writeln!(out, "  {line}")?;
-        }
-    }
-    Ok(true)
+    paint_gate_activity_snapshot_at(details, chrono::Utc::now(), out)
 }
 
-fn active_gate_or_repair_progress(details: &RunDetails) -> Option<&RunProgress> {
-    let progress = details.progress.as_ref()?;
-    if is_terminal_status(details.run.status) || progress.command.trim().is_empty() {
-        return None;
-    }
-    if is_gate_or_repair_phase(&progress.phase) {
-        Some(progress)
-    } else {
-        None
-    }
-}
-
-fn is_gate_or_repair_phase(phase: &str) -> bool {
-    let normalized = phase.to_ascii_lowercase();
-    normalized.contains("integration_gate") || normalized.contains("integration_repair")
-}
-
-fn gate_activity_label(phase: &str) -> &'static str {
-    if phase.to_ascii_lowercase().contains("repair") {
-        "Repair"
-    } else {
-        "Integration Gate"
-    }
-}
-
-fn compact_gate_activity_tail(output_tail: &str) -> Vec<String> {
-    output_tail
-        .trim_end()
-        .lines()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|line| truncate_display(line, MONITOR_LINE_WIDTH))
-        .collect()
+fn paint_gate_activity_snapshot_at(
+    details: &RunDetails,
+    now: chrono::DateTime<chrono::Utc>,
+    out: &mut impl Write,
+) -> Result<bool> {
+    let projection = project_gate_pane(details, now);
+    render_feed_plain(out, &projection.feed)?;
+    Ok(projection.active)
 }
 
 fn paint_worker_activity(
@@ -2039,9 +1953,10 @@ mod tests {
 
     #[test]
     fn gate_activity_painter_renders_active_command_from_daemon_progress() -> Result<()> {
-        let now = chrono::Utc::now();
-        let details = test_run_details(
-            Some(RunProgress {
+        let now = fixed_time();
+        let details = test_run_details(TestRunDetailsOptions {
+            status: RunStatus::Running,
+            progress: Some(crate::domain::RunProgress {
                 run_id: "kd-test".to_string(),
                 phase: "integration_gate".to_string(),
                 slice_id: String::new(),
@@ -2049,68 +1964,186 @@ mod tests {
                 command: "cargo test gate --quiet".to_string(),
                 message: "running integration gate command".to_string(),
                 output_tail: "gate line 1\ngate line 2\n".to_string(),
-                phase_started_at: now,
-                updated_at: now,
+                phase_started_at: now - chrono::Duration::seconds(185),
+                updated_at: now - chrono::Duration::seconds(5),
                 worker: None,
                 parallel_layer: false,
                 parallel_slices: Vec::new(),
             }),
-            None,
-        );
+            ..Default::default()
+        });
 
-        let mut out = Vec::new();
-        let active = paint_gate_activity_snapshot(&details, &mut out)?;
-        let rendered = String::from_utf8(out).unwrap();
-
-        assert!(active);
-        assert!(rendered.contains("gate/repair activity painter (read-only)"));
-        assert!(rendered.contains("Integration Gate"));
-        assert!(rendered.contains("cargo test gate --quiet"));
-        assert!(rendered.contains("daemon status feed / shell progress"));
-        assert!(rendered.contains("gate line 1"));
-        assert!(rendered.contains("gate line 2"));
+        assert_gate_pane_golden(
+            &details,
+            now,
+            true,
+            include_str!("../tests/fixtures/gate_activity_active_command.golden.txt"),
+        )?;
         Ok(())
     }
 
     #[test]
-    fn gate_activity_painter_falls_back_to_idle_feed_summary() -> Result<()> {
-        let feed = StatusFeed {
-            feed_version: 1,
-            summary_line: "existing daemon feed/status summary".to_string(),
-            terminal_reason: None,
-            operator_commands: Vec::new(),
-            attention: Vec::new(),
-            blocks: vec![crate::domain::StatusFeedBlock {
-                label: "Run".to_string(),
-                meta: "running".to_string(),
-                lines: vec![crate::domain::StatusFeedLine {
-                    text: "summary line from daemon feed".to_string(),
-                    role: StatusFeedRole::Info,
-                }],
-            }],
-        };
-        let details = test_run_details(None, Some(feed));
+    fn gate_pane_summary_idle_passed_uses_gate_scoped_golden() -> Result<()> {
+        let now = fixed_time();
+        let details = test_run_details(TestRunDetailsOptions {
+            status: RunStatus::Completed,
+            events: vec![
+                run_started_event(now),
+                implementation_summary_event(
+                    now,
+                    serde_json::json!({
+                        "integration_gate": {
+                            "status": "passed",
+                            "summary": "integration gate passed",
+                            "commands": [
+                                { "command": "cargo test gate --quiet", "status": "passed", "exit_code": 0, "output": "ok" }
+                            ]
+                        },
+                        "integration_repair": {
+                            "status": "skipped",
+                            "summary": "integration gate passed; integration_repair=auto skipped repair",
+                            "trigger": "gate_passed"
+                        },
+                        "exit_states": {
+                            "run": "completed",
+                            "handoff": "ready",
+                            "evidence": "attested",
+                            "slices": []
+                        }
+                    }),
+                ),
+            ],
+            economics: Some(test_economics()),
+            feed: Some(generic_monitor_feed()),
+            ..Default::default()
+        });
 
-        let mut out = Vec::new();
-        let active = paint_gate_activity_snapshot(&details, &mut out)?;
-        let rendered = String::from_utf8(out).unwrap();
-
-        assert!(!active);
-        assert!(rendered.contains("gate/repair status (idle)"));
-        assert!(rendered.contains("no active gate/repair command"));
-        assert!(rendered.contains("existing daemon feed/status summary"));
-        assert!(rendered.contains("summary line from daemon feed"));
+        let rendered = assert_gate_pane_golden(
+            &details,
+            now,
+            false,
+            include_str!("../tests/fixtures/gate_activity_idle_passed.golden.txt"),
+        )?;
+        assert_absent_generic_monitor_sections(&rendered);
         Ok(())
     }
 
-    fn test_run_details(progress: Option<RunProgress>, feed: Option<StatusFeed>) -> RunDetails {
-        let now = chrono::Utc::now();
+    #[test]
+    fn gate_pane_summary_idle_failed_repairable_uses_daemon_gate_economics() -> Result<()> {
+        let now = fixed_time();
+        let mut economics = test_economics();
+        economics
+            .command_executions
+            .push(crate::domain::CommandExecutionEconomics {
+                phase: "integration_gate".to_string(),
+                slice_id: String::new(),
+                attempt: 0,
+                command: "cargo test gate --quiet".to_string(),
+                cwd: ".".to_string(),
+                status: "failed".to_string(),
+                exit_code: Some(1),
+                duration_ms: 1200,
+                dedupe_key: "cargo test gate --quiet".to_string(),
+                tree_sha: "tree".to_string(),
+                cache_key: "cache".to_string(),
+                cache_hit: false,
+                skip_reason: String::new(),
+            });
+        economics.command_execution_count = 1;
+        let details = test_run_details(TestRunDetailsOptions {
+            status: RunStatus::Running,
+            events: vec![run_started_event(now)],
+            economics: Some(economics),
+            feed: Some(generic_monitor_feed()),
+            ..Default::default()
+        });
+
+        let rendered = assert_gate_pane_golden(
+            &details,
+            now,
+            false,
+            include_str!("../tests/fixtures/gate_activity_idle_failed_repairable.golden.txt"),
+        )?;
+        assert_absent_generic_monitor_sections(&rendered);
+        Ok(())
+    }
+
+    #[test]
+    fn gate_pane_summary_idle_no_gate_yet_uses_gate_scoped_golden() -> Result<()> {
+        let now = fixed_time();
+        let details = test_run_details(TestRunDetailsOptions {
+            status: RunStatus::Running,
+            events: vec![run_started_event(now)],
+            economics: Some(test_economics()),
+            feed: Some(generic_monitor_feed()),
+            ..Default::default()
+        });
+
+        let rendered = assert_gate_pane_golden(
+            &details,
+            now,
+            false,
+            include_str!("../tests/fixtures/gate_activity_idle_no_gate.golden.txt"),
+        )?;
+        assert_absent_generic_monitor_sections(&rendered);
+        Ok(())
+    }
+
+    fn assert_gate_pane_golden(
+        details: &RunDetails,
+        now: chrono::DateTime<chrono::Utc>,
+        expected_active: bool,
+        expected: &str,
+    ) -> Result<String> {
+        let mut out = Vec::new();
+        let active = paint_gate_activity_snapshot_at(details, now, &mut out)?;
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(active, expected_active);
+        assert_eq!(rendered, expected);
+        Ok(rendered)
+    }
+
+    fn assert_absent_generic_monitor_sections(rendered: &str) {
+        assert!(!rendered.contains("Activity"), "{rendered}");
+        assert!(!rendered.contains("Todos"), "{rendered}");
+        assert!(
+            !rendered.contains("unrelated worker feed entry"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("existing daemon feed/status summary"),
+            "{rendered}"
+        );
+    }
+
+    struct TestRunDetailsOptions {
+        status: RunStatus,
+        progress: Option<crate::domain::RunProgress>,
+        events: Vec<crate::domain::Event>,
+        economics: Option<crate::domain::RunEconomics>,
+        feed: Option<StatusFeed>,
+    }
+
+    impl Default for TestRunDetailsOptions {
+        fn default() -> Self {
+            Self {
+                status: RunStatus::Running,
+                progress: None,
+                events: Vec::new(),
+                economics: None,
+                feed: None,
+            }
+        }
+    }
+
+    fn test_run_details(options: TestRunDetailsOptions) -> RunDetails {
+        let now = fixed_time();
         RunDetails {
             run: crate::domain::Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
                 repo_path: "/tmp/repo".to_string(),
-                status: RunStatus::Running,
+                status: options.status,
                 base_branch: "main".to_string(),
                 base_sha: "base".to_string(),
                 integration_branch: "khazad/kd-test/integration".to_string(),
@@ -2121,14 +2154,72 @@ mod tests {
             },
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
-            progress,
+            progress: options.progress,
             incidents: Vec::new(),
             questions: Vec::new(),
             replan: Default::default(),
-            events: Vec::new(),
-            economics: None,
+            events: options.events,
+            economics: options.economics,
             primary_terminal_reason: None,
-            feed,
+            feed: options.feed,
         }
+    }
+
+    fn test_economics() -> crate::domain::RunEconomics {
+        crate::domain::RunEconomics {
+            repair_policy: "auto".to_string(),
+            repair_max_attempts: 1,
+            ..Default::default()
+        }
+    }
+
+    fn run_started_event(now: chrono::DateTime<chrono::Utc>) -> crate::domain::Event {
+        crate::domain::Event {
+            id: 1,
+            run_id: "kd-test".to_string(),
+            typ: "run_started".to_string(),
+            payload: serde_json::json!({
+                "verify_profile": "full",
+                "verify_profiles": ["full"]
+            }),
+            created_at: now,
+        }
+    }
+
+    fn implementation_summary_event(
+        now: chrono::DateTime<chrono::Utc>,
+        payload: serde_json::Value,
+    ) -> crate::domain::Event {
+        crate::domain::Event {
+            id: 2,
+            run_id: "kd-test".to_string(),
+            typ: "implementation_summary".to_string(),
+            payload,
+            created_at: now,
+        }
+    }
+
+    fn generic_monitor_feed() -> StatusFeed {
+        StatusFeed {
+            feed_version: 1,
+            summary_line: "existing daemon feed/status summary".to_string(),
+            terminal_reason: None,
+            operator_commands: Vec::new(),
+            attention: Vec::new(),
+            blocks: vec![crate::domain::StatusFeedBlock {
+                label: "Activity".to_string(),
+                meta: "(1 recent)".to_string(),
+                lines: vec![crate::domain::StatusFeedLine {
+                    text: "unrelated worker feed entry".to_string(),
+                    role: StatusFeedRole::Dim,
+                }],
+            }],
+        }
+    }
+
+    fn fixed_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
     }
 }

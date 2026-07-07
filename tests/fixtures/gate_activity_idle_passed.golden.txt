@@ -1,0 +1,14 @@
+Khazad-Doom gate/repair status (idle)
+Gate (passed)
+  - Verification profile: full
+  - Latest gate: passed — integration gate passed
+  - Last failure: none
+Repair (auto)
+  - State: skipped — integration gate passed; integration_repair=auto skipped repair (gate_passed)
+  - Attempts: 0/1
+Handoff (ready)
+  - Handoff: ready
+  - Evidence: attested
+  - Run: completed
+Next
+  - khazad-doom handoff --run kd-test

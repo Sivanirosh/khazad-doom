@@ -1156,6 +1156,8 @@ impl Manager {
                 last_error: String::new(),
             })?;
         }
+        let verify_profiles = selected_verify_profiles(&selected_slices);
+        let verify_profile = verify_profiles.join(", ");
         self.state.record_event(
             &run.id,
             "run_started",
@@ -1163,6 +1165,8 @@ impl Manager {
                 "run": run,
                 "selected_slices": selected_ids,
                 "skipped_closed_slices": skipped_closed_slices,
+                "verify_profile": verify_profile,
+                "verify_profiles": verify_profiles,
                 "agent": runner.name(),
                 "agent_profile": &runner_metadata.profile,
                 "agent_provider": &runner_metadata.provider,
@@ -4004,6 +4008,21 @@ fn primary_failure_for_terminal_summary(
                 .map(str::to_string)
         })
         .unwrap_or_default()
+}
+
+fn selected_verify_profiles(slices: &[Slice]) -> Vec<String> {
+    let mut profiles = Vec::new();
+    for slice in slices {
+        let profile = if slice.verify_profile.trim().is_empty() {
+            "default"
+        } else {
+            slice.verify_profile.trim()
+        };
+        if !profiles.iter().any(|existing| existing == profile) {
+            profiles.push(profile.to_string());
+        }
+    }
+    profiles
 }
 
 fn terminal_next_commands(run: &Run, status: RunStatus) -> Vec<String> {

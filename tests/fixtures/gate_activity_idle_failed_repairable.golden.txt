@@ -1,0 +1,13 @@
+Khazad-Doom gate/repair status (idle)
+Gate (failed)
+  - Verification profile: full
+  - Latest gate: failed — one or more integration gate commands failed
+  - Last failure: cargo test gate --quiet (exit 1)
+Repair (auto)
+  - State: repairable: daemon policy can run integration repair
+  - Attempts: 0/1
+Handoff (not_ready)
+  - Handoff: not ready — latest gate failed
+  - Run: running
+Next
+  - No operator gate/repair command is currently needed.
