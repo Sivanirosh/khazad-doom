@@ -392,6 +392,176 @@ fn herdr_cockpit_workspace_real() -> TestResult {
 }
 
 #[test]
+fn herdr_open_focus_reports_fallback_when_unavailable() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    write_failing_herdr(fake_bin.path())?;
+    let fake_path = prepend_path(fake_bin.path());
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "HERDR-OPEN-FALLBACK",
+            "title": "Herdr open fallback",
+            "goal": "Keep daemon status useful when Herdr cannot open.",
+            "acceptance": ["HERDR-OPEN-FALLBACK.txt exists"],
+            "verify": ["test -f HERDR-OPEN-FALLBACK.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add Herdr open fallback slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let opened = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("PATH", fake_path.as_str())],
+        &["cockpit", "open", "--run", &run_id],
+    )?;
+    let opened = json_stdout(&opened)?;
+    assert_eq!(opened["run_id"].as_str(), Some(run_id.as_str()));
+    assert_eq!(opened["opened"].as_bool(), Some(false));
+    assert_eq!(opened["adapter"].as_str(), Some("herdr"));
+    assert!(
+        opened["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fake herdr failure")
+    );
+    assert!(
+        opened["fallback"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("status/watch/monitor")
+    );
+    assert!(
+        opened["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("herdr")
+    );
+    assert!(
+        opened["operator_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                command
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("khazad-doom monitor --run")
+            })
+    );
+
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn herdr_open_focus_real() -> TestResult {
+    if std::env::var("HERDR_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping real Herdr open/focus smoke; set HERDR_E2E=1 to enable");
+        return Ok(());
+    }
+    if !herdr_available() {
+        eprintln!("skipping real Herdr open/focus smoke; herdr binary is not on PATH");
+        return Ok(());
+    }
+
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "HERDR-OPEN",
+            "title": "Herdr open focus",
+            "goal": "Open or focus Herdr explicitly after a run exists.",
+            "acceptance": ["HERDR-OPEN.txt exists"],
+            "verify": ["test -f HERDR-OPEN.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add Herdr open focus slice"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let opened = kd_ok(&bin, home.path(), &["cockpit", "open", "--run", &run_id])?;
+    let opened = json_stdout(&opened)?;
+    assert_eq!(opened["opened"].as_bool(), Some(true));
+    assert_eq!(opened["action"].as_str(), Some("opened"));
+    assert_eq!(
+        opened["workspace_label"].as_str(),
+        Some(format!("Khazad-Doom {run_id}").as_str())
+    );
+    let workspace_id = wait_for_herdr_workspace(opened["workspace_label"].as_str().unwrap())?;
+    let _workspace_guard = HerdrWorkspaceGuard::new(workspace_id.clone());
+    wait_for_herdr_pane_label(&workspace_id, "Run Status / Event Feed")?;
+    wait_for_herdr_pane_label(&workspace_id, "Integration Gate / Repair")?;
+
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let focused = kd_ok(
+        &bin,
+        home.path(),
+        &["cockpit", "open", "--latest", "--repo", path(repo.path())],
+    )?;
+    let focused = json_stdout(&focused)?;
+    assert_eq!(focused["run_id"].as_str(), Some(run_id.as_str()));
+    assert_eq!(focused["opened"].as_bool(), Some(true));
+    assert_eq!(focused["action"].as_str(), Some("focused_existing"));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn herdr_worker_wrapper_real() -> TestResult {
     if std::env::var("HERDR_E2E").ok().as_deref() != Some("1") {
         eprintln!("skipping real Herdr worker wrapper smoke; set HERDR_E2E=1 to enable");

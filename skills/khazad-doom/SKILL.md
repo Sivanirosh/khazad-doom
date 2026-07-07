@@ -1,7 +1,7 @@
 ---
 name: khazad-doom
 description: "Drive the Khazad-Doom workflow daemon: initialize repo workflow contracts, run JSON Issue Slices through isolated Pi workers, use fake only as a deterministic test seam, inspect status/artifacts, create handoffs, and report blockers."
-argument-hint: "[init|slices|run|resume|status|monitor|watch|cancel|handoff|inspect] [options]"
+argument-hint: "[init|slices|run|resume|status|monitor|watch|cockpit|cancel|handoff|inspect] [options]"
 ---
 
 # Khazad-Doom
@@ -34,6 +34,8 @@ khazad-doom status --run <run-id> --follow
 khazad-doom monitor --repo . --latest
 khazad-doom monitor --run <run-id>
 khazad-doom watch --run <run-id>
+khazad-doom cockpit open --run <run-id>
+khazad-doom cockpit open --latest --repo .
 khazad-doom handoff --run <run-id>
 khazad-doom handoff --run <run-id> --dry-run
 khazad-doom inspect --run <run-id>
@@ -96,11 +98,12 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 - Herdr cockpit failures and pre-launch worker pane/wrapper handoff failures are non-fatal fallback incidents/feed evidence with remediation; they must not change slice selection, worker authorization, verification, merge, handoff, or terminal run status by themselves. Worker panes run a Khazad-owned wrapper and KD reads only wrapper stdout/stderr/exit/result artifacts through the Pi contract parser, never pane text, scrollback, or Herdr agent-status metadata.
 - The Planner Pi pane is deferred until RPL planner authority exists; do not launch a planner agent for cockpit setup.
 - `khazad-doom monitor` is attach-only: Ctrl-C exits the terminal dashboard, but must not stop or suspend the daemon-owned run.
-- `khazad-doom monitor`, `watch`, Herdr cockpit panes, and the optional Pi `/khazad-attach <run-id>` widget paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording; terminal reasons and operator commands come from `primary_terminal_reason`, `feed.terminal_reason`, and `feed.operator_commands`.
-- Do not require Herdr or a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks. If the operator wants in-Pi feedback, suggest explicit `/khazad-attach <run-id>` and `/khazad-detach`.
+- `khazad-doom monitor`, `watch`, Herdr cockpit panes, and the optional Pi `/khazad-attach <run-id>` / `/khazad-explain <run-id|--latest>` bridge paint the daemon `feed` projection from `status` JSON. Renderers may choose layout/color but should not invent workflow wording; terminal reasons and operator commands come from `primary_terminal_reason`, `feed.terminal_reason`, and `feed.operator_commands`.
+- `khazad-doom cockpit open --run <run-id>` and `khazad-doom cockpit open --latest --repo .` explicitly open/focus Herdr for an existing daemon run. If Herdr is unavailable, the command returns JSON with fallback/remediation and the `status`/`watch`/`monitor` operator commands instead of making Herdr required.
+- Do not require Herdr or a Pi UI extension for core monitoring; keep `khazad-doom monitor --repo . --latest` as the terminal path over daemon state and `watch`/`status` as fallbacks. If the operator wants in-Pi feedback, suggest explicit `/khazad-attach <run-id>`, `/khazad-explain <run-id|--latest>`, `/khazad-open <run-id|--latest>`, and `/khazad-detach`.
 - Verification/gate timeouts are per-command hang protection, not global workflow timeouts.
 - Worker attempt supervision separates daemon/process liveness from worker output activity. In `status`, `watch`, or `monitor`, treat `Supervisor: alive` as "Khazad-Doom still observes the child process," not proof of semantic progress.
 - Missing worker output is advisory by default. If monitor says `Warning: worker is quiet`, explain that it may be normal and offer wait, inspect, or `khazad-doom cancel --run <id> --reason ...`; do not claim the worker is hung unless an explicit timeout/policy made it terminal.
 - `worker_attempt_timeout_seconds: 0` means no fatal worker-attempt timeout. Any nonzero worker attempt timeout is an explicit repo/operator policy, separate from run lifetime.
 
-If status/monitor shows an `Attention` line or pending worker question, ask the user for the answer and then run `khazad-doom answer <run-id> <question-id> "..."` after normal command confirmation. If a run still blocks with an `ask-user` finding, relay the blocker with exact details and ask for a decision before resuming.
+If status/monitor shows an `Attention` line or pending worker question, ask the user for the answer and then run `khazad-doom answer <run-id> <question-id> "..."` (or `/khazad-answer <run-id> <question-id> "..."` in Pi) after normal command confirmation. Do not answer by typing into Herdr worker panes. If a run still blocks with an `ask-user` finding, relay the blocker with exact details and ask for a decision before resuming.

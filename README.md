@@ -158,9 +158,11 @@ Run the command above from the repo checkout; from elsewhere, use the absolute `
 
 The default cockpit mode is `auto`: if a usable `herdr` binary is on `PATH`, run start asks Herdr to create or focus a `Khazad-Doom <run-id>` workspace with read-only `Run Status / Event Feed` and `Integration Gate / Repair` panes backed by daemon `monitor`/`status` commands. Pi slice workers may also appear in deterministic panes named from the run id, slice id, and attempt, but they execute a Khazad-owned wrapper that captures stdout, stderr, exit status, and parsed-result artifacts under `.workflow/runs/<run>/outputs/`; pane text, scrollback, and Herdr agent metadata are never correctness inputs. If Herdr is missing, cockpit commands fail, or a worker pane/wrapper handoff fails before Pi launches, Khazad-Doom records a non-fatal fallback incident and continues direct Pi execution. Override per run with `--cockpit auto|herdr|direct`, or set durable repo policy with `"cockpit": "auto"`, `"herdr"`, or `"direct"` in `.workflow/khazad.json`. Herdr never owns workflow truth, cancellation, authorization, verification, merge, or handoff. The Planner Pi pane is explicitly deferred until RPL planner authority exists.
 
+To focus Herdr after a run already exists, use `khazad-doom cockpit open --run <run-id>` or `khazad-doom cockpit open --latest --repo .`. The command reads daemon status to identify the run, opens or focuses the Herdr workspace, and returns JSON with a clear `fallback`, `remediation`, and `operator_commands` list when Herdr is unavailable; headless `status`, `watch`, `monitor`, `answer`, and `handoff` flows do not require Herdr.
+
 Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI or Herdr cockpit is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, Herdr cockpit panes, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and exact `operator_commands`. The shared vocabulary includes `Todos`, `Run`, `Terminal`, current `Worker`/`Shell`/`Merge`/`Repair`, `Commands`, `Warn`, `Economics`, `Incidents`, `Activity`, `Tail`, and `Attention` when a worker needs the operator.
 
-Inside Pi, `/khazad-attach <run-id>` explicitly attaches a compact read-only widget to one daemon run feed. `/khazad-detach` clears it. The adapter does not auto-discover runs, own workflow state, or replace `status`/`watch`/`monitor`; it polls daemon `status`, renders `RunDetails.feed`, and cleans up on Pi session shutdown/reload.
+Inside Pi, the shipped adapter is a thin bridge, not a second cockpit. `/khazad-attach <run-id>` attaches a compact read-only widget to one daemon run feed, `/khazad-explain <run-id>` (or explicit `/khazad-explain --latest`) paints one daemon `feed` snapshot, `/khazad-open <run-id>` (or explicit `/khazad-open --latest`) delegates Herdr open/focus to `khazad-doom cockpit open`, `/khazad-handoff <run-id>` summarizes daemon handoff JSON, `/khazad-answer <run-id> <question-id> <answer>` answers through daemon state, and `/khazad-detach` clears the widget. The adapter does not implicitly auto-discover runs, own workflow state, infer lifecycle from the Pi session, or replace `status`/`watch`/`monitor`; all live wording comes from `RunDetails.feed`, and session shutdown/reload only cleans up Pi UI resources.
 
 During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
 
@@ -203,9 +205,9 @@ khazad-doom answer <run-id> <question-id> "your answer"
 
 The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk`. If no answer arrives before the tool timeout, the worker falls back to the existing blocked contract and the unanswered question remains visible as run evidence.
 
-### The Pi package: skill and worker tool
+### The Pi package: skill and monitor bridge
 
-This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and `extensions/khazad-worker`, which provides the worker escalation tool plus explicit `/khazad-attach` and `/khazad-detach` feed-widget commands. It does not ship the old Pi monitor overlay; core observability stays in the daemon-owned `status`, `watch`, and `monitor` commands.
+This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and `extensions/khazad-monitor`, a thin bridge for the jobs Pi is good at: starting or shaping daemon CLI workflows from chat, explaining daemon feed/handoff data, answering blockers through daemon commands, and opening/focusing Herdr. It does not ship the old rich Pi monitor overlay or emulate a live multi-agent cockpit; core observability stays in daemon-owned `status`, `watch`, and `monitor`, while Herdr shows the live workspace and agents when available.
 
 Enable it intentionally from a trusted checkout or package source; Khazad-Doom never writes Pi user settings automatically:
 
@@ -215,9 +217,9 @@ pi install /path/to/khazad-doom
 pi -e /path/to/khazad-doom
 ```
 
-The worker extension registers the `ask_operator` tool for daemon-launched Pi workers. It lets a worker pause at a slice `must_ask_if` fence, ask the operator through the daemon, and resume after an answer. The tool is unavailable outside a Khazad-Doom worker environment and degrades to the existing blocked-output contract.
+The monitor bridge also registers the `ask_operator` tool for daemon-launched Pi workers. It lets a worker pause at a slice `must_ask_if` fence, ask the operator through the daemon, and resume after an answer. The tool is unavailable outside a Khazad-Doom worker environment and degrades to the existing blocked-output contract. Operator answers are submitted through `khazad-doom answer` or `/khazad-answer`, not by manually typing into Herdr worker panes.
 
-To install only the skill without the worker extension, use Pi package filters in settings:
+To install only the skill without the monitor bridge extension, use Pi package filters in settings:
 
 ```json
 {
@@ -242,6 +244,8 @@ To install only the skill without the worker extension, use Pi package filters i
 | `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently, then integrate only after the whole parallel layer succeeds. |
 | `khazad-doom run --allow-dirty ...` | Explicitly allow a dirty source repo; the preflight artifact records the dirty snapshot. |
 | `khazad-doom run --cockpit auto|herdr|direct ...` | Override the live cockpit for one run; Herdr failures remain non-fatal. |
+| `khazad-doom cockpit open --run <id>` | Open or focus the Herdr cockpit for one daemon-owned run; reports monitor/watch/status fallback when Herdr is unavailable. |
+| `khazad-doom cockpit open --latest --repo .` | Open or focus the Herdr cockpit for the latest run in a repo, including terminal runs. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
 | `khazad-doom status` | Show recent runs. |
 | `khazad-doom status --run <id>` | Show one run, slice states, progress snapshot, and events. |
