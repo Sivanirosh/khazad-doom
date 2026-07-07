@@ -12,23 +12,21 @@ use crate::ipc::{
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
-use crate::workflow::cockpit_mode_transport_arg;
+use crate::workflow::{
+    CockpitOpenFocus, cockpit_mode_transport_arg, cockpit_workspace_label_for_run,
+    open_default_run_cockpit_for_operator,
+};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use serde_json::Value;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-const RUN_STATUS_FEED_PANE: &str = "Run Status / Event Feed";
-const INTEGRATION_GATE_REPAIR_PANE: &str = "Integration Gate / Repair";
 
 #[derive(Debug, Serialize)]
 struct RunStartOutput {
@@ -792,139 +790,47 @@ fn fetch_latest_run(
     )
 }
 
-fn open_or_focus_herdr_cockpit(paths: &Paths, details: &RunDetails) -> Result<CockpitOpenOutput> {
+fn open_or_focus_cockpit(paths: &Paths, details: &RunDetails) -> Result<CockpitOpenOutput> {
     let run = &details.run;
-    let workspace_label = workspace_label_for_run(&run.id);
-    let operator_commands = vec![
-        format!("khazad-doom monitor --run {}", shell_quote_arg(&run.id)),
-        format!("khazad-doom watch --run {}", shell_quote_arg(&run.id)),
-        format!("khazad-doom status --run {}", shell_quote_arg(&run.id)),
-    ];
-    let Some(herdr) = find_executable_in_path("herdr") else {
-        return Ok(cockpit_unavailable_output(
+    let workspace_label = cockpit_workspace_label_for_run(&run.id);
+    let operator_commands = cockpit_operator_commands(&run.id);
+    match open_default_run_cockpit_for_operator(run, &paths.root) {
+        Ok(opened) => Ok(cockpit_open_success_output(run, opened, operator_commands)),
+        Err(unavailable) => Ok(cockpit_unavailable_output(
             run,
             workspace_label,
-            "herdr binary was not found on PATH".to_string(),
+            unavailable.message,
             operator_commands,
-        ));
-    };
-    if let Err(err) = run_herdr_command(&herdr, &["--version".to_string()]) {
-        return Ok(cockpit_unavailable_output(
-            run,
-            workspace_label,
-            err.to_string(),
-            operator_commands,
-        ));
+        )),
     }
+}
 
-    let workspaces = match run_herdr_json(&herdr, &["workspace".to_string(), "list".to_string()]) {
-        Ok(value) => value,
-        Err(err) => {
-            return Ok(cockpit_unavailable_output(
-                run,
-                workspace_label,
-                err.to_string(),
-                operator_commands,
-            ));
-        }
-    };
-    if let Some(workspace_id) = find_herdr_workspace_id(&workspaces, &workspace_label) {
-        if let Err(err) = run_herdr_json(
-            &herdr,
-            &[
-                "workspace".to_string(),
-                "focus".to_string(),
-                workspace_id.clone(),
-            ],
-        ) {
-            return Ok(cockpit_unavailable_output(
-                run,
-                workspace_label,
-                err.to_string(),
-                operator_commands,
-            ));
-        }
-        return Ok(CockpitOpenOutput {
-            run_id: run.id.clone(),
-            repo_path: run.repo_path.clone(),
-            workspace_label,
-            adapter: "herdr".to_string(),
-            opened: true,
-            action: "focused_existing".to_string(),
-            pane_labels: Vec::new(),
-            fallback: String::new(),
-            remediation: String::new(),
-            message: "focused existing Herdr cockpit workspace".to_string(),
-            operator_commands,
-        });
-    }
-
-    let created = match create_herdr_workspace(&herdr, paths, run, &workspace_label) {
-        Ok(value) => value,
-        Err(err) => {
-            return Ok(cockpit_unavailable_output(
-                run,
-                workspace_label,
-                err.to_string(),
-                operator_commands,
-            ));
-        }
-    };
-    let Some(root_pane) = created
-        .pointer("/result/root_pane/pane_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return Ok(cockpit_unavailable_output(
-            run,
-            workspace_label,
-            "herdr workspace create omitted root_pane.pane_id".to_string(),
-            operator_commands,
-        ));
-    };
-    let feed_command = format!(
-        "{} monitor --run {} --interval-ms 1000",
-        current_khazad_binary(),
-        shell_quote_arg(&run.id)
-    );
-    let phase_command = format!(
-        "{} status --run {} --follow --interval-ms 1000",
-        current_khazad_binary(),
-        shell_quote_arg(&run.id)
-    );
-    for (label, direction, command) in [
-        (RUN_STATUS_FEED_PANE, "right", feed_command),
-        (INTEGRATION_GATE_REPAIR_PANE, "down", phase_command),
-    ] {
-        if let Err(err) =
-            create_herdr_read_only_pane(&herdr, paths, run, &root_pane, label, direction, &command)
-        {
-            return Ok(cockpit_unavailable_output(
-                run,
-                workspace_label,
-                err.to_string(),
-                operator_commands,
-            ));
-        }
-    }
-
-    Ok(CockpitOpenOutput {
+fn cockpit_open_success_output(
+    run: &crate::domain::Run,
+    opened: CockpitOpenFocus,
+    operator_commands: Vec<String>,
+) -> CockpitOpenOutput {
+    CockpitOpenOutput {
         run_id: run.id.clone(),
         repo_path: run.repo_path.clone(),
-        workspace_label,
-        adapter: "herdr".to_string(),
+        workspace_label: opened.workspace_label,
+        adapter: opened.adapter,
         opened: true,
-        action: "opened".to_string(),
-        pane_labels: vec![
-            RUN_STATUS_FEED_PANE.to_string(),
-            INTEGRATION_GATE_REPAIR_PANE.to_string(),
-        ],
+        action: opened.action,
+        pane_labels: opened.pane_labels,
         fallback: String::new(),
         remediation: String::new(),
-        message: "opened Herdr cockpit workspace backed by daemon monitor/status commands"
-            .to_string(),
+        message: opened.message,
         operator_commands,
-    })
+    }
+}
+
+fn cockpit_operator_commands(run_id: &str) -> Vec<String> {
+    vec![
+        format!("khazad-doom monitor --run {}", shell_quote_arg(run_id)),
+        format!("khazad-doom watch --run {}", shell_quote_arg(run_id)),
+        format!("khazad-doom status --run {}", shell_quote_arg(run_id)),
+    ]
 }
 
 fn monitor_once_result(details: &RunDetails) -> Result<()> {
@@ -992,7 +898,7 @@ fn run_cockpit_open(
     } else {
         fetch_run_details(&client, &run_id, 20)?
     };
-    let output = open_or_focus_herdr_cockpit(&paths, &details)?;
+    let output = open_or_focus_cockpit(&paths, &details)?;
     print_json(&output)
 }
 
@@ -1422,206 +1328,6 @@ fn cockpit_unavailable_output(
         remediation: "Install a usable herdr binary on PATH, fix the Herdr command failure, or keep using khazad-doom monitor/watch/status for headless operation.".to_string(),
         message,
         operator_commands,
-    }
-}
-
-fn create_herdr_workspace(
-    herdr: &Path,
-    paths: &Paths,
-    run: &crate::domain::Run,
-    workspace_label: &str,
-) -> Result<Value> {
-    run_herdr_json(
-        herdr,
-        &[
-            "workspace".to_string(),
-            "create".to_string(),
-            "--cwd".to_string(),
-            run.repo_path.clone(),
-            "--label".to_string(),
-            workspace_label.to_string(),
-            "--env".to_string(),
-            format!("KHAZAD_HOME={}", paths.root.to_string_lossy()),
-            "--focus".to_string(),
-        ],
-    )
-}
-
-fn create_herdr_read_only_pane(
-    herdr: &Path,
-    paths: &Paths,
-    run: &crate::domain::Run,
-    root_pane: &str,
-    label: &str,
-    direction: &str,
-    command: &str,
-) -> Result<()> {
-    let split = run_herdr_json(
-        herdr,
-        &[
-            "pane".to_string(),
-            "split".to_string(),
-            root_pane.to_string(),
-            "--direction".to_string(),
-            direction.to_string(),
-            "--ratio".to_string(),
-            "0.5".to_string(),
-            "--cwd".to_string(),
-            run.repo_path.clone(),
-            "--env".to_string(),
-            format!("KHAZAD_HOME={}", paths.root.to_string_lossy()),
-            "--env".to_string(),
-            "KHAZAD_COCKPIT_READ_ONLY=1".to_string(),
-            "--no-focus".to_string(),
-        ],
-    )?;
-    let pane_id = split
-        .pointer("/result/pane/pane_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("herdr pane split omitted pane_id"))?;
-    run_herdr_json(
-        herdr,
-        &[
-            "pane".to_string(),
-            "rename".to_string(),
-            pane_id.to_string(),
-            label.to_string(),
-        ],
-    )?;
-    run_herdr_command(
-        herdr,
-        &[
-            "pane".to_string(),
-            "run".to_string(),
-            pane_id.to_string(),
-            command.to_string(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn find_herdr_workspace_id(value: &Value, workspace_label: &str) -> Option<String> {
-    value
-        .pointer("/result/workspaces")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|workspace| workspace.get("label").and_then(Value::as_str) == Some(workspace_label))
-        .and_then(|workspace| workspace.get("workspace_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn workspace_label_for_run(run_id: &str) -> String {
-    format!("Khazad-Doom {run_id}")
-}
-
-fn current_khazad_binary() -> String {
-    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
-    shell_quote_arg(&binary.to_string_lossy())
-}
-
-fn run_herdr_json(herdr: &Path, args: &[String]) -> Result<Value> {
-    let output = run_herdr_command(herdr, args)?;
-    serde_json::from_str(&output.stdout).with_context(|| {
-        format!(
-            "herdr {} did not return JSON: {}{}{}",
-            display_args(args),
-            bounded(&output.stdout),
-            if output.stdout.is_empty() || output.stderr.is_empty() {
-                ""
-            } else {
-                " | "
-            },
-            bounded(&output.stderr)
-        )
-    })
-}
-
-#[derive(Debug)]
-struct CommandOutput {
-    stdout: String,
-    stderr: String,
-}
-
-fn run_herdr_command(herdr: &Path, args: &[String]) -> Result<CommandOutput> {
-    let mut child = Command::new(herdr)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn herdr {}", display_args(args)))?;
-    let deadline = Instant::now() + HERDR_COMMAND_TIMEOUT;
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if output.status.success() {
-                return Ok(CommandOutput { stdout, stderr });
-            }
-            bail!(
-                "herdr {} exited with {}: {}{}{}",
-                display_args(args),
-                output.status,
-                bounded(&stdout),
-                if stdout.is_empty() || stderr.is_empty() {
-                    ""
-                } else {
-                    " | "
-                },
-                bounded(&stderr)
-            );
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            bail!(
-                "herdr {} timed out after {}s: {}{}{}",
-                display_args(args),
-                HERDR_COMMAND_TIMEOUT.as_secs(),
-                bounded(&stdout),
-                if stdout.is_empty() || stderr.is_empty() {
-                    ""
-                } else {
-                    " | "
-                },
-                bounded(&stderr)
-            );
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn find_executable_in_path(name: &str) -> Option<PathBuf> {
-    let name = OsStr::new(name);
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-}
-
-fn display_args(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| shell_quote_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn bounded(value: &str) -> String {
-    const LIMIT: usize = 500;
-    if value.len() <= LIMIT {
-        value.to_string()
-    } else {
-        let prefix: String = value.chars().take(LIMIT).collect();
-        format!("{prefix}…")
     }
 }
 

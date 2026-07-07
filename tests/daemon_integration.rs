@@ -392,6 +392,24 @@ fn herdr_cockpit_workspace_real() -> TestResult {
 }
 
 #[test]
+fn cockpit_cli_does_not_reimplement_herdr_protocol_helpers() -> TestResult {
+    let cli = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"))?;
+    for forbidden in [
+        "run_herdr",
+        "create_herdr",
+        "find_herdr_workspace_id",
+        "root_pane",
+        "pane_id",
+    ] {
+        assert!(
+            !cli.contains(forbidden),
+            "src/cli.rs must delegate Herdr protocol details through workflow::cockpit; found {forbidden}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn herdr_open_focus_reports_fallback_when_unavailable() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
