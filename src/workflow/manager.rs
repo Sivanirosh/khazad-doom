@@ -1,6 +1,6 @@
 use super::cockpit::{
     CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, open_default_run_cockpit,
-    open_default_worker_pane, take_cockpit_mode_transport_arg,
+    open_default_worker_pane, take_cockpit_mode_transport_arg, worker_activity_pane_command,
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
@@ -688,8 +688,14 @@ impl Manager {
         }
         let artifacts = PiWrapperArtifacts::for_output_path(output_path)
             .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
-        let command = prepare_pi_wrapper_artifacts(spec, job, &artifacts)
+        let wrapper_command = prepare_pi_wrapper_artifacts(spec, job, &artifacts)
             .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
+        let command = worker_activity_pane_command(
+            &wrapper_command,
+            &artifacts.stdout_path,
+            &artifacts.status_path,
+            &artifacts.exit_path,
+        );
         let worker_request = CockpitWorkerPaneRequest {
             run_id: run.id.clone(),
             slice_id: context.slice_id.clone(),

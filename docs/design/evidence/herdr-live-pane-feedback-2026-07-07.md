@@ -43,7 +43,7 @@ The fix should be display-only:
 - Never accept operator input in the worker pane.
 - If the painter crashes or is killed, the Pi worker and daemon-owned attempt must continue or fail exactly as they would without the painter.
 
-Possible implementation shape: keep the wrapper/pid handshake and artifact writes as the load-bearing worker path, but run a foreground painter in the Herdr pane that reads the same artifact files the daemon already owns.
+Implementation shape: keep the wrapper/pid handshake and artifact writes as the load-bearing worker path, but run a foreground read-only painter in the Herdr pane that follows the same daemon-owned stdout artifact. The wrapper still writes stdout/stderr/status/exit/result artifacts, the daemon still reads those artifacts for correctness, and the painter ignores pane input and exits non-fatally when its display work is done or fails.
 
 ## Follow-up
 

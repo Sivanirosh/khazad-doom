@@ -14,6 +14,7 @@ use crate::ipc::{
     StartRunParams, StartRunResult, StatusParams,
 };
 use crate::paths::Paths;
+use crate::pi_contract::PiActivityFormatter;
 use crate::state::Store as StateStore;
 use crate::workflow::{
     CockpitOpenFocus, cockpit_mode_transport_arg, cockpit_workspace_label_for_run,
@@ -21,12 +22,12 @@ use crate::workflow::{
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,6 +53,20 @@ struct CockpitOpenOutput {
     pub remediation: String,
     pub message: String,
     pub operator_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerActivityPainterOptions {
+    stdout_path: PathBuf,
+    status_path: PathBuf,
+    exit_path: PathBuf,
+    poll_interval: Duration,
+    startup_timeout: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerActivityWrapperStatus {
+    state: String,
 }
 
 impl RunStartOutput {
@@ -270,6 +285,18 @@ enum CockpitCommand {
         /// Open/focus the latest daemon-owned run for the repository, including terminal runs.
         #[arg(long)]
         latest: bool,
+    },
+    /// Internal read-only Herdr worker-pane painter over daemon-owned wrapper artifacts.
+    #[command(name = "paint-worker-activity", hide = true)]
+    PaintWorkerActivity {
+        #[arg(long)]
+        stdout: PathBuf,
+        #[arg(long)]
+        status: PathBuf,
+        #[arg(long)]
+        exit: PathBuf,
+        #[arg(long, default_value_t = 250)]
+        interval_ms: u64,
     },
 }
 
@@ -949,7 +976,125 @@ fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
 fn run_cockpit(paths: Paths, command: CockpitCommand) -> Result<()> {
     match command {
         CockpitCommand::Open { run, repo, latest } => run_cockpit_open(paths, run, repo, latest),
+        CockpitCommand::PaintWorkerActivity {
+            stdout,
+            status,
+            exit,
+            interval_ms,
+        } => run_cockpit_paint_worker_activity(stdout, status, exit, interval_ms),
     }
+}
+
+fn run_cockpit_paint_worker_activity(
+    stdout_path: PathBuf,
+    status_path: PathBuf,
+    exit_path: PathBuf,
+    interval_ms: u64,
+) -> Result<()> {
+    let options = WorkerActivityPainterOptions {
+        stdout_path,
+        status_path,
+        exit_path,
+        poll_interval: Duration::from_millis(interval_ms.max(50)),
+        startup_timeout: Duration::from_secs(10),
+    };
+    let mut out = io::stdout();
+    paint_worker_activity(options, &mut out)
+}
+
+fn paint_worker_activity(
+    options: WorkerActivityPainterOptions,
+    out: &mut impl Write,
+) -> Result<()> {
+    writeln!(out, "Khazad-Doom worker activity painter (read-only)")?;
+    writeln!(out, "source: {}", options.stdout_path.display())?;
+    writeln!(
+        out,
+        "operator input: use daemon commands such as answer or cancel; this pane is display-only"
+    )?;
+    out.flush()?;
+
+    let mut formatter = PiActivityFormatter::default();
+    let mut offset = 0_u64;
+    let started_at = Instant::now();
+    loop {
+        for line in read_new_activity_lines(&options.stdout_path, &mut offset)? {
+            for rendered in formatter.render_line(&line) {
+                writeln!(out, "{rendered}")?;
+            }
+            out.flush()?;
+        }
+        if worker_activity_terminal(&options.status_path, &options.exit_path) {
+            for rendered in formatter.flush() {
+                writeln!(out, "{rendered}")?;
+            }
+            writeln!(
+                out,
+                "[khazad] wrapper terminal artifacts observed; painter exiting"
+            )?;
+            out.flush()?;
+            return Ok(());
+        }
+        if !options.stdout_path.exists()
+            && !options.status_path.exists()
+            && started_at.elapsed() >= options.startup_timeout
+        {
+            bail!(
+                "worker activity painter timed out waiting for wrapper artifacts at {}",
+                options.stdout_path.display()
+            );
+        }
+        thread::sleep(options.poll_interval);
+    }
+}
+
+fn read_new_activity_lines(path: &Path, offset: &mut u64) -> Result<Vec<String>> {
+    let Ok(mut file) = File::open(path) else {
+        return Ok(Vec::new());
+    };
+    let len = file.metadata()?.len();
+    if len < *offset {
+        *offset = 0;
+    }
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut consumed = 0_u64;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        consumed += bytes as u64;
+        if line.ends_with('\n') {
+            while matches!(line.chars().last(), Some('\n' | '\r')) {
+                line.pop();
+            }
+            lines.push(line);
+        } else {
+            consumed = consumed.saturating_sub(bytes as u64);
+            break;
+        }
+    }
+    *offset += consumed;
+    Ok(lines)
+}
+
+fn worker_activity_terminal(status_path: &Path, exit_path: &Path) -> bool {
+    if exit_path.exists() {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(status_path) else {
+        return false;
+    };
+    let Ok(status) = serde_json::from_str::<WorkerActivityWrapperStatus>(&text) else {
+        return false;
+    };
+    matches!(
+        status.state.as_str(),
+        "finished" | "handoff_failed" | "setup_failed"
+    )
 }
 
 fn run_cockpit_open(
@@ -1692,4 +1837,58 @@ fn resolve_repo_path(repo: PathBuf) -> Result<PathBuf> {
         .with_context(|| format!("resolve repository path {}", repo.display()))?;
     crate::gitutil::repo_root(&canonical)
         .with_context(|| format!("resolve git repository root for {}", canonical.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_activity_painter_follows_file_growth_until_exit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stdout_path = temp.path().join("worker.stdout.ndjson");
+        let status_path = temp.path().join("worker.status.json");
+        let exit_path = temp.path().join("worker.exit.json");
+        let fixture = include_str!("../tests/fixtures/rpl_worker_activity.ndjson");
+        let lines: Vec<_> = fixture.lines().collect();
+        fs::write(&status_path, r#"{"state":"launched","pid":123}"#)?;
+        fs::write(&stdout_path, format!("{}\n", lines[0]))?;
+
+        let writer_stdout = stdout_path.clone();
+        let writer_status = status_path.clone();
+        let writer_exit = exit_path.clone();
+        let remaining = lines[1..].join("\n") + "\n";
+        let writer = thread::spawn(move || -> std::io::Result<()> {
+            thread::sleep(Duration::from_millis(50));
+            let mut file = fs::OpenOptions::new().append(true).open(&writer_stdout)?;
+            file.write_all(remaining.as_bytes())?;
+            file.flush()?;
+            fs::write(&writer_exit, r#"{"exit_code":0}"#)?;
+            fs::write(
+                &writer_status,
+                r#"{"state":"finished","pid":123,"exit_code":0}"#,
+            )?;
+            Ok(())
+        });
+
+        let mut out = Vec::new();
+        paint_worker_activity(
+            WorkerActivityPainterOptions {
+                stdout_path,
+                status_path,
+                exit_path,
+                poll_interval: Duration::from_millis(10),
+                startup_timeout: Duration::from_secs(1),
+            },
+            &mut out,
+        )?;
+        writer.join().expect("writer thread")?;
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("read-only"));
+        assert!(rendered.contains("tool read started"));
+        assert!(rendered.contains("unknown event ignored"));
+        assert!(rendered.contains("wrapper terminal artifacts observed"));
+        Ok(())
+    }
 }
