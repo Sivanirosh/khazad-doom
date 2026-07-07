@@ -37,6 +37,21 @@ pub const WORKER_RESULT_SCHEMA: &str = r#"{
         "required": ["severity", "action", "description"]
       }
     },
+    "finding_dispositions": {
+      "description": "Required for each actionable finding in a successful output. Workers claim disposition only; the daemon/operator attests or rejects it.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "finding_id": {"type": "string"},
+          "finding_index": {"type": "integer", "minimum": 1},
+          "disposition": {"type": "string", "enum": ["fixed", "not_applicable", "documented", "proposed"]},
+          "replan_proposal_id": {"type": "string"},
+          "rationale": {"type": "string"}
+        },
+        "required": ["disposition", "rationale"]
+      }
+    },
     "assumptions": {"type": "array", "items": {"type": "string"}}
   },
   "required": ["slice_id", "status", "summary", "acceptance_status"]
@@ -63,6 +78,21 @@ pub const REPAIR_RESULT_SCHEMA: &str = r#"{
           "description": {"type": "string"}
         },
         "required": ["severity", "action", "description"]
+      }
+    },
+    "finding_dispositions": {
+      "description": "Required for each actionable finding in a successful repair output. Use disposition=proposed when operator approval/replan is required.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "finding_id": {"type": "string"},
+          "finding_index": {"type": "integer", "minimum": 1},
+          "disposition": {"type": "string", "enum": ["fixed", "not_applicable", "documented", "proposed"]},
+          "replan_proposal_id": {"type": "string"},
+          "rationale": {"type": "string"}
+        },
+        "required": ["disposition", "rationale"]
       }
     }
   },

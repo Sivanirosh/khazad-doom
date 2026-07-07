@@ -260,6 +260,19 @@ pub struct Finding {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FindingDisposition {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finding_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub finding_index: usize,
+    pub disposition: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replan_proposal_id: String,
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -422,6 +435,8 @@ pub struct WorkerResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_dispositions: Vec<FindingDisposition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assumptions: Vec<String>,
 }
 
@@ -496,6 +511,8 @@ pub struct RepairResult {
     pub tests_run: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_dispositions: Vec<FindingDisposition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

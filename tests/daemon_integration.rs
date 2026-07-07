@@ -1514,6 +1514,114 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
 }
 
 #[test]
+fn invalid_worker_output_pi_attempt_is_preserved_and_counted_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_invalid_then_valid_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Retry invalid output",
+            "goal": "Retry after an invalid worker JSON attempt.",
+            "acceptance": ["invalid output is preserved before retry"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add invalid-output retry slice"],
+    )?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &["run", "--repo", path(repo.path()), "--agent", "pi", "--all"],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let completed = wait_for_terminal_status(&bin, home.path(), &run_id, "completed")?;
+    let slice_run = completed["slice_runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|slice_run| slice_run["slice_id"].as_str() == Some("slice-001"))
+        .expect("slice run");
+    assert_eq!(slice_run["attempts"], 3);
+
+    let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
+    let inspected = json_stdout(&inspected)?;
+    let invalid_path = artifact_path(&inspected, "slice-001.worker.attempt-1.invalid-output.json")?;
+    let invalid: Value = serde_json::from_str(&fs::read_to_string(invalid_path)?)?;
+    assert_eq!(invalid["slice_id"], "slice-001");
+    assert_eq!(invalid["attempt"], 1);
+    assert!(
+        invalid["parse_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("parse pi JSON output failed")
+    );
+    assert!(
+        invalid["raw_invalid_payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("this is not json from worker")
+    );
+    assert!(
+        invalid["stderr_tail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid worker stderr tail")
+    );
+    let invalid_schema_path =
+        artifact_path(&inspected, "slice-001.worker.attempt-2.invalid-output.json")?;
+    let invalid_schema: Value = serde_json::from_str(&fs::read_to_string(invalid_schema_path)?)?;
+    assert!(
+        invalid_schema["parse_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("worker JSON did not match result model")
+    );
+    assert!(
+        invalid_schema["raw_invalid_payload"]
+            .to_string()
+            .contains("complete")
+    );
+
+    let invalid_event = completed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"].as_str() == Some("invalid_worker_output"))
+        .expect("invalid output event");
+    assert_eq!(invalid_event["payload"]["attempt"], 1);
+    assert!(
+        invalid_event["payload"]["raw_invalid_payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("this is not json from worker")
+    );
+
+    let run_summary_path = artifact_path(&inspected, "run-summary.json")?;
+    let run_summary: Value = serde_json::from_str(&fs::read_to_string(run_summary_path)?)?;
+    assert_eq!(run_summary["economics"]["agent_call_count"], 3);
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -2646,6 +2754,85 @@ else:
     signal.signal(signal.SIGTERM, terminate)
     while True:
         time.sleep(0.1)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
+}
+
+fn write_invalid_then_valid_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+prompt = sys.stdin.read()
+handoff_path = ""
+lines = prompt.splitlines()
+for index, line in enumerate(lines):
+    if line.strip() == "Read this handoff JSON first:" and index + 1 < len(lines):
+        handoff_path = lines[index + 1].strip()
+        break
+if not handoff_path:
+    event = {
+        "type": "agent_end",
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": json.dumps({"status": "no-op", "summary": "no repair"})}]}],
+    }
+    print(json.dumps(event), flush=True)
+    sys.exit(0)
+with open(handoff_path, encoding="utf-8") as fh:
+    handoff = json.load(fh)
+slice_id = handoff["slice"]["id"]
+state_path = Path(__file__).with_name(f"{slice_id}.attempt")
+attempt = int(state_path.read_text(encoding="utf-8")) + 1 if state_path.exists() else 1
+state_path.write_text(str(attempt), encoding="utf-8")
+if attempt == 1:
+    print("invalid worker stdout tail", flush=True)
+    print("invalid worker stderr tail", file=sys.stderr, flush=True)
+    event = {
+        "type": "agent_end",
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": "this is not json from worker"}]}],
+    }
+    print(json.dumps(event), flush=True)
+    sys.exit(0)
+if attempt == 2:
+    bad_result = {"slice_id": slice_id, "status": "complete"}
+    event = {
+        "type": "agent_end",
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": json.dumps(bad_result)}]}],
+    }
+    print(json.dumps(event), flush=True)
+    sys.exit(0)
+with open(f"{slice_id}.txt", "w", encoding="utf-8") as fh:
+    fh.write(f"valid implementation after invalid output for {slice_id}\n")
+subprocess.run(["git", "add", "."], check=True)
+subprocess.run(["git", "commit", "-m", f"fake pi implement {slice_id}"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+result = {
+    "slice_id": slice_id,
+    "status": "complete",
+    "summary": "valid retry after invalid worker output",
+    "commit_sha": sha,
+    "changed_files": [f"{slice_id}.txt"],
+    "tests_run": handoff["slice"].get("verify", []),
+    "acceptance_status": [
+        {"criterion": criterion, "status": "satisfied", "evidence": "valid retry completed"}
+        for criterion in handoff["slice"].get("acceptance", [])
+    ],
+}
+event = {
+    "type": "agent_end",
+    "messages": [{"role": "assistant", "content": [{"type": "text", "text": json.dumps(result)}]}],
+}
+print(json.dumps(event), flush=True)
 "#,
     )?;
     let mut perms = fs::metadata(&path)?.permissions();

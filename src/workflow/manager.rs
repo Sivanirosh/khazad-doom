@@ -13,17 +13,19 @@ use super::{
 };
 use crate::agent::{
     CancellationToken, Job, PiCommandSpec, PiWrapperArtifacts, Runner, RunnerError, RunnerEvent,
-    RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, collect_pi_wrapper_result,
-    prepare_pi_wrapper_artifacts, runner_from_spec, wait_for_pi_wrapper_launch,
+    RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, RunnerTranscript,
+    collect_pi_wrapper_result, prepare_pi_wrapper_artifacts, runner_from_spec,
+    wait_for_pi_wrapper_launch,
 };
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
 use crate::domain::{
     AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
-    GateResult, Handoff, HandoffActionResult, HandoffDiagnostics, ImplementationSummary,
-    MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice,
-    SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
-    WorkflowConfig, WorkflowExitStates, replan_decision_commands,
+    FindingDisposition, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
+    ImplementationSummary, MergeConflictReport, RepairResult, ReplanEvidenceLink,
+    ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus,
+    Slice, SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult,
+    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -2383,6 +2385,33 @@ impl Manager {
                         &mut secondary_failures,
                         &last_failure,
                     );
+                    if invalid_worker_output_error(&last_failure) {
+                        let transcript = err
+                            .downcast_ref::<RunnerError>()
+                            .map(|err| err.transcript().clone())
+                            .unwrap_or_default();
+                        self.record_invalid_worker_output_attempt(
+                            run,
+                            slice,
+                            attempt,
+                            &last_failure,
+                            &worker_worktree,
+                            &output_path,
+                            None,
+                            transcript,
+                        )?;
+                        self.update_invalid_worker_attempt_status(
+                            run,
+                            slice,
+                            &worker_branch,
+                            &worker_worktree,
+                            attempt,
+                            primary_failure.as_deref(),
+                            &last_failure,
+                            &secondary_failures,
+                        )?;
+                        continue;
+                    }
                     self.write_worker_attempt_failure_artifact(
                         run,
                         slice,
@@ -2444,9 +2473,29 @@ impl Manager {
                     &mut secondary_failures,
                     &last_failure,
                 );
+                self.record_invalid_worker_output_attempt(
+                    run,
+                    slice,
+                    attempt,
+                    &last_failure,
+                    &worker_worktree,
+                    &output_path,
+                    None,
+                    RunnerTranscript::default(),
+                )?;
+                self.update_invalid_worker_attempt_status(
+                    run,
+                    slice,
+                    &worker_branch,
+                    &worker_worktree,
+                    attempt,
+                    primary_failure.as_deref(),
+                    &last_failure,
+                    &secondary_failures,
+                )?;
                 continue;
             };
-            let mut worker_result: WorkerResult = match serde_json::from_value(output) {
+            let mut worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
                 Ok(value) => value,
                 Err(err) => {
                     last_failure = format!("worker JSON did not match result model: {err}");
@@ -2455,6 +2504,26 @@ impl Manager {
                         &mut secondary_failures,
                         &last_failure,
                     );
+                    self.record_invalid_worker_output_attempt(
+                        run,
+                        slice,
+                        attempt,
+                        &last_failure,
+                        &worker_worktree,
+                        &output_path,
+                        Some(output),
+                        RunnerTranscript::default(),
+                    )?;
+                    self.update_invalid_worker_attempt_status(
+                        run,
+                        slice,
+                        &worker_branch,
+                        &worker_worktree,
+                        attempt,
+                        primary_failure.as_deref(),
+                        &last_failure,
+                        &secondary_failures,
+                    )?;
                     continue;
                 }
             };
@@ -2465,8 +2534,35 @@ impl Manager {
                     &mut secondary_failures,
                     &last_failure,
                 );
+                self.record_invalid_worker_output_attempt(
+                    run,
+                    slice,
+                    attempt,
+                    &last_failure,
+                    &worker_worktree,
+                    &output_path,
+                    Some(serde_json::to_value(&worker_result).unwrap_or_default()),
+                    RunnerTranscript::default(),
+                )?;
+                self.update_invalid_worker_attempt_status(
+                    run,
+                    slice,
+                    &worker_branch,
+                    &worker_worktree,
+                    attempt,
+                    primary_failure.as_deref(),
+                    &last_failure,
+                    &secondary_failures,
+                )?;
                 continue;
             }
+            self.create_worker_finding_replan_proposals(
+                run,
+                slice,
+                attempt,
+                &output_path,
+                &mut worker_result,
+            )?;
             artifact::write_json(&output_path, &worker_result)?;
             if let Err(err) = self.run_worktree_setup(
                 run,
@@ -2744,6 +2840,290 @@ impl Manager {
         Ok(check)
     }
 
+    fn create_worker_finding_replan_proposals(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        attempt: usize,
+        output_path: &Path,
+        result: &mut WorkerResult,
+    ) -> Result<()> {
+        let proposed_indices = proposed_finding_disposition_indices(&result.finding_dispositions);
+        for index in proposed_indices {
+            let finding =
+                finding_for_disposition(&result.findings, &result.finding_dispositions[index]);
+            let finding_id =
+                disposition_finding_id(index, finding, &result.finding_dispositions[index]);
+            let summary = finding
+                .map(|finding| finding.description.clone())
+                .unwrap_or_else(|| result.finding_dispositions[index].rationale.clone());
+            let proposal = self.state.create_replan_proposal(
+                &run.id,
+                "",
+                ReplanProposalSource {
+                    kind: "worker_finding".to_string(),
+                    slice_id: slice.id.clone(),
+                    phase: "slice_worker".to_string(),
+                    attempt,
+                    summary: result.summary.clone(),
+                },
+                vec![finding_id.clone()],
+                vec![ReplanEvidenceLink {
+                    kind: "worker_output".to_string(),
+                    path: output_path.to_string_lossy().to_string(),
+                    event_id: 0,
+                    summary: format!("worker finding {finding_id}: {summary}"),
+                }],
+                vec![ReplanProposedChange {
+                    kind: "follow_up_or_revision".to_string(),
+                    target: finding
+                        .map(|finding| finding.file.clone())
+                        .filter(|file| !file.trim().is_empty())
+                        .unwrap_or_else(|| slice.id.clone()),
+                    summary: result.finding_dispositions[index].rationale.clone(),
+                }],
+                "operator_review_required_for_worker_finding",
+            )?;
+            result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
+            self.state.record_event(
+                &run.id,
+                "finding_replan_proposal_created",
+                &json!({
+                    "source": "worker",
+                    "slice_id": slice.id,
+                    "attempt": attempt,
+                    "finding_id": finding_id,
+                    "proposal_id": proposal.id,
+                    "output_path": output_path,
+                    "summary": summary,
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn create_repair_finding_replan_proposals(
+        &self,
+        run: &Run,
+        attempt: usize,
+        output_path: &Path,
+        result: &mut RepairResult,
+    ) -> Result<bool> {
+        let proposed_indices = proposed_finding_disposition_indices(&result.finding_dispositions);
+        let created = !proposed_indices.is_empty();
+        for index in proposed_indices {
+            let finding =
+                finding_for_disposition(&result.findings, &result.finding_dispositions[index]);
+            let finding_id =
+                disposition_finding_id(index, finding, &result.finding_dispositions[index]);
+            let summary = finding
+                .map(|finding| finding.description.clone())
+                .unwrap_or_else(|| result.finding_dispositions[index].rationale.clone());
+            let proposal = self.state.create_replan_proposal(
+                &run.id,
+                "",
+                ReplanProposalSource {
+                    kind: "repair_finding".to_string(),
+                    slice_id: String::new(),
+                    phase: "integration_repair".to_string(),
+                    attempt,
+                    summary: result.summary.clone(),
+                },
+                vec![finding_id.clone()],
+                vec![ReplanEvidenceLink {
+                    kind: "repair_output".to_string(),
+                    path: output_path.to_string_lossy().to_string(),
+                    event_id: 0,
+                    summary: format!("repair finding {finding_id}: {summary}"),
+                }],
+                vec![ReplanProposedChange {
+                    kind: "repair_follow_up_or_revision".to_string(),
+                    target: finding
+                        .map(|finding| finding.file.clone())
+                        .filter(|file| !file.trim().is_empty())
+                        .unwrap_or_else(|| "integration".to_string()),
+                    summary: result.finding_dispositions[index].rationale.clone(),
+                }],
+                "operator_review_required_for_repair_finding",
+            )?;
+            result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
+            self.state.record_event(
+                &run.id,
+                "finding_replan_proposal_created",
+                &json!({
+                    "source": "integration_repair",
+                    "attempt": attempt,
+                    "finding_id": finding_id,
+                    "proposal_id": proposal.id,
+                    "output_path": output_path,
+                    "summary": summary,
+                }),
+            )?;
+        }
+        Ok(created)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_repair_authority_proposal(
+        &self,
+        run: &Run,
+        attempt: usize,
+        output_path: &Path,
+        repair_base: &str,
+        repair_head: &str,
+        unauthorized: &[String],
+        result: &RepairResult,
+    ) -> Result<String> {
+        let proposal = self.state.create_replan_proposal(
+            &run.id,
+            "",
+            ReplanProposalSource {
+                kind: "repair_authority".to_string(),
+                slice_id: String::new(),
+                phase: "integration_repair".to_string(),
+                attempt,
+                summary: result.summary.clone(),
+            },
+            vec!["repair-authority".to_string()],
+            vec![ReplanEvidenceLink {
+                kind: "repair_output".to_string(),
+                path: output_path.to_string_lossy().to_string(),
+                event_id: 0,
+                summary: format!(
+                    "repair revision {repair_head} attempted unauthorized paths: {}",
+                    unauthorized.join(", ")
+                ),
+            }],
+            vec![ReplanProposedChange {
+                kind: "repair_revision".to_string(),
+                target: repair_head.to_string(),
+                summary: format!(
+                    "Apply repair revision {repair_head} on top of {repair_base} only if operator approves paths: {}",
+                    unauthorized.join(", ")
+                ),
+            }],
+            "out_of_authority_repair_requires_operator_approval",
+        )?;
+        self.state.record_event(
+            &run.id,
+            "repair_authority_proposal_created",
+            &json!({
+                "proposal_id": proposal.id,
+                "attempt": attempt,
+                "repair_base": repair_base,
+                "repair_head": repair_head,
+                "unauthorized_paths": unauthorized,
+                "repair_output_path": output_path,
+                "policy": "repair revisions outside slice areas or workflow policy require operator approval before application",
+            }),
+        )?;
+        Ok(proposal.id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_invalid_worker_output_attempt(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        attempt: usize,
+        error: &str,
+        worker_worktree: &Path,
+        expected_output_path: &Path,
+        raw_payload: Option<serde_json::Value>,
+        transcript: RunnerTranscript,
+    ) -> Result<PathBuf> {
+        let store = artifact::Store::new(&run.repo_path);
+        store.ensure_run_dirs(&run.id)?;
+        let progress = self.state.get_progress(&run.id)?;
+        let invalid_output_path = store.output_path(
+            &run.id,
+            &format!("{}.worker.attempt-{attempt}.invalid-output.json", slice.id),
+        );
+        let raw_payload_text = raw_payload
+            .as_ref()
+            .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
+            .or_else(|| {
+                (!transcript.assistant_tail.trim().is_empty())
+                    .then(|| transcript.assistant_tail.clone())
+            })
+            .map(|text| bounded_text(&text, 20_000))
+            .unwrap_or_default();
+        let diagnostic = json!({
+            "run_id": run.id,
+            "slice_id": slice.id,
+            "attempt": attempt,
+            "phase": "invalid_worker_output",
+            "parse_error": bounded_text(error, 20_000),
+            "expected_output_path": expected_output_path.to_string_lossy(),
+            "worktree_path": worker_worktree.to_string_lossy(),
+            "worktree_status": git_output_or_empty(worker_worktree, &["status", "--porcelain"]),
+            "worktree_diff_tail": bounded_text(&git_output_or_empty(worker_worktree, &["diff"]), 20_000),
+            "committed_diff_name_only": git_output_or_empty(worker_worktree, &["diff", "--name-only", &self.current_slice_base_for_artifact(run, slice), "HEAD"]),
+            "raw_invalid_payload": raw_payload_text,
+            "stdout_tail": transcript.stdout_tail,
+            "stderr_tail": transcript.stderr_tail,
+            "assistant_tail": transcript.assistant_tail,
+            "progress": progress,
+            "created_at": Utc::now(),
+        });
+        artifact::write_json(&invalid_output_path, &diagnostic)?;
+        self.state.record_event(
+            &run.id,
+            "invalid_worker_output",
+            &json!({
+                "slice_id": slice.id,
+                "attempt": attempt,
+                "parse_error": bounded_text(error, 4_000),
+                "artifact_path": invalid_output_path,
+                "expected_output_path": expected_output_path,
+                "raw_invalid_payload": bounded_text(&raw_payload_text, 4_000),
+                "stdout_tail": bounded_text(&transcript.stdout_tail, 4_000),
+                "stderr_tail": bounded_text(&transcript.stderr_tail, 4_000),
+                "assistant_tail": bounded_text(&transcript.assistant_tail, 4_000),
+            }),
+        )?;
+        Ok(invalid_output_path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_invalid_worker_attempt_status(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        worker_branch: &str,
+        worker_worktree: &Path,
+        attempt: usize,
+        primary_failure: Option<&str>,
+        last_failure: &str,
+        secondary_failures: &[String],
+    ) -> Result<()> {
+        let retrying = attempt < MAX_WORKER_ATTEMPTS;
+        let message = if retrying {
+            last_failure.to_string()
+        } else {
+            final_attempt_failure_message(
+                &slice.id,
+                primary_failure,
+                last_failure,
+                secondary_failures,
+            )
+        };
+        self.state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: slice.id.clone(),
+            status: if retrying {
+                SliceStatus::RepairNeeded
+            } else {
+                SliceStatus::Failed
+            },
+            branch: worker_branch.to_string(),
+            commit_sha: gitutil::head_sha(worker_worktree).unwrap_or_default(),
+            attempts: attempt,
+            last_error: message.clone(),
+        })?;
+        if retrying { Ok(()) } else { bail!(message) }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn write_worker_attempt_failure_artifact(
         &self,
@@ -2810,10 +3190,16 @@ impl Manager {
             serde_json::to_string_pretty(context.checks).unwrap_or_else(|_| "[]".to_string());
         let gate_summary =
             serde_json::to_string_pretty(context.gate_failure).unwrap_or_else(|_| "{}".to_string());
+        let store = artifact::Store::new(&run.repo_path);
         let mut last_error = String::new();
         for attempt in 1..=DEFAULT_REPAIR_ATTEMPTS {
             economics.set_repair_attempts(attempt);
             check_cancelled(cancel)?;
+            let repair_base = gitutil::head_sha(integration_worktree).unwrap_or_default();
+            let output_path = store.output_path(
+                &run.id,
+                &format!("integration-repair.attempt-{attempt}.json"),
+            );
             self.mark_progress(
                 &run.id,
                 "integration_repair",
@@ -2890,6 +3276,18 @@ impl Manager {
                 last_error = format!("integration repair JSON failed validation: {err}");
                 continue;
             }
+            result.trigger = context.trigger.to_string();
+            result.attempts = attempt;
+            let created_finding_proposal = self.create_repair_finding_replan_proposals(
+                run,
+                attempt,
+                &output_path,
+                &mut result,
+            )?;
+            artifact::write_json(&output_path, &result)?;
+            if created_finding_proposal {
+                self.block_if_pending_replan(run, "integration repair finding proposal")?;
+            }
             if result.status == "blocked" {
                 return Err(BlockedError::new(format!(
                     "integration repair blocked: {}",
@@ -2918,8 +3316,51 @@ impl Manager {
             {
                 result.commit_sha = head;
             }
-            result.trigger = context.trigger.to_string();
-            result.attempts = attempt;
+            if result.status == "fixed" {
+                let repair_head = gitutil::head_sha(integration_worktree).unwrap_or_default();
+                let unauthorized = repair_authority_violations(
+                    integration_worktree,
+                    &repair_base,
+                    &repair_head,
+                    slices,
+                )?;
+                if !unauthorized.is_empty() {
+                    let proposal_id = self.create_repair_authority_proposal(
+                        run,
+                        attempt,
+                        &output_path,
+                        &repair_base,
+                        &repair_head,
+                        &unauthorized,
+                        &result,
+                    )?;
+                    result.findings.push(Finding {
+                        id: "repair-authority".to_string(),
+                        severity: "error".to_string(),
+                        action: "ask-user".to_string(),
+                        file: unauthorized.first().cloned().unwrap_or_default(),
+                        line: 0,
+                        description: format!(
+                            "integration repair changed out-of-authority paths: {}",
+                            unauthorized.join(", ")
+                        ),
+                    });
+                    result.finding_dispositions.push(FindingDisposition {
+                        finding_id: "repair-authority".to_string(),
+                        finding_index: 0,
+                        disposition: "proposed".to_string(),
+                        replan_proposal_id: proposal_id.clone(),
+                        rationale: format!(
+                            "repair revision {repair_head} requires operator approval before applying {}",
+                            unauthorized.join(", ")
+                        ),
+                    });
+                    artifact::write_json(&output_path, &result)?;
+                    gitutil::run(integration_worktree, &["reset", "--hard", &repair_base])?;
+                    self.block_if_pending_replan(run, "integration repair authority proposal")?;
+                }
+            }
+            artifact::write_json(&output_path, &result)?;
             self.state.record_event(
                 &run.id,
                 "integration_repair_completed",
@@ -3184,6 +3625,44 @@ fn bounded_text(text: &str, max_bytes: usize) -> String {
         start += 1;
     }
     text[start..].to_string()
+}
+
+fn repair_authority_violations(
+    worktree: &Path,
+    base_sha: &str,
+    head_sha: &str,
+    slices: &[Slice],
+) -> Result<Vec<String>> {
+    if base_sha.trim().is_empty() || head_sha.trim().is_empty() || base_sha == head_sha {
+        return Ok(Vec::new());
+    }
+    let output = gitutil::run(worktree, &["diff", "--name-only", base_sha, head_sha])?;
+    let areas = slices
+        .iter()
+        .flat_map(|slice| slice.areas.iter().cloned())
+        .collect::<Vec<_>>();
+    let unrestricted = areas.is_empty() || areas.iter().any(|area| area.trim() == ".");
+    let violations = output
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter(|path| {
+            workflow_policy_path(path)
+                || (!unrestricted && !areas.iter().any(|area| path_matches_area(path, area)))
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok(violations)
+}
+
+fn workflow_policy_path(path: &str) -> bool {
+    let path = path.trim().trim_matches('/');
+    path == ".workflow"
+        || path.starts_with(".workflow/")
+        || path == ".agents"
+        || path.starts_with(".agents/")
+        || path == ".pi"
+        || path.starts_with(".pi/")
 }
 
 fn changed_files_outside_slice_areas(
@@ -3851,6 +4330,13 @@ fn validate_worker_result(result: &WorkerResult, slice: &Slice) -> Result<()> {
     if result.summary.trim().is_empty() {
         bail!("worker summary is required");
     }
+    if result.status == "complete" {
+        validate_actionable_finding_dispositions(
+            "worker",
+            &result.findings,
+            &result.finding_dispositions,
+        )?;
+    }
     validate_acceptance_evidence(result, slice)?;
     Ok(())
 }
@@ -3901,7 +4387,128 @@ fn validate_repair_result(result: &RepairResult) -> Result<()> {
     if result.summary.trim().is_empty() {
         bail!("integration repair summary is required");
     }
+    if matches!(result.status.as_str(), "no-op" | "fixed") {
+        validate_actionable_finding_dispositions(
+            "integration repair",
+            &result.findings,
+            &result.finding_dispositions,
+        )?;
+    }
     Ok(())
+}
+
+fn validate_actionable_finding_dispositions(
+    source: &str,
+    findings: &[Finding],
+    dispositions: &[FindingDisposition],
+) -> Result<()> {
+    for disposition in dispositions {
+        if disposition.disposition.trim().is_empty() {
+            bail!("{source} finding disposition is required");
+        }
+        if !matches!(
+            disposition.disposition.as_str(),
+            "fixed" | "not_applicable" | "documented" | "proposed"
+        ) {
+            bail!(
+                "unknown {source} finding disposition {:?}",
+                disposition.disposition
+            );
+        }
+        if disposition.rationale.trim().is_empty() {
+            bail!("{source} finding disposition rationale is required");
+        }
+        if disposition.finding_id.trim().is_empty() && disposition.finding_index == 0 {
+            bail!("{source} finding disposition must identify finding_id or finding_index");
+        }
+    }
+
+    for (index, finding) in findings.iter().enumerate() {
+        if !is_actionable_finding(finding) {
+            continue;
+        }
+        let Some(disposition) = dispositions
+            .iter()
+            .find(|disposition| disposition_matches_finding(disposition, finding, index))
+        else {
+            let finding_label = if finding.id.trim().is_empty() {
+                format!("#{}", index + 1)
+            } else {
+                finding.id.clone()
+            };
+            bail!(
+                "{source} actionable finding {finding_label} requires a terminal disposition or replan proposal"
+            );
+        };
+        if disposition.disposition == "proposed"
+            || !disposition.replan_proposal_id.trim().is_empty()
+        {
+            continue;
+        }
+        if !matches!(
+            disposition.disposition.as_str(),
+            "fixed" | "not_applicable" | "documented"
+        ) {
+            bail!(
+                "{source} actionable finding disposition {:?} is not terminal",
+                disposition.disposition
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_actionable_finding(finding: &Finding) -> bool {
+    !matches!(finding.action.as_str(), "" | "no-op")
+}
+
+fn disposition_matches_finding(
+    disposition: &FindingDisposition,
+    finding: &Finding,
+    index: usize,
+) -> bool {
+    (!disposition.finding_id.trim().is_empty() && disposition.finding_id == finding.id)
+        || (disposition.finding_index == index + 1)
+}
+
+fn proposed_finding_disposition_indices(dispositions: &[FindingDisposition]) -> Vec<usize> {
+    dispositions
+        .iter()
+        .enumerate()
+        .filter(|(_, disposition)| {
+            disposition.disposition == "proposed"
+                && disposition.replan_proposal_id.trim().is_empty()
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn finding_for_disposition<'a>(
+    findings: &'a [Finding],
+    disposition: &FindingDisposition,
+) -> Option<&'a Finding> {
+    findings.iter().enumerate().find_map(|(index, finding)| {
+        disposition_matches_finding(disposition, finding, index).then_some(finding)
+    })
+}
+
+fn disposition_finding_id(
+    index: usize,
+    finding: Option<&Finding>,
+    disposition: &FindingDisposition,
+) -> String {
+    finding
+        .and_then(|finding| (!finding.id.trim().is_empty()).then(|| finding.id.clone()))
+        .or_else(|| {
+            (!disposition.finding_id.trim().is_empty()).then(|| disposition.finding_id.clone())
+        })
+        .unwrap_or_else(|| format!("finding-{}", disposition.finding_index.max(index + 1)))
+}
+
+fn invalid_worker_output_error(message: &str) -> bool {
+    message.contains("parse pi JSON output")
+        || message.contains("no JSON object found")
+        || message.contains("invalid JSON object")
 }
 
 fn new_run_id() -> String {
@@ -3970,13 +4577,16 @@ impl Error for BlockedError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Manager, StartOptions, validate_repair_result, validate_worker_result};
+    use super::{
+        Manager, StartOptions, repair_authority_violations, validate_repair_result,
+        validate_worker_result,
+    };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, CheckResult, CockpitMode, Handoff, ImplementationSummary, RepairResult,
-        Run, RunStatus, Slice, SliceRun, SliceStatus, VerifyCommand, VerifyProfile, WorkerResult,
-        WorkflowConfig,
+        AcceptanceEvidence, CheckResult, CockpitMode, Finding, FindingDisposition, Handoff,
+        ImplementationSummary, RepairResult, Run, RunStatus, Slice, SliceRun, SliceStatus,
+        VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -4062,6 +4672,49 @@ mod tests {
             ..RepairResult::default()
         };
         assert!(validate_repair_result(&repair).is_err());
+    }
+
+    #[test]
+    fn finding_disposition_rejects_successful_unresolved_actionable_findings() {
+        let actionable = Finding {
+            id: "needs-followup".to_string(),
+            severity: "warning".to_string(),
+            action: "ask-user".to_string(),
+            file: "src/lib.rs".to_string(),
+            line: 0,
+            description: "needs a follow-up decision".to_string(),
+        };
+        let mut worker = WorkerResult {
+            slice_id: "slice-001".to_string(),
+            status: "complete".to_string(),
+            summary: "done".to_string(),
+            acceptance_status: vec![AcceptanceEvidence {
+                criterion: "done".to_string(),
+                status: "satisfied".to_string(),
+                evidence: "implemented".to_string(),
+            }],
+            findings: vec![actionable.clone()],
+            ..WorkerResult::default()
+        };
+        let err = validate_worker_result(&worker, &slice("slice-001")).unwrap_err();
+        assert!(err.to_string().contains("requires a terminal disposition"));
+
+        worker.finding_dispositions = vec![FindingDisposition {
+            finding_id: "needs-followup".to_string(),
+            disposition: "proposed".to_string(),
+            rationale: "operator should decide the follow-up".to_string(),
+            ..FindingDisposition::default()
+        }];
+        validate_worker_result(&worker, &slice("slice-001")).unwrap();
+
+        let repair = RepairResult {
+            status: "fixed".to_string(),
+            summary: "repair done".to_string(),
+            findings: vec![actionable],
+            ..RepairResult::default()
+        };
+        let err = validate_repair_result(&repair).unwrap_err();
+        assert!(err.to_string().contains("requires a terminal disposition"));
     }
 
     #[test]
@@ -4713,6 +5366,33 @@ mod tests {
                 .contains("source repo has uncommitted changes")
         );
         assert!(err.to_string().contains("dirty.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn repair_authority_flags_workflow_policy_and_out_of_area_paths() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let base = gitutil::head_sha(repo.path())?;
+        fs::create_dir_all(repo.path().join("src"))?;
+        fs::create_dir_all(repo.path().join("docs"))?;
+        fs::create_dir_all(repo.path().join(".workflow"))?;
+        fs::write(repo.path().join("src/authorized.rs"), "pub fn ok() {}\n")?;
+        fs::write(repo.path().join("docs/out-of-area.md"), "not authorized\n")?;
+        fs::write(
+            repo.path().join(".workflow/khazad.json"),
+            "{\"integration_repair\":\"auto\"}\n",
+        )?;
+        gitutil::run(repo.path(), &["add", "."])?;
+        gitutil::run(repo.path(), &["commit", "-m", "repair attempt"])?;
+        let head = gitutil::head_sha(repo.path())?;
+        let mut authorized = slice("slice-001");
+        authorized.areas = vec!["src".to_string()];
+
+        let violations = repair_authority_violations(repo.path(), &base, &head, &[authorized])?;
+        assert!(violations.contains(&"docs/out-of-area.md".to_string()));
+        assert!(violations.contains(&".workflow/khazad.json".to_string()));
+        assert!(!violations.contains(&"src/authorized.rs".to_string()));
         Ok(())
     }
 
