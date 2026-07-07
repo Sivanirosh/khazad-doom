@@ -145,3 +145,12 @@ These slices are architecture outputs for Phase 5. They should be converted into
 The main architecture correction from Phase 3 is that replan is not the first mechanism to implement. Replan depends on reliable publication truth. The close-record/report-promotion seam had to be fixed first or replan would repeatedly ask the operator to adjudicate contradictions caused by Khazad-Doom itself.
 
 The post-PUB-01B scope correction is that Pi should not become the live multi-agent cockpit. Herdr is admitted as the optional-default cockpit adapter after FEED-01 because it answers F-013's Pi UI churn without making Herdr a workflow owner. Khazad-Doom remains the source of truth; Herdr shows/focuses workspaces and panes; Pi starts, shapes, explains, answers blockers, summarizes handoff, and opens/focuses Herdr.
+
+## Post-dogfood UX follow-up slices
+
+After `kd-20260707-070851-bd30eb80`, Herdr panes proved operational but exposed one cockpit UX gap: worker panes show the wrapper process rather than the live Pi event stream already captured in daemon-owned artifacts. This is display debt, not truth-path debt.
+
+- `HERDR-04` adds a read-only worker activity painter over wrapper `stdout.ndjson`, parsed only through `src/pi_contract.rs`, with throttling and renderer-crash isolation.
+- `HERDR-05` follows with a read-only gate/repair activity painter over daemon-owned gate/shell output artifacts and feed data.
+
+Both preserve the architecture rejection that Herdr pane text, scrollback, and agent-status metadata are never correctness evidence.

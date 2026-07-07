@@ -328,6 +328,17 @@ Revised Phase 5 order after publication truth and first Herdr dogfood review:
 
 Post-Herdr dogfood review evidence is recorded in `docs/design/evidence/herdr-dogfood-review-2026-07-07.md`.
 
+## Post-completion UX follow-ups
+
+The Herdr/RPL/Pi-proof dogfood run proved worker activity is already captured live in daemon-owned wrapper artifacts, but the worker panes remain visually quiet because HERDR-02 correctly redirects Pi output away from the terminal tty and into KD-owned files.
+
+Follow-up tracking:
+
+1. HERDR-04 — live worker activity painter. Read-only Herdr worker panes tail the wrapper `stdout.ndjson`, parse through `src/pi_contract.rs`, throttle high-volume deltas, and never become a truth or input path.
+2. HERDR-05 — gate and repair activity painter. The Gate/Repair pane shows live daemon-owned gate/shell output when commands run and otherwise falls back to feed summary.
+
+Evidence and design constraints are recorded in `docs/design/evidence/herdr-live-pane-feedback-2026-07-07.md`.
+
 ## Plan-level completion criteria
 
 The revision plan is complete when:

@@ -1,0 +1,45 @@
+{
+  "id": "HERDR-05",
+  "title": "Gate and repair activity painter",
+  "goal": "Make the Herdr Integration Gate / Repair pane show live daemon-owned gate and repair command activity when commands are running, while retaining summary/status output when no command is active.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-04"
+  ],
+  "areas": [
+    "src/workflow/cockpit.rs",
+    "src/workflow/gate.rs",
+    "src/workflow/shell.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "docs/design/evidence/herdr-live-pane-feedback-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "The Integration Gate / Repair Herdr pane can render live daemon-owned gate or repair command activity while a command is running and falls back to the existing daemon feed/status summary otherwise.",
+    "Gate/repair painter input comes only from daemon-owned gate/shell artifacts or status feed data; it never reads Herdr pane scrollback or UI state as workflow evidence.",
+    "The gate/shell correctness path is unchanged: command exit status, stdout/stderr artifacts, typed gate results, repair decisions, verification, and handoff readiness remain daemon-owned.",
+    "Renderer failures are non-fatal visibility incidents and do not change gate result, repair policy, run status, slice status, merge, or handoff behavior.",
+    "Live command output is rate-limited or compacted so verbose gates remain readable without losing the underlying artifacts.",
+    "Tests cover both active command rendering and idle summary rendering without requiring Herdr for the normal cargo test suite."
+  ],
+  "must_ask_if": [
+    "The implementation would make Herdr required for gate or repair execution.",
+    "The implementation would parse terminal scrollback or pane text as gate/repair correctness evidence.",
+    "The implementation would alter verification, repair, merge, or handoff decisions based on painter output.",
+    "The implementation would remove or weaken existing daemon-owned gate/shell result artifacts."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test gate --quiet",
+    "cargo test cockpit --quiet",
+    "cargo test gate_activity_painter --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet"
+  ],
+  "verify_timeout_seconds": 1200
+}

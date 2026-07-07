@@ -1,0 +1,48 @@
+{
+  "id": "HERDR-04",
+  "title": "Live worker activity painter",
+  "goal": "Make Herdr worker panes visibly useful during long Pi worker attempts by painting the daemon-owned wrapper stdout event stream live, without changing the correctness path or making terminal scrollback authoritative.",
+  "status": "open",
+  "depends_on": [
+    "PI-PROOF-01"
+  ],
+  "areas": [
+    "src/agent.rs",
+    "src/pi_contract.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/manager.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/fixtures",
+    "docs/design/evidence/herdr-live-pane-feedback-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "A read-only worker activity painter can follow a Herdr wrapper stdout.ndjson artifact with tail-F semantics and render live Pi worker activity in the worker pane.",
+    "All Pi event interpretation for the painter goes through src/pi_contract.rs; no new module parses Pi wire-format event names or fields directly.",
+    "High-volume message_update/token deltas are throttled or compacted for human display without dropping the underlying daemon-owned artifact data.",
+    "The worker correctness path is unchanged: Khazad-Doom still reads wrapper stdout/stderr/status/exit/result artifacts, never Herdr pane text, terminal scrollback, or Herdr agent-status metadata.",
+    "The painter is not an authority channel: it accepts no worker instructions, answers, approvals, or manual result JSON, and operator actions still go through daemon commands such as answer or cancel.",
+    "If the painter process crashes or is killed while the Pi worker continues, the worker attempt completes, fails, or is cancelled according to the same daemon-owned wrapper/result path as before; the failure is at most a non-fatal cockpit visibility incident.",
+    "A bounded recorded event-stream fixture derived from HERDR/RPL dogfood artifacts is promoted into tests and covers message, tool, turn, unknown-field, and unknown-event tolerance for the painter/contract path."
+  ],
+  "must_ask_if": [
+    "The implementation would parse Herdr pane scrollback, terminal text, or Herdr agent-status metadata as correctness evidence.",
+    "The implementation would make the painter required for worker completion, verification, merge, handoff, or result capture.",
+    "The implementation would add a second Pi event parser outside src/pi_contract.rs.",
+    "The implementation would let operators type answers, approvals, or worker result JSON into the worker pane as accepted workflow input.",
+    "The implementation would weaken the HERDR-02 wrapper artifact contract or remove daemon-owned stdout/stderr/exit/result files."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test pi_contract --quiet",
+    "cargo test cockpit --quiet",
+    "cargo test worker_activity_painter --quiet",
+    "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+    "bash -lc '! rg -n \"message_update|tool_execution_start|tool_execution_update|tool_execution_end|turn_start|turn_end\" src | rg -v \"src/pi_contract.rs|tests|fixtures\"'"
+  ],
+  "verify_timeout_seconds": 1200
+}
