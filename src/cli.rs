@@ -2,7 +2,7 @@ use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
     BranchHandoff, ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState,
-    ReplanProposedChange, RunDetails, RunInspection, RunStatus, SliceValidationReport,
+    ReplanProposedChange, RunDetails, RunInspection, RunProgress, RunStatus, SliceValidationReport,
     SliceWriteResult, StatusFeed, StatusFeedRole,
 };
 use crate::ipc::{
@@ -296,6 +296,14 @@ enum CockpitCommand {
         #[arg(long)]
         exit: PathBuf,
         #[arg(long, default_value_t = 250)]
+        interval_ms: u64,
+    },
+    /// Internal read-only Herdr gate/repair-pane painter over daemon status feed data.
+    #[command(name = "paint-gate-activity", hide = true)]
+    PaintGateActivity {
+        #[arg(long)]
+        run: String,
+        #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
 }
@@ -982,6 +990,9 @@ fn run_cockpit(paths: Paths, command: CockpitCommand) -> Result<()> {
             exit,
             interval_ms,
         } => run_cockpit_paint_worker_activity(stdout, status, exit, interval_ms),
+        CockpitCommand::PaintGateActivity { run, interval_ms } => {
+            run_cockpit_paint_gate_activity(paths, run, interval_ms)
+        }
     }
 }
 
@@ -1000,6 +1011,129 @@ fn run_cockpit_paint_worker_activity(
     };
     let mut out = io::stdout();
     paint_worker_activity(options, &mut out)
+}
+
+fn run_cockpit_paint_gate_activity(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
+    if run_id.trim().is_empty() {
+        bail!("cockpit paint-gate-activity requires --run <run-id>");
+    }
+    let client = Client::new(paths);
+    let interval = Duration::from_millis(interval_ms.max(250));
+    let mut out = io::stdout();
+    let mut first = true;
+    loop {
+        let details = fetch_run_details(&client, &run_id, 10)?;
+        if !first {
+            writeln!(out, "---")?;
+        }
+        first = false;
+        paint_gate_activity_snapshot(&details, &mut out)?;
+        out.flush()?;
+        if is_terminal_status(details.run.status) {
+            return Ok(());
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn paint_gate_activity_snapshot(details: &RunDetails, out: &mut impl Write) -> Result<bool> {
+    let Some(progress) = active_gate_or_repair_progress(details) else {
+        writeln!(out, "Khazad-Doom gate/repair status (idle)")?;
+        writeln!(out, "Run: {}", details.run.id)?;
+        writeln!(out, "Status: {}", details.run.status)?;
+        writeln!(
+            out,
+            "Source: daemon status feed; no active gate/repair command"
+        )?;
+        match &details.feed {
+            Some(feed) => render_feed_plain(out, feed)?,
+            None => writeln!(out, "daemon status feed unavailable")?,
+        }
+        return Ok(false);
+    };
+
+    writeln!(out, "Khazad-Doom gate/repair activity painter (read-only)")?;
+    writeln!(out, "Run: {}", details.run.id)?;
+    writeln!(out, "Status: {}", details.run.status)?;
+    writeln!(
+        out,
+        "Source: daemon status feed / shell progress; gate results and artifacts remain authoritative"
+    )?;
+    writeln!(out, "{}", gate_activity_label(&progress.phase))?;
+    writeln!(
+        out,
+        "  command: {}",
+        truncate_display(&progress.command, MONITOR_LINE_WIDTH)
+    )?;
+    if progress.attempt > 0 {
+        writeln!(out, "  attempt: {}", progress.attempt)?;
+    }
+    if !progress.message.trim().is_empty() {
+        writeln!(
+            out,
+            "  status: {}",
+            truncate_display(&progress.message, MONITOR_LINE_WIDTH)
+        )?;
+    }
+    if let Some(worker) = &progress.worker {
+        let supervisor = if worker.process_observed_at.is_some() {
+            "observed"
+        } else {
+            "starting"
+        };
+        writeln!(out, "  supervisor: {supervisor}")?;
+        if !worker.last_event_kind.trim().is_empty() {
+            writeln!(out, "  last worker event: {}", worker.last_event_kind)?;
+        }
+    }
+    let tail = compact_gate_activity_tail(&progress.output_tail);
+    if tail.is_empty() {
+        writeln!(out, "Tail: waiting for daemon-owned command output")?;
+    } else {
+        writeln!(out, "Tail (last {} compact lines):", tail.len())?;
+        for line in tail {
+            writeln!(out, "  {line}")?;
+        }
+    }
+    Ok(true)
+}
+
+fn active_gate_or_repair_progress(details: &RunDetails) -> Option<&RunProgress> {
+    let progress = details.progress.as_ref()?;
+    if is_terminal_status(details.run.status) || progress.command.trim().is_empty() {
+        return None;
+    }
+    if is_gate_or_repair_phase(&progress.phase) {
+        Some(progress)
+    } else {
+        None
+    }
+}
+
+fn is_gate_or_repair_phase(phase: &str) -> bool {
+    let normalized = phase.to_ascii_lowercase();
+    normalized.contains("integration_gate") || normalized.contains("integration_repair")
+}
+
+fn gate_activity_label(phase: &str) -> &'static str {
+    if phase.to_ascii_lowercase().contains("repair") {
+        "Repair"
+    } else {
+        "Integration Gate"
+    }
+}
+
+fn compact_gate_activity_tail(output_tail: &str) -> Vec<String> {
+    output_tail
+        .trim_end()
+        .lines()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| truncate_display(line, MONITOR_LINE_WIDTH))
+        .collect()
 }
 
 fn paint_worker_activity(
@@ -1890,5 +2024,100 @@ mod tests {
         assert!(rendered.contains("unknown event ignored"));
         assert!(rendered.contains("wrapper terminal artifacts observed"));
         Ok(())
+    }
+
+    #[test]
+    fn gate_activity_painter_renders_active_command_from_daemon_progress() -> Result<()> {
+        let now = chrono::Utc::now();
+        let details = test_run_details(
+            Some(RunProgress {
+                run_id: "kd-test".to_string(),
+                phase: "integration_gate".to_string(),
+                slice_id: String::new(),
+                attempt: 0,
+                command: "cargo test gate --quiet".to_string(),
+                message: "running integration gate command".to_string(),
+                output_tail: "gate line 1\ngate line 2\n".to_string(),
+                phase_started_at: now,
+                updated_at: now,
+                worker: None,
+                parallel_layer: false,
+                parallel_slices: Vec::new(),
+            }),
+            None,
+        );
+
+        let mut out = Vec::new();
+        let active = paint_gate_activity_snapshot(&details, &mut out)?;
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(active);
+        assert!(rendered.contains("gate/repair activity painter (read-only)"));
+        assert!(rendered.contains("Integration Gate"));
+        assert!(rendered.contains("cargo test gate --quiet"));
+        assert!(rendered.contains("daemon status feed / shell progress"));
+        assert!(rendered.contains("gate line 1"));
+        assert!(rendered.contains("gate line 2"));
+        Ok(())
+    }
+
+    #[test]
+    fn gate_activity_painter_falls_back_to_idle_feed_summary() -> Result<()> {
+        let feed = StatusFeed {
+            feed_version: 1,
+            summary_line: "existing daemon feed/status summary".to_string(),
+            terminal_reason: None,
+            operator_commands: Vec::new(),
+            attention: Vec::new(),
+            blocks: vec![crate::domain::StatusFeedBlock {
+                label: "Run".to_string(),
+                meta: "running".to_string(),
+                lines: vec![crate::domain::StatusFeedLine {
+                    text: "summary line from daemon feed".to_string(),
+                    role: StatusFeedRole::Info,
+                }],
+            }],
+        };
+        let details = test_run_details(None, Some(feed));
+
+        let mut out = Vec::new();
+        let active = paint_gate_activity_snapshot(&details, &mut out)?;
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(!active);
+        assert!(rendered.contains("gate/repair status (idle)"));
+        assert!(rendered.contains("no active gate/repair command"));
+        assert!(rendered.contains("existing daemon feed/status summary"));
+        assert!(rendered.contains("summary line from daemon feed"));
+        Ok(())
+    }
+
+    fn test_run_details(progress: Option<RunProgress>, feed: Option<StatusFeed>) -> RunDetails {
+        let now = chrono::Utc::now();
+        RunDetails {
+            run: crate::domain::Run {
+                id: "kd-test".to_string(),
+                repo_id: "repo".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                status: RunStatus::Running,
+                base_branch: "main".to_string(),
+                base_sha: "base".to_string(),
+                integration_branch: "khazad/kd-test/integration".to_string(),
+                selected_slice_id: "slice-1".to_string(),
+                error: String::new(),
+                started_at: now,
+                updated_at: now,
+            },
+            worker_profile: Default::default(),
+            slice_runs: Vec::new(),
+            progress,
+            incidents: Vec::new(),
+            questions: Vec::new(),
+            replan: Default::default(),
+            events: Vec::new(),
+            economics: None,
+            primary_terminal_reason: None,
+            feed,
+        }
     }
 }
