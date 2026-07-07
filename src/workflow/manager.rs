@@ -1,4 +1,7 @@
-use super::cockpit::{CockpitLaunch, open_default_run_cockpit, take_cockpit_mode_transport_arg};
+use super::cockpit::{
+    CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, open_default_run_cockpit,
+    open_default_worker_pane, take_cockpit_mode_transport_arg,
+};
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
@@ -9,8 +12,9 @@ use super::{
     integration_repair_prompt, worker_prompt,
 };
 use crate::agent::{
-    CancellationToken, Job, Runner, RunnerError, RunnerEvent, RunnerEventSink, RunnerLaunchFailure,
-    RunnerMetadata, runner_from_spec,
+    CancellationToken, Job, PiCommandSpec, PiWrapperArtifacts, Runner, RunnerError, RunnerEvent,
+    RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, collect_pi_wrapper_result,
+    prepare_pi_wrapper_artifacts, runner_from_spec, wait_for_pi_wrapper_launch,
 };
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
@@ -131,6 +135,7 @@ struct WorkerExecutionContext {
     cancel: CancellationToken,
     runner: Arc<dyn Runner>,
     config: WorkflowConfig,
+    cockpit_mode: CockpitMode,
     economics: RunEconomicsRecorder,
     verification_cache: VerificationCommandCache,
     worker_token: String,
@@ -160,6 +165,11 @@ struct AgentLaunchIncidentContext<'a> {
     attempt: usize,
     runner_name: &'a str,
     metadata: &'a RunnerMetadata,
+}
+
+enum CockpitWorkerJobError {
+    Fallback(String),
+    Worker(anyhow::Error),
 }
 
 impl WorkerAttemptContext {
@@ -276,19 +286,36 @@ impl Manager {
     fn run_supervised_worker_job(
         &self,
         runner: Arc<dyn Runner>,
-        mut job: Job,
+        job: Job,
         cancel: &CancellationToken,
         context: WorkerAttemptContext,
     ) -> Result<SupervisedWorkerJobResult> {
+        self.run_supervised_worker_job_with(job, cancel, context, move |job, cancel, events| {
+            runner.run(job, cancel, events)
+        })
+    }
+
+    fn run_supervised_worker_job_with<F>(
+        &self,
+        mut job: Job,
+        cancel: &CancellationToken,
+        context: WorkerAttemptContext,
+        run_job: F,
+    ) -> Result<SupervisedWorkerJobResult>
+    where
+        F: FnOnce(
+            Job,
+            CancellationToken,
+            Option<RunnerEventSink>,
+        ) -> Result<crate::agent::ResultData>,
+    {
         job.termination_grace_seconds = context.termination_grace_seconds;
         let events = Some(self.worker_event_sink(&context));
         if context.timeout_seconds == 0 {
-            return runner
-                .run(job, cancel.clone(), events)
-                .map(|data| SupervisedWorkerJobResult {
-                    data,
-                    operator_pause: Duration::ZERO,
-                });
+            return run_job(job, cancel.clone(), events).map(|data| SupervisedWorkerJobResult {
+                data,
+                operator_pause: Duration::ZERO,
+            });
         }
 
         let attempt_cancel = CancellationToken::new();
@@ -342,7 +369,7 @@ impl Manager {
             }
         });
 
-        let result = runner.run(job, attempt_cancel, events);
+        let result = run_job(job, attempt_cancel, events);
         done.store(true, Ordering::SeqCst);
         let _ = supervisor.join();
         if timed_out.load(Ordering::SeqCst) {
@@ -427,6 +454,220 @@ impl Manager {
                 Err(err)
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_recorded_slice_worker_job(
+        &self,
+        runner: Arc<dyn Runner>,
+        job: Job,
+        cancel: &CancellationToken,
+        context: WorkerAttemptContext,
+        economics: &RunEconomicsRecorder,
+        call: AgentCallContext<'_>,
+        run: &Run,
+        cockpit_mode: CockpitMode,
+        output_path: &Path,
+    ) -> Result<crate::agent::ResultData> {
+        let Some(spec) = runner.pi_command_spec() else {
+            return self.run_recorded_agent_job(runner, job, cancel, context, economics, call);
+        };
+        if cockpit_mode == CockpitMode::Direct {
+            return self.run_recorded_agent_job(runner, job, cancel, context, economics, call);
+        }
+
+        let kind = job.kind.clone();
+        let runner_name = runner.name().to_string();
+        let runner_metadata = runner.metadata();
+        let started_at = Instant::now();
+        let direct_runner = runner.clone();
+        let run = run.clone();
+        let output_path = output_path.to_path_buf();
+        let context_for_job = context.clone();
+        match self.run_supervised_worker_job_with(
+            job,
+            cancel,
+            context.clone(),
+            move |job, cancel, events| {
+                self.run_herdr_worker_or_direct(
+                    direct_runner,
+                    spec,
+                    job,
+                    cancel,
+                    events,
+                    &context_for_job,
+                    &run,
+                    cockpit_mode,
+                    &output_path,
+                )
+            },
+        ) {
+            Ok(result) => {
+                let duration = started_at.elapsed().saturating_sub(result.operator_pause);
+                economics.record_agent_call(agent_call(
+                    call.phase,
+                    call.slice_id,
+                    call.attempt,
+                    kind.as_str(),
+                    runner_name.as_str(),
+                    &runner_metadata,
+                    "succeeded",
+                    duration,
+                    result.operator_pause,
+                    Some(&result.data.usage),
+                    "",
+                ));
+                self.record_contract_warnings(
+                    &context,
+                    &runner_name,
+                    &result.data.contract_warnings,
+                );
+                Ok(result.data)
+            }
+            Err(err) => {
+                let error = err.to_string();
+                economics.record_agent_call(agent_call(
+                    call.phase,
+                    call.slice_id,
+                    call.attempt,
+                    kind.as_str(),
+                    runner_name.as_str(),
+                    &runner_metadata,
+                    "failed",
+                    started_at.elapsed(),
+                    Duration::ZERO,
+                    None,
+                    &error,
+                ));
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_herdr_worker_or_direct(
+        &self,
+        direct_runner: Arc<dyn Runner>,
+        spec: PiCommandSpec,
+        job: Job,
+        cancel: CancellationToken,
+        events: Option<RunnerEventSink>,
+        context: &WorkerAttemptContext,
+        run: &Run,
+        cockpit_mode: CockpitMode,
+        output_path: &Path,
+    ) -> Result<crate::agent::ResultData> {
+        match self.try_run_herdr_worker_job(
+            &spec,
+            &job,
+            cancel.clone(),
+            events.clone(),
+            context,
+            run,
+            cockpit_mode,
+            output_path,
+        ) {
+            Ok(data) => Ok(data),
+            Err(CockpitWorkerJobError::Fallback(message)) => {
+                self.record_cockpit_worker_fallback(run, context, cockpit_mode, &message)?;
+                direct_runner.run(job, cancel, events)
+            }
+            Err(CockpitWorkerJobError::Worker(err)) => Err(err),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_run_herdr_worker_job(
+        &self,
+        spec: &PiCommandSpec,
+        job: &Job,
+        cancel: CancellationToken,
+        events: Option<RunnerEventSink>,
+        context: &WorkerAttemptContext,
+        run: &Run,
+        cockpit_mode: CockpitMode,
+        output_path: &Path,
+    ) -> std::result::Result<crate::agent::ResultData, CockpitWorkerJobError> {
+        if cancel.is_cancelled() {
+            return Err(CockpitWorkerJobError::Worker(anyhow!("job cancelled")));
+        }
+        let artifacts = PiWrapperArtifacts::for_output_path(output_path)
+            .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
+        let command = prepare_pi_wrapper_artifacts(spec, job, &artifacts)
+            .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
+        let worker_request = CockpitWorkerPaneRequest {
+            run_id: run.id.clone(),
+            slice_id: context.slice_id.clone(),
+            attempt: context.attempt,
+            command,
+            cwd: job.cwd.clone(),
+            env: vec![
+                ("KHAZAD_COCKPIT_WORKER".to_string(), "1".to_string()),
+                (
+                    "KHAZAD_COCKPIT_SOURCE_OF_TRUTH".to_string(),
+                    "kd_artifacts".to_string(),
+                ),
+            ],
+        };
+        let opened =
+            match open_default_worker_pane(run, cockpit_mode, &self.paths.root, &worker_request) {
+                Ok(CockpitWorkerLaunch::Opened(opened)) => opened,
+                Ok(CockpitWorkerLaunch::SkippedDirect) => {
+                    return Err(CockpitWorkerJobError::Fallback(
+                        "cockpit mode resolved to direct before worker pane launch".to_string(),
+                    ));
+                }
+                Err(unavailable) => {
+                    return Err(CockpitWorkerJobError::Fallback(unavailable.message));
+                }
+            };
+        self.state
+            .record_event(
+                &run.id,
+                "cockpit_worker_ready",
+                &json!({
+                    "adapter": opened.adapter,
+                    "mode": opened.mode.as_str(),
+                    "workspace": opened.workspace_label,
+                    "pane": opened.pane_label,
+                    "pane_id": opened.pane_id,
+                    "slice_id": context.slice_id,
+                    "attempt": context.attempt,
+                    "source_of_truth": "kd_artifact_files",
+                }),
+            )
+            .map_err(CockpitWorkerJobError::Worker)?;
+        let pid = match wait_for_pi_wrapper_launch(&artifacts, Duration::from_secs(5), &events) {
+            Ok(pid) => pid,
+            Err(err) if cancel.is_cancelled() => return Err(CockpitWorkerJobError::Worker(err)),
+            Err(err) => return Err(CockpitWorkerJobError::Fallback(err.to_string())),
+        };
+        collect_pi_wrapper_result(job, &artifacts, cancel, events, pid)
+            .map_err(CockpitWorkerJobError::Worker)
+    }
+
+    fn record_cockpit_worker_fallback(
+        &self,
+        run: &Run,
+        context: &WorkerAttemptContext,
+        mode: CockpitMode,
+        message: &str,
+    ) -> Result<()> {
+        self.state.record_event(
+            &run.id,
+            "run_incident",
+            &json!({
+                "severity": "warning",
+                "kind": "cockpit_worker_fallback",
+                "adapter": "herdr",
+                "mode": mode.as_str(),
+                "slice_id": context.slice_id,
+                "attempt": context.attempt,
+                "message": message,
+                "fallback": "direct",
+                "source_of_truth": "kd_artifact_files",
+            }),
+        )
     }
 
     fn record_contract_warnings(
@@ -812,6 +1053,7 @@ impl Manager {
                 runner,
                 parallelism,
                 IntegrationMode::Fresh,
+                cockpit_mode,
                 worker_token,
             );
         });
@@ -924,6 +1166,7 @@ impl Manager {
                 runner,
                 parallelism,
                 IntegrationMode::Existing,
+                cockpit_mode,
                 worker_token,
             );
         });
@@ -1182,6 +1425,7 @@ impl Manager {
         runner: Arc<dyn Runner>,
         parallelism: usize,
         integration_mode: IntegrationMode,
+        cockpit_mode: CockpitMode,
         worker_token: String,
     ) {
         let outcome = self.run_slices(
@@ -1192,6 +1436,7 @@ impl Manager {
             runner,
             parallelism,
             integration_mode,
+            cockpit_mode,
             worker_token,
         );
         let (terminal_status, terminal_message) = match &outcome {
@@ -1272,6 +1517,7 @@ impl Manager {
         runner: Arc<dyn Runner>,
         parallelism: usize,
         integration_mode: IntegrationMode,
+        cockpit_mode: CockpitMode,
         worker_token: String,
     ) -> Result<ImplementationSummary> {
         check_cancelled(cancel)?;
@@ -1347,6 +1593,7 @@ impl Manager {
                 cancel: cancel.clone(),
                 runner: runner.clone(),
                 config: config.clone(),
+                cockpit_mode,
                 economics: economics.clone(),
                 verification_cache: verification_cache.clone(),
                 worker_token: worker_token.clone(),
@@ -2068,7 +2315,7 @@ impl Manager {
                 runner.name(),
                 "slice worker is running",
             );
-            let result = match self.run_recorded_agent_job(
+            let result = match self.run_recorded_slice_worker_job(
                 runner.clone(),
                 Job {
                     kind: "slice-worker".to_string(),
@@ -2086,6 +2333,9 @@ impl Manager {
                     slice_id: &slice.id,
                     attempt,
                 },
+                run,
+                ctx.cockpit_mode,
+                &output_path,
             ) {
                 Ok(result) => result,
                 Err(err) => {

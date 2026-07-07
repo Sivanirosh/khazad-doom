@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
@@ -282,6 +285,16 @@ pub trait Runner: Send + Sync {
     fn pi_contract_observation(&self) -> Option<PiContractObservation> {
         None
     }
+
+    fn pi_command_spec(&self) -> Option<PiCommandSpec> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiCommandSpec {
+    pub bin: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +368,15 @@ pub struct PiRunner {
     pub metadata: RunnerMetadata,
 }
 
+impl PiRunner {
+    pub fn command_spec(&self) -> PiCommandSpec {
+        PiCommandSpec {
+            bin: resolved_pi_bin(&self.bin),
+            args: pi_contract::launch_args(&self.extra_args),
+        }
+    }
+}
+
 impl Runner for PiRunner {
     fn run(
         &self,
@@ -365,20 +387,16 @@ impl Runner for PiRunner {
         if cancel.is_cancelled() {
             bail!("job cancelled");
         }
-        let bin = if self.bin.trim().is_empty() {
-            "pi"
-        } else {
-            &self.bin
-        };
-        let mut cmd = Command::new(bin);
-        cmd.args(pi_contract::launch_args(&self.extra_args))
+        let spec = self.command_spec();
+        let mut cmd = Command::new(&spec.bin);
+        cmd.args(&spec.args)
             .envs(&job.env)
             .current_dir(&job.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().with_context(|| format!("start {bin}"))?;
+        let mut child = cmd.spawn().with_context(|| format!("start {}", spec.bin))?;
         let pid = child.id();
         emit_runner_event(&events, RunnerEvent::started(Some(pid)));
 
@@ -470,6 +488,18 @@ impl Runner for PiRunner {
     fn pi_contract_observation(&self) -> Option<PiContractObservation> {
         Some(pi_contract::observation(&self.bin, &self.extra_args))
     }
+
+    fn pi_command_spec(&self) -> Option<PiCommandSpec> {
+        Some(self.command_spec())
+    }
+}
+
+fn resolved_pi_bin(bin: &str) -> String {
+    if bin.trim().is_empty() {
+        "pi".to_string()
+    } else {
+        bin.to_string()
+    }
 }
 
 fn join_parser(parser_thread: thread::JoinHandle<Result<PiParser>>) -> Result<PiParser> {
@@ -505,6 +535,467 @@ fn request_child_terminate(pid: u32) {
 
 #[cfg(not(unix))]
 fn request_child_terminate(_pid: u32) {}
+
+#[cfg(unix)]
+fn request_child_kill(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn request_child_kill(_pid: u32) {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PiWrapperArtifacts {
+    pub prompt_path: PathBuf,
+    pub env_path: PathBuf,
+    pub wrapper_path: PathBuf,
+    pub command_path: PathBuf,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+    pub exit_path: PathBuf,
+    pub status_path: PathBuf,
+    pub result_path: PathBuf,
+}
+
+impl PiWrapperArtifacts {
+    pub fn for_output_path(output_path: &Path) -> Result<Self> {
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("worker output path has no parent"))?;
+        let file_name = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("worker output path is not UTF-8"))?;
+        let prefix = file_name.strip_suffix(".json").unwrap_or(file_name);
+        let path = |suffix: &str| parent.join(format!("{prefix}.herdr.{suffix}"));
+        Ok(Self {
+            prompt_path: path("prompt.txt"),
+            env_path: path("env.sh"),
+            wrapper_path: path("wrapper.sh"),
+            command_path: path("command.json"),
+            stdout_path: path("stdout.ndjson"),
+            stderr_path: path("stderr.log"),
+            exit_path: path("exit.json"),
+            status_path: path("status.json"),
+            result_path: path("result.json"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PiWrapperStatus {
+    state: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+pub(crate) fn prepare_pi_wrapper_artifacts(
+    spec: &PiCommandSpec,
+    job: &Job,
+    artifacts: &PiWrapperArtifacts,
+) -> Result<String> {
+    if let Some(parent) = artifacts.wrapper_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    for path in [
+        &artifacts.stdout_path,
+        &artifacts.stderr_path,
+        &artifacts.exit_path,
+        &artifacts.status_path,
+        &artifacts.result_path,
+    ] {
+        let _ = fs::remove_file(path);
+    }
+
+    write_private(
+        &artifacts.prompt_path,
+        build_prompt(&job.prompt, &job.json_schema),
+    )?;
+    write_private(&artifacts.env_path, env_file_text(&job.env))?;
+    artifact::write_json(
+        &artifacts.command_path,
+        &json!({
+            "bin": spec.bin,
+            "args": spec.args,
+            "cwd": job.cwd,
+            "prompt_path": artifacts.prompt_path,
+            "stdout_path": artifacts.stdout_path,
+            "stderr_path": artifacts.stderr_path,
+            "exit_path": artifacts.exit_path,
+            "status_path": artifacts.status_path,
+            "result_path": artifacts.result_path,
+            "env_keys": effective_env(&job.env).keys().cloned().collect::<Vec<_>>(),
+            "contract": "khazad-owned-herdr-pi-wrapper-v1",
+        }),
+    )?;
+    write_private(
+        &artifacts.wrapper_path,
+        wrapper_script(spec, job, artifacts),
+    )?;
+    make_executable_private(&artifacts.wrapper_path)?;
+    Ok(format!(
+        "/bin/sh {}",
+        shell_quote_path(&artifacts.wrapper_path)
+    ))
+}
+
+pub(crate) fn wait_for_pi_wrapper_launch(
+    artifacts: &PiWrapperArtifacts,
+    timeout: Duration,
+    events: &Option<RunnerEventSink>,
+) -> Result<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = read_wrapper_status(&artifacts.status_path)? {
+            if let Some(pid) = status.pid
+                && matches!(status.state.as_str(), "launched" | "finished")
+            {
+                emit_runner_event(events, RunnerEvent::started(Some(pid)));
+                return Ok(pid);
+            }
+            if matches!(status.state.as_str(), "handoff_failed" | "setup_failed") {
+                bail!(
+                    "Herdr worker wrapper failed before launching Pi: {}",
+                    status.state
+                );
+            }
+        }
+        if artifacts.exit_path.exists() {
+            bail!(
+                "Herdr worker wrapper exited before reporting a launched Pi process: {}",
+                bounded_file_text(&artifacts.stderr_path, 2000)
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Herdr worker wrapper did not report a launched Pi process within {}s",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub(crate) fn collect_pi_wrapper_result(
+    job: &Job,
+    artifacts: &PiWrapperArtifacts,
+    cancel: CancellationToken,
+    events: Option<RunnerEventSink>,
+    pid: u32,
+) -> Result<ResultData> {
+    let mut stdout_offset = 0_u64;
+    let mut stderr_offset = 0_u64;
+    let mut next_observation = Instant::now();
+    let exit_code = loop {
+        emit_new_file_lines(
+            &artifacts.stdout_path,
+            &mut stdout_offset,
+            &events,
+            pid,
+            RunnerEvent::stdout,
+        )?;
+        emit_new_file_lines(
+            &artifacts.stderr_path,
+            &mut stderr_offset,
+            &events,
+            pid,
+            RunnerEvent::stderr,
+        )?;
+        if cancel.is_cancelled() {
+            terminate_wrapped_process(
+                pid,
+                &artifacts.exit_path,
+                Duration::from_secs(job.termination_grace_seconds),
+            );
+            let transcript = wrapper_transcript(artifacts, Some(pid));
+            return Err(RunnerError::new("job cancelled", transcript).into());
+        }
+        if let Some(code) = read_wrapper_exit_code(artifacts)? {
+            emit_runner_event(&events, RunnerEvent::finished(Some(pid), Some(code)));
+            break code;
+        }
+        if Instant::now() >= next_observation {
+            emit_runner_event(&events, RunnerEvent::process_observed(Some(pid)));
+            next_observation = Instant::now() + Duration::from_secs(1);
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    emit_new_file_lines(
+        &artifacts.stdout_path,
+        &mut stdout_offset,
+        &events,
+        pid,
+        RunnerEvent::stdout,
+    )?;
+    emit_new_file_lines(
+        &artifacts.stderr_path,
+        &mut stderr_offset,
+        &events,
+        pid,
+        RunnerEvent::stderr,
+    )?;
+    let data = parse_pi_artifact_result(job, artifacts, exit_code, Some(pid))?;
+    artifact::write_json(
+        &artifacts.result_path,
+        &json!({
+            "output": data.output,
+            "usage": data.usage,
+            "contract_warnings": data.contract_warnings,
+            "source": "khazad_owned_wrapper_artifacts",
+        }),
+    )?;
+    Ok(data)
+}
+
+fn parse_pi_artifact_result(
+    job: &Job,
+    artifacts: &PiWrapperArtifacts,
+    exit_code: i32,
+    pid: Option<u32>,
+) -> Result<ResultData> {
+    let stdout = File::open(&artifacts.stdout_path).with_context(|| {
+        format!(
+            "open Pi stdout artifact {}",
+            artifacts.stdout_path.display()
+        )
+    })?;
+    let mut parser = PiParser::default();
+    parser.parse(stdout, None, pid)?;
+    let stderr = fs::read_to_string(&artifacts.stderr_path).unwrap_or_default();
+    if exit_code != 0 {
+        let status = format!("exit status: {exit_code}");
+        let msg = stderr.trim();
+        let message = if msg.is_empty() {
+            format!("pi exited with {status}")
+        } else {
+            format!("pi exited with {status}: {msg}")
+        };
+        return Err(RunnerError::new(message, parser.transcript(&stderr)).into());
+    }
+
+    let text = parser.final_text().trim().to_string();
+    let output = if job.json_schema.trim().is_empty() {
+        None
+    } else {
+        Some(
+            extract_json_object(&text)
+                .with_context(|| format!("parse pi JSON output from {text:?}"))?,
+        )
+    };
+    Ok(ResultData {
+        output,
+        usage: parser.usage().clone(),
+        contract_warnings: parser.warnings().to_vec(),
+    })
+}
+
+fn wrapper_transcript(artifacts: &PiWrapperArtifacts, pid: Option<u32>) -> RunnerTranscript {
+    let stdout = File::open(&artifacts.stdout_path);
+    let stderr = fs::read_to_string(&artifacts.stderr_path).unwrap_or_default();
+    let mut parser = PiParser::default();
+    if let Ok(stdout) = stdout {
+        let _ = parser.parse(stdout, None, pid);
+    }
+    parser.transcript(&stderr)
+}
+
+fn read_wrapper_exit_code(artifacts: &PiWrapperArtifacts) -> Result<Option<i32>> {
+    if artifacts.exit_path.exists() {
+        let value: Value = artifact::read_json(&artifacts.exit_path)?;
+        return Ok(value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map(|value| value as i32));
+    }
+    Ok(
+        read_wrapper_status(&artifacts.status_path)?.and_then(|status| {
+            (status.state == "finished")
+                .then_some(status.exit_code)
+                .flatten()
+        }),
+    )
+}
+
+fn read_wrapper_status(path: &Path) -> Result<Option<PiWrapperStatus>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    artifact::read_json(path).map(Some)
+}
+
+fn emit_new_file_lines(
+    path: &Path,
+    offset: &mut u64,
+    events: &Option<RunnerEventSink>,
+    pid: u32,
+    make_event: fn(Option<u32>, String) -> RunnerEvent,
+) -> Result<()> {
+    let Ok(mut file) = File::open(path) else {
+        return Ok(());
+    };
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    *offset += text.len() as u64;
+    for line in text.lines() {
+        emit_runner_event(events, make_event(Some(pid), line.to_string()));
+    }
+    Ok(())
+}
+
+fn terminate_wrapped_process(pid: u32, exit_path: &Path, grace: Duration) {
+    request_child_terminate(pid);
+    if grace.as_millis() > 0 {
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if exit_path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    request_child_kill(pid);
+}
+
+fn wrapper_script(spec: &PiCommandSpec, job: &Job, artifacts: &PiWrapperArtifacts) -> String {
+    let command = std::iter::once(shell_quote(&spec.bin))
+        .chain(spec.args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        r#"#!/usr/bin/env sh
+set -u
+umask 077
+STATUS={status}
+EXIT={exit}
+STDOUT={stdout}
+STDERR={stderr}
+PROMPT={prompt}
+ENV_FILE={env_file}
+CWD={cwd}
+printf '{{"state":"starting"}}\n' > "$STATUS"
+. "$ENV_FILE"
+code=$?
+if [ "$code" -ne 0 ]; then
+  printf '{{"state":"handoff_failed","exit_code":%s}}\n' "$code" > "$STATUS"
+  exit "$code"
+fi
+cd "$CWD"
+code=$?
+if [ "$code" -ne 0 ]; then
+  printf '{{"state":"handoff_failed","exit_code":%s}}\n' "$code" > "$STATUS"
+  exit "$code"
+fi
+: > "$STDOUT"
+: > "$STDERR"
+env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
+pid=$!
+printf '{{"state":"launched","pid":%s}}\n' "$pid" > "$STATUS"
+wait "$pid"
+code=$?
+printf '{{"exit_code":%s}}\n' "$code" > "$EXIT"
+printf '{{"state":"finished","pid":%s,"exit_code":%s}}\n' "$pid" "$code" > "$STATUS"
+exit "$code"
+"#,
+        status = shell_quote_path(&artifacts.status_path),
+        exit = shell_quote_path(&artifacts.exit_path),
+        stdout = shell_quote_path(&artifacts.stdout_path),
+        stderr = shell_quote_path(&artifacts.stderr_path),
+        prompt = shell_quote_path(&artifacts.prompt_path),
+        env_file = shell_quote_path(&artifacts.env_path),
+        cwd = shell_quote_path(&job.cwd),
+        command = command,
+    )
+}
+
+fn env_file_text(job_env: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (key, value) in effective_env(job_env) {
+        if is_valid_env_key(&key) {
+            out.push_str("export ");
+            out.push_str(&key);
+            out.push('=');
+            out.push_str(&shell_quote(&value));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn effective_env(job_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    env.extend(
+        job_env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    env
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn write_private(path: &Path, text: String) -> Result<()> {
+    fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    set_private_permissions(path, 0o600)
+}
+
+fn make_executable_private(path: &Path) -> Result<()> {
+    set_private_permissions(path, 0o700)
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    shell_quote(&path.to_string_lossy())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn bounded_file_text(path: &Path, max_bytes: usize) -> String {
+    fs::read_to_string(path)
+        .map(|text| tail_text(&text, max_bytes))
+        .unwrap_or_default()
+}
+
+fn tail_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) && start < text.len() {
+        start += 1;
+    }
+    text[start..].to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct FakeRunner;
