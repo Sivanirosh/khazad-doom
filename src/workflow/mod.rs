@@ -12,7 +12,10 @@ use anyhow::Result;
 use std::error::Error;
 use std::fmt;
 
-pub(crate) use cockpit::cockpit_mode_transport_arg;
+pub(crate) use cockpit::{
+    CockpitOpenFocus, cockpit_mode_transport_arg, open_default_run_cockpit_for_operator,
+    workspace_label_for_run as cockpit_workspace_label_for_run,
+};
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
 pub(crate) use projection::project_run;
 pub use prompts::{integration_repair_prompt, worker_prompt};

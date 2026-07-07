@@ -58,7 +58,8 @@ pub(crate) struct CockpitWorkerPaneRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct CockpitWorkspaceRef {
     id: String,
-    anchor_pane: CockpitPaneRef,
+    anchor_pane: Option<CockpitPaneRef>,
+    existed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,16 @@ pub(crate) struct CockpitOpened {
 pub(crate) enum CockpitLaunch {
     Opened(CockpitOpened),
     SkippedDirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitOpenFocus {
+    pub adapter: String,
+    pub mode: CockpitMode,
+    pub workspace_label: String,
+    pub action: String,
+    pub pane_labels: Vec<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,11 +156,11 @@ impl<A: CockpitAdapter> Cockpit<A> {
         Self { mode, adapter }
     }
 
-    pub fn open_run(&self, request: &CockpitRunRequest) -> Result<CockpitLaunch> {
-        if self.mode == CockpitMode::Direct {
-            return Ok(CockpitLaunch::SkippedDirect);
-        }
-        let workspace = self.adapter.open_or_focus_run_workspace(request)?;
+    fn create_run_panes(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        request: &CockpitRunRequest,
+    ) -> Result<Vec<String>> {
         let pane_env = vec![
             (
                 "KHAZAD_HOME".to_string(),
@@ -163,20 +174,56 @@ impl<A: CockpitAdapter> Cockpit<A> {
             cwd: request.repo_path.clone(),
             env: pane_env.clone(),
         };
-        self.adapter.create_read_only_pane(&workspace, &feed)?;
+        self.adapter.create_read_only_pane(workspace, &feed)?;
         let phase = CockpitPaneRequest {
             label: INTEGRATION_GATE_REPAIR_PANE.to_string(),
             command: request.phase_command.clone(),
             cwd: request.repo_path.clone(),
             env: pane_env,
         };
-        self.adapter.create_read_only_pane(&workspace, &phase)?;
+        self.adapter.create_read_only_pane(workspace, &phase)?;
+        Ok(vec![feed.label, phase.label])
+    }
+
+    pub fn open_run(&self, request: &CockpitRunRequest) -> Result<CockpitLaunch> {
+        if self.mode == CockpitMode::Direct {
+            return Ok(CockpitLaunch::SkippedDirect);
+        }
+        let workspace = self.adapter.open_or_focus_run_workspace(request)?;
+        let pane_labels = self.create_run_panes(&workspace, request)?;
         Ok(CockpitLaunch::Opened(CockpitOpened {
             adapter: self.adapter.name().to_string(),
             mode: self.mode,
             workspace_label: request.workspace_label.clone(),
-            pane_labels: vec![feed.label, phase.label],
+            pane_labels,
         }))
+    }
+
+    pub fn open_or_focus_run(&self, request: &CockpitRunRequest) -> Result<CockpitOpenFocus> {
+        if self.mode == CockpitMode::Direct {
+            bail!("cockpit direct mode does not open a Herdr workspace");
+        }
+        let workspace = self.adapter.open_or_focus_run_workspace(request)?;
+        if workspace.existed {
+            return Ok(CockpitOpenFocus {
+                adapter: self.adapter.name().to_string(),
+                mode: self.mode,
+                workspace_label: request.workspace_label.clone(),
+                action: "focused_existing".to_string(),
+                pane_labels: Vec::new(),
+                message: "focused existing Herdr cockpit workspace".to_string(),
+            });
+        }
+        let pane_labels = self.create_run_panes(&workspace, request)?;
+        Ok(CockpitOpenFocus {
+            adapter: self.adapter.name().to_string(),
+            mode: self.mode,
+            workspace_label: request.workspace_label.clone(),
+            action: "opened".to_string(),
+            pane_labels,
+            message: "opened Herdr cockpit workspace backed by daemon monitor/status commands"
+                .to_string(),
+        })
     }
 
     pub fn open_worker_pane(
@@ -226,6 +273,18 @@ pub(crate) fn open_default_run_cockpit(
     let request = CockpitRunRequest::for_run(run, khazad_home);
     Cockpit::new(mode, adapter)
         .open_run(&request)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn open_default_run_cockpit_for_operator(
+    run: &Run,
+    khazad_home: &Path,
+) -> std::result::Result<CockpitOpenFocus, CockpitUnavailable> {
+    let mode = CockpitMode::Herdr;
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    let request = CockpitRunRequest::for_run(run, khazad_home);
+    Cockpit::new(mode, adapter)
+        .open_or_focus_run(&request)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
 }
 
@@ -376,7 +435,8 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             ])?;
             return Ok(CockpitWorkspaceRef {
                 id: workspace_id.to_string(),
-                anchor_pane: self.first_pane_in_workspace(workspace_id)?,
+                anchor_pane: None,
+                existed: true,
             });
         }
 
@@ -402,9 +462,10 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             .ok_or_else(|| anyhow!("herdr workspace create omitted root_pane.pane_id"))?;
         Ok(CockpitWorkspaceRef {
             id: workspace_id.to_string(),
-            anchor_pane: CockpitPaneRef {
+            anchor_pane: Some(CockpitPaneRef {
                 id: root_pane.to_string(),
-            },
+            }),
+            existed: false,
         })
     }
 
@@ -418,10 +479,14 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         } else {
             "right"
         };
+        let anchor_pane_id = match &workspace.anchor_pane {
+            Some(pane) => pane.id.clone(),
+            None => self.first_pane_in_workspace(&workspace.id)?.id,
+        };
         let mut args = vec![
             "pane".to_string(),
             "split".to_string(),
-            workspace.anchor_pane.id.clone(),
+            anchor_pane_id,
             "--direction".to_string(),
             direction.to_string(),
             "--ratio".to_string(),
@@ -570,9 +635,17 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeCockpitAdapter {
         calls: Arc<Mutex<Vec<String>>>,
+        workspace_existed: bool,
     }
 
     impl FakeCockpitAdapter {
+        fn existing_workspace() -> Self {
+            Self {
+                workspace_existed: true,
+                ..Self::default()
+            }
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
@@ -593,9 +666,10 @@ mod tests {
                 .push(format!("workspace:{}", request.workspace_label));
             Ok(CockpitWorkspaceRef {
                 id: "workspace-1".to_string(),
-                anchor_pane: CockpitPaneRef {
+                anchor_pane: Some(CockpitPaneRef {
                     id: "pane-1".to_string(),
-                },
+                }),
+                existed: self.workspace_existed,
             })
         }
 
@@ -651,6 +725,26 @@ mod tests {
                 .iter()
                 .all(|call| !call.to_lowercase().contains("planner"))
         );
+    }
+
+    #[test]
+    fn cockpit_open_or_focus_existing_workspace_does_not_create_duplicate_panes() {
+        let adapter = FakeCockpitAdapter::existing_workspace();
+        let request = CockpitRunRequest {
+            repo_path: PathBuf::from("/repo"),
+            khazad_home: PathBuf::from("/khazad-home"),
+            workspace_label: workspace_label_for_run("kd-test"),
+            feed_command: "khazad-doom monitor --run kd-test".to_string(),
+            phase_command: "khazad-doom status --run kd-test --follow".to_string(),
+        };
+
+        let opened = Cockpit::new(CockpitMode::Herdr, adapter.clone())
+            .open_or_focus_run(&request)
+            .unwrap();
+
+        assert_eq!(opened.action, "focused_existing");
+        assert!(opened.pane_labels.is_empty());
+        assert_eq!(adapter.calls(), vec!["workspace:Khazad-Doom kd-test"]);
     }
 
     #[test]
