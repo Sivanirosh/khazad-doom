@@ -4,6 +4,7 @@ mod gate;
 mod manager;
 mod projection;
 mod prompts;
+pub(crate) mod read_model;
 mod schema;
 mod shell;
 
@@ -18,8 +19,8 @@ pub(crate) use cockpit::{
     workspace_label_for_run as cockpit_workspace_label_for_run,
 };
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
-pub(crate) use projection::project_run;
 pub use prompts::{integration_repair_prompt, worker_prompt};
+pub(crate) use read_model::{RunReadModel, RunReadModelBuilder, RunReadModelOptions};
 pub use schema::{REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA};
 
 pub(crate) fn check_cancelled(cancel: &CancellationToken) -> Result<()> {
