@@ -636,7 +636,7 @@ impl Manager {
                     "source_of_truth": "kd_artifact_files",
                 }),
             )
-            .map_err(|err| CockpitWorkerJobError::Worker(err.into()))?;
+            .map_err(CockpitWorkerJobError::Worker)?;
         let pid = match wait_for_pi_wrapper_launch(&artifacts, Duration::from_secs(5), &events) {
             Ok(pid) => pid,
             Err(err) if cancel.is_cancelled() => return Err(CockpitWorkerJobError::Worker(err)),
