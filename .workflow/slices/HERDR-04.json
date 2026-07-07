@@ -2,7 +2,9 @@
   "id": "HERDR-04",
   "title": "Live worker activity painter",
   "goal": "Make Herdr worker panes visibly useful during long Pi worker attempts by painting the daemon-owned wrapper stdout event stream live, without changing the correctness path or making terminal scrollback authoritative.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-091412-a77ab877",
+  "closed_at": "2026-07-07T09:47:09.312286835+00:00",
   "depends_on": [
     "PI-PROOF-01"
   ],

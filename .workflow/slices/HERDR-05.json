@@ -2,7 +2,9 @@
   "id": "HERDR-05",
   "title": "Gate and repair activity painter",
   "goal": "Make the Herdr Integration Gate / Repair pane show live daemon-owned gate and repair command activity when commands are running, while retaining summary/status output when no command is active.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-091412-a77ab877",
+  "closed_at": "2026-07-07T09:47:09.312286835+00:00",
   "depends_on": [
     "HERDR-04"
   ],
