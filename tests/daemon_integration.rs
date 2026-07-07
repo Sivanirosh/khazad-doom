@@ -241,6 +241,7 @@ fn cockpit_herdr_failure_is_nonfatal_incident() -> TestResult {
     let fake_bin = tempfile::tempdir()?;
     init_git_repo(repo.path())?;
     write_failing_herdr(fake_bin.path())?;
+    let fake_pi = write_quiet_fake_pi(fake_bin.path())?;
     let fake_path = prepend_path(fake_bin.path());
     let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
 
@@ -255,7 +256,7 @@ fn cockpit_herdr_failure_is_nonfatal_incident() -> TestResult {
         json!({
             "id": "COCKPIT-FALLBACK",
             "title": "Cockpit fallback",
-            "goal": "Complete fake work even when Herdr cockpit launch fails.",
+            "goal": "Complete Pi work even when Herdr cockpit launch fails.",
             "acceptance": ["COCKPIT-FALLBACK.txt exists"],
             "verify": ["test -f COCKPIT-FALLBACK.txt"]
         }),
@@ -272,7 +273,9 @@ fn cockpit_herdr_failure_is_nonfatal_incident() -> TestResult {
             "--repo",
             path(repo.path()),
             "--agent",
-            "fake",
+            "pi",
+            "--pi-bin",
+            path(&fake_pi),
             "--cockpit",
             "herdr",
             "--all",
@@ -290,11 +293,18 @@ fn cockpit_herdr_failure_is_nonfatal_incident() -> TestResult {
     )?;
     let completed = json_stdout(&completed)?;
     assert_eq!(completed["run"]["status"].as_str(), Some("completed"));
-    assert!(completed["events"].as_array().unwrap().iter().any(|event| {
+    let events = completed["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| {
         event["type"].as_str() == Some("run_incident")
             && event["payload"]["kind"].as_str() == Some("cockpit_unavailable")
             && event["payload"]["fallback"].as_str() == Some("direct")
             && event["payload"]["remediation"].as_str().is_some()
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"].as_str() == Some("run_incident")
+            && event["payload"]["kind"].as_str() == Some("cockpit_worker_fallback")
+            && event["payload"]["fallback"].as_str() == Some("direct")
+            && event["payload"]["slice_id"].as_str() == Some("COCKPIT-FALLBACK")
     }));
 
     guard.stop();
@@ -376,6 +386,102 @@ fn herdr_cockpit_workspace_real() -> TestResult {
         event["type"].as_str() == Some("cockpit_ready")
             && event["payload"]["workspace"].as_str() == Some(workspace_label.as_str())
     }));
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn herdr_worker_wrapper_real() -> TestResult {
+    if std::env::var("HERDR_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping real Herdr worker wrapper smoke; set HERDR_E2E=1 to enable");
+        return Ok(());
+    }
+    if !herdr_available() {
+        eprintln!("skipping real Herdr worker wrapper smoke; herdr binary is not on PATH");
+        return Ok(());
+    }
+
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_quiet_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    fs::write(
+        repo.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "pi",
+                "parallelism": 1,
+                "worker_termination_grace_seconds": 1
+            }))?
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "HERDR-WRAP",
+            "title": "Herdr wrapper worker smoke",
+            "goal": "Run a Pi-compatible worker through the KD-owned Herdr wrapper.",
+            "acceptance": ["HERDR-WRAP.txt exists"],
+            "verify": ["test -f HERDR-WRAP.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add Herdr wrapper smoke slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--pi-bin",
+            path(&fake_pi),
+            "--cockpit",
+            "herdr",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let workspace_label = format!("Khazad-Doom {run_id}");
+    let workspace_id = wait_for_herdr_workspace(&workspace_label)?;
+    let _workspace_guard = HerdrWorkspaceGuard::new(workspace_id.clone());
+    let worker_label = format!("Worker {run_id}/HERDR-WRAP attempt 1");
+    wait_for_herdr_pane_label(&workspace_id, &worker_label)?;
+
+    let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    assert!(completed["events"].as_array().unwrap().iter().any(|event| {
+        event["type"].as_str() == Some("cockpit_worker_ready")
+            && event["payload"]["pane"].as_str() == Some(worker_label.as_str())
+            && event["payload"]["source_of_truth"].as_str() == Some("kd_artifact_files")
+    }));
+
+    let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
+    let inspected = json_stdout(&inspected)?;
+    for artifact in [
+        "HERDR-WRAP.worker.attempt-1.herdr.stdout.ndjson",
+        "HERDR-WRAP.worker.attempt-1.herdr.stderr.log",
+        "HERDR-WRAP.worker.attempt-1.herdr.exit.json",
+        "HERDR-WRAP.worker.attempt-1.herdr.result.json",
+        "HERDR-WRAP.worker.attempt-1.json",
+    ] {
+        artifact_path(&inspected, artifact)?;
+    }
 
     guard.stop();
     Ok(())
@@ -1725,6 +1831,25 @@ fn wait_for_herdr_workspace(label: &str) -> TestResult<String> {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for Herdr workspace {label:?}; workspaces: {workspaces:#}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_herdr_pane_label(workspace_id: &str, label: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let panes = herdr_json(&["pane", "list", "--workspace", workspace_id])?;
+        if panes["result"]["panes"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|pane| pane["label"].as_str() == Some(label))
+        }) {
+            return Ok(());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Herdr pane {label:?}; panes: {panes:#}"
         );
         thread::sleep(Duration::from_millis(100));
     }

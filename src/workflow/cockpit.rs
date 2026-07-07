@@ -46,6 +46,16 @@ pub(crate) struct CockpitPaneRequest {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct CockpitWorkerPaneRequest {
+    pub run_id: String,
+    pub slice_id: String,
+    pub attempt: usize,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CockpitWorkspaceRef {
     id: String,
     anchor_pane: CockpitPaneRef,
@@ -67,6 +77,21 @@ pub(crate) struct CockpitOpened {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CockpitLaunch {
     Opened(CockpitOpened),
+    SkippedDirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitWorkerOpened {
+    pub adapter: String,
+    pub mode: CockpitMode,
+    pub workspace_label: String,
+    pub pane_label: String,
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CockpitWorkerLaunch {
+    Opened(CockpitWorkerOpened),
     SkippedDirect,
 }
 
@@ -100,6 +125,13 @@ pub(crate) trait CockpitAdapter {
         workspace: &CockpitWorkspaceRef,
         request: &CockpitPaneRequest,
     ) -> Result<CockpitPaneRef>;
+    fn create_worker_pane(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        request: &CockpitPaneRequest,
+    ) -> Result<CockpitPaneRef> {
+        self.create_read_only_pane(workspace, request)
+    }
 }
 
 #[derive(Debug)]
@@ -146,6 +178,35 @@ impl<A: CockpitAdapter> Cockpit<A> {
             pane_labels: vec![feed.label, phase.label],
         }))
     }
+
+    pub fn open_worker_pane(
+        &self,
+        run_request: &CockpitRunRequest,
+        worker_request: &CockpitWorkerPaneRequest,
+    ) -> Result<CockpitWorkerLaunch> {
+        if self.mode == CockpitMode::Direct {
+            return Ok(CockpitWorkerLaunch::SkippedDirect);
+        }
+        let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
+        let pane = CockpitPaneRequest {
+            label: worker_pane_label(
+                &worker_request.run_id,
+                &worker_request.slice_id,
+                worker_request.attempt,
+            ),
+            command: worker_request.command.clone(),
+            cwd: worker_request.cwd.clone(),
+            env: worker_request.env.clone(),
+        };
+        let pane_ref = self.adapter.create_worker_pane(&workspace, &pane)?;
+        Ok(CockpitWorkerLaunch::Opened(CockpitWorkerOpened {
+            adapter: self.adapter.name().to_string(),
+            mode: self.mode,
+            workspace_label: run_request.workspace_label.clone(),
+            pane_label: pane.label,
+            pane_id: pane_ref.id,
+        }))
+    }
 }
 
 pub(crate) fn open_default_run_cockpit(
@@ -166,6 +227,30 @@ pub(crate) fn open_default_run_cockpit(
     Cockpit::new(mode, adapter)
         .open_run(&request)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn open_default_worker_pane(
+    run: &Run,
+    mode: CockpitMode,
+    khazad_home: &Path,
+    worker_request: &CockpitWorkerPaneRequest,
+) -> std::result::Result<CockpitWorkerLaunch, CockpitUnavailable> {
+    #[cfg(test)]
+    if std::env::var("KHAZAD_UNIT_TEST_COCKPIT").ok().as_deref() != Some("1") {
+        return Ok(CockpitWorkerLaunch::SkippedDirect);
+    }
+    if mode == CockpitMode::Direct {
+        return Ok(CockpitWorkerLaunch::SkippedDirect);
+    }
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    let request = CockpitRunRequest::for_run(run, khazad_home);
+    Cockpit::new(mode, adapter)
+        .open_worker_pane(&request, worker_request)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn worker_pane_label(run_id: &str, slice_id: &str, attempt: usize) -> String {
+    format!("Worker {run_id}/{slice_id} attempt {attempt}")
 }
 
 pub(crate) fn cockpit_mode_transport_arg(value: &str) -> Result<String> {
@@ -585,6 +670,44 @@ mod tests {
 
         assert_eq!(launched, CockpitLaunch::SkippedDirect);
         assert!(adapter.calls().is_empty());
+    }
+
+    #[test]
+    fn cockpit_worker_pane_uses_deterministic_run_and_slice_label() {
+        let adapter = FakeCockpitAdapter::default();
+        let request = CockpitRunRequest {
+            repo_path: PathBuf::from("/repo"),
+            khazad_home: PathBuf::from("/khazad-home"),
+            workspace_label: workspace_label_for_run("kd-run"),
+            feed_command: "feed".to_string(),
+            phase_command: "phase".to_string(),
+        };
+        let worker = CockpitWorkerPaneRequest {
+            run_id: "kd-run".to_string(),
+            slice_id: "SLICE-1".to_string(),
+            attempt: 2,
+            command: "/bin/sh wrapper.sh".to_string(),
+            cwd: PathBuf::from("/repo/worker"),
+            env: vec![("KHAZAD_COCKPIT_WORKER".to_string(), "1".to_string())],
+        };
+
+        let opened = Cockpit::new(CockpitMode::Herdr, adapter.clone())
+            .open_worker_pane(&request, &worker)
+            .unwrap();
+
+        assert_eq!(
+            opened,
+            CockpitWorkerLaunch::Opened(CockpitWorkerOpened {
+                adapter: "fake-herdr".to_string(),
+                mode: CockpitMode::Herdr,
+                workspace_label: "Khazad-Doom kd-run".to_string(),
+                pane_label: "Worker kd-run/SLICE-1 attempt 2".to_string(),
+                pane_id: "pane-31".to_string(),
+            })
+        );
+        let calls = adapter.calls();
+        assert_eq!(calls[0], "workspace:Khazad-Doom kd-run");
+        assert!(calls[1].starts_with("pane:Worker kd-run/SLICE-1 attempt 2:/bin/sh wrapper.sh"));
     }
 
     #[test]
