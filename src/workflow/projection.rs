@@ -50,8 +50,8 @@ pub fn project_waiting(repo: &str) -> StatusFeed {
 
 pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
     let mut blocks = Vec::new();
-    blocks.push(todos_block(details));
     blocks.push(run_block(details, now));
+    blocks.push(todos_block(details));
     if let Some(reason) = &details.primary_terminal_reason {
         blocks.push(terminal_reason_block(reason));
     }
@@ -75,17 +75,18 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
             ));
         }
     }
-    if let Some(economics) = &details.economics {
-        blocks.push(economics_block(economics));
-    }
-    if !details.incidents.is_empty() {
-        blocks.push(incidents_block(&details.incidents));
-    }
+    blocks.push(semantic_progress_block(details, now));
     if let Some(activity) = activity_block(details) {
         blocks.push(activity);
     }
     if let Some(tail) = tail_block(details) {
         blocks.push(tail);
+    }
+    if let Some(economics) = &details.economics {
+        blocks.push(economics_block(details, economics));
+    }
+    if !details.incidents.is_empty() {
+        blocks.push(incidents_block(&details.incidents));
     }
 
     let question_commands = pending_question_commands(details);
@@ -460,16 +461,6 @@ fn progress_block(
                 StatusFeedRole::Info,
             ),
             line(
-                format!(
-                    "Last semantic progress: {}",
-                    worker
-                        .last_semantic_progress_at
-                        .map(|time| since_time(time, now))
-                        .unwrap_or_else(|| "unknown".to_string())
-                ),
-                StatusFeedRole::Info,
-            ),
-            line(
                 format!("Timeout: {}", timeout_label(worker, now)),
                 StatusFeedRole::Dim,
             ),
@@ -533,13 +524,66 @@ fn progress_block(
     block(label, format!("({})", meta.join(" • ")), lines)
 }
 
-fn economics_block(economics: &RunEconomics) -> StatusFeedBlock {
+fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
+    let worker = details
+        .progress
+        .as_ref()
+        .and_then(|progress| progress.worker.as_ref());
+    let mut lines = vec![line(
+        format!(
+            "Last semantic progress: {}",
+            last_semantic_progress_label(worker, now)
+        ),
+        if worker
+            .and_then(|worker| worker.last_semantic_progress_at)
+            .is_some()
+        {
+            StatusFeedRole::Info
+        } else {
+            StatusFeedRole::Dim
+        },
+    )];
+    if let Some(worker) = worker {
+        lines.push(line(
+            format!(
+                "Last worker event: {}",
+                last_worker_event_label(worker, now)
+            ),
+            StatusFeedRole::Dim,
+        ));
+    }
+    block("Progress", "semantic", lines)
+}
+
+fn last_semantic_progress_label(
+    worker: Option<&WorkerAttemptProgress>,
+    now: DateTime<Utc>,
+) -> String {
+    let Some(worker) = worker else {
+        return "unknown".to_string();
+    };
+    match (
+        worker.last_semantic_progress_summary.trim(),
+        worker.last_semantic_progress_at,
+    ) {
+        (summary, Some(time)) if !summary.is_empty() => {
+            format!("{summary} • {} ago", since_time(time, now))
+        }
+        (_, Some(time)) => format!("{} ago", since_time(time, now)),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn economics_block(details: &RunDetails, economics: &RunEconomics) -> StatusFeedBlock {
+    let active_agents = active_agent_call_count(details);
+    let active_commands = active_command_count(details);
+    let active_work = active_agents > 0 || active_commands > 0;
     let mut lines = vec![
         line(
             format!(
                 "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
-                economics.agent_call_count,
-                economics.command_execution_count,
+                agent_call_count_label(economics.agent_call_count, active_agents, active_work),
+                command_count_label(economics.command_execution_count, active_commands),
                 economics.duplicate_command_count,
                 economics.cache_hits,
                 economics.cache_misses
@@ -575,7 +619,59 @@ fn economics_block(economics: &RunEconomics) -> StatusFeedBlock {
             StatusFeedRole::Warning,
         ));
     }
-    block("Economics", "", lines)
+    block("Economics", if active_work { "active" } else { "" }, lines)
+}
+
+fn agent_call_count_label(completed: usize, in_flight: usize, active_work: bool) -> String {
+    if in_flight > 0 {
+        format!("{completed} completed + {in_flight} in flight")
+    } else if active_work && completed == 0 {
+        "0 completed (in-flight/unknown)".to_string()
+    } else {
+        completed.to_string()
+    }
+}
+
+fn command_count_label(completed: usize, in_flight: usize) -> String {
+    if in_flight > 0 {
+        format!("{completed} completed + {in_flight} in flight")
+    } else {
+        completed.to_string()
+    }
+}
+
+fn active_agent_call_count(details: &RunDetails) -> usize {
+    let Some(progress) = &details.progress else {
+        return 0;
+    };
+    if is_terminal_status(details.run.status) || !is_worker_agent_phase(&progress.phase) {
+        return 0;
+    }
+    if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+        progress.parallel_slices.len()
+    } else {
+        1
+    }
+}
+
+fn active_command_count(details: &RunDetails) -> usize {
+    let Some(progress) = &details.progress else {
+        return 0;
+    };
+    if is_terminal_status(details.run.status)
+        || progress.command.trim().is_empty()
+        || is_worker_agent_phase(&progress.phase)
+    {
+        return 0;
+    }
+    1
+}
+
+fn is_worker_agent_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "worker_running" | "integration_repair" | "awaiting_operator"
+    )
 }
 
 fn incidents_block(incidents: &[RunIncident]) -> StatusFeedBlock {
@@ -605,11 +701,16 @@ fn incidents_block(incidents: &[RunIncident]) -> StatusFeedBlock {
 }
 
 fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {
-    let lines = details
-        .events
-        .iter()
-        .filter_map(|event| activity_line(event, details))
-        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    for event in &details.events {
+        let Some(text) = activity_line(event, details) else {
+            continue;
+        };
+        if lines.last().is_some_and(|previous| previous == &text) {
+            continue;
+        }
+        lines.push(text);
+    }
     if lines.is_empty() {
         return None;
     }
@@ -733,6 +834,11 @@ fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
         "implementation_summary" => implementation_summary_line(payload),
         "run_completed" => Some("Run (completed): handoff artifacts are ready".to_string()),
         "worktrees_cleaned" => Some("Cleanup: worker worktrees cleaned".to_string()),
+        "cockpit_ready" => cockpit_ready_line(payload),
+        "cockpit_worker_ready" => cockpit_worker_ready_line(payload),
+        "terminal_summary_written" => terminal_summary_line(payload),
+        "terminal_notification_sent" => terminal_notification_line(payload, "sent"),
+        "terminal_notification_skipped" => terminal_notification_line(payload, "skipped"),
         "checkpoint_written" => checkpoint_line(payload),
         "worker_question_asked" => Some(format!(
             "Attention: {}",
@@ -787,6 +893,52 @@ fn implementation_summary_line(
         parts.push(format!("final {}", short_sha(final_sha)));
     }
     (!parts.is_empty()).then(|| format!("Summary: {}", parts.join(" • ")))
+}
+
+fn cockpit_ready_line(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let workspace = payload_text(Some(payload), "workspace")
+        .or_else(|| payload_text(Some(payload), "workspace_label"))
+        .unwrap_or_else(|| "workspace".to_string());
+    let adapter = payload_text(Some(payload), "adapter").unwrap_or_else(|| "cockpit".to_string());
+    Some(format!("Cockpit: {adapter} workspace ready ({workspace})"))
+}
+
+fn cockpit_worker_ready_line(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let slice_id = payload_text(Some(payload), "slice_id").unwrap_or_else(|| "slice".to_string());
+    let attempt = payload_text(Some(payload), "attempt")
+        .map(|attempt| format!(" attempt {attempt}"))
+        .unwrap_or_default();
+    Some(format!(
+        "Cockpit: worker pane ready for {slice_id}{attempt}"
+    ))
+}
+
+fn terminal_summary_line(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let payload = payload?;
+    let name = payload_text(Some(payload), "path")
+        .and_then(|path| path.rsplit('/').next().map(str::to_string))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "run-summary.json".to_string());
+    Some(format!("Terminal: summary written ({name})"))
+}
+
+fn terminal_notification_line(
+    payload: Option<&serde_json::Map<String, serde_json::Value>>,
+    verb: &str,
+) -> Option<String> {
+    let payload = payload?;
+    let status = payload_text(Some(payload), "terminal_status")
+        .or_else(|| payload_text(Some(payload), "status"))
+        .unwrap_or_else(|| "terminal status".to_string());
+    Some(format!("Terminal: notification {verb} for {status}"))
 }
 
 fn checkpoint_line(payload: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
@@ -863,34 +1015,47 @@ fn payload_text(
 ) -> Option<String> {
     payload
         .and_then(|payload| payload.get(key))
-        .and_then(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| (!value.is_null()).then(|| value.to_string()))
-        })
+        .and_then(primitive_payload_text)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number.to_string());
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number.to_string());
+    }
+    if let Some(number) = value.as_f64() {
+        return Some(number.to_string());
+    }
+    if let Some(flag) = value.as_bool() {
+        return Some(flag.to_string());
+    }
+    None
 }
 
 fn event_summary(event: &Event) -> String {
     let Some(map) = event.payload.as_object() else {
-        return truncate_display(&event.payload.to_string(), 120);
+        return String::new();
     };
     let mut parts = Vec::new();
     for key in [
         "slice_id", "phase", "status", "message", "summary", "error", "command",
     ] {
         let Some(value) = map.get(key) else { continue };
-        let text = value
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| value.to_string());
+        let Some(text) = primitive_payload_text(value) else {
+            continue;
+        };
         if !text.trim().is_empty() {
             parts.push(format!("{key}={}", truncate_display(&text, 80)));
         }
     }
     if parts.is_empty() {
-        truncate_display(&event.payload.to_string(), 120)
+        String::new()
     } else {
         truncate_display(&parts.join(" "), 160)
     }
@@ -1260,7 +1425,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         ReplanProposal, ReplanProposalSource, ReplanProposedChange, ReplanStatus, Run,
-        replan_decision_commands,
+        WorkerQuestion, replan_decision_commands,
     };
 
     #[test]
@@ -1301,8 +1466,220 @@ mod tests {
         };
         let feed = project_run_at(&details, now);
         assert_eq!(feed.feed_version, 1);
-        assert_eq!(feed.blocks[0].label, "Todos");
-        assert_eq!(feed.blocks[1].label, "Run");
+        assert_eq!(feed.blocks[0].label, "Run");
+        assert_eq!(feed.blocks[1].label, "Todos");
+        assert_eq!(feed.blocks[2].label, "Progress");
+    }
+
+    #[test]
+    fn projection_information_orders_tiers_and_humanizes_activity() {
+        let now = Utc::now();
+        let progress_at = now - chrono::Duration::seconds(5);
+        let details = RunDetails {
+            run: Run {
+                id: "kd-test".to_string(),
+                repo_id: "repo".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                status: RunStatus::Running,
+                base_branch: "main".to_string(),
+                base_sha: "base".to_string(),
+                integration_branch: "khazad/kd-test/integration".to_string(),
+                selected_slice_id: "slice-1".to_string(),
+                error: String::new(),
+                started_at: now - chrono::Duration::minutes(2),
+                updated_at: now,
+            },
+            worker_profile: Default::default(),
+            slice_runs: vec![SliceRun {
+                run_id: "kd-test".to_string(),
+                slice_id: "slice-1".to_string(),
+                status: SliceStatus::Running,
+                branch: String::new(),
+                commit_sha: String::new(),
+                attempts: 1,
+                last_error: String::new(),
+            }],
+            progress: Some(RunProgress {
+                run_id: "kd-test".to_string(),
+                phase: "worker_running".to_string(),
+                slice_id: "slice-1".to_string(),
+                attempt: 1,
+                command: "pi".to_string(),
+                message: "slice worker is running".to_string(),
+                output_tail: String::new(),
+                phase_started_at: now - chrono::Duration::minutes(1),
+                updated_at: now,
+                worker: Some(WorkerAttemptProgress {
+                    attempt_started_at: now - chrono::Duration::minutes(1),
+                    pid: Some(123),
+                    process_observed_at: Some(now - chrono::Duration::seconds(1)),
+                    last_event_at: Some(now - chrono::Duration::seconds(1)),
+                    last_event_kind: "stdout".to_string(),
+                    last_semantic_progress_at: Some(progress_at),
+                    last_semantic_progress_summary: "tool read finished".to_string(),
+                    attempt_timeout_seconds: 0,
+                    no_output_warning_seconds: 0,
+                }),
+                parallel_layer: false,
+                parallel_slices: Vec::new(),
+            }),
+            incidents: Vec::new(),
+            questions: vec![WorkerQuestion {
+                id: "q-1".to_string(),
+                run_id: "kd-test".to_string(),
+                slice_id: "slice-1".to_string(),
+                attempt: 1,
+                question: "choose a path".to_string(),
+                options: Vec::new(),
+                state: "pending".to_string(),
+                asked_at: now,
+                answered_at: None,
+                answer: String::new(),
+            }],
+            replan: Default::default(),
+            events: vec![
+                Event {
+                    id: 1,
+                    run_id: "kd-test".to_string(),
+                    typ: "cockpit_ready".to_string(),
+                    payload: serde_json::json!({
+                        "adapter": "herdr",
+                        "workspace": "Khazad-Doom kd-test",
+                        "panes": ["Run Status / Event Feed"]
+                    }),
+                    created_at: now,
+                },
+                Event {
+                    id: 2,
+                    run_id: "kd-test".to_string(),
+                    typ: "terminal_summary_written".to_string(),
+                    payload: serde_json::json!({"path": "/tmp/run-summary.json"}),
+                    created_at: now,
+                },
+                Event {
+                    id: 3,
+                    run_id: "kd-test".to_string(),
+                    typ: "opaque_event".to_string(),
+                    payload: serde_json::json!({"nested": {"raw": true}}),
+                    created_at: now,
+                },
+                Event {
+                    id: 4,
+                    run_id: "kd-test".to_string(),
+                    typ: "progress".to_string(),
+                    payload: serde_json::json!({
+                        "phase": "worker_running",
+                        "slice_id": "slice-1",
+                        "attempt": 1,
+                        "message": "slice worker is running"
+                    }),
+                    created_at: now,
+                },
+                Event {
+                    id: 5,
+                    run_id: "kd-test".to_string(),
+                    typ: "progress".to_string(),
+                    payload: serde_json::json!({
+                        "phase": "worker_running",
+                        "slice_id": "slice-1",
+                        "attempt": 1,
+                        "message": "slice worker is running"
+                    }),
+                    created_at: now,
+                },
+            ],
+            economics: Some(RunEconomics::default()),
+            primary_terminal_reason: None,
+            feed: None,
+        };
+
+        let feed = project_run_at(&details, now);
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/projection_information_feed_golden.json"
+        ))
+        .expect("projection golden fixture");
+        let labels = feed
+            .blocks
+            .iter()
+            .map(|block| block.label.as_str())
+            .collect::<Vec<_>>();
+        for (index, expected) in golden["required_block_order"]
+            .as_array()
+            .expect("required block order")
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(labels[index], expected.as_str().expect("block label"));
+        }
+        assert!(position(&labels, "Run") < position(&labels, "Todos"));
+        assert!(position(&labels, "Progress") < position(&labels, "Activity"));
+        assert!(position(&labels, "Activity") < position(&labels, "Economics"));
+
+        let progress = block_by_label(&feed, "Progress");
+        assert!(progress.lines.iter().any(|line| {
+            line.text.contains(
+                golden["semantic_progress_substring"]
+                    .as_str()
+                    .expect("semantic progress substring"),
+            )
+        }));
+
+        let activity = block_by_label(&feed, "Activity");
+        let activity_text = activity
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        for forbidden in golden["forbidden_activity_substrings"]
+            .as_array()
+            .expect("forbidden activity substrings")
+        {
+            let forbidden = forbidden.as_str().expect("forbidden substring");
+            assert!(activity_text.iter().all(|text| !text.contains(forbidden)));
+        }
+        for expected in golden["required_activity_substrings"]
+            .as_array()
+            .expect("required activity substrings")
+        {
+            let expected = expected.as_str().expect("activity substring");
+            assert!(activity_text.iter().any(|text| text.contains(expected)));
+        }
+        assert!(!activity_text.windows(2).any(|pair| pair[0] == pair[1]));
+        let dedup = golden["dedup_activity_substring"]
+            .as_str()
+            .expect("dedup substring");
+        assert_eq!(
+            activity_text
+                .iter()
+                .filter(|text| text.contains(dedup))
+                .count(),
+            1
+        );
+
+        let economics = block_by_label(&feed, "Economics");
+        assert_eq!(economics.meta, "active");
+        assert!(
+            economics.lines[0].text.contains(
+                golden["economics_substring"]
+                    .as_str()
+                    .expect("economics substring")
+            )
+        );
+        assert!(!economics.lines[0].text.contains("Agent calls: 0 |"));
+    }
+
+    fn position(labels: &[&str], label: &str) -> usize {
+        labels
+            .iter()
+            .position(|value| *value == label)
+            .unwrap_or_else(|| panic!("missing block {label}"))
+    }
+
+    fn block_by_label<'a>(feed: &'a StatusFeed, label: &str) -> &'a StatusFeedBlock {
+        feed.blocks
+            .iter()
+            .find(|block| block.label == label)
+            .unwrap_or_else(|| panic!("missing block {label}"))
     }
 
     #[test]

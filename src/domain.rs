@@ -969,6 +969,8 @@ pub struct WorkerAttemptProgress {
     pub last_event_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_semantic_progress_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_semantic_progress_summary: String,
     #[serde(default)]
     pub attempt_timeout_seconds: u64,
     #[serde(default)]

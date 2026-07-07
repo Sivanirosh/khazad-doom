@@ -1,0 +1,4 @@
+{"type":"session","id":"projection-information-fixture","timestamp":"2026-07-07T00:00:00Z"}
+{"type":"tool_execution_start","toolCallId":"call_projection_information","toolName":"bash","args":{"command":"cargo test semantic_progress"}}
+{"type":"tool_execution_update","toolCallId":"call_projection_information","toolName":"bash","partialResult":{"status":"running"}}
+{"type":"tool_execution_end","toolCallId":"call_projection_information","toolName":"bash","result":{"exit_code":0}}
