@@ -1,7 +1,10 @@
+use super::attention::{
+    OperatorAttention, ReplanDecisionPending, TerminalTransitionNotification,
+    WorkerPaneTerminalRename,
+};
 use super::cockpit::{
-    CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, focus_default_agent_target,
-    open_default_run_cockpit, open_default_worker_pane, rename_default_agent_target,
-    send_default_agent_message, take_cockpit_mode_transport_arg, worker_activity_pane_command,
+    CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, open_default_run_cockpit,
+    open_default_worker_pane, take_cockpit_mode_transport_arg, worker_activity_pane_command,
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
@@ -27,8 +30,8 @@ use crate::domain::{
     ImplementationSummary, MergeConflictReport, OriginNotificationTarget, PlanRevisions,
     RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange,
     Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun, SliceStatus,
-    SliceValidationReport, SliceWriteResult, TerminalNotificationRecord, WorkerProfileEvidence,
-    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
+    SliceValidationReport, SliceWriteResult, WorkerProfileEvidence, WorkerResult, WorkflowConfig,
+    WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -37,7 +40,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rand::RngCore;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -321,84 +324,8 @@ impl Manager {
     }
 
     fn notify_attention_for_replan(&self, run: &Run, proposal: &ReplanProposal) {
-        let store = artifact::Store::new(&run.repo_path);
-        let Ok(Some(origin)) = store.read_origin_notification_target(&run.id) else {
-            return;
-        };
-        if origin.target.trim().is_empty() {
-            return;
-        }
-        let commands = replan_decision_commands(&run.id, &proposal.id);
-        let payload = json!({
-            "schema_version": 1,
-            "kind": "replan_decision_pending",
-            "run_id": run.id,
-            "proposal_id": proposal.id,
-            "source": proposal.source,
-            "risk": proposal.risk,
-            "proposed_changes": proposal.proposed_changes,
-            "decision_commands": commands,
-            "source_of_truth": "daemon_replan_proposals",
-        });
-        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-        match send_default_agent_message(&origin.target, &text) {
-            Ok(sent) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "attention_notification_sent",
-                    &json!({
-                        "kind": "replan_decision_pending",
-                        "proposal_id": proposal.id,
-                        "adapter": sent.adapter,
-                        "surface": sent.surface,
-                        "target_kind": origin.target_kind,
-                    }),
-                );
-            }
-            Err(err) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "run_incident",
-                    &json!({
-                        "severity": "warning",
-                        "kind": "attention_notification_failed",
-                        "visibility_kind": "delivery_failed",
-                        "message": format!("replan proposal notification was not delivered: {}", err.message),
-                        "proposal_id": proposal.id,
-                        "source_of_truth": "daemon_replan_proposals",
-                    }),
-                );
-            }
-        }
-        match focus_default_agent_target(&origin.target) {
-            Ok(focused) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "attention_focus_sent",
-                    &json!({
-                        "kind": "replan_decision_pending",
-                        "proposal_id": proposal.id,
-                        "adapter": focused.adapter,
-                        "surface": focused.surface,
-                        "target_kind": origin.target_kind,
-                    }),
-                );
-            }
-            Err(err) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "run_incident",
-                    &json!({
-                        "severity": "warning",
-                        "kind": "attention_focus_failed",
-                        "visibility_kind": "focus_failed",
-                        "message": format!("replan proposal focus was not delivered: {}", err.message),
-                        "proposal_id": proposal.id,
-                        "source_of_truth": "daemon_replan_proposals",
-                    }),
-                );
-            }
-        }
+        OperatorAttention::new(self.state.clone())
+            .replan_decision_pending(ReplanDecisionPending { run, proposal });
     }
 
     fn run_read_model(&self, run: &Run, options: RunReadModelOptions) -> Result<RunReadModel> {
@@ -1709,288 +1636,20 @@ impl Manager {
             "terminal_summary_written",
             &json!({ "path": summary_path }),
         )?;
-        self.rename_worker_panes_for_terminal(run, &events, &slice_runs);
-        let transition_key = terminal_transition_key(status, progress.as_ref());
-        self.emit_terminal_run_feedback(run, status, &summary, &summary_path, &transition_key);
-        Ok(())
-    }
-
-    fn emit_terminal_run_feedback(
-        &self,
-        run: &Run,
-        status: RunStatus,
-        summary: &Value,
-        summary_path: &Path,
-        transition_key: &str,
-    ) {
-        if !terminal_feedback_status_supported(status) {
-            return;
-        }
-        let store = artifact::Store::new(&run.repo_path);
-        let terminal_status = status.as_str();
-        if store.terminal_notification_exists(&run.id, transition_key) {
-            return;
-        }
-        let created_at = Utc::now().to_rfc3339();
-        let final_report_path = store.output_path(&run.id, "final-report.json");
-        let implementation_summary_path = store.output_path(&run.id, "implementation-summary.json");
-        let payload = terminal_feedback_payload(
+        let attention = OperatorAttention::new(self.state.clone());
+        attention.worker_pane_terminal_rename(WorkerPaneTerminalRename {
+            run,
+            events: &events,
+            slice_runs: &slice_runs,
+        });
+        attention.terminal_transition_notification(TerminalTransitionNotification {
             run,
             status,
-            summary,
-            summary_path,
-            final_report_path
-                .exists()
-                .then_some(final_report_path.as_path()),
-            implementation_summary_path
-                .exists()
-                .then_some(implementation_summary_path.as_path()),
-        );
-        let origin = match store.read_origin_notification_target(&run.id) {
-            Ok(Some(origin)) if !origin.target.trim().is_empty() => origin,
-            Ok(Some(_)) => {
-                self.write_terminal_notification_record(
-                    &store,
-                    run,
-                    terminal_status,
-                    transition_key,
-                    "skipped",
-                    "",
-                    "missing origin notification target",
-                    payload,
-                    created_at,
-                );
-                let _ = self.state.record_event(
-                    &run.id,
-                    "terminal_notification_skipped",
-                    &json!({
-                        "status": terminal_status,
-                        "transition_key": transition_key,
-                        "reason": "missing_origin_target",
-                    }),
-                );
-                return;
-            }
-            Ok(None) => {
-                return;
-            }
-            Err(err) => {
-                self.write_terminal_notification_record(
-                    &store,
-                    run,
-                    terminal_status,
-                    transition_key,
-                    "failed",
-                    "",
-                    &format!("origin target read failed: {err}"),
-                    payload,
-                    created_at,
-                );
-                self.record_terminal_notification_incident(
-                    run,
-                    terminal_status,
-                    transition_key,
-                    "origin_target_read_failed",
-                    &err.to_string(),
-                );
-                return;
-            }
-        };
-        if !self.write_terminal_notification_record(
-            &store,
-            run,
-            terminal_status,
-            transition_key,
-            "pending",
-            &origin.target,
-            "",
-            payload.clone(),
-            created_at.clone(),
-        ) {
-            return;
-        }
-        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-        match send_default_agent_message(&origin.target, &text) {
-            Ok(sent) => {
-                self.write_terminal_notification_record(
-                    &store,
-                    run,
-                    terminal_status,
-                    transition_key,
-                    "sent",
-                    &origin.target,
-                    "",
-                    payload,
-                    created_at,
-                );
-                let _ = self.state.record_event(
-                    &run.id,
-                    "terminal_notification_sent",
-                    &json!({
-                        "status": terminal_status,
-                        "transition_key": transition_key,
-                        "adapter": sent.adapter,
-                        "surface": sent.surface,
-                        "target_kind": origin.target_kind,
-                    }),
-                );
-            }
-            Err(err) => {
-                self.write_terminal_notification_record(
-                    &store,
-                    run,
-                    terminal_status,
-                    transition_key,
-                    "failed",
-                    &origin.target,
-                    &err.message,
-                    payload,
-                    created_at,
-                );
-                self.record_terminal_notification_incident(
-                    run,
-                    terminal_status,
-                    transition_key,
-                    "delivery_failed",
-                    &err.message,
-                );
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_terminal_notification_record(
-        &self,
-        store: &artifact::Store,
-        run: &Run,
-        terminal_status: &str,
-        transition_key: &str,
-        delivery_status: &str,
-        origin_target: &str,
-        error: &str,
-        payload: Value,
-        created_at: String,
-    ) -> bool {
-        let record = TerminalNotificationRecord {
-            schema_version: 1,
-            run_id: run.id.clone(),
-            terminal_status: terminal_status.to_string(),
-            transition_key: transition_key.to_string(),
-            delivery_status: delivery_status.to_string(),
-            origin_target: origin_target.to_string(),
-            delivery_adapter: "herdr".to_string(),
-            delivery_surface: "agent_send".to_string(),
-            error: error.to_string(),
-            payload,
-            created_at,
-        };
-        if let Err(err) = store.write_terminal_notification_record(&run.id, transition_key, &record)
-        {
-            self.record_terminal_notification_incident(
-                run,
-                terminal_status,
-                transition_key,
-                "record_write_failed",
-                &err.to_string(),
-            );
-            return false;
-        }
-        true
-    }
-
-    fn rename_worker_panes_for_terminal(
-        &self,
-        run: &Run,
-        events: &[crate::domain::Event],
-        slice_runs: &[SliceRun],
-    ) {
-        let statuses = slice_runs
-            .iter()
-            .map(|slice| (slice.slice_id.as_str(), slice.status))
-            .collect::<BTreeMap<_, _>>();
-        let mut seen = BTreeSet::new();
-        for event in events
-            .iter()
-            .filter(|event| event.typ == "cockpit_worker_ready")
-        {
-            let pane_id = event
-                .payload
-                .get("pane_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let slice_id = event
-                .payload
-                .get("slice_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if pane_id.is_empty() || slice_id.is_empty() || !seen.insert(pane_id.to_string()) {
-                continue;
-            }
-            let status = statuses
-                .get(slice_id)
-                .copied()
-                .unwrap_or(SliceStatus::Pending);
-            let marker = match status {
-                SliceStatus::Merged => "✓",
-                SliceStatus::Blocked | SliceStatus::Failed | SliceStatus::Cancelled => "✗",
-                SliceStatus::Interrupted => "!",
-                _ => "◐",
-            };
-            let label = format!("{marker} {slice_id} {status}");
-            match rename_default_agent_target(pane_id, &label) {
-                Ok(renamed) => {
-                    let _ = self.state.record_event(
-                        &run.id,
-                        "cockpit_worker_renamed",
-                        &json!({
-                            "pane_id": pane_id,
-                            "slice_id": slice_id,
-                            "status": status,
-                            "label": label,
-                            "adapter": renamed.adapter,
-                            "surface": renamed.surface,
-                        }),
-                    );
-                }
-                Err(err) => {
-                    let _ = self.state.record_event(
-                        &run.id,
-                        "run_incident",
-                        &json!({
-                            "severity": "warning",
-                            "kind": "cockpit_worker_rename_failed",
-                            "message": format!("worker pane rename failed for {slice_id}: {}", err.message),
-                            "pane_id": pane_id,
-                            "slice_id": slice_id,
-                            "source_of_truth": "daemon_terminal_summary",
-                        }),
-                    );
-                }
-            }
-        }
-    }
-
-    fn record_terminal_notification_incident(
-        &self,
-        run: &Run,
-        terminal_status: &str,
-        transition_key: &str,
-        failure_kind: &str,
-        message: &str,
-    ) {
-        let _ = self.state.record_event(
-            &run.id,
-            "run_incident",
-            &json!({
-                "severity": "warning",
-                "kind": "terminal_notification_failed",
-                "visibility_kind": failure_kind,
-                "message": format!("terminal notification for {terminal_status} was not delivered: {message}"),
-                "terminal_status": terminal_status,
-                "transition_key": transition_key,
-                "source_of_truth": "daemon_terminal_summary",
-            }),
-        );
+            progress: progress.as_ref(),
+            summary: &summary,
+            summary_path: &summary_path,
+        });
+        Ok(())
     }
 
     fn run_worktree_snapshots(&self, run: &Run) -> Vec<serde_json::Value> {
@@ -4206,81 +3865,6 @@ fn terminal_next_commands(run: &Run, status: RunStatus) -> Vec<String> {
         }
         RunStatus::Pending | RunStatus::Running => Vec::new(),
     }
-}
-
-fn terminal_feedback_status_supported(status: RunStatus) -> bool {
-    matches!(
-        status,
-        RunStatus::Completed | RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled
-    )
-}
-
-fn terminal_transition_key(
-    status: RunStatus,
-    progress: Option<&crate::domain::RunProgress>,
-) -> String {
-    let phase_started_at = progress
-        .filter(|progress| progress.phase == status.as_str())
-        .map(|progress| progress.phase_started_at.to_rfc3339())
-        .unwrap_or_else(|| Utc::now().to_rfc3339());
-    format!("terminal:{}:{}", status.as_str(), phase_started_at)
-}
-
-fn terminal_handoff_evidence(final_report_path: &Path) -> (String, String) {
-    let Ok(summary) = artifact::read_json::<ImplementationSummary>(final_report_path) else {
-        return (String::new(), String::new());
-    };
-    (summary.final_sha, summary.exit_states.handoff)
-}
-
-fn terminal_feedback_payload(
-    run: &Run,
-    status: RunStatus,
-    summary: &Value,
-    summary_path: &Path,
-    final_report_path: Option<&Path>,
-    implementation_summary_path: Option<&Path>,
-) -> Value {
-    let (final_sha, handoff_readiness) = final_report_path
-        .map(terminal_handoff_evidence)
-        .unwrap_or_default();
-    let evidence_artifacts = [
-        Some(summary_path),
-        final_report_path,
-        implementation_summary_path,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|path| path.to_string_lossy().to_string())
-    .collect::<Vec<_>>();
-    let feed = summary.get("feed").cloned().unwrap_or(Value::Null);
-    let feed_summary = feed
-        .get("summary_line")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            summary
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-        });
-    json!({
-        "kind": "khazad_terminal_feedback",
-        "run_id": run.id,
-        "terminal_status": status.as_str(),
-        "repo_path": run.repo_path,
-        "integration_branch": run.integration_branch,
-        "selected_slice_id": run.selected_slice_id,
-        "message": feed_summary,
-        "feed_summary_line": feed_summary,
-        "feed": feed,
-        "primary_failure": summary.get("primary_failure").and_then(Value::as_str).unwrap_or_default(),
-        "cancel_reason": summary.get("cancel_reason").and_then(Value::as_str).unwrap_or_default(),
-        "final_sha": final_sha,
-        "handoff_readiness": handoff_readiness,
-        "evidence_artifacts": evidence_artifacts,
-        "next_commands": summary.get("next_commands").cloned().unwrap_or_else(|| json!([])),
-    })
 }
 
 fn git_output_or_empty(worktree: &Path, args: &[&str]) -> String {
