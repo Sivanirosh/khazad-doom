@@ -1,0 +1,52 @@
+{
+  "id": "HERDR-05B",
+  "title": "Gate pane semantic summary",
+  "goal": "Make the Herdr Integration Gate / Repair pane answer gate-specific state questions instead of falling back to generic monitor/feed text when idle.",
+  "status": "open",
+  "depends_on": [
+    "FEED-02"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/gate.rs",
+    "src/workflow/shell.rs",
+    "src/workflow/manager.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/fixtures",
+    "docs/design/evidence/herdr-cockpit-information-design-2026-07-07.md",
+    "docs/design/evidence/herdr-live-pane-feedback-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "When a gate or repair command is active, the Gate / Repair pane shows compact live command identity, elapsed time, bounded tail output, and pass/fail/running state from daemon-owned gate/shell progress data.",
+    "When idle, the Gate / Repair pane shows a gate-scoped summary rather than the generic monitor feed: verification profile, latest gate result, last gate failure if any, repair policy/state, handoff readiness if known, and next gate/repair-relevant commands.",
+    "The gate pane consumes FEED-02 projection fields or daemon-owned gate/shell artifacts; it never reads Herdr scrollback, pane text, or UI state as workflow evidence.",
+    "Golden fixtures cover active command rendering, idle passed state, idle failed/repairable state, no-gate-yet state, and absence of generic monitor sections such as full run activity or unrelated worker feed entries.",
+    "Gate pane rendering is display-only: command exit status, stdout/stderr artifacts, typed gate results, repair decisions, verification, merge, and handoff readiness remain daemon-owned and unchanged.",
+    "Renderer failures remain non-fatal visibility incidents or pane warnings and do not change gate result, repair policy, run status, slice status, merge, final SHA, or handoff behavior.",
+    "Normal cargo test remains portable without Herdr; real Herdr/cockpit behavior stays behind explicit Herdr-gated tests or manual evidence."
+  ],
+  "must_ask_if": [
+    "The implementation would make Herdr required for gate or repair execution, verification, merge, or handoff.",
+    "The implementation would parse terminal scrollback or pane text as gate/repair correctness evidence.",
+    "The implementation would alter gate result, repair decisions, verification, merge, or handoff based on painter output.",
+    "The implementation would reintroduce generic monitor/feed fallback as the normal idle Gate / Repair pane instead of a gate-scoped summary.",
+    "The implementation would remove or weaken daemon-owned gate/shell result artifacts.",
+    "The implementation would duplicate FEED-02 projection wording instead of reusing the shared projection/gate-summary seam."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test gate_activity_painter --quiet",
+    "cargo test gate_pane_summary --quiet",
+    "cargo test gate --quiet",
+    "cargo test cockpit --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet"
+  ],
+  "verify_timeout_seconds": 1200
+}

@@ -1,0 +1,52 @@
+{
+  "id": "FEED-02",
+  "title": "Projection information design",
+  "goal": "Turn the shared daemon feed/status projection from a noisy event log into an operator-oriented state summary that answers whether attention is needed, where the run is, and what semantic progress last occurred.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-06"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/pi_contract.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/fixtures",
+    "extensions/khazad-monitor",
+    "docs/design/evidence/herdr-cockpit-information-design-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "The shared feed/status projection is organized into clear altitude tiers: attention first, run state/phase and queue position, last semantic progress, milestones-only activity, and economics/health. Existing CLI monitor/watch/status and Herdr feed panes consume the same wording rather than duplicating prose.",
+    "Wrapper-mode runs populate worker_last_semantic_progress_at and a human last-semantic-progress summary from typed Pi tool execution events observed in the wrapper stdout path, without changing worker correctness or result parsing.",
+    "Feed activity lines are humanized and bounded: raw JSON object payloads are not printed directly, cockpit-ready and terminal-summary events become human sentences, and consecutive duplicate activity entries are coalesced.",
+    "Economics distinguish in-flight work from completed zero work while a worker/gate is active; the display should count started-but-unfinished agent calls or explicitly show in-flight/unknown, never a misleading bare zero during active work.",
+    "Golden projection fixtures cover the screenshot warts: no raw JSON in feed lines, no consecutive duplicate activity entries, semantic progress populated from a wrapper-mode tool event fixture, attention block ordering, and in-flight economics wording.",
+    "Projection changes are display-only: terminal state, slice state, verification, merge, repair, handoff readiness, evidence attestation, and economics source data remain daemon-owned and unchanged except for the new observability semantic-progress fields.",
+    "Terminal notification summaries introduced by HERDR-06 continue to build from the daemon feed/projection and inherit the improved wording without adding a second notification-specific prose path."
+  ],
+  "must_ask_if": [
+    "The implementation would make monitor/feed wording depend on Herdr pane text, terminal scrollback, or Pi UI state.",
+    "The implementation would parse Pi event names or fields outside src/pi_contract.rs except in tests/fixtures.",
+    "The implementation would change run terminal status, verification, merge, repair, handoff, or evidence attestation based on semantic-progress display fields.",
+    "The implementation would add a second projection/prose path for Herdr or terminal notifications instead of deepening the shared projection seam.",
+    "The implementation would suppress economics entirely for active runs instead of representing in-flight or unknown work truthfully, unless it records a blocker explaining why in-flight counting is not possible in this slice."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test projection_information --quiet",
+    "cargo test semantic_progress --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+    "cargo test terminal_notification --quiet",
+    "bash -lc '! rg -n \"Activity:.*\\{\" tests src || true'"
+  ],
+  "verify_timeout_seconds": 1200
+}

@@ -347,6 +347,16 @@ HERDR-07 is the planned successor for higher-value mid-run attention: pending `a
 
 Evidence and design constraints are recorded in `docs/design/evidence/herdr-terminal-feedback-plan-2026-07-07.md`.
 
+## Cockpit information-design follow-ups
+
+The live Herdr cockpit now works but still reads like an event log. The next display-only sequence is:
+
+1. FEED-02 — projection information design. Shared feed/status wording gets attention-first ordering, semantic-progress wiring from wrapper-mode tool events, humanized bounded activity, duplicate coalescing, and truthful in-flight economics.
+2. HERDR-04B — worker pane semantic painter. The worker pane drops envelope noise and renders typed Pi event payloads: assistant text, labelled reasoning/progress when Pi emits it, and bounded tool identity/outcome.
+3. HERDR-05B — gate pane semantic summary. The gate pane depends on FEED-02 and shows gate-specific active/idle state instead of generic monitor fallback.
+
+Evidence and design constraints are recorded in `docs/design/evidence/herdr-cockpit-information-design-2026-07-07.md`.
+
 ## Plan-level completion criteria
 
 The revision plan is complete when:

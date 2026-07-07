@@ -1,0 +1,48 @@
+{
+  "id": "HERDR-04B",
+  "title": "Worker pane semantic painter",
+  "goal": "Make the Herdr worker activity pane answer what the worker is doing by rendering typed Pi event payloads instead of stream-envelope noise and chunk counts.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-04"
+  ],
+  "areas": [
+    "src/pi_contract.rs",
+    "src/workflow/cockpit.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/fixtures",
+    "docs/design/evidence/herdr-cockpit-information-design-2026-07-07.md",
+    "docs/design/evidence/herdr-live-pane-feedback-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "The worker pane suppresses low-value envelope events such as message_start/message_end and turn_start/turn_end by default, while preserving underlying daemon-owned stdout.ndjson artifacts unchanged for inspection.",
+    "Assistant text deltas are coalesced into readable bounded output at a human rate rather than reported primarily as chunk counts; the pane shows the payload text Pi emitted through typed pi_contract events.",
+    "Reasoning/progress display renders only content present in typed pi_contract events, such as provider-emitted thinking_delta or equivalent summaries, labels it as reasoning/progress, and never reconstructs hidden chain-of-thought from timing, token counts, unknown fields, or private provider data.",
+    "Tool activity lines include bounded identity and outcome where the typed events provide them, for example tool name, command/file/path summary, running/ok/failed state, and duration when available. Sensitive or long arguments are redacted/truncated for display without altering artifacts.",
+    "Recorded ndjson golden fixtures cover the observed screenshot warts: envelope events absent, tool identity present, assistant text visible, reasoning/progress labelled only when present in typed events, unknown events tolerated, and deltas coalesced.",
+    "The painter remains display-only and read-only: it never reads Herdr scrollback or pane text, never accepts operator answers/approvals/result JSON, and never changes worker correctness, result parsing, verification, merge, or handoff behavior.",
+    "Renderer failures remain non-fatal visibility incidents or pane warnings; killing the painter does not alter the daemon-owned wrapper/result path introduced by HERDR-04."
+  ],
+  "must_ask_if": [
+    "The implementation would expose, infer, reconstruct, or label hidden chain-of-thought that is not present as typed Pi JSON event content.",
+    "The implementation would parse Pi wire-format event names or fields outside src/pi_contract.rs except in tests/fixtures.",
+    "The implementation would read Herdr pane text, terminal scrollback, or Herdr agent-status metadata as worker evidence.",
+    "The implementation would make painter output an input to worker result parsing, acceptance, verification, merge, or handoff.",
+    "The implementation would type into worker panes, auto-answer operator questions, or accept pasted/manual result JSON.",
+    "The implementation would remove the raw stdout.ndjson/stderr/status/result artifacts or make them less complete."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test worker_activity_painter --quiet",
+    "cargo test pi_contract --quiet",
+    "cargo test worker_pane_golden --quiet",
+    "cargo test cockpit --quiet",
+    "bash -lc '! rg -n \"message_start|message_end|turn_start|turn_end|thinking_delta|tool_execution_start|tool_execution_update|tool_execution_end\" src | rg -v \"src/pi_contract.rs|tests|fixtures\"'"
+  ],
+  "verify_timeout_seconds": 1200
+}
