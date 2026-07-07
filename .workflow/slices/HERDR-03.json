@@ -2,6 +2,9 @@
   "id": "HERDR-03",
   "title": "Pi bridge opens Herdr cockpit",
   "goal": "Reduce the Khazad-Doom Pi extension to the jobs Pi is good at: starting/shaping/explaining workflows, answering blockers, summarizing handoffs, and opening or focusing the Herdr cockpit; remove any expectation that Pi emulates a full live multi-agent dashboard.",
+  "status": "closed",
+  "closed_by_run": "kd-20260706-230801-b54357e3",
+  "closed_at": "2026-07-07T00:29:36.886475469+00:00",
   "depends_on": [
     "HERDR-02"
   ],

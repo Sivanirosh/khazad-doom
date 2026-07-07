@@ -2,6 +2,9 @@
   "id": "HERDR-01",
   "title": "Herdr cockpit contract and default workspace",
   "goal": "Introduce Herdr as the optional-default live observability cockpit for Khazad-Doom runs through a small daemon-owned cockpit seam: Khazad-Doom opens/focuses Herdr workspaces and read-only feed/phase panes when available, but direct Pi execution remains the fallback and source of truth stays in daemon state.",
+  "status": "closed",
+  "closed_by_run": "kd-20260706-230801-b54357e3",
+  "closed_at": "2026-07-07T00:29:36.886475469+00:00",
   "depends_on": [
     "FEED-01"
   ],

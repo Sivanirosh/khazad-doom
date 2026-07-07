@@ -2,6 +2,9 @@
   "id": "FEED-01",
   "title": "Terminal reason and projection authority",
   "goal": "Make the daemon status feed the single interpretation seam for terminal reasons and live progress so CLI, Pi adapters, and later Herdr cockpit panes paint the same daemon-owned truth instead of reclassifying raw events independently.",
+  "status": "closed",
+  "closed_by_run": "kd-20260706-230801-b54357e3",
+  "closed_at": "2026-07-07T00:29:36.886475469+00:00",
   "areas": [
     "src/domain.rs",
     "src/workflow/projection.rs",

@@ -2,6 +2,9 @@
   "id": "HERDR-02",
   "title": "Herdr worker panes with KD-owned result capture",
   "goal": "Run authorized Pi workers inside named Herdr panes while preserving Khazad-Doom as the process-contract owner: KD builds the exact worker command, uses a KD-owned wrapper to capture stdout/stderr/exit/result artifacts, parses the same Pi contract output, and falls back to direct Pi execution when cockpit launch is unavailable.",
+  "status": "closed",
+  "closed_by_run": "kd-20260706-230801-b54357e3",
+  "closed_at": "2026-07-07T00:29:36.886475469+00:00",
   "depends_on": [
     "HERDR-01"
   ],

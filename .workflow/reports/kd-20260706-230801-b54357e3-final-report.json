@@ -1,0 +1,1697 @@
+{
+  "run_id": "kd-20260706-230801-b54357e3",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260706-230801-b54357e3/integration",
+  "base_sha": "3571197dc981fec5fe97a009507b9849a0dc4318",
+  "completed_slices": [
+    {
+      "slice_id": "FEED-01",
+      "status": "complete",
+      "summary": "Centralized terminal reasons and live status interpretation in the daemon-owned feed projection, made CLI painters render RunDetails.feed, documented the projection authority, and kept run/slice status enums unchanged.",
+      "commit_sha": "c19645962237b74ad117b9da7bca95525847768d",
+      "commit_message": "Implement FEED-01 status feed authority",
+      "changed_files": [
+        "README.md",
+        "docs/workflow-invariants.md",
+        "skills/khazad-doom/SKILL.md",
+        "src/cli.rs",
+        "src/daemon.rs",
+        "src/domain.rs",
+        "src/workflow/projection.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "RunDetails status JSON now exposes primary_terminal_reason for terminal blocked/failed/cancelled/interrupted runs.",
+        "RunDetails.feed is the versioned daemon-side StatusFeed projection and includes feed.terminal_reason plus feed.operator_commands.",
+        "TerminalReason and StatusFeed fields are serialized as daemon status JSON consumed by CLI/Pi painters."
+      ],
+      "tests_run": [
+        "cargo test terminal_reason --quiet",
+        "cargo test projection --quiet",
+        "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "npm test",
+        "bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "khazad-doom slices validate --repo .",
+        "cargo test monitor --quiet"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Blocked and failed runs expose a structured primary terminal reason with kind, resolution owner, retryability or operator-action flags where applicable, evidence links, and remediation or disposition text.",
+          "status": "satisfied",
+          "evidence": "src/domain.rs defines TerminalReason; src/daemon.rs derives primary_terminal_reason from structured incident/run-error data or terminal fallback; cargo test terminal_reason --quiet and monitor_specific_run_returns_error_for_failed_terminal_status verified blocked auth and failed-run terminal reasons with kind, owner, retryability/operator-action flags, evidence, remediation/disposition surfaces, and commands."
+        },
+        {
+          "criterion": "RunDetails/status JSON includes one versioned daemon-side feed projection that carries terminal reasons, progress, incidents, economics summary, and exact operator commands needed for questions or replan decisions.",
+          "status": "satisfied",
+          "evidence": "Server::run_details now sets details.feed = Some(project_run(&details)); src/workflow/projection.rs emits feed_version 1 with terminal_reason, operator_commands, progress, incidents, economics, attention, and commands blocks. cargo test projection --quiet and status_and_watch_expose_live_progress_for_long_verification --quiet passed."
+        },
+        {
+          "criterion": "CLI status, watch, and monitor render feed blocks as painters and no longer match raw daemon event-type strings to decide human wording.",
+          "status": "satisfied",
+          "evidence": "src/cli.rs watch and monitor render RunDetails.feed blocks or report feed unavailability; raw event interpretation was removed from CLI painters. The required rg guard passed with no matches in src/cli.rs."
+        },
+        {
+          "criterion": "The Pi feedback adapter consumes the same feed projection and does not independently infer workflow state from raw events or process/session lifecycle.",
+          "status": "satisfied",
+          "evidence": "The existing khazad-worker Pi adapter renders details.feed.summary_line, attention, and blocks from daemon status JSON and does not read raw events; npm test passed, including the khazad attach daemon-feed rendering coverage."
+        },
+        {
+          "criterion": "Existing monitor behavior remains equivalent on the recorded-run corpus except for deliberate wording changes documented in the slice result.",
+          "status": "satisfied",
+          "evidence": "cargo test monitor --quiet and monitor_specific_run_returns_error_for_failed_terminal_status --quiet passed. Deliberate wording/schema changes are documented in README.md, docs/workflow-invariants.md, and skills/khazad-doom/SKILL.md as Terminal and Commands feed blocks plus feed-owned terminal reason/operator command wording."
+        },
+        {
+          "criterion": "No new run or slice status values are introduced.",
+          "status": "satisfied",
+          "evidence": "RunStatus and SliceStatus variants/parsers remain unchanged in src/domain.rs; terminal classification is represented by TerminalReason/feed fields instead of new statuses. The slice validation and targeted cargo tests passed."
+        }
+      ],
+      "assumptions": [
+        "The existing ./extensions/khazad-worker package is the Pi feedback adapter in this checkout; the listed extensions/khazad-monitor path is not present, so no extension path rename or out-of-area adapter edit was made.",
+        "Monitor wording changes are intentionally limited to daemon feed block wording, especially Terminal and Commands blocks."
+      ]
+    },
+    {
+      "slice_id": "HERDR-01",
+      "status": "complete",
+      "summary": "Implemented the Herdr cockpit seam with auto/default fallback behavior, durable and per-run cockpit mode overrides, non-fatal cockpit incident recording, docs/skill updates, real-Herdr smoke coverage, and repaired the clippy too_many_arguments failure in run_resume.",
+      "commit_sha": "221655c9badfb38ff54a21e1c90fb85f7df1fa0c",
+      "commit_message": "Implement Herdr cockpit seam",
+      "changed_files": [
+        "README.md",
+        "docs/workflow-invariants.md",
+        "skills/khazad-doom/SKILL.md",
+        "src/cli.rs",
+        "src/domain.rs",
+        "src/workflow/cockpit.rs",
+        "src/workflow/manager.rs",
+        "src/workflow/mod.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "Added durable .workflow/khazad.json cockpit mode values: auto, herdr, direct",
+        "Added khazad-doom run/resume --cockpit auto|herdr|direct",
+        "Added daemon events cockpit_ready and non-fatal cockpit_unavailable incident payloads"
+      ],
+      "tests_run": [
+        "cargo fmt",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cargo test cockpit --quiet",
+        "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "khazad-doom slices validate --repo .",
+        "herdr --version",
+        "HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "A small Cockpit/CockpitAdapter seam exists for opening or focusing a run workspace and creating named read-only panes; callers do not learn Herdr command details, pane ids beyond opaque references, or terminal-layout mechanics.",
+          "status": "satisfied",
+          "evidence": "src/workflow/cockpit.rs adds Cockpit, CockpitAdapter, opaque workspace/pane refs, and named pane requests; workflow callers only call record_cockpit_launch/open_default_run_cockpit."
+        },
+        {
+          "criterion": "The default cockpit mode is auto: when a usable herdr binary is found, a run attempts to create or focus a workspace named for the run and opens a Run Status / Event Feed pane plus a read-only Integration Gate / Repair phase pane; when Herdr is unavailable or fails, the run falls back to current direct execution.",
+          "status": "satisfied",
+          "evidence": "WorkflowConfig defaults cockpit to auto; CockpitRunRequest names workspaces Khazad-Doom <run-id>; open_run creates Run Status / Event Feed and Integration Gate / Repair panes; failures return cockpit_unavailable while execution continues."
+        },
+        {
+          "criterion": "Operators can override cockpit behavior through durable config and per-run CLI flag values equivalent to auto, herdr, or direct.",
+          "status": "satisfied",
+          "evidence": "src/domain.rs adds CockpitMode and config field; src/cli.rs adds --cockpit auto|herdr|direct for run/resume; tests cover direct CLI overriding durable herdr config."
+        },
+        {
+          "criterion": "Herdr cockpit failures are recorded as non-fatal cockpit-unavailable incidents or feed entries with remediation, and they never change slice selection, worker authorization, verification, merge, handoff, or terminal run status by themselves.",
+          "status": "satisfied",
+          "evidence": "src/workflow/manager.rs records run_incident kind cockpit_unavailable with remediation/fallback/source_of_truth and does not alter run status; cockpit_herdr_failure_is_nonfatal_incident passes."
+        },
+        {
+          "criterion": "The Planner Pi pane is explicitly deferred until RPL planner behavior exists; HERDR-01 does not launch a planner agent.",
+          "status": "satisfied",
+          "evidence": "Cockpit setup only creates feed and integration/repair panes; cockpit tests assert no planner commands, and cockpit_ready payload marks planner as deferred."
+        },
+        {
+          "criterion": "Real-Herdr smoke evidence proves workspace creation/focus and feed/phase pane creation on an installed Herdr, while the normal full test suite remains portable when Herdr is absent.",
+          "status": "satisfied",
+          "evidence": "herdr --version reported herdr 0.7.1; HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet passed and checks workspace plus both pane labels; regular cockpit tests also pass without requiring Herdr."
+        }
+      ],
+      "findings": [
+        {
+          "id": "clippy-too-many-arguments",
+          "severity": "info",
+          "action": "auto-fix",
+          "file": "src/cli.rs",
+          "line": 455,
+          "description": "Replaced run_resume's eight-argument signature with ResumeCliOptions; clippy now passes with -D warnings."
+        }
+      ],
+      "assumptions": [
+        "Herdr remains an observability launcher/painter only; daemon state remains the source of truth.",
+        "The Planner Pi pane is intentionally deferred to later RPL planner-authority slices."
+      ]
+    },
+    {
+      "slice_id": "HERDR-02",
+      "status": "complete",
+      "summary": "Implemented Herdr-backed Pi worker panes while keeping Khazad-Doom authoritative: deterministic worker pane labels, KD-owned wrapper artifacts, Pi contract parsing from captured stdout, daemon-owned cancellation/fallback behavior, docs updates, real-Herdr smoke coverage, and clippy/env-isolation repairs.",
+      "commit_sha": "cde499cabf47601b51a1083847e69c3d2f804c01",
+      "commit_message": "khazad: isolate herdr wrapper pi env",
+      "changed_files": [
+        "README.md",
+        "docs/workflow-invariants.md",
+        "skills/khazad-doom/SKILL.md",
+        "src/agent.rs",
+        "src/workflow/cockpit.rs",
+        "src/workflow/manager.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "src/agent.rs: added PiCommandSpec and Runner::pi_command_spec() so the workflow manager can reuse the resolved Pi command for wrapped Herdr launches"
+      ],
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cargo test cockpit --quiet",
+        "cargo test pi_contract --quiet",
+        "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "khazad-doom slices validate --repo ."
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "For Herdr-backed runs, each active slice worker is visible in a deterministically named Herdr pane tied to the run id and slice id, but Khazad-Doom still decides which slice is active and which worker command is authorized.",
+          "status": "satisfied",
+          "evidence": "src/workflow/cockpit.rs creates worker panes named `Worker {run_id}/{slice_id} attempt {attempt}`; src/workflow/manager.rs builds the authorized worker request from the daemon-selected run/slice/attempt. Covered by `cargo test cockpit --quiet` and `HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet`."
+        },
+        {
+          "criterion": "Herdr worker panes execute a KD-owned wrapper that launches Pi with the same resolved provider/model/profile/env/prompt/schema as the direct Pi runner and writes stdout, stderr, exit status, and result files under the run artifact directory.",
+          "status": "satisfied",
+          "evidence": "src/agent.rs exposes the direct Pi command spec, writes prompt/env/command/wrapper artifacts, launches Pi via the wrapper, captures stdout/stderr/exit/result files, and isolates the launched Pi environment with `env -i` plus KD-written env data. Real-Herdr smoke verified artifact creation."
+        },
+        {
+          "criterion": "Khazad-Doom parses worker results from KD-owned artifact files using the same Pi contract parser and JSON-only result validation as direct Pi execution; Herdr terminal rendering, pane scrollback, and agent-status metadata are never correctness inputs.",
+          "status": "satisfied",
+          "evidence": "src/agent.rs `parse_pi_artifact_result` reads wrapper stdout/stderr artifacts, uses `PiParser`, and applies the same JSON extraction path as direct Pi. README, docs/workflow-invariants.md, and skill docs state pane text/scrollback/Herdr metadata are non-authoritative. `cargo test pi_contract --quiet` passed."
+        },
+        {
+          "criterion": "Cancellation remains daemon-owned: cancelling a run requests termination of the wrapped Pi process and records the same terminal/cancellation evidence as the direct runner path.",
+          "status": "satisfied",
+          "evidence": "src/agent.rs `collect_pi_wrapper_result` observes the daemon cancellation token, terminates the wrapped Pi pid with the configured grace path, and returns a RunnerError transcript through the existing supervised worker pipeline. `cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet` passed."
+        },
+        {
+          "criterion": "If Herdr pane startup or wrapper handoff fails before a worker is launched, the run falls back to the existing direct Pi runner and records a non-fatal cockpit fallback incident; if the wrapped Pi worker itself fails, the failure is treated like a normal worker failure, not hidden as a cockpit fallback.",
+          "status": "satisfied",
+          "evidence": "src/workflow/manager.rs separates `CockpitWorkerJobError::Fallback` from `Worker`, records `cockpit_worker_fallback` only for pre-launch cockpit/wrapper handoff failures, and otherwise returns worker errors. `cargo test cockpit --quiet` covered fallback incidents."
+        },
+        {
+          "criterion": "Real-Herdr evidence proves a worker pane can run the wrapper and return a valid worker JSON result through artifact capture; normal cargo test remains portable unless the explicit Herdr e2e test is requested.",
+          "status": "satisfied",
+          "evidence": "`HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet` passed with Herdr on PATH, verifying pane label and wrapper artifacts. The test skips unless HERDR_E2E=1, keeping normal cargo tests portable."
+        }
+      ],
+      "findings": [
+        {
+          "id": "HERDR-02-REPAIR-001",
+          "severity": "info",
+          "action": "auto-fix",
+          "file": "src/workflow/manager.rs",
+          "line": 639,
+          "description": "Removed the useless anyhow::Error conversion reported by clippy."
+        },
+        {
+          "id": "HERDR-02-REPAIR-002",
+          "severity": "info",
+          "action": "auto-fix",
+          "file": "src/agent.rs",
+          "line": 893,
+          "description": "Adjusted the wrapper to launch Pi under a sanitized environment rebuilt from KD-owned env artifacts so pane-only env does not affect worker execution."
+        }
+      ],
+      "assumptions": [
+        "No must_ask_if fence was hit because worker JSON remains read only from KD-owned artifacts, Herdr remains non-authoritative, direct Pi fallback remains intact, and the Pi JSON contract was not changed or relaxed."
+      ]
+    },
+    {
+      "slice_id": "HERDR-03",
+      "status": "complete",
+      "summary": "Implemented a thin Pi/Herdr bridge: added the khazad-monitor extension with feed/explain/open/handoff/answer actions, added `khazad-doom cockpit open` for run/latest Herdr open/focus with fallback JSON, updated docs/package metadata, and added integration/extension tests.",
+      "commit_sha": "5ed2eaefb3f0571ec7caf45327d5b80f0d87e63a",
+      "commit_message": "khazad(slice:HERDR-03): open herdr cockpit from pi bridge",
+      "changed_files": [
+        "README.md",
+        "docs/workflow-invariants.md",
+        "extensions/khazad-monitor/index.js",
+        "extensions/khazad-monitor/index.test.mjs",
+        "package.json",
+        "skills/khazad-doom/SKILL.md",
+        "src/cli.rs",
+        "tests/daemon_integration.rs"
+      ],
+      "public_interfaces_changed": [
+        "New CLI: khazad-doom cockpit open --run <id>",
+        "New CLI: khazad-doom cockpit open --latest --repo <path>",
+        "Pi package extension path now declares ./extensions/khazad-monitor",
+        "Pi commands: /khazad-explain, /khazad-open, /khazad-handoff, /khazad-answer"
+      ],
+      "tests_run": [
+        "khazad-doom slices validate --repo .",
+        "node --check extensions/khazad-monitor/index.js",
+        "npm test",
+        "cargo check",
+        "cargo test herdr_open_focus_reports_fallback_when_unavailable --quiet",
+        "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "git diff --check"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "The Pi adapter surface is documented and implemented as a thin bridge: start or shape a run, explain current run state from daemon feed/handoff data, answer operator blockers through daemon commands, summarize handoff, and open or focus the Herdr cockpit for a run.",
+          "status": "satisfied",
+          "evidence": "extensions/khazad-monitor registers ask_operator plus explicit /khazad-attach, /khazad-explain, /khazad-open, /khazad-handoff, and /khazad-answer commands; README/skill docs describe Pi starting/shaping via daemon CLI and bridge-only actions."
+        },
+        {
+          "criterion": "The Pi adapter does not render or emulate a full live multi-agent cockpit, does not own process/session lifecycle, and does not infer workflow state from Pi session lifecycle.",
+          "status": "satisfied",
+          "evidence": "The adapter renders only a compact daemon feed widget/snapshot, delegates Herdr focus to the CLI, and session shutdown only clears Pi UI resources; docs/invariants explicitly reject a peer Pi cockpit."
+        },
+        {
+          "criterion": "An explicit command or adapter action can open/focus the Herdr workspace for the latest or specified run and reports a clear fallback/remediation message when Herdr is unavailable.",
+          "status": "satisfied",
+          "evidence": "src/cli.rs adds `khazad-doom cockpit open --run` and `--latest --repo`; /khazad-open delegates to it. tests/daemon_integration.rs covers real open/focus and unavailable-Herdr fallback JSON with remediation/operator_commands."
+        },
+        {
+          "criterion": "All live status text shown through Pi comes from the daemon-owned feed projection added by FEED-01; no raw event-type interpretation is duplicated in the Pi adapter.",
+          "status": "satisfied",
+          "evidence": "extensions/khazad-monitor renderRunFeed consumes RunDetails.feed and status text uses feed.summary_line; the Node test injects a raw event string and asserts it is not rendered."
+        },
+        {
+          "criterion": "README, package metadata, and skill docs present the intended model: Pi starts/shapes/explains, Khazad-Doom owns run truth, Herdr shows and focuses live agents.",
+          "status": "satisfied",
+          "evidence": "README.md, package.json, and skills/khazad-doom/SKILL.md now describe khazad-monitor as a thin bridge, daemon-owned truth/status, and Herdr as the optional live cockpit."
+        },
+        {
+          "criterion": "Existing operator escalation behavior remains intact: answering blockers goes through daemon state and token-scoped worker questions, not through manual typing in Herdr worker panes.",
+          "status": "satisfied",
+          "evidence": "ask_operator still calls daemon workerAsk with KHAZAD_WORKER_TOKEN; /khazad-answer calls daemon answerQuestion; docs state not to answer by typing in Herdr worker panes; npm tests cover workerAsk forwarding."
+        }
+      ],
+      "assumptions": [
+        "Pi start/shape remains the khazad-doom skill invoking daemon CLI commands; the extension adds bridge helpers rather than a separate run lifecycle owner."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "FEED-01",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo .",
+        "cargo test terminal_reason --quiet",
+        "cargo test projection --quiet",
+        "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "npm test",
+        "bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'"
+      ],
+      "attempt": 2,
+      "worker_head": "c19645962237b74ad117b9da7bca95525847768d",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "HERDR-01",
+      "status": "failed",
+      "summary": "verify command failed: PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings\nChecking once_cell v1.21.4\n    Checking bitflags v2.13.0\n    Checking linux-raw-sys v0.12.1\n    Checking fastrand v2.4.1\n    Checking getrandom v0.4.3\n    Checking ahash v0.8.12\n    Checking hashbrown v0.14.5\n    Checking rustix v1.1.4\n    Checking hashlink v0.9.1\n    Checking rusqlite v0.32.1\n    Checking khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01)\n    Checking tempfile v3.27.0\nerror: this function has too many arguments (8/7)\n   --> src/cli.rs:447:1\n    |\n447 | / fn run_resume(\n448 | |     paths: Paths,\n449 | |     run_id: String,\n450 | |     agent: String,\n...   |\n455 | |     wait: bool,\n456 | | ) -> Result<()> {\n    | |_______________^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments\n    = note: `-D clippy::too-many-arguments` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`\n\nerror: could not compile `khazad-doom` (bin \"khazad-doom\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `khazad-doom` (bin \"khazad-doom\" test) due to 1 previous error",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings"
+      ],
+      "findings": [
+        {
+          "severity": "error",
+          "action": "auto-fix",
+          "description": "verify command failed: PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings\nChecking once_cell v1.21.4\n    Checking bitflags v2.13.0\n    Checking linux-raw-sys v0.12.1\n    Checking fastrand v2.4.1\n    Checking getrandom v0.4.3\n    Checking ahash v0.8.12\n    Checking hashbrown v0.14.5\n    Checking rustix v1.1.4\n    Checking hashlink v0.9.1\n    Checking rusqlite v0.32.1\n    Checking khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01)\n    Checking tempfile v3.27.0\nerror: this function has too many arguments (8/7)\n   --> src/cli.rs:447:1\n    |\n447 | / fn run_resume(\n448 | |     paths: Paths,\n449 | |     run_id: String,\n450 | |     agent: String,\n...   |\n455 | |     wait: bool,\n456 | | ) -> Result<()> {\n    | |_______________^\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments\n    = note: `-D clippy::too-many-arguments` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`\n\nerror: could not compile `khazad-doom` (bin \"khazad-doom\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `khazad-doom` (bin \"khazad-doom\" test) due to 1 previous error"
+        }
+      ],
+      "attempt": 2,
+      "worker_head": "7ec26fc96d4f8d43deda900cf5b48edac8f81425",
+      "worktree_clean": true,
+      "commit_found": true,
+      "failure_kind": "command_failed"
+    },
+    {
+      "slice_id": "HERDR-01",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo .",
+        "cargo test cockpit --quiet",
+        "HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet"
+      ],
+      "attempt": 3,
+      "worker_head": "221655c9badfb38ff54a21e1c90fb85f7df1fa0c",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "HERDR-02",
+      "status": "failed",
+      "summary": "verify command failed: PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings\nChecking once_cell v1.21.4\n    Checking bitflags v2.13.0\n    Checking linux-raw-sys v0.12.1\n    Checking fastrand v2.4.1\n    Checking getrandom v0.4.3\n    Checking ahash v0.8.12\n    Checking hashbrown v0.14.5\n    Checking rustix v1.1.4\n    Checking hashlink v0.9.1\n    Checking rusqlite v0.32.1\n    Checking khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02)\n    Checking tempfile v3.27.0\nerror: useless conversion to the same type: `anyhow::Error`\n   --> src/workflow/manager.rs:639:58\n    |\n639 |             .map_err(|err| CockpitWorkerJobError::Worker(err.into()))?;\n    |                                                          ^^^^^^^^^^ help: consider removing `.into()`: `err`\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion\n    = note: `-D clippy::useless-conversion` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::useless_conversion)]`\n\nerror: could not compile `khazad-doom` (bin \"khazad-doom\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `khazad-doom` (bin \"khazad-doom\" test) due to 1 previous error",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings"
+      ],
+      "findings": [
+        {
+          "severity": "error",
+          "action": "auto-fix",
+          "description": "verify command failed: PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings\nChecking once_cell v1.21.4\n    Checking bitflags v2.13.0\n    Checking linux-raw-sys v0.12.1\n    Checking fastrand v2.4.1\n    Checking getrandom v0.4.3\n    Checking ahash v0.8.12\n    Checking hashbrown v0.14.5\n    Checking rustix v1.1.4\n    Checking hashlink v0.9.1\n    Checking rusqlite v0.32.1\n    Checking khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02)\n    Checking tempfile v3.27.0\nerror: useless conversion to the same type: `anyhow::Error`\n   --> src/workflow/manager.rs:639:58\n    |\n639 |             .map_err(|err| CockpitWorkerJobError::Worker(err.into()))?;\n    |                                                          ^^^^^^^^^^ help: consider removing `.into()`: `err`\n    |\n    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion\n    = note: `-D clippy::useless-conversion` implied by `-D warnings`\n    = help: to override `-D warnings` add `#[allow(clippy::useless_conversion)]`\n\nerror: could not compile `khazad-doom` (bin \"khazad-doom\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `khazad-doom` (bin \"khazad-doom\" test) due to 1 previous error"
+        }
+      ],
+      "attempt": 1,
+      "worker_head": "6755c9e9a35b363f39f4d24b16e28e667a56f017",
+      "worktree_clean": true,
+      "commit_found": true,
+      "failure_kind": "command_failed"
+    },
+    {
+      "slice_id": "HERDR-02",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo .",
+        "cargo test cockpit --quiet",
+        "cargo test pi_contract --quiet",
+        "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet"
+      ],
+      "attempt": 2,
+      "worker_head": "cde499cabf47601b51a1083847e69c3d2f804c01",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "HERDR-03",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "bash -n scripts/install.sh scripts/package.sh",
+        "khazad-doom slices validate --repo .",
+        "npm test",
+        "node --check extensions/khazad-monitor/index.js",
+        "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet"
+      ],
+      "attempt": 1,
+      "worker_head": "5ed2eaefb3f0571ec7caf45327d5b80f0d87e63a",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "duration_ms": 201
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 63 tests\ntest agent::tests::classifies_pi_auth_failure_only_without_assistant_output ... ok\ntest agent::tests::parses_explicit_runner_specs ... ok\ntest agent::tests::extracts_embedded_json_object ... ok\ntest agent_profile::tests::default_operator_profile_is_used_for_pi_workers ... ok\ntest agent_profile::tests::fake_bypasses_pi_profile ... ok\ntest artifact::tests::accepts_safe_slice_id ... ok\ntest agent_profile::tests::pi_profile_generates_args_then_request_overrides_last ... ok\ntest artifact::tests::dependency_layers_group_independent_slices ... ok\ntest artifact::tests::parses_agent_profile_args ... ok\ntest artifact::tests::rejects_path_or_ref_unsafe_slice_ids ... ok\ntest artifact::tests::topological_order_includes_requested_dependencies_first ... ok\ntest artifact::tests::reports_missing_dependencies ... ok\ntest daemon::tests::terminal_reason_failed_run_falls_back_to_run_error ... ok\ntest daemon::tests::terminal_reason_prefers_structured_incident_payload ... ok\ntest pi_contract::tests::classifies_auth_launch_failures_inside_contract_boundary ... ok\ntest pi_contract::tests::unknown_future_events_warn_once_and_do_not_block_text ... ok\ntest workflow::cockpit::tests::cockpit_config_defaults_auto_and_deserializes_durable_overrides ... ok\ntest workflow::cockpit::tests::cockpit_direct_mode_skips_adapter ... ok\ntest pi_contract::tests::parses_current_pi_event_shapes_and_usage ... ok\ntest workflow::cockpit::tests::cockpit_opens_default_workspace_and_read_only_panes_without_planner ... ok\ntest workflow::cockpit::tests::cockpit_mode_transport_round_trips_and_filters_pi_args ... ok\ntest paths::tests::ensure_creates_operator_agent_profiles_file ... ok\ntest workflow::cockpit::tests::cockpit_worker_pane_uses_deterministic_run_and_slice_label ... ok\ntest workflow::cockpit::tests::cockpit_request_uses_run_named_workspace_and_no_planner_command ... ok\ntest artifact::tests::ensure_default_config_uses_parallelism_three ... ok\ntest workflow::manager::tests::rejects_worker_result_for_wrong_slice ... ok\ntest workflow::manager::tests::rejects_missing_acceptance_evidence_for_completed_worker ... ok\ntest workflow::projection::tests::terminal_reason_projection_carries_reason_and_operator_commands ... ok\ntest workflow::manager::tests::rejects_unknown_worker_and_repair_statuses ... ok\ntest workflow::projection::tests::projection_has_versioned_blocks_and_raw_safe_roles ... ok\ntest workflow::prompts::tests::worker_prompt_authorizes_within_intent_tdd_discoveries ... ok\ntest workflow::shell::tests::shell_command_progress_is_bounded_and_preserves_streams ... ok\ntest workflow::manager::tests::repo_local_agents_toml_is_not_a_worker_profile_input ... ok\ntest workflow::shell::tests::shell_command_cancellation_returns_promptly ... ok\ntest workflow::manager::tests::explicitly_requested_closed_slice_is_rejected ... ok\ntest workflow::manager::tests::dirty_source_repo_requires_explicit_allow_dirty ... ok\ntest state::tests::worker_questions_are_token_scoped_and_single_answered ... ok\ntest workflow::gate::tests::integration_gate_success_uses_cwd_env_and_dedupes_commands ... ok\ntest workflow::gate::tests::integration_gate_fail_fast_skips_remaining_commands ... ok\ntest workflow::gate::tests::integration_gate_failure_preserves_result_and_finding_text ... ok\ntest workflow::gate::tests::slice_verification_missing_command_is_operator_failure ... ok\ntest workflow::gate::tests::slice_verification_failure_preserves_check_summary_text ... ok\ntest state::tests::latest_run_for_repo_is_deterministic_and_active_scoped ... ok\ntest workflow::manager::tests::recovery_marks_stale_running_runs_interrupted ... ok\ntest workflow::gate::tests::integration_gate_cancellation_returns_promptly ... ok\ntest workflow::gate::tests::integration_gate_preserves_profile_order ... ok\ntest workflow::shell::tests::shell_command_timeout_returns_promptly ... ok\ntest workflow::manager::tests::missing_verify_tool_fails_once_and_preserves_primary_cause ... ok\ntest workflow::manager::tests::changed_files_outside_slice_areas_block_worker ... ok\ntest workflow::gate::tests::integration_gate_timeout_returns_failed_command_result ... ok\ntest workflow::manager::tests::merge_conflicts_are_structured_blocked_artifacts ... ok\ntest workflow::manager::tests::untracked_workflow_slices_do_not_fail_successful_finalization ... ok\ntest workflow::manager::tests::integration_repair_never_preserves_failed_gate_evidence ... ok\ntest workflow::manager::tests::repo_config_verify_profile_runs_with_env_and_cwd ... ok\ntest workflow::manager::tests::closed_dependency_is_satisfied_and_not_rerun ... ok\ntest workflow::manager::tests::integration_gate_operator_environment_failure_blocks_without_repair ... ok\ntest workflow::manager::tests::resume_removes_stale_integration_worktree_before_recreating ... ok\ntest workflow::manager::tests::integration_repair_always_reruns_gate_and_uses_cache_for_noop ... ok\ntest workflow::manager::tests::fake_runner_parallelizes_independent_slices ... ok\ntest workflow::manager::tests::resume_after_completion_publication_is_idempotent ... ok\ntest workflow::manager::tests::worktree_setup_runs_in_worker_and_integration_worktrees ... ok\ntest workflow::manager::tests::fake_runner_e2e_executes_dependent_slices_and_cleans_worktrees ... ok\ntest workflow::manager::tests::active_repo_run_blocks_second_run ... ok\n\ntest result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.25s\n\n\nrunning 21 tests\ntest herdr_cockpit_workspace_real ... ok\ntest herdr_open_focus_real ... ok\ntest herdr_worker_wrapper_real ... ok\ntest daemon_start_detaches_from_parent_process_group_black_box ... ok\ntest daemon_status_responds_while_raw_socket_client_is_idle_black_box ... ok\ntest daemon_status_reports_stopped_daemon_without_hanging_black_box ... ok\ntest pi_auth_launch_failure_blocks_without_retries_or_later_layers ... ok\ntest cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box ... ok\ntest herdr_open_focus_reports_fallback_when_unavailable ... ok\ntest monitor_specific_run_returns_error_for_failed_terminal_status ... ok\ntest cockpit_direct_cli_override_beats_durable_herdr_config ... ok\ntest final_sha_advertises_publication_commit_with_close_records ... ok\ntest schema_import_and_handoff_v2_black_box ... ok\ntest untracked_slice_metadata_completes_with_incident_flag_black_box ... ok\ntest interrupted_run_resumes_without_duplicate_merges_black_box ... ok\ntest daemon_fake_run_handoff_and_inspect_black_box ... ok\ntest monitor_exposes_quiet_pi_worker_supervision_without_default_timeout ... ok\ntest cockpit_herdr_failure_is_nonfatal_incident ... ok\ntest status_and_watch_expose_live_progress_for_long_verification ... ok\ntest parallel_layer_failure_joins_records_and_cancels_siblings_black_box ... ok\ntest status_latest_returns_active_run_for_repo_or_null ... ok\n\ntest result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.64s\n\n   Compiling version_check v0.9.5\n   Compiling cfg-if v1.0.4\n   Compiling zerocopy v0.8.52\n   Compiling proc-macro2 v1.0.106\n   Compiling unicode-ident v1.0.24\n   Compiling libc v0.2.186\n   Compiling quote v1.0.46\n   Compiling typenum v1.20.1\n   Compiling find-msvc-tools v0.1.9\n   Compiling once_cell v1.21.4\n   Compiling serde_core v1.0.228\n   Compiling shlex v2.0.1\n   Compiling pkg-config v0.3.33\n   Compiling utf8parse v0.2.2\n   Compiling vcpkg v0.2.15\n   Compiling autocfg v1.5.1\n   Compiling anstyle v1.0.14\n   Compiling is_terminal_polyfill v1.70.2\n   Compiling bitflags v2.13.0\n   Compiling anstyle-query v1.1.5\n   Compiling serde v1.0.228\n   Compiling zmij v1.0.21\n   Compiling colorchoice v1.0.5\n   Compiling strsim v0.11.1\n   Compiling serde_json v1.0.150\n   Compiling getrandom v0.4.3\n   Compiling rustix v1.1.4\n   Compiling clap_lex v1.1.0\n   Compiling heck v0.5.0\n   Compiling anyhow v1.0.103\n   Compiling smallvec v1.15.2\n   Compiling fallible-streaming-iterator v0.1.9\n   Compiling fallible-iterator v0.3.0\n   Compiling anstyle-parse v1.0.0\n   Compiling memchr v2.8.2\n   Compiling cpufeatures v0.2.17\n   Compiling cc v1.2.65\n   Compiling iana-time-zone v0.1.65\n   Compiling linux-raw-sys v0.12.1\n   Compiling itoa v1.0.18\n   Compiling fastrand v2.4.1\n   Compiling hex v0.4.3\n   Compiling generic-array v0.14.7\n   Compiling ahash v0.8.12\n   Compiling anstream v1.0.0\n   Compiling num-traits v0.2.19\n   Compiling clap_builder v4.6.0\n   Compiling syn v2.0.118\n   Compiling libsqlite3-sys v0.30.1\n   Compiling getrandom v0.2.17\n   Compiling block-buffer v0.10.4\n   Compiling crypto-common v0.1.7\n   Compiling rand_core v0.6.4\n   Compiling digest v0.10.7\n   Compiling sha2 v0.10.9\n   Compiling tempfile v3.27.0\n   Compiling serde_derive v1.0.228\n   Compiling clap_derive v4.6.1\n   Compiling ppv-lite86 v0.2.21\n   Compiling hashbrown v0.14.5\n   Compiling rand_chacha v0.3.1\n   Compiling rand v0.8.6\n   Compiling hashlink v0.9.1\n   Compiling clap v4.6.1\n   Compiling chrono v0.4.45\n   Compiling rusqlite v0.32.1\n   Compiling khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.94s\n     Running unittests src/main.rs (target/debug/deps/khazad_doom-5a3ff85b4912457c)\n     Running tests/daemon_integration.rs (target/debug/deps/daemon_integration-060352e879623867)",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "duration_ms": 44926
+      },
+      {
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Checking cfg-if v1.0.4\n    Checking once_cell v1.21.4\n    Checking typenum v1.20.1\n    Checking utf8parse v0.2.2\n    Checking anstyle v1.0.14\n    Checking bitflags v2.13.0\n    Checking anstyle-query v1.1.5\n    Checking colorchoice v1.0.5\n    Checking is_terminal_polyfill v1.70.2\n    Checking clap_lex v1.1.0\n    Checking strsim v0.11.1\n    Checking memchr v2.8.2\n    Checking cpufeatures v0.2.17\n    Checking itoa v1.0.18\n    Checking linux-raw-sys v0.12.1\n    Checking fallible-streaming-iterator v0.1.9\n    Checking iana-time-zone v0.1.65\n    Checking zerocopy v0.8.52\n    Checking libc v0.2.186\n    Checking serde_core v1.0.228\n    Checking zmij v1.0.21\n    Checking smallvec v1.15.2\n    Checking fallible-iterator v0.3.0\n    Checking anyhow v1.0.103\n    Checking fastrand v2.4.1\n    Checking hex v0.4.3\n    Checking num-traits v0.2.19\n    Checking libsqlite3-sys v0.30.1\n    Checking anstyle-parse v1.0.0\n    Checking anstream v1.0.0\n    Checking clap_builder v4.6.0\n    Checking rustix v1.1.4\n    Checking generic-array v0.14.7\n    Checking getrandom v0.2.17\n    Checking getrandom v0.4.3\n    Checking rand_core v0.6.4\n    Checking crypto-common v0.1.7\n    Checking block-buffer v0.10.4\n    Checking digest v0.10.7\n    Checking sha2 v0.10.9\n    Checking tempfile v3.27.0\n    Checking clap v4.6.1\n    Checking serde v1.0.228\n    Checking serde_json v1.0.150\n    Checking chrono v0.4.45\n    Checking ahash v0.8.12\n    Checking ppv-lite86 v0.2.21\n    Checking hashbrown v0.14.5\n    Checking rand_chacha v0.3.1\n    Checking rand v0.8.6\n    Checking hashlink v0.9.1\n    Checking rusqlite v0.32.1\n    Checking khazad-doom v0.1.0 (/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.91s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "duration_ms": 5004
+      },
+      {
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "duration_ms": 100
+      },
+      {
+        "command": "khazad-doom slices validate --repo .",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "{\n  \"valid\": true,\n  \"slices\": [\n    {\n      \"id\": \"FEED-01\",\n      \"title\": \"Terminal reason and projection authority\",\n      \"areas\": [\n        \"src/domain.rs\",\n        \"src/workflow/projection.rs\",\n        \"src/cli.rs\",\n        \"src/daemon.rs\",\n        \"src/ipc.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"extensions/khazad-monitor\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 7\n    },\n    {\n      \"id\": \"HERDR-01\",\n      \"title\": \"Herdr cockpit contract and default workspace\",\n      \"depends_on\": [\n        \"FEED-01\"\n      ],\n      \"areas\": [\n        \"src/domain.rs\",\n        \"src/cli.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/workflow/mod.rs\",\n        \"src/workflow/cockpit.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 4\n    },\n    {\n      \"id\": \"HERDR-02\",\n      \"title\": \"Herdr worker panes with KD-owned result capture\",\n      \"depends_on\": [\n        \"HERDR-01\"\n      ],\n      \"areas\": [\n        \"src/agent.rs\",\n        \"src/pi_contract.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/workflow/cockpit.rs\",\n        \"src/workflow/mod.rs\",\n        \"src/domain.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 6\n    },\n    {\n      \"id\": \"HERDR-03\",\n      \"title\": \"Pi bridge opens Herdr cockpit\",\n      \"depends_on\": [\n        \"HERDR-02\"\n      ],\n      \"areas\": [\n        \"extensions/khazad-monitor\",\n        \"package.json\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"docs/workflow-invariants.md\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 5\n    },\n    {\n      \"id\": \"PI-00\",\n      \"title\": \"Pi-first doctrine\",\n      \"areas\": [\n        \".pi/memory/VISION.md\",\n        \".pi/memory/PLAN.md\",\n        \".pi/memory/DECISIONS.md\",\n        \"README.md\",\n        \"docs/workflow-invariants.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"PI-01\",\n      \"title\": \"Classify non-retryable Pi launch failures\",\n      \"areas\": [\n        \"src/agent.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/workflow/gate.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 3\n    },\n    {\n      \"id\": \"PUB-01\",\n      \"title\": \"Completion publisher and close-record promotion\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/artifact.rs\",\n        \"src/domain.rs\",\n        \"src/gitutil.rs\",\n        \"src/state.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 4\n    },\n    {\n      \"id\": \"PUB-01A\",\n      \"title\": \"Fix publication final_sha to advertise close-record commit\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/artifact.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 6\n    },\n    {\n      \"id\": \"PUB-01B\",\n      \"title\": \"Validate restarted-daemon publication SHA\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"docs/design/evidence/pub-01a-bootstrap-exception-2026-07-06.md\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 2\n    },\n    {\n      \"id\": \"slice-021\",\n      \"title\": \"Dogfood slice set\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-022\",\n      \"title\": \"Repo config file\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-021\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-023\",\n      \"title\": \"Resume e2e hardening\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-022\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-024\",\n      \"title\": \"Merge conflict handling\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-023\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-025\",\n      \"title\": \"Slice JSON schema export\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-024\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-026\",\n      \"title\": \"GitHub import v2\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-025\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-027\",\n      \"title\": \"Handoff v2\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-026\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-028\",\n      \"title\": \"Repo/run locking\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-027\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-029\",\n      \"title\": \"Verification profiles\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-028\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-030\",\n      \"title\": \"Release automation\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-029\"\n      ],\n      \"areas\": [\n        \"khazad-doom\",\n        \"workflow\"\n      ],\n      \"acceptance_count\": 3,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-031\",\n      \"title\": \"Pre-release codebase audit\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src\",\n        \"tests\",\n        \"scripts\",\n        \"workflow\",\n        \"docs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-032\",\n      \"title\": \"Deepen live progress implementation\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/state.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-033\",\n      \"title\": \"Latest run lookup for monitors\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/state.rs\",\n        \"src/ipc.rs\",\n        \"src/daemon.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-034\",\n      \"title\": \"Harness-neutral terminal monitor\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-033\"\n      ],\n      \"areas\": [\n        \"src/cli.rs\",\n        \"src/ipc.rs\",\n        \"src/daemon.rs\",\n        \"src/state.rs\",\n        \"tests/daemon_integration.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-035\",\n      \"title\": \"Document always-on monitor UX\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-034\"\n      ],\n      \"areas\": [\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"src/cli.rs\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 0\n    },\n    {\n      \"id\": \"slice-036\",\n      \"title\": \"Optional Pi monitor overlay adapter\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-035\"\n      ],\n      \"areas\": [\n        \"package.json\",\n        \"extensions/khazad-monitor\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 5,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-037\",\n      \"title\": \"Worker attempt supervision\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-036\"\n      ],\n      \"areas\": [\n        \"src/agent.rs\",\n        \"src/domain.rs\",\n        \"src/state.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \"extensions/khazad-monitor/index.js\"\n      ],\n      \"acceptance_count\": 8,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-038\",\n      \"title\": \"Document workflow invariants\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"docs/workflow-invariants.md\",\n        \"README.md\",\n        \"skills/khazad-doom/SKILL.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-039\",\n      \"title\": \"Extract integration gate seam\",\n      \"status\": \"closed\",\n      \"depends_on\": [\n        \"slice-038\"\n      ],\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/workflow/mod.rs\",\n        \"src/workflow/gate.rs\",\n        \"src/workflow/shell.rs\",\n        \"src/domain.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-040\",\n      \"title\": \"Slice lifecycle safety\",\n      \"status\": \"closed\",\n      \"areas\": [\n        \"src/domain.rs\",\n        \"src/artifact.rs\",\n        \"src/workflow/manager.rs\",\n        \"src/cli.rs\",\n        \"README.md\",\n        \"docs/workflow-invariants.md\",\n        \"skills/khazad-doom/SKILL.md\",\n        \".workflow/slices\",\n        \".workflow/schema/slice.schema.json\"\n      ],\n      \"acceptance_count\": 7,\n      \"verify_count\": 1\n    },\n    {\n      \"id\": \"slice-041\",\n      \"title\": \"Parallel scheduler hardening\",\n      \"areas\": [\n        \"src/workflow/manager.rs\",\n        \"src/state.rs\",\n        \"src/cli.rs\",\n        \"tests/daemon_integration.rs\",\n        \"docs/workflow-invariants.md\",\n        \"README.md\"\n      ],\n      \"acceptance_count\": 6,\n      \"verify_count\": 1\n    }\n  ],\n  \"issues\": []\n}",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000khazad-doom slices validate --repo .",
+        "duration_ms": 108
+      },
+      {
+        "command": "cargo test terminal_reason --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test terminal_reason --quiet",
+        "duration_ms": 101
+      },
+      {
+        "command": "cargo test projection --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test projection --quiet",
+        "duration_ms": 101
+      },
+      {
+        "command": "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 9.18s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "duration_ms": 9266
+      },
+      {
+        "command": "cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 1.16s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "duration_ms": 1223
+      },
+      {
+        "command": "npm test",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "> khazad-doom@0.1.0 test\n> npm run test:extension\n\n\n> khazad-doom@0.1.0 test:extension\n> node --test extensions/khazad-monitor/index.test.mjs\n\n✔ package ships the thin monitor bridge extension (2.795086ms)\n✔ monitor bridge registers tools and explicit bridge commands (0.237859ms)\n✔ khazad attach renders only daemon feed projection text (3.975786ms)\n✔ khazad open delegates Herdr focus to the daemon CLI command (18.114217ms)\n✔ ask_operator forwards bounded questions to daemon state (1.203883ms)\n✔ khazad attach ignores delayed daemon responses after shutdown (6.243887ms)\nℹ tests 6\nℹ suites 0\nℹ pass 6\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 63.522479",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000npm test",
+        "duration_ms": 237
+      },
+      {
+        "command": "bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "duration_ms": 101
+      },
+      {
+        "command": "cargo test cockpit --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 6 tests\n......\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 0.00s\n\n\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 5.54s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test cockpit --quiet",
+        "duration_ms": 5624
+      },
+      {
+        "command": "HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 1.40s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "duration_ms": 1501
+      },
+      {
+        "command": "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 3.41s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "duration_ms": 3503
+      },
+      {
+        "command": "cargo test pi_contract --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test pi_contract --quiet",
+        "duration_ms": 101
+      },
+      {
+        "command": "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 6.74s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "duration_ms": 6826
+      },
+      {
+        "command": "cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.91s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "duration_ms": 1001
+      },
+      {
+        "command": "node --check extensions/khazad-monitor/index.js",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000node --check extensions/khazad-monitor/index.js",
+        "duration_ms": 101
+      },
+      {
+        "command": "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 1.35s",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "duration_ms": 1422
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "FEED-01",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "HERDR-01",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "HERDR-02",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "HERDR-03",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 8,
+    "command_execution_count": 63,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 63,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "FEED-01",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 780964,
+        "input_tokens": 396,
+        "output_tokens": 839
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 210784,
+        "input_tokens": 11592,
+        "output_tokens": 1457
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "HERDR-01",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 1428982,
+        "input_tokens": 450,
+        "output_tokens": 741
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "HERDR-01",
+        "attempt": 2,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 91806,
+        "input_tokens": 2768,
+        "output_tokens": 1466
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 169109,
+        "input_tokens": 263,
+        "output_tokens": 2604
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "HERDR-02",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 969601,
+        "input_tokens": 608,
+        "output_tokens": 2339
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 246198,
+        "input_tokens": 770,
+        "output_tokens": 1895
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 730513,
+        "input_tokens": 557,
+        "output_tokens": 1494
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 81979
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 16
+      },
+      "worker_layer:FEED-01": {
+        "phase": "worker_layer:FEED-01",
+        "duration_ms": 1028098
+      },
+      "worker_layer:HERDR-01": {
+        "phase": "worker_layer:HERDR-01",
+        "duration_ms": 1741559
+      },
+      "worker_layer:HERDR-02": {
+        "phase": "worker_layer:HERDR-02",
+        "duration_ms": 1277235
+      },
+      "worker_layer:HERDR-03": {
+        "phase": "worker_layer:HERDR-03",
+        "duration_ms": 766046
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 200,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 19581,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 4925,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "khazad-doom slices validate --repo .",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 119,
+        "dedupe_key": "\u0000\u0000khazad-doom slices validate --repo .",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000khazad-doom slices validate --repo .",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "cargo test terminal_reason --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000cargo test terminal_reason --quiet",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000cargo test terminal_reason --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "cargo test projection --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test projection --quiet",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000cargo test projection --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 9235,
+        "dedupe_key": "\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1227,
+        "dedupe_key": "\u0000\u0000cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "npm test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 215,
+        "dedupe_key": "\u0000\u0000npm test",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000npm test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "FEED-01",
+        "attempt": 2,
+        "command": "bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "tree_sha": "7cc8537a96db78a6a868fdf4fbcad0c204cf4797",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/FEED-01\u00007cc8537a96db78a6a868fdf4fbcad0c204cf4797\u0000\u0000\u0000bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "3fdec3c249b14c8af16dcce51ce7d3779b7753c2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u00003fdec3c249b14c8af16dcce51ce7d3779b7753c2\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 19967,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "3fdec3c249b14c8af16dcce51ce7d3779b7753c2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u00003fdec3c249b14c8af16dcce51ce7d3779b7753c2\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "failed",
+        "exit_code": 101,
+        "duration_ms": 3517,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "3fdec3c249b14c8af16dcce51ce7d3779b7753c2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u00003fdec3c249b14c8af16dcce51ce7d3779b7753c2\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 19967,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "khazad-doom slices validate --repo .",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000khazad-doom slices validate --repo .",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000khazad-doom slices validate --repo .",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "cargo test cockpit --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1902,
+        "dedupe_key": "\u0000\u0000cargo test cockpit --quiet",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000cargo test cockpit --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1523,
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-01",
+        "attempt": 3,
+        "command": "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 3503,
+        "dedupe_key": "\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "tree_sha": "88416dbdcb20dc4de677f93970dc681a5471f48c",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-01\u000088416dbdcb20dc4de677f93970dc681a5471f48c\u0000\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 1,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "db517135b39933831deaa08ef808135438de1ccf",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000db517135b39933831deaa08ef808135438de1ccf\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 1,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 19489,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "db517135b39933831deaa08ef808135438de1ccf",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000db517135b39933831deaa08ef808135438de1ccf\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 1,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "failed",
+        "exit_code": 101,
+        "duration_ms": 3703,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "db517135b39933831deaa08ef808135438de1ccf",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000db517135b39933831deaa08ef808135438de1ccf\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 19771,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "khazad-doom slices validate --repo .",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000khazad-doom slices validate --repo .",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000khazad-doom slices validate --repo .",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "cargo test cockpit --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 5818,
+        "dedupe_key": "\u0000\u0000cargo test cockpit --quiet",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000cargo test cockpit --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "cargo test pi_contract --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test pi_contract --quiet",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000cargo test pi_contract --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 6824,
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1001,
+        "dedupe_key": "\u0000\u0000cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-02",
+        "attempt": 2,
+        "command": "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 3503,
+        "dedupe_key": "\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "tree_sha": "663bc360a10049dab11667a4f0ab468d9cbe394e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-02\u0000663bc360a10049dab11667a4f0ab468d9cbe394e\u0000\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 19777,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 3722,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "khazad-doom slices validate --repo .",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000khazad-doom slices validate --repo .",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000khazad-doom slices validate --repo .",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "npm test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 301,
+        "dedupe_key": "\u0000\u0000npm test",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000npm test",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "node --check extensions/khazad-monitor/index.js",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000node --check extensions/khazad-monitor/index.js",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000node --check extensions/khazad-monitor/index.js",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1501,
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "HERDR-03",
+        "attempt": 1,
+        "command": "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 9258,
+        "dedupe_key": "\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/HERDR-03\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 201,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 44926,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo test",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 5004,
+        "dedupe_key": "\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --all-targets --all-features -- -D warnings",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "bash -n scripts/install.sh scripts/package.sh",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000bash -n scripts/install.sh scripts/package.sh",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "khazad-doom slices validate --repo .",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 108,
+        "dedupe_key": "\u0000\u0000khazad-doom slices validate --repo .",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000khazad-doom slices validate --repo .",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test terminal_reason --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000cargo test terminal_reason --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test terminal_reason --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test projection --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000cargo test projection --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test projection --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 9266,
+        "dedupe_key": "\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1223,
+        "dedupe_key": "\u0000\u0000cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test monitor_specific_run_returns_error_for_failed_terminal_status --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "npm test",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 237,
+        "dedupe_key": "\u0000\u0000npm test",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000npm test",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000bash -lc '! rg -n \"event\\.type|\\\"run_completed\\\"|\\\"progress\\\"|\\\"incident\\\"\" src/cli.rs'",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test cockpit --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 5624,
+        "dedupe_key": "\u0000\u0000cargo test cockpit --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test cockpit --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1501,
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000HERDR_E2E=1 cargo test herdr_cockpit_workspace_real --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 3503,
+        "dedupe_key": "\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test daemon_fake_run_handoff_and_inspect_black_box --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test pi_contract --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000cargo test pi_contract --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test pi_contract --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 6826,
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000HERDR_E2E=1 cargo test herdr_worker_wrapper_real --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1001,
+        "dedupe_key": "\u0000\u0000cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000cargo test cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box --quiet",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "node --check extensions/khazad-monitor/index.js",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000node --check extensions/khazad-monitor/index.js",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000node --check extensions/khazad-monitor/index.js",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 1422,
+        "dedupe_key": "\u0000\u0000HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "tree_sha": "cb041e8c482b60c3630c2fea37c3fc60bb79aa31",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260706-230801-b54357e3/integration\u0000cb041e8c482b60c3630c2fea37c3fc60bb79aa31\u0000\u0000\u0000HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+        "cache_hit": false
+      }
+    ]
+  },
+  "created_at": "2026-07-07T00:29:36.886777029Z"
+}
