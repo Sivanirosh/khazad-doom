@@ -2,7 +2,8 @@ use crate::artifact;
 use crate::domain::{
     BranchHandoff, Event, ImplementationSummary, ReplanProposal, ReplanProposalState, ReplanStatus,
     Run, RunDetails, RunEconomics, RunIncident, RunInspection, RunProgress, RunStatus, SliceRun,
-    SliceStatus, SliceWriteResult, TerminalReason, WorkerQuestion, replan_decision_commands,
+    SliceStatus, SliceWriteResult, TerminalReason, WorkerProfileEvidence, WorkerQuestion,
+    replan_decision_commands,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -276,6 +277,7 @@ impl Server {
             annotate_parallel_progress(progress, &slice_runs, &events);
         }
         let economics = read_run_economics(&run).ok();
+        let worker_profile = read_worker_profile(&run, economics.as_ref()).unwrap_or_default();
         let incident_events = self.store.get_incident_events(&run_id)?;
         let incidents = run_incidents_from_events(&incident_events);
         let questions = self
@@ -292,6 +294,7 @@ impl Server {
             &questions,
         );
         let mut details = RunDetails {
+            worker_profile,
             slice_runs,
             progress,
             incidents,
@@ -334,6 +337,7 @@ impl Server {
             &question_id,
             &params.run_id,
             &params.slice_id,
+            params.attempt,
             &params.question,
             &params.options,
         )?;
@@ -343,6 +347,7 @@ impl Server {
             &json!({
                 "question_id": question.id,
                 "slice_id": question.slice_id,
+                "attempt": question.attempt,
                 "question": question.question,
                 "options": question.options,
                 "answer_command": format!("khazad-doom answer {} {} <answer>", params.run_id, question.id),
@@ -415,6 +420,15 @@ impl Server {
             answer: String::new(),
             timed_out: true,
         })
+    }
+
+    fn worker_question_is_currently_awaited(&self, question: &WorkerQuestion) -> Result<bool> {
+        let Some(progress) = self.store.get_progress(&question.run_id)? else {
+            return Ok(false);
+        };
+        Ok(progress.phase == "awaiting_operator"
+            && progress.slice_id == question.slice_id
+            && progress.attempt == question.attempt)
     }
 
     fn handle(&self, method: &str, raw: Option<serde_json::Value>) -> Result<HandleOutcome> {
@@ -570,6 +584,27 @@ impl Server {
                         "run {} is {}; resume first before answering",
                         run.id,
                         run.status
+                    );
+                }
+                let pending = self
+                    .store
+                    .get_worker_question(&params.question_id)?
+                    .ok_or_else(|| anyhow!("question {:?} not found", params.question_id))?;
+                if pending.run_id != params.run_id {
+                    bail!(
+                        "question {:?} belongs to run {}, not {}",
+                        params.question_id,
+                        pending.run_id,
+                        params.run_id
+                    );
+                }
+                if pending.state != "pending" {
+                    bail!("question {:?} is already {}", pending.id, pending.state);
+                }
+                if !self.worker_question_is_currently_awaited(&pending)? {
+                    bail!(
+                        "question {} is not attached to the active worker attempt; resume the run and answer the fresh pending question shown by status/watch/monitor",
+                        pending.id
                     );
                 }
                 let question = self.store.answer_worker_question(
@@ -1098,6 +1133,42 @@ fn read_run_economics(run: &Run) -> Result<RunEconomics> {
     let summary: ImplementationSummary =
         artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
     Ok(summary.economics)
+}
+
+fn read_worker_profile(
+    run: &Run,
+    economics: Option<&RunEconomics>,
+) -> Option<WorkerProfileEvidence> {
+    let store = artifact::Store::new(&run.repo_path);
+    if let Ok(summary) = artifact::read_json::<ImplementationSummary>(
+        store.output_path(&run.id, "final-report.json"),
+    ) && !summary.worker_profile.is_empty()
+    {
+        return Some(summary.worker_profile);
+    }
+    if let Ok(value) =
+        artifact::read_json::<serde_json::Value>(store.output_path(&run.id, "preflight.json"))
+        && let Some(profile) = WorkerProfileEvidence::from_json_surface(&value)
+    {
+        return Some(profile);
+    }
+    economics.and_then(|economics| {
+        economics.agent_calls.iter().find_map(|call| {
+            let value = json!({
+                "agent": call.runner,
+                "agent_profile": call.agent_profile,
+                "agent_provider": call.agent_provider,
+                "agent_model": call.agent_model,
+                "agent_reasoning": call.agent_reasoning,
+                "agent_mode": call.agent_mode,
+                "profile_summary": call.profile_summary,
+                "launch_summary": call.launch_summary,
+                "worker_evidence_kind": call.worker_evidence_kind(),
+                "worker_evidence_label": call.worker_evidence_label(),
+            });
+            WorkerProfileEvidence::from_json_surface(&value)
+        })
+    })
 }
 
 fn annotate_parallel_progress(

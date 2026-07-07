@@ -15,7 +15,7 @@ use crate::agent::{
     CancellationToken, Job, PiCommandSpec, PiWrapperArtifacts, Runner, RunnerError, RunnerEvent,
     RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, RunnerTranscript,
     collect_pi_wrapper_result, prepare_pi_wrapper_artifacts, runner_from_spec,
-    wait_for_pi_wrapper_launch,
+    wait_for_pi_wrapper_launch, worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
 };
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
@@ -25,8 +25,8 @@ use crate::domain::{
     ImplementationSummary, MergeConflictReport, PlanRevisionDecisionSummary, PlanRevisionRecord,
     PlanRevisions, RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
     ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState,
-    SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult, WorkflowConfig,
-    WorkflowExitStates, replan_decision_commands,
+    SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerProfileEvidence,
+    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -53,6 +53,47 @@ use std::time::{Duration, Instant};
 pub const MAX_WORKER_ATTEMPTS: usize = 3;
 pub const DEFAULT_REPAIR_ATTEMPTS: usize = 1;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
+
+fn worker_profile_evidence(runner_name: &str, metadata: &RunnerMetadata) -> WorkerProfileEvidence {
+    WorkerProfileEvidence {
+        agent: runner_name.to_string(),
+        agent_profile: metadata.profile.clone(),
+        agent_provider: metadata.provider.clone(),
+        agent_model: metadata.model.clone(),
+        agent_reasoning: metadata.reasoning.clone(),
+        agent_mode: metadata.mode.clone(),
+        profile_summary: metadata.profile_summary(),
+        launch_summary: metadata.launch_summary(),
+        worker_evidence_kind: worker_evidence_kind_for_runner(runner_name).to_string(),
+        worker_evidence_label: worker_evidence_label_for_runner(runner_name).to_string(),
+        source_attribution: metadata.source_attribution.clone(),
+    }
+}
+
+fn append_worker_evidence_attestation_basis(
+    attestation: &mut EvidenceAttestation,
+    worker_profile: &WorkerProfileEvidence,
+) {
+    if worker_profile.worker_evidence_kind.trim().is_empty() {
+        return;
+    }
+    let basis = format!(
+        "worker evidence kind: {} ({})",
+        worker_profile.worker_evidence_kind, worker_profile.worker_evidence_label
+    );
+    if !attestation.basis.iter().any(|existing| existing == &basis) {
+        attestation.basis.push(basis);
+    }
+}
+
+fn read_worker_profile_from_preflight(
+    store: &artifact::Store,
+    run_id: &str,
+) -> Option<WorkerProfileEvidence> {
+    artifact::read_json::<serde_json::Value>(store.output_path(run_id, "preflight.json"))
+        .ok()
+        .and_then(|value| WorkerProfileEvidence::from_json_surface(&value))
+}
 
 #[derive(Clone)]
 pub struct Manager {
@@ -1035,11 +1076,15 @@ impl Manager {
         self.state.insert_run(&run)?;
         artifact::Store::new(&run.repo_path).ensure_run_dirs(&run.id)?;
         let runner_metadata = runner.metadata();
+        let worker_profile = worker_profile_evidence(runner.name(), &runner_metadata);
         let pi_contract = runner.pi_contract_observation();
         artifact::write_json(
             artifact::Store::new(&run.repo_path).output_path(&run.id, "preflight.json"),
             &json!({
                 "agent": runner.name(),
+                "worker_profile": &worker_profile,
+                "worker_evidence_kind": &worker_profile.worker_evidence_kind,
+                "worker_evidence_label": &worker_profile.worker_evidence_label,
                 "profile_summary": runner_metadata.profile_summary(),
                 "launch_summary": runner_metadata.launch_summary(),
                 "profile_source_attribution": &runner_metadata.source_attribution,
@@ -1080,6 +1125,9 @@ impl Manager {
                 "agent_model": &runner_metadata.model,
                 "agent_reasoning": &runner_metadata.reasoning,
                 "agent_mode": &runner_metadata.mode,
+                "worker_profile": &worker_profile,
+                "worker_evidence_kind": &worker_profile.worker_evidence_kind,
+                "worker_evidence_label": &worker_profile.worker_evidence_label,
                 "profile_summary": runner_metadata.profile_summary(),
                 "launch_summary": runner_metadata.launch_summary(),
                 "profile_source_attribution": &runner_metadata.source_attribution,
@@ -1252,6 +1300,16 @@ impl Manager {
                 )?,
             }
             self.state.interrupt_active_slice_runs(&run.id, reason)?;
+            let interrupted_questions = self
+                .state
+                .interrupt_pending_worker_questions(&run.id, reason)?;
+            if interrupted_questions > 0 {
+                self.state.record_event(
+                    &run.id,
+                    "worker_questions_interrupted",
+                    &json!({ "count": interrupted_questions, "reason": reason }),
+                )?;
+            }
             self.state.mark_run_interrupted(&run.id, reason)?;
             self.state.record_event(
                 &run.id,
@@ -1317,6 +1375,12 @@ impl Manager {
             .map(|summary| summary.evidence_attestation.clone())
             .filter(|attestation| !attestation.status.trim().is_empty())
             .unwrap_or_else(historical_evidence_attestation);
+        let worker_profile = summary
+            .as_ref()
+            .map(|summary| summary.worker_profile.clone())
+            .filter(|profile| !profile.is_empty())
+            .or_else(|| read_worker_profile_from_preflight(&store, &run.id))
+            .unwrap_or_default();
         let plan_revisions = self.plan_revisions_for_run(&run)?;
         if plan_revisions.unresolved_pending_blocks_handoff {
             let ids = plan_revisions
@@ -1395,6 +1459,7 @@ impl Manager {
             base_branch: run.base_branch,
             base_sha: run.base_sha,
             final_sha,
+            worker_profile,
             completed_slices,
             exit_states,
             evidence_attestation,
@@ -1440,6 +1505,8 @@ impl Manager {
         let progress = self.state.get_progress(&run.id)?;
         let economics: Option<crate::domain::RunEconomics> =
             artifact::read_json(store.output_path(&run.id, "economics.json")).ok();
+        let worker_profile =
+            read_worker_profile_from_preflight(&store, &run.id).unwrap_or_default();
         let plan_revisions = self.plan_revisions_for_run(run)?;
         let cancel_reason = latest_cancel_reason(&events);
         let primary_failure = primary_failure_for_terminal_summary(message, &slice_runs, &events);
@@ -1451,6 +1518,7 @@ impl Manager {
             "base_sha": run.base_sha,
             "integration_branch": run.integration_branch,
             "selected_slice_id": run.selected_slice_id,
+            "worker_profile": worker_profile,
             "message": message,
             "primary_failure": primary_failure,
             "cancel_reason": cancel_reason,
@@ -1857,7 +1925,9 @@ impl Manager {
             }
         }
         let exit_states = final_exit_states(&gate, &completed_slices);
-        let evidence_attestation = final_evidence_attestation(&gate);
+        let worker_profile = worker_profile_evidence(runner.name(), &runner.metadata());
+        let mut evidence_attestation = final_evidence_attestation(&gate);
+        append_worker_evidence_attestation_basis(&mut evidence_attestation, &worker_profile);
         let plan_revisions = self.plan_revisions_for_run(run)?;
         let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -1865,6 +1935,7 @@ impl Manager {
             integration_branch: run.integration_branch.clone(),
             base_sha: run.base_sha.clone(),
             final_sha: String::new(),
+            worker_profile,
             completed_slices,
             checks,
             integration_repair: repair,
@@ -2375,6 +2446,7 @@ impl Manager {
                 branch: worker_branch.clone(),
                 slice: slice.clone(),
                 dependency_summary: ctx.dependency_summary.clone(),
+                worker_profile: worker_profile_evidence(runner.name(), &runner_metadata),
                 agent_profile: runner_metadata.profile.clone(),
                 agent_provider: runner_metadata.provider.clone(),
                 agent_model: runner_metadata.model.clone(),

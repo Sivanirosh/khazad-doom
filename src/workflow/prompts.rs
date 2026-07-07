@@ -115,6 +115,7 @@ mod tests {
             branch: "khazad/slice-test".to_string(),
             slice,
             dependency_summary: BTreeMap::new(),
+            worker_profile: Default::default(),
             agent_profile: String::new(),
             agent_provider: String::new(),
             agent_model: String::new(),

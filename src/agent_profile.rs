@@ -1,4 +1,4 @@
-use crate::agent::{RunnerMetadata, RunnerSpec};
+use crate::agent::{RunnerMetadata, RunnerSpec, fake_runner_metadata};
 use crate::domain::{AgentProfile, AgentProfilesConfig, IMPLEMENTER_PROFILE, WorkflowConfig};
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
@@ -37,17 +37,13 @@ pub fn resolve_effective_worker_profile(
 
     if agent == "fake" {
         let mut spec = RunnerSpec::from_parts("fake", String::new(), Vec::new())?;
-        let metadata = RunnerMetadata {
-            profile_summary: "fake runner".to_string(),
-            launch_summary: "fake runner".to_string(),
-            source_attribution: source_attribution.clone(),
-            ..RunnerMetadata::default()
-        };
-        spec.metadata = metadata;
+        let mut metadata = fake_runner_metadata();
+        metadata.source_attribution = source_attribution.clone();
+        spec.metadata = metadata.clone();
         return Ok(EffectiveWorkerProfile {
             spec,
-            profile_summary: "fake runner".to_string(),
-            launch_summary: "fake runner".to_string(),
+            profile_summary: metadata.profile_summary(),
+            launch_summary: metadata.launch_summary(),
             source_attribution,
         });
     }
@@ -164,7 +160,10 @@ mod tests {
         .unwrap();
         assert_eq!(effective.spec.kind, "fake");
         assert!(effective.spec.pi_args.is_empty());
-        assert_eq!(effective.spec.metadata.launch_summary(), "fake runner");
+        assert_eq!(
+            effective.spec.metadata.launch_summary(),
+            "fake: deterministic test-double evidence (not real Pi worker implementation evidence)"
+        );
     }
 
     #[test]
