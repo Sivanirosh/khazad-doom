@@ -23,7 +23,7 @@ use crate::domain::{
     GateResult, Handoff, HandoffActionResult, HandoffDiagnostics, ImplementationSummary,
     MergeConflictReport, RepairResult, Run, RunCheckpoint, RunInspection, RunStatus, Slice,
     SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult,
-    WorkflowConfig, WorkflowExitStates,
+    WorkflowConfig, WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -232,6 +232,35 @@ impl Manager {
         self.progress_reporter(run_id).mark(&ProgressScope::new(
             phase, slice_id, attempt, command, message,
         ));
+    }
+
+    fn block_if_pending_replan(&self, run: &Run, checkpoint: &str) -> Result<()> {
+        let pending = self.state.pending_replan_proposals(&run.id)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let ids = pending
+            .iter()
+            .map(|proposal| proposal.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut commands = Vec::new();
+        for proposal in &pending {
+            commands.extend(replan_decision_commands(&run.id, &proposal.id));
+        }
+        let message = format!("awaiting replan decision for {ids} before {checkpoint}");
+        self.mark_progress(&run.id, "awaiting_replan", "", 0, "replan", &message);
+        self.state.record_event(
+            &run.id,
+            "replan_checkpoint_blocked",
+            &json!({
+                "proposal_ids": pending.iter().map(|proposal| proposal.id.clone()).collect::<Vec<_>>(),
+                "checkpoint": checkpoint,
+                "message": message,
+                "decision_commands": commands,
+            }),
+        )?;
+        Err(BlockedError::new(format!("{message}; decide with: {}", commands.join("; "))).into())
     }
 
     fn record_cockpit_launch(&self, run: &Run, mode: CockpitMode) -> Result<()> {
@@ -1102,6 +1131,7 @@ impl Manager {
             );
         }
         self.ensure_repo_run_available(&run.repo_id, Some(&run.id))?;
+        self.block_if_pending_replan(&run, "resume")?;
         let store = artifact::Store::new(&run.repo_path);
         let _last_checkpoint = store.read_checkpoint(&run.id).ok();
         self.prepare_resume_worktrees(&run)?;
@@ -1578,6 +1608,7 @@ impl Manager {
             .collect();
         for layer in artifact::dependency_layers(worker_slices)? {
             check_cancelled(cancel)?;
+            self.block_if_pending_replan(run, "worker dispatch")?;
             let slice_base_sha = gitutil::head_sha(&integration_worktree)?;
             let layer_ids = layer
                 .iter()
@@ -1654,6 +1685,7 @@ impl Manager {
         }
 
         check_cancelled(cancel)?;
+        self.block_if_pending_replan(run, "integration gate")?;
         self.run_worktree_setup(
             run,
             "",
@@ -1692,6 +1724,7 @@ impl Manager {
         let repair = if should_run_integration_repair(repair_policy, &gate) {
             pre_repair_gate = Some(gate.clone());
             check_cancelled(cancel)?;
+            self.block_if_pending_replan(run, "integration repair")?;
             self.mark_progress(
                 &run.id,
                 "integration_repair",

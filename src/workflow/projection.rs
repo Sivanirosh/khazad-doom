@@ -1,7 +1,7 @@
 use crate::domain::{
-    Event, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus,
-    StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole, TerminalReason,
-    WorkerAttemptProgress,
+    Event, ReplanProposalState, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus,
+    SliceRun, SliceStatus, StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole,
+    TerminalReason, WorkerAttemptProgress,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -55,6 +55,9 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
     if let Some(reason) = &details.primary_terminal_reason {
         blocks.push(terminal_reason_block(reason));
     }
+    if let Some(replan) = replan_block(details) {
+        blocks.push(replan);
+    }
     if let Some(progress) = &details.progress
         && !should_hide_current_progress(details, progress)
     {
@@ -86,21 +89,24 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
     }
 
     let question_commands = pending_question_commands(details);
-    let attention = details
-        .questions
-        .iter()
-        .filter(|question| question.state == "pending")
-        .map(|question| {
-            line(
-                format!(
-                    "{}: {} — answer with: khazad-doom answer {} {} <answer>",
-                    question.slice_id, question.question, question.run_id, question.id
-                ),
-                StatusFeedRole::Attention,
-            )
-        })
-        .collect::<Vec<_>>();
-    let operator_commands = operator_commands(details, &question_commands);
+    let replan_commands = pending_replan_commands(details);
+    let mut attention = replan_attention(details);
+    attention.extend(
+        details
+            .questions
+            .iter()
+            .filter(|question| question.state == "pending")
+            .map(|question| {
+                line(
+                    format!(
+                        "{}: {} — answer with: khazad-doom answer {} {} <answer>",
+                        question.slice_id, question.question, question.run_id, question.id
+                    ),
+                    StatusFeedRole::Attention,
+                )
+            }),
+    );
+    let operator_commands = operator_commands(details, &question_commands, &replan_commands);
     if !attention.is_empty() {
         blocks.insert(0, block("Attention", "", attention.clone()));
     }
@@ -167,6 +173,83 @@ fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {
     block("Terminal", display_or_dash(&reason.kind), lines)
 }
 
+fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {
+    if details.replan.pending.is_empty() && details.replan.history.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for proposal in &details.replan.pending {
+        let changes = proposal
+            .proposed_changes
+            .iter()
+            .map(|change| format!("{}:{}", change.kind, change.target))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(line(
+            format!(
+                "pending {} • {} • risk={} • {}",
+                proposal.id,
+                replan_source_label(proposal),
+                display_or_dash(&proposal.risk),
+                truncate_display(&changes, LINE_WIDTH)
+            ),
+            StatusFeedRole::Attention,
+        ));
+        for command in &proposal.decision_commands {
+            lines.push(line(command.clone(), StatusFeedRole::Attention));
+        }
+    }
+    for proposal in details.replan.history.iter().rev().take(5).rev() {
+        let decision = proposal.operator_decision.as_ref();
+        let rationale = decision
+            .map(|decision| decision.rationale.as_str())
+            .unwrap_or_default();
+        lines.push(line(
+            format!(
+                "{} {} • {}{}",
+                proposal.state,
+                proposal.id,
+                replan_source_label(proposal),
+                if rationale.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" • {}", truncate_display(rationale, LINE_WIDTH))
+                }
+            ),
+            match proposal.state {
+                ReplanProposalState::Accepted => StatusFeedRole::Success,
+                ReplanProposalState::Rejected
+                | ReplanProposalState::Deferred
+                | ReplanProposalState::Superseded => StatusFeedRole::Dim,
+                ReplanProposalState::Pending => StatusFeedRole::Attention,
+            },
+        ));
+    }
+    Some(block(
+        "Replan",
+        format!(
+            "({} pending, {} decided)",
+            details.replan.pending.len(),
+            details.replan.history.len()
+        ),
+        lines,
+    ))
+}
+
+fn replan_source_label(proposal: &crate::domain::ReplanProposal) -> String {
+    let mut parts = vec![display_or_dash(&proposal.source.kind).to_string()];
+    if !proposal.source.slice_id.trim().is_empty() {
+        parts.push(proposal.source.slice_id.clone());
+    }
+    if !proposal.source.phase.trim().is_empty() {
+        parts.push(proposal.source.phase.clone());
+    }
+    if proposal.source.attempt > 0 {
+        parts.push(format!("attempt {}", proposal.source.attempt));
+    }
+    parts.join("/")
+}
+
 fn pending_question_commands(details: &RunDetails) -> Vec<String> {
     details
         .questions
@@ -181,8 +264,49 @@ fn pending_question_commands(details: &RunDetails) -> Vec<String> {
         .collect()
 }
 
-fn operator_commands(details: &RunDetails, question_commands: &[String]) -> Vec<String> {
+fn pending_replan_commands(details: &RunDetails) -> Vec<String> {
+    details
+        .replan
+        .pending
+        .iter()
+        .flat_map(|proposal| proposal.decision_commands.clone())
+        .collect()
+}
+
+fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
+    details
+        .replan
+        .pending
+        .iter()
+        .map(|proposal| {
+            let source = replan_source_label(proposal);
+            let summary = proposal
+                .proposed_changes
+                .first()
+                .map(|change| change.summary.as_str())
+                .unwrap_or("replan proposal needs an operator decision");
+            line(
+                format!(
+                    "Awaiting replan decision {} ({source}, risk={}): {}",
+                    proposal.id,
+                    display_or_dash(&proposal.risk),
+                    truncate_display(summary, LINE_WIDTH)
+                ),
+                StatusFeedRole::Attention,
+            )
+        })
+        .collect()
+}
+
+fn operator_commands(
+    details: &RunDetails,
+    question_commands: &[String],
+    replan_commands: &[String],
+) -> Vec<String> {
     let mut commands = Vec::new();
+    for command in replan_commands {
+        push_unique(&mut commands, command.clone());
+    }
     for command in question_commands {
         push_unique(&mut commands, command.clone());
     }
@@ -1108,7 +1232,10 @@ fn line(text: impl Into<String>, role: StatusFeedRole) -> StatusFeedLine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Run;
+    use crate::domain::{
+        ReplanProposal, ReplanProposalSource, ReplanProposedChange, ReplanStatus, Run,
+        replan_decision_commands,
+    };
 
     #[test]
     fn projection_has_versioned_blocks_and_raw_safe_roles() {
@@ -1139,6 +1266,7 @@ mod tests {
             progress: None,
             incidents: Vec::new(),
             questions: Vec::new(),
+            replan: Default::default(),
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: None,
@@ -1171,6 +1299,7 @@ mod tests {
             progress: None,
             incidents: Vec::new(),
             questions: Vec::new(),
+            replan: Default::default(),
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: Some(TerminalReason {
@@ -1215,5 +1344,106 @@ mod tests {
                 .any(|line| line.text.contains("owner=operator"))
         );
         assert!(feed.blocks.iter().any(|block| block.label == "Commands"));
+    }
+
+    #[test]
+    fn replan_projection_renders_pending_and_decided_proposals() {
+        let now = Utc::now();
+        let pending = ReplanProposal {
+            id: "rp-test-001".to_string(),
+            run_id: "kd-test".to_string(),
+            state: ReplanProposalState::Pending,
+            source: ReplanProposalSource {
+                kind: "worker".to_string(),
+                slice_id: "slice-1".to_string(),
+                phase: "blocked".to_string(),
+                attempt: 2,
+                summary: "worker proposed follow-up".to_string(),
+            },
+            trigger_finding_ids: vec!["finding-1".to_string()],
+            evidence: Vec::new(),
+            proposed_changes: vec![ReplanProposedChange {
+                kind: "add_followup_slice".to_string(),
+                target: "slice-1-followup".to_string(),
+                summary: "repair needs out-of-area files".to_string(),
+            }],
+            risk: "intent_affecting".to_string(),
+            operator_decision: None,
+            created_at: now,
+            updated_at: now,
+            decision_commands: replan_decision_commands("kd-test", "rp-test-001"),
+        };
+        let decided = ReplanProposal {
+            id: "rp-test-000".to_string(),
+            run_id: "kd-test".to_string(),
+            state: ReplanProposalState::Rejected,
+            operator_decision: Some(crate::domain::ReplanDecision {
+                decision: "rejected".to_string(),
+                rationale: "duplicate".to_string(),
+                authorizer: "operator".to_string(),
+                source: "cli".to_string(),
+                decided_at: now,
+                applied: false,
+                applied_at: None,
+                replacement_id: String::new(),
+                revisit_condition: String::new(),
+            }),
+            decision_commands: Vec::new(),
+            ..pending.clone()
+        };
+        let details = RunDetails {
+            run: Run {
+                id: "kd-test".to_string(),
+                repo_id: "repo".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                status: RunStatus::Running,
+                base_branch: "main".to_string(),
+                base_sha: "base".to_string(),
+                integration_branch: "khazad/kd-test/integration".to_string(),
+                selected_slice_id: "slice-1".to_string(),
+                error: String::new(),
+                started_at: now,
+                updated_at: now,
+            },
+            slice_runs: Vec::new(),
+            progress: None,
+            incidents: Vec::new(),
+            questions: Vec::new(),
+            replan: ReplanStatus {
+                pending_attention_reason: "awaiting replan decision for rp-test-001".to_string(),
+                pending: vec![pending],
+                history: vec![decided],
+                auto_approvable: Vec::new(),
+            },
+            events: Vec::new(),
+            economics: None,
+            primary_terminal_reason: None,
+            feed: None,
+        };
+
+        let feed = project_run_at(&details, now);
+        assert!(
+            feed.attention
+                .iter()
+                .any(|line| { line.text.contains("Awaiting replan decision rp-test-001") })
+        );
+        assert!(feed.operator_commands.iter().any(|command| {
+            command == "khazad-doom replan accept kd-test rp-test-001 --reason <reason>"
+        }));
+        let replan = feed
+            .blocks
+            .iter()
+            .find(|block| block.label == "Replan")
+            .expect("replan block");
+        assert_eq!(replan.meta, "(1 pending, 1 decided)");
+        assert!(replan.lines.iter().any(|line| {
+            line.text.contains("pending rp-test-001") && line.text.contains("risk=intent_affecting")
+        }));
+        assert!(
+            replan
+                .lines
+                .iter()
+                .any(|line| line.text.contains("rejected rp-test-000"))
+        );
     }
 }

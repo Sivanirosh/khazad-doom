@@ -1,4 +1,7 @@
-use crate::domain::{SliceSummary, SliceValidationIssue, WorkerQuestion};
+use crate::domain::{
+    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange, SliceSummary,
+    SliceValidationIssue, WorkerQuestion,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -116,6 +119,57 @@ pub struct AnswerQuestionParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerQuestionResult {
     pub question: WorkerQuestion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListReplanProposalsParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListReplanProposalsResult {
+    pub proposals: Vec<ReplanProposal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CreateReplanProposalParams {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub source: ReplanProposalSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_finding_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ReplanEvidenceLink>,
+    pub proposed_changes: Vec<ReplanProposedChange>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub risk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateReplanProposalResult {
+    pub proposal: ReplanProposal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DecideReplanProposalParams {
+    pub run_id: String,
+    pub proposal_id: String,
+    pub decision: String,
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authorizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replacement_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revisit_condition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideReplanProposalResult {
+    pub proposal: ReplanProposal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -821,6 +821,135 @@ pub struct WorkerQuestion {
     pub answer: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplanProposalState {
+    Pending,
+    Accepted,
+    Rejected,
+    Deferred,
+    Superseded,
+}
+
+impl ReplanProposalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Deferred => "deferred",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "deferred" => Ok(Self::Deferred),
+            "superseded" => Ok(Self::Superseded),
+            _ => anyhow::bail!("unknown replan proposal state {value:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ReplanProposalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReplanProposalSource {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReplanEvidenceLink {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub event_id: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReplanProposedChange {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplanDecision {
+    pub decision: String,
+    pub rationale: String,
+    pub authorizer: String,
+    pub source: String,
+    pub decided_at: DateTime<Utc>,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replacement_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revisit_condition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplanProposal {
+    pub id: String,
+    pub run_id: String,
+    pub state: ReplanProposalState,
+    pub source: ReplanProposalSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_finding_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ReplanEvidenceLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_changes: Vec<ReplanProposedChange>,
+    pub risk: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_decision: Option<ReplanDecision>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReplanStatus {
+    pub pending_attention_reason: String,
+    pub pending: Vec<ReplanProposal>,
+    pub history: Vec<ReplanProposal>,
+    pub auto_approvable: Vec<ReplanProposal>,
+}
+
+pub fn replan_decision_commands(run_id: &str, proposal_id: &str) -> Vec<String> {
+    vec![
+        format!("khazad-doom replan accept {run_id} {proposal_id} --reason <reason>"),
+        format!("khazad-doom replan reject {run_id} {proposal_id} --reason <reason>"),
+        format!(
+            "khazad-doom replan defer {run_id} {proposal_id} --until <condition> --reason <reason>"
+        ),
+        format!(
+            "khazad-doom replan supersede {run_id} {proposal_id} <replacement-proposal> --reason <reason>"
+        ),
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
@@ -831,6 +960,8 @@ pub struct RunDetails {
     pub incidents: Vec<RunIncident>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<WorkerQuestion>,
+    #[serde(default)]
+    pub replan: ReplanStatus,
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economics: Option<RunEconomics>,

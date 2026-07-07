@@ -41,6 +41,11 @@ khazad-doom handoff --run <run-id> --dry-run
 khazad-doom inspect --run <run-id>
 khazad-doom inspect --repo . --latest
 khazad-doom cancel --run <run-id>
+khazad-doom replan list <run-id>
+khazad-doom replan propose <run-id> --change kind:target:summary
+khazad-doom replan accept <run-id> <proposal-id> --reason "..."
+khazad-doom replan reject <run-id> <proposal-id> --reason "..."
+khazad-doom replan defer <run-id> <proposal-id> --until "condition" --reason "..."
 khazad-doom daemon status
 ```
 
@@ -107,3 +112,5 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 - `worker_attempt_timeout_seconds: 0` means no fatal worker-attempt timeout. Any nonzero worker attempt timeout is an explicit repo/operator policy, separate from run lifetime.
 
 If status/monitor shows an `Attention` line or pending worker question, ask the user for the answer and then run `khazad-doom answer <run-id> <question-id> "..."` (or `/khazad-answer <run-id> <question-id> "..."` in Pi) after normal command confirmation. Do not answer by typing into Herdr worker panes. If a run still blocks with an `ask-user` finding, relay the blocker with exact details and ask for a decision before resuming.
+
+If status/monitor shows `Awaiting replan decision`, use the exact `khazad-doom replan accept|reject|defer` command shown by the daemon feed. Replan v1 never auto-applies queue/slice/verification/policy mutations; accepted decisions record `applied=false` until a later authorized slice adds application semantics.

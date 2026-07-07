@@ -1,6 +1,7 @@
 use crate::domain::{
-    Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptProgress,
-    WorkerQuestion,
+    Event, ReplanDecision, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
+    ReplanProposalState, ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus,
+    WorkerAttemptProgress, WorkerQuestion,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -180,6 +181,21 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_worker_questions_run_state
                 ON worker_questions(run_id, state);
+            CREATE TABLE IF NOT EXISTS replan_proposals (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                source_json TEXT NOT NULL,
+                trigger_finding_ids_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                proposed_changes_json TEXT NOT NULL,
+                risk TEXT NOT NULL,
+                decision_json TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_replan_proposals_run_state
+                ON replan_proposals(run_id, state, created_at);
             "#,
         )?;
         ensure_column(
@@ -479,6 +495,187 @@ impl Store {
             params![Utc::now().to_rfc3339(), question_id],
         )?;
         self.get_worker_question(question_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_replan_proposal(
+        &self,
+        run_id: &str,
+        requested_id: &str,
+        source: ReplanProposalSource,
+        trigger_finding_ids: Vec<String>,
+        evidence: Vec<ReplanEvidenceLink>,
+        proposed_changes: Vec<ReplanProposedChange>,
+        risk: &str,
+    ) -> Result<ReplanProposal> {
+        if self.get_run(run_id)?.is_none() {
+            anyhow::bail!("run {run_id:?} not found");
+        }
+        if source.kind.trim().is_empty() {
+            anyhow::bail!("replan proposal source kind is required");
+        }
+        if proposed_changes.is_empty() {
+            anyhow::bail!("replan proposal requires at least one proposed change");
+        }
+        let conn = self.conn()?;
+        let id = if requested_id.trim().is_empty() {
+            next_replan_id(&conn, run_id)?
+        } else {
+            requested_id.trim().to_string()
+        };
+        let now = Utc::now();
+        let proposal = ReplanProposal {
+            id,
+            run_id: run_id.to_string(),
+            state: ReplanProposalState::Pending,
+            source,
+            trigger_finding_ids,
+            evidence,
+            proposed_changes,
+            risk: if risk.trim().is_empty() {
+                "operator_review".to_string()
+            } else {
+                risk.trim().to_string()
+            },
+            operator_decision: None,
+            created_at: now,
+            updated_at: now,
+            decision_commands: Vec::new(),
+        };
+        conn.execute(
+            r#"INSERT INTO replan_proposals
+               (id, run_id, state, source_json, trigger_finding_ids_json, evidence_json,
+                proposed_changes_json, risk, decision_json, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10)"#,
+            params![
+                &proposal.id,
+                &proposal.run_id,
+                proposal.state.as_str(),
+                serde_json::to_string(&proposal.source)?,
+                serde_json::to_string(&proposal.trigger_finding_ids)?,
+                serde_json::to_string(&proposal.evidence)?,
+                serde_json::to_string(&proposal.proposed_changes)?,
+                &proposal.risk,
+                proposal.created_at.to_rfc3339(),
+                proposal.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(proposal)
+    }
+
+    pub fn get_replan_proposal(
+        &self,
+        run_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<ReplanProposal>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
+                          evidence_json, proposed_changes_json, risk, decision_json,
+                          created_at, updated_at
+                   FROM replan_proposals WHERE run_id=?1 AND id=?2"#,
+                params![run_id, proposal_id],
+                replan_proposal_tuple_from_row,
+            )
+            .optional()?;
+        row.map(replan_proposal_from_tuple).transpose()
+    }
+
+    pub fn list_replan_proposals(&self, run_id: &str) -> Result<Vec<ReplanProposal>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
+                      evidence_json, proposed_changes_json, risk, decision_json,
+                      created_at, updated_at
+               FROM replan_proposals WHERE run_id=?1 ORDER BY created_at ASC, id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![run_id], replan_proposal_tuple_from_row)?;
+        let mut proposals = Vec::new();
+        for row in rows {
+            proposals.push(replan_proposal_from_tuple(row?)?);
+        }
+        Ok(proposals)
+    }
+
+    pub fn pending_replan_proposals(&self, run_id: &str) -> Result<Vec<ReplanProposal>> {
+        Ok(self
+            .list_replan_proposals(run_id)?
+            .into_iter()
+            .filter(|proposal| proposal.state == ReplanProposalState::Pending)
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_replan_proposal(
+        &self,
+        run_id: &str,
+        proposal_id: &str,
+        state: ReplanProposalState,
+        rationale: &str,
+        authorizer: &str,
+        source: &str,
+        replacement_id: &str,
+        revisit_condition: &str,
+    ) -> Result<ReplanProposal> {
+        if state == ReplanProposalState::Pending {
+            anyhow::bail!("replan decision cannot leave proposal pending");
+        }
+        if rationale.trim().is_empty() {
+            anyhow::bail!("replan decision rationale is required");
+        }
+        if state == ReplanProposalState::Deferred && revisit_condition.trim().is_empty() {
+            anyhow::bail!("replan defer requires --until <condition>");
+        }
+        if state == ReplanProposalState::Superseded && replacement_id.trim().is_empty() {
+            anyhow::bail!("replan supersede requires a replacement proposal id");
+        }
+        let existing = self
+            .get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("replan proposal {proposal_id:?} for run {run_id:?} not found")
+            })?;
+        if existing.state != ReplanProposalState::Pending {
+            anyhow::bail!(
+                "replan proposal {proposal_id:?} is already {}",
+                existing.state
+            );
+        }
+        let now = Utc::now();
+        let decision = ReplanDecision {
+            decision: state.as_str().to_string(),
+            rationale: rationale.trim().to_string(),
+            authorizer: if authorizer.trim().is_empty() {
+                "operator".to_string()
+            } else {
+                authorizer.trim().to_string()
+            },
+            source: if source.trim().is_empty() {
+                "daemon_ipc".to_string()
+            } else {
+                source.trim().to_string()
+            },
+            decided_at: now,
+            applied: false,
+            applied_at: None,
+            replacement_id: replacement_id.trim().to_string(),
+            revisit_condition: revisit_condition.trim().to_string(),
+        };
+        let conn = self.conn()?;
+        conn.execute(
+            r#"UPDATE replan_proposals
+               SET state=?1, decision_json=?2, updated_at=?3
+               WHERE run_id=?4 AND id=?5"#,
+            params![
+                state.as_str(),
+                serde_json::to_string(&decision)?,
+                now.to_rfc3339(),
+                run_id,
+                proposal_id,
+            ],
+        )?;
+        self.get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -858,6 +1055,19 @@ type RunTuple = (
 
 type SliceRunTuple = (String, String, String, String, String, i64, String);
 type EventTuple = (i64, String, String, String, String);
+type ReplanProposalTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 type RunProgressTuple = (
     String,
     String,
@@ -913,6 +1123,24 @@ fn event_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventTuple>
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+    ))
+}
+
+fn replan_proposal_tuple_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ReplanProposalTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
     ))
 }
 
@@ -990,6 +1218,86 @@ fn event_from_tuple(row: EventTuple) -> Result<Event> {
             .with_context(|| format!("parse event payload {payload_json:?}"))?,
         created_at: parse_time("created_at", &created_at)?,
     })
+}
+
+fn replan_proposal_from_tuple(row: ReplanProposalTuple) -> Result<ReplanProposal> {
+    let (
+        id,
+        run_id,
+        state,
+        source_json,
+        trigger_finding_ids_json,
+        evidence_json,
+        proposed_changes_json,
+        risk,
+        decision_json,
+        created_at,
+        updated_at,
+    ) = row;
+    Ok(ReplanProposal {
+        id,
+        run_id,
+        state: ReplanProposalState::parse(&state)?,
+        source: serde_json::from_str(&source_json)
+            .with_context(|| format!("parse replan proposal source {source_json:?}"))?,
+        trigger_finding_ids: serde_json::from_str(&trigger_finding_ids_json).with_context(
+            || format!("parse replan proposal finding ids {trigger_finding_ids_json:?}"),
+        )?,
+        evidence: serde_json::from_str(&evidence_json)
+            .with_context(|| format!("parse replan proposal evidence {evidence_json:?}"))?,
+        proposed_changes: serde_json::from_str(&proposed_changes_json)
+            .with_context(|| format!("parse replan proposal changes {proposed_changes_json:?}"))?,
+        risk,
+        operator_decision: if decision_json.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&decision_json)
+                    .with_context(|| format!("parse replan proposal decision {decision_json:?}"))?,
+            )
+        },
+        created_at: parse_time("created_at", &created_at)?,
+        updated_at: parse_time("updated_at", &updated_at)?,
+        decision_commands: Vec::new(),
+    })
+}
+
+fn next_replan_id(conn: &Connection, run_id: &str) -> Result<String> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM replan_proposals WHERE run_id=?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    let short = short_replan_run_id(run_id);
+    let mut sequence = count + 1;
+    loop {
+        let id = format!("rp-{short}-{sequence:03}");
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT id FROM replan_proposals WHERE id=?1",
+                params![&id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(id);
+        }
+        sequence += 1;
+    }
+}
+
+fn short_replan_run_id(run_id: &str) -> String {
+    let trimmed = run_id.strip_prefix("kd-").unwrap_or(run_id);
+    let short = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    if short.is_empty() {
+        "run".to_string()
+    } else {
+        short
+    }
 }
 
 fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQuestion> {
@@ -1169,6 +1477,156 @@ mod tests {
         assert_eq!(tied.id, "run-tie-b");
 
         assert!(store.latest_run_for_repo("/tmp/missing", true)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn replan_proposals_persist_pending_and_decided_states() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run("kd-replan-run", "/tmp/repo", RunStatus::Running, now))?;
+
+        let source = ReplanProposalSource {
+            kind: "worker".to_string(),
+            slice_id: "slice-001".to_string(),
+            phase: "worker_running".to_string(),
+            attempt: 1,
+            summary: "worker found a follow-up".to_string(),
+        };
+        let evidence = vec![ReplanEvidenceLink {
+            kind: "worker_output".to_string(),
+            path: ".workflow/runs/kd-replan-run/outputs/slice-001.worker.json".to_string(),
+            event_id: 7,
+            summary: "blocked finding".to_string(),
+        }];
+        let changes = vec![ReplanProposedChange {
+            kind: "add_followup_slice".to_string(),
+            target: "slice-001-followup".to_string(),
+            summary: "capture the out-of-area work separately".to_string(),
+        }];
+
+        let pending = store.create_replan_proposal(
+            "kd-replan-run",
+            "",
+            source.clone(),
+            vec!["finding-1".to_string()],
+            evidence.clone(),
+            changes.clone(),
+            "intent_affecting",
+        )?;
+        assert_eq!(pending.state, ReplanProposalState::Pending);
+        assert!(pending.id.starts_with("rp-replanru-"));
+        assert_eq!(store.pending_replan_proposals("kd-replan-run")?.len(), 1);
+
+        let accepted = store.create_replan_proposal(
+            "kd-replan-run",
+            "rp-accept",
+            source.clone(),
+            Vec::new(),
+            evidence.clone(),
+            changes.clone(),
+            "mechanical",
+        )?;
+        let accepted = store.decide_replan_proposal(
+            "kd-replan-run",
+            &accepted.id,
+            ReplanProposalState::Accepted,
+            "approved for later application",
+            "test-operator",
+            "cli",
+            "",
+            "",
+        )?;
+        assert_eq!(accepted.state, ReplanProposalState::Accepted);
+        let decision = accepted.operator_decision.as_ref().expect("decision");
+        assert_eq!(decision.authorizer, "test-operator");
+        assert_eq!(decision.source, "cli");
+        assert!(!decision.applied);
+        assert!(decision.applied_at.is_none());
+
+        let rejected = store.create_replan_proposal(
+            "kd-replan-run",
+            "rp-reject",
+            source.clone(),
+            Vec::new(),
+            evidence.clone(),
+            changes.clone(),
+            "operator_review",
+        )?;
+        let rejected = store.decide_replan_proposal(
+            "kd-replan-run",
+            &rejected.id,
+            ReplanProposalState::Rejected,
+            "duplicate proposal",
+            "test-operator",
+            "cli",
+            "",
+            "",
+        )?;
+        assert_eq!(rejected.state, ReplanProposalState::Rejected);
+
+        let deferred = store.create_replan_proposal(
+            "kd-replan-run",
+            "rp-defer",
+            source.clone(),
+            Vec::new(),
+            evidence.clone(),
+            changes.clone(),
+            "operator_review",
+        )?;
+        let deferred = store.decide_replan_proposal(
+            "kd-replan-run",
+            &deferred.id,
+            ReplanProposalState::Deferred,
+            "not needed for this run",
+            "test-operator",
+            "cli",
+            "",
+            "if the same finding repeats",
+        )?;
+        assert_eq!(deferred.state, ReplanProposalState::Deferred);
+        assert_eq!(
+            deferred
+                .operator_decision
+                .as_ref()
+                .expect("decision")
+                .revisit_condition,
+            "if the same finding repeats"
+        );
+
+        let superseded = store.create_replan_proposal(
+            "kd-replan-run",
+            "rp-supersede",
+            source,
+            Vec::new(),
+            evidence,
+            changes,
+            "operator_review",
+        )?;
+        let superseded = store.decide_replan_proposal(
+            "kd-replan-run",
+            &superseded.id,
+            ReplanProposalState::Superseded,
+            "replacement has narrower scope",
+            "test-operator",
+            "cli",
+            "rp-replacement",
+            "",
+        )?;
+        assert_eq!(superseded.state, ReplanProposalState::Superseded);
+        assert_eq!(
+            superseded
+                .operator_decision
+                .as_ref()
+                .expect("decision")
+                .replacement_id,
+            "rp-replacement"
+        );
+
+        let proposals = store.list_replan_proposals("kd-replan-run")?;
+        assert_eq!(proposals.len(), 5);
+        assert_eq!(store.pending_replan_proposals("kd-replan-run")?.len(), 1);
         Ok(())
     }
 
