@@ -32,7 +32,7 @@ impl CockpitRunRequest {
             khazad_home: khazad_home.to_path_buf(),
             workspace_label: workspace_label_for_run(&run.id),
             feed_command: format!("{binary} monitor --run {run_id} --interval-ms 1000"),
-            phase_command: format!("{binary} status --run {run_id} --follow --interval-ms 1000"),
+            phase_command: gate_activity_pane_command(&run.id),
         }
     }
 }
@@ -123,6 +123,19 @@ impl CockpitUnavailable {
             remediation: "Install a usable herdr binary, or run with --cockpit direct to suppress cockpit attempts. Khazad-Doom continues to use daemon state, status, watch, monitor, verification, merge, and handoff as the source of truth.".to_string(),
         }
     }
+}
+
+pub(crate) fn gate_activity_pane_command(run_id: &str) -> String {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
+    let painter_command = format!(
+        "{} cockpit paint-gate-activity --run {} --interval-ms 1000",
+        shell_quote(&binary.to_string_lossy()),
+        shell_quote(run_id),
+    );
+    let script = format!(
+        "{painter_command}; khazad_painter_status=$?; if [ \"$khazad_painter_status\" -ne 0 ]; then printf '%s\\n' '[khazad] gate/repair activity painter exited non-fatally; daemon gate artifacts remain authoritative' >&2; fi; exit 0"
+    );
+    format!("/bin/sh -c {}", shell_quote(&script))
 }
 
 pub(crate) fn worker_activity_pane_command(
@@ -892,7 +905,12 @@ mod tests {
         assert!(
             request
                 .phase_command
-                .contains("status --run kd-123 --follow")
+                .contains("cockpit paint-gate-activity --run kd-123")
+        );
+        assert!(
+            request
+                .phase_command
+                .contains("daemon gate artifacts remain authoritative")
         );
         assert!(!request.feed_command.to_lowercase().contains("planner"));
         assert!(!request.phase_command.to_lowercase().contains("planner"));

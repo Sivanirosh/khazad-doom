@@ -48,3 +48,5 @@ Implementation shape: keep the wrapper/pid handshake and artifact writes as the 
 ## Follow-up
 
 Create `HERDR-05 — Gate and repair activity painter` after HERDR-04 if the worker painter proves useful. The gate/repair pane currently duplicates monitor summary more than it shows command activity. The same display-only model can tail daemon-owned gate/shell output artifacts for the current gate or repair command, while retaining summary output when no command is active.
+
+HERDR-05 disposition: the pane now runs a hidden read-only `cockpit paint-gate-activity` renderer. Its input is daemon `status`/`feed` data, including bounded shell progress tails owned by the daemon; it does not inspect Herdr pane text, scrollback, or UI state. When no active integration gate or repair command is present, the renderer prints the existing feed/status summary instead of inventing a second workflow view.
