@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Lint roadmap matrix status claims against slice JSON and daemon report evidence.
+
+Roadmap Markdown is a summary only. A row may claim done/closed/accepted only
+when the corresponding .workflow/slices/<id>.json is closed and names a run
+with committed report evidence that includes the slice as completed.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+DONE_STATUS_RE = re.compile(r"^(done|closed|accepted|complete|completed)\b")
+SLICE_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b")
+
+
+def main(argv: list[str]) -> int:
+    repo = Path(argv[1]) if len(argv) > 1 else Path.cwd()
+    matrix = Path(argv[2]) if len(argv) > 2 else repo / "docs/roadmap/pi-native/00-matrix.md"
+    if not matrix.is_absolute():
+        matrix = repo / matrix
+    issues = lint_roadmap(repo, matrix)
+    if issues:
+        for issue in issues:
+            print(issue, file=sys.stderr)
+        return 1
+    print(f"roadmap truth check passed: {matrix}")
+    return 0
+
+
+def lint_roadmap(repo: Path, matrix: Path) -> list[str]:
+    if not matrix.exists():
+        return [f"roadmap matrix not found: {matrix}"]
+    issues: list[str] = []
+    header: list[str] | None = None
+    for line_number, line in enumerate(matrix.read_text(encoding="utf-8").splitlines(), 1):
+        cells = markdown_row_cells(line)
+        if not cells:
+            continue
+        lowered = [cell.strip().lower() for cell in cells]
+        if "slice id" in lowered and "status" in lowered:
+            header = lowered
+            continue
+        if header is None or is_separator_row(cells):
+            continue
+        if len(cells) < len(header):
+            continue
+        slice_index = header.index("slice id")
+        status_index = header.index("status")
+        slice_ids = SLICE_ID_RE.findall(strip_markdown(cells[slice_index]))
+        status = normalize_status(cells[status_index])
+        if not DONE_STATUS_RE.search(status):
+            continue
+        for slice_id in slice_ids:
+            issues.extend(done_status_issues(repo, matrix, line_number, slice_id, status))
+    return issues
+
+
+def done_status_issues(
+    repo: Path, matrix: Path, line_number: int, slice_id: str, status: str
+) -> list[str]:
+    prefix = f"{matrix}:{line_number}: {slice_id} status {status!r}"
+    slice_path = repo / ".workflow" / "slices" / f"{slice_id}.json"
+    if not slice_path.exists():
+        return [f"{prefix} claims completion but slice JSON is missing: {slice_path}"]
+    try:
+        slice_data = json.loads(slice_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"{prefix} cannot be checked because slice JSON is invalid: {exc}"]
+    if slice_data.get("status", "open") != "closed":
+        return [f"{prefix} claims completion but {slice_path} is not closed"]
+    run_id = str(slice_data.get("closed_by_run") or "").strip()
+    if not run_id:
+        return [f"{prefix} claims completion but {slice_path} has no closed_by_run"]
+    if not str(slice_data.get("closed_at") or "").strip():
+        return [f"{prefix} claims completion but {slice_path} has no closed_at"]
+    report = load_run_report(repo, run_id)
+    if report is None:
+        return [f"{prefix} claims completion by {run_id} but no named daemon report evidence was found"]
+    if report.get("run_id") != run_id:
+        return [f"{prefix} report evidence has mismatched run_id {report.get('run_id')!r}"]
+    exit_run = ((report.get("exit_states") or {}).get("run") or "").strip()
+    if exit_run != "completed":
+        return [f"{prefix} report evidence for {run_id} is not completed: exit_states.run={exit_run!r}"]
+    completed = [item.get("slice_id") for item in report.get("completed_slices") or []]
+    if slice_id not in completed:
+        return [f"{prefix} report evidence for {run_id} does not list the slice in completed_slices"]
+    return []
+
+
+def load_run_report(repo: Path, run_id: str) -> dict[str, Any] | None:
+    reports = repo / ".workflow" / "reports"
+    candidates = [
+        reports / f"{run_id}-final-report.json",
+        reports / f"{run_id}-implementation-summary.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                return data
+    return None
+
+
+def markdown_row_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return []
+    return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
+def is_separator_row(cells: list[str]) -> bool:
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def strip_markdown(value: str) -> str:
+    return value.replace("`", "")
+
+
+def normalize_status(value: str) -> str:
+    return strip_markdown(value).strip().lower().replace("_", "-")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

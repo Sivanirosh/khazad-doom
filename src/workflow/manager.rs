@@ -22,10 +22,11 @@ use crate::artifact;
 use crate::domain::{
     AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
     FindingDisposition, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
-    ImplementationSummary, MergeConflictReport, RepairResult, ReplanEvidenceLink,
-    ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus,
-    Slice, SliceExitState, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult,
-    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
+    ImplementationSummary, MergeConflictReport, PlanRevisionDecisionSummary, PlanRevisionRecord,
+    PlanRevisions, RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
+    ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState,
+    SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerResult, WorkflowConfig,
+    WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -263,6 +264,28 @@ impl Manager {
             }),
         )?;
         Err(BlockedError::new(format!("{message}; decide with: {}", commands.join("; "))).into())
+    }
+
+    fn plan_revisions_for_run(&self, run: &Run) -> Result<PlanRevisions> {
+        plan_revisions_from_proposals(run, self.state.list_replan_proposals(&run.id)?)
+    }
+
+    fn write_worker_handoff_with_plan_revisions(
+        &self,
+        store: &artifact::Store,
+        run: &Run,
+        handoff: &Handoff,
+    ) -> Result<PathBuf> {
+        let path = store.write_handoff(&run.id, handoff)?;
+        let mut value = serde_json::to_value(handoff)?;
+        if let serde_json::Value::Object(fields) = &mut value {
+            fields.insert(
+                "plan_revisions".to_string(),
+                serde_json::to_value(self.plan_revisions_for_run(run)?)?,
+            );
+        }
+        artifact::write_json(&path, &value)?;
+        Ok(path)
     }
 
     fn record_cockpit_launch(&self, run: &Run, mode: CockpitMode) -> Result<()> {
@@ -1294,6 +1317,24 @@ impl Manager {
             .map(|summary| summary.evidence_attestation.clone())
             .filter(|attestation| !attestation.status.trim().is_empty())
             .unwrap_or_else(historical_evidence_attestation);
+        let plan_revisions = self.plan_revisions_for_run(&run)?;
+        if plan_revisions.unresolved_pending_blocks_handoff {
+            let ids = plan_revisions
+                .pending
+                .iter()
+                .map(|proposal| proposal.proposal_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let commands = plan_revisions
+                .pending
+                .iter()
+                .flat_map(|proposal| proposal.decision_commands.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!(
+                "handoff is not ready; unresolved replan proposal(s) {ids} require operator disposition; decide with: {commands}"
+            );
+        }
         let pr_title = format!("Khazad-Doom {}: {}", run.id, run.selected_slice_id);
         let pr_body = format!(
             "Khazad-Doom run `{}` completed.\n\nIntegration branch: `{}`\nBase branch: `{}`\nFinal SHA: `{}`\nFinal report: `{}`\n",
@@ -1357,6 +1398,7 @@ impl Manager {
             completed_slices,
             exit_states,
             evidence_attestation,
+            plan_revisions,
             summary_path: summary_path.to_string_lossy().to_string(),
             final_report_path: final_report_path.to_string_lossy().to_string(),
             push_command,
@@ -1398,6 +1440,7 @@ impl Manager {
         let progress = self.state.get_progress(&run.id)?;
         let economics: Option<crate::domain::RunEconomics> =
             artifact::read_json(store.output_path(&run.id, "economics.json")).ok();
+        let plan_revisions = self.plan_revisions_for_run(run)?;
         let cancel_reason = latest_cancel_reason(&events);
         let primary_failure = primary_failure_for_terminal_summary(message, &slice_runs, &events);
         let summary = json!({
@@ -1414,6 +1457,7 @@ impl Manager {
             "slice_runs": slice_runs,
             "progress": progress,
             "economics": economics,
+            "plan_revisions": plan_revisions,
             "worktree_snapshots": self.run_worktree_snapshots(run),
             "next_commands": terminal_next_commands(run, status),
             "created_at": Utc::now(),
@@ -1814,6 +1858,7 @@ impl Manager {
         }
         let exit_states = final_exit_states(&gate, &completed_slices);
         let evidence_attestation = final_evidence_attestation(&gate);
+        let plan_revisions = self.plan_revisions_for_run(run)?;
         let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
             repo_path: run.repo_path.clone(),
@@ -1828,6 +1873,7 @@ impl Manager {
             exit_states,
             evidence_attestation,
             economics: economics.snapshot(),
+            plan_revisions,
             created_at: Utc::now(),
         };
 
@@ -2340,7 +2386,8 @@ impl Manager {
                 contract: "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
                     .to_string(),
             };
-            let handoff_path = store.write_handoff(&run.id, &handoff)?;
+            let handoff_path =
+                self.write_worker_handoff_with_plan_revisions(&store, run, &handoff)?;
             let prompt = worker_prompt(&handoff_path.to_string_lossy(), &handoff, &last_failure);
             self.mark_progress(
                 &run.id,
@@ -3904,6 +3951,159 @@ fn slice_closed_by_run_or_absent(store: &artifact::Store, slice_id: &str, run_id
         .unwrap_or(false)
 }
 
+fn plan_revisions_from_proposals(
+    run: &Run,
+    proposals: Vec<ReplanProposal>,
+) -> Result<PlanRevisions> {
+    let mut plan = PlanRevisions {
+        source_of_truth: "daemon_replan_proposals".to_string(),
+        queue_summary: if run.selected_slice_id.trim().is_empty() {
+            "selected slices: <none>".to_string()
+        } else {
+            format!("selected slices: {}", run.selected_slice_id)
+        },
+        ..PlanRevisions::default()
+    };
+    for mut proposal in proposals {
+        if proposal.state.as_str() == "pending" {
+            proposal.decision_commands = replan_decision_commands(&run.id, &proposal.id);
+        }
+        let record = plan_revision_record(run, proposal)?;
+        match record.state.as_str() {
+            "pending" => plan.pending.push(record),
+            "accepted" => plan.accepted.push(record),
+            "rejected" => plan.rejected.push(record),
+            "deferred" => plan.deferred.push(record),
+            "superseded" => plan.superseded.push(record),
+            _ => {}
+        }
+    }
+    plan.unresolved_pending_blocks_handoff = !plan.pending.is_empty();
+    Ok(plan)
+}
+
+fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevisionRecord> {
+    let state = proposal.state.as_str().to_string();
+    let after = plan_revision_after_summary(&proposal);
+    let decision = proposal
+        .operator_decision
+        .clone()
+        .map(plan_revision_decision_summary)
+        .transpose()?;
+    Ok(PlanRevisionRecord {
+        proposal_id: proposal.id.clone(),
+        state,
+        source: proposal.source.clone(),
+        trigger_finding_ids: proposal.trigger_finding_ids.clone(),
+        evidence: proposal.evidence.clone(),
+        proposed_changes: proposal.proposed_changes.clone(),
+        risk: proposal.risk.clone(),
+        before_queue_or_slice_summary: plan_revision_before_summary(run, &proposal),
+        after_queue_or_slice_summary: after,
+        decision_commands: proposal.decision_commands.clone(),
+        decision,
+        created_at: proposal.created_at,
+        updated_at: proposal.updated_at,
+    })
+}
+
+fn plan_revision_decision_summary(
+    decision: crate::domain::ReplanDecision,
+) -> Result<PlanRevisionDecisionSummary> {
+    let applied_at_checkpoint = if decision.applied {
+        decision
+            .applied_at
+            .map(|applied_at| format!("applied_at:{applied_at}"))
+            .unwrap_or_else(|| "applied_without_timestamp".to_string())
+    } else {
+        format!(
+            "not_applied:{}; proposal-only replan v1 left queue/slice state unchanged",
+            decision.decided_at
+        )
+    };
+    Ok(PlanRevisionDecisionSummary {
+        decision: decision.decision,
+        rationale: decision.rationale,
+        authorizer: decision.authorizer,
+        source: decision.source,
+        decided_at: decision.decided_at,
+        applied: decision.applied,
+        applied_at: decision.applied_at,
+        applied_at_checkpoint,
+        replacement_id: decision.replacement_id,
+        revisit_condition: decision.revisit_condition,
+    })
+}
+
+fn plan_revision_before_summary(run: &Run, proposal: &ReplanProposal) -> String {
+    let queue = if run.selected_slice_id.trim().is_empty() {
+        "<none>"
+    } else {
+        run.selected_slice_id.as_str()
+    };
+    format!(
+        "queue before proposal {}: {}; proposed changes: {}",
+        proposal.id,
+        queue,
+        proposed_change_summary(&proposal.proposed_changes)
+    )
+}
+
+fn plan_revision_after_summary(proposal: &ReplanProposal) -> String {
+    match proposal.operator_decision.as_ref() {
+        Some(decision) if decision.applied => format!(
+            "{} proposal applied by {} at {}; changes: {}",
+            proposal.state,
+            decision.authorizer,
+            decision
+                .applied_at
+                .map(|applied_at| applied_at.to_rfc3339())
+                .unwrap_or_else(|| "unknown checkpoint".to_string()),
+            proposed_change_summary(&proposal.proposed_changes)
+        ),
+        Some(decision) if decision.decision == "accepted" => format!(
+            "accepted by {}; proposal-only replan v1 records applied=false, so no queue/slice mutation was applied; proposed changes remain: {}",
+            decision.authorizer,
+            proposed_change_summary(&proposal.proposed_changes)
+        ),
+        Some(decision) if decision.decision == "rejected" => {
+            format!("rejected; queue/slice state unchanged; rationale: {}", decision.rationale)
+        }
+        Some(decision) if decision.decision == "deferred" => format!(
+            "deferred; queue/slice state unchanged until revisit condition: {}",
+            display_or_dash(&decision.revisit_condition)
+        ),
+        Some(decision) if decision.decision == "superseded" => format!(
+            "superseded by {}; queue/slice state unchanged by this proposal",
+            display_or_dash(&decision.replacement_id)
+        ),
+        Some(decision) => format!(
+            "{} decision recorded; queue/slice state unchanged unless applied=true",
+            decision.decision
+        ),
+        None => "pending; unresolved proposal blocks handoff readiness until an operator disposition records it as non-blocking or decided".to_string(),
+    }
+}
+
+fn proposed_change_summary(changes: &[ReplanProposedChange]) -> String {
+    if changes.is_empty() {
+        return "<none>".to_string();
+    }
+    changes
+        .iter()
+        .map(|change| {
+            let target = display_or_dash(&change.target);
+            format!("{}:{}:{}", change.kind, target, change.summary)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn display_or_dash(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() { "-" } else { trimmed }
+}
+
 fn final_exit_states(gate: &GateResult, completed_slices: &[WorkerResult]) -> WorkflowExitStates {
     let gate_passed = gate.status == "passed";
     let gate_blocked = !gate_passed && gate_needs_operator(gate);
@@ -4585,7 +4785,8 @@ mod tests {
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         AcceptanceEvidence, CheckResult, CockpitMode, Finding, FindingDisposition, Handoff,
-        ImplementationSummary, RepairResult, Run, RunStatus, Slice, SliceRun, SliceStatus,
+        ImplementationSummary, RepairResult, ReplanEvidenceLink, ReplanProposalSource,
+        ReplanProposalState, ReplanProposedChange, Run, RunStatus, Slice, SliceRun, SliceStatus,
         VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
@@ -4986,6 +5187,140 @@ mod tests {
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_and_reports_include_plan_revision_history() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths,
+            state.clone(),
+            Arc::new(ReplanRecordingRunner {
+                state: state.clone(),
+            }),
+        );
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let final_report: serde_json::Value =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        let implementation_summary: serde_json::Value =
+            artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
+        for report in [&final_report, &implementation_summary] {
+            let revisions = &report["plan_revisions"];
+            assert_eq!(revisions["source_of_truth"], "daemon_replan_proposals");
+            assert_eq!(revisions["unresolved_pending_blocks_handoff"], false);
+            assert_eq!(revisions["pending"].as_array().unwrap().len(), 0);
+            assert_eq!(revisions["accepted"].as_array().unwrap().len(), 1);
+            assert_eq!(revisions["rejected"].as_array().unwrap().len(), 1);
+            assert_eq!(revisions["deferred"].as_array().unwrap().len(), 1);
+            assert_eq!(revisions["superseded"].as_array().unwrap().len(), 1);
+            let accepted = &revisions["accepted"][0];
+            assert!(!accepted["evidence"].as_array().unwrap().is_empty());
+            assert_eq!(accepted["decision"]["authorizer"], "test-authorizer");
+            assert!(
+                accepted["decision"]["applied_at_checkpoint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not_applied")
+            );
+            assert!(
+                accepted["before_queue_or_slice_summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("slice-001")
+            );
+            assert!(
+                accepted["after_queue_or_slice_summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("applied=false")
+            );
+            assert_eq!(
+                revisions["deferred"][0]["decision"]["revisit_condition"],
+                "after release"
+            );
+        }
+
+        let worker_handoff: serde_json::Value =
+            artifact::read_json(store.handoff_dir(&run.id).join("slice-001.json"))?;
+        assert_eq!(
+            worker_handoff["plan_revisions"]["source_of_truth"],
+            "daemon_replan_proposals"
+        );
+        let handoff = manager.branch_handoff(&run.id, false, false, false)?;
+        assert_eq!(handoff.plan_revisions.accepted.len(), 1);
+        assert_eq!(handoff.plan_revisions.rejected.len(), 1);
+        assert_eq!(handoff.plan_revisions.deferred.len(), 1);
+        assert_eq!(handoff.plan_revisions.superseded.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_blocks_pending_replan_proposals() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let pending = create_test_replan_proposal(&state, &run.id, "slice-001", "pending")?;
+        let err = manager
+            .branch_handoff(&run.id, false, false, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("handoff is not ready"));
+        assert!(err.to_string().contains(&pending.id));
+        assert!(err.to_string().contains("khazad-doom replan accept"));
         Ok(())
     }
 
@@ -5930,6 +6265,136 @@ mod tests {
         fn name(&self) -> &str {
             "fake"
         }
+    }
+
+    struct ReplanRecordingRunner {
+        state: StateStore,
+    }
+
+    impl Runner for ReplanRecordingRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            let run_id = job
+                .env
+                .get("KHAZAD_RUN_ID")
+                .ok_or_else(|| anyhow::anyhow!("missing KHAZAD_RUN_ID"))?;
+            let accepted =
+                create_test_replan_proposal(&self.state, run_id, &handoff.slice.id, "accepted")?;
+            self.state.decide_replan_proposal(
+                run_id,
+                &accepted.id,
+                ReplanProposalState::Accepted,
+                "operator accepted fixture",
+                "test-authorizer",
+                "test-runner",
+                "",
+                "",
+            )?;
+            let rejected =
+                create_test_replan_proposal(&self.state, run_id, &handoff.slice.id, "rejected")?;
+            self.state.decide_replan_proposal(
+                run_id,
+                &rejected.id,
+                ReplanProposalState::Rejected,
+                "duplicate proposal",
+                "test-authorizer",
+                "test-runner",
+                "",
+                "",
+            )?;
+            let deferred =
+                create_test_replan_proposal(&self.state, run_id, &handoff.slice.id, "deferred")?;
+            self.state.decide_replan_proposal(
+                run_id,
+                &deferred.id,
+                ReplanProposalState::Deferred,
+                "not now",
+                "test-authorizer",
+                "test-runner",
+                "",
+                "after release",
+            )?;
+            let superseded =
+                create_test_replan_proposal(&self.state, run_id, &handoff.slice.id, "superseded")?;
+            self.state.decide_replan_proposal(
+                run_id,
+                &superseded.id,
+                ReplanProposalState::Superseded,
+                "newer proposal exists",
+                "test-authorizer",
+                "test-runner",
+                "rp-replacement",
+                "",
+            )?;
+            fs::write(
+                job.cwd.join(format!("{}.txt", handoff.slice.id)),
+                format!("{}\n", handoff.slice.id),
+            )?;
+            gitutil::run(&job.cwd, &["add", "."])?;
+            gitutil::run(
+                &job.cwd,
+                &["commit", "-m", &format!("implement {}", handoff.slice.id)],
+            )?;
+            let sha = gitutil::head_sha(&job.cwd)?;
+            let acceptance_status = acceptance_status_json(&handoff.slice);
+            Ok(ResultData {
+                output: Some(json!({
+                    "slice_id": handoff.slice.id,
+                    "status": "complete",
+                    "summary": "implemented with plan revision history",
+                    "commit_sha": sha,
+                    "changed_files": [format!("{}.txt", handoff.slice.id)],
+                    "acceptance_status": acceptance_status
+                })),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "replan-recording"
+        }
+    }
+
+    fn create_test_replan_proposal(
+        state: &StateStore,
+        run_id: &str,
+        slice_id: &str,
+        label: &str,
+    ) -> Result<crate::domain::ReplanProposal> {
+        state.create_replan_proposal(
+            run_id,
+            "",
+            ReplanProposalSource {
+                kind: format!("fixture-{label}"),
+                slice_id: slice_id.to_string(),
+                phase: "test".to_string(),
+                attempt: 1,
+                summary: format!("{label} fixture proposal"),
+            },
+            vec![format!("finding-{label}")],
+            vec![ReplanEvidenceLink {
+                kind: "worker_output".to_string(),
+                path: format!(".workflow/runs/{run_id}/outputs/{slice_id}.worker.json"),
+                event_id: 0,
+                summary: format!("{label} evidence"),
+            }],
+            vec![ReplanProposedChange {
+                kind: "queue_revision".to_string(),
+                target: slice_id.to_string(),
+                summary: format!("{label} proposed queue change"),
+            }],
+            "intent_affecting",
+        )
     }
 
     struct DependencyInstallingRunner;

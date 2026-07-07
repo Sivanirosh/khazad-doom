@@ -195,16 +195,16 @@ All surfaces render the shared daemon feed projection:
 - `deferred`: proposal id, rationale, and revisit condition.
 - `superseded`: old proposal id and replacement id.
 
-Terminal summaries, reports, and handoffs include a `plan_revisions` section with every proposal and decision that affected or attempted to affect the run.
+Terminal summaries, reports, and handoffs include a `plan_revisions` section with every proposal and decision that affected or attempted to affect the run. The section is generated from daemon replan proposal state; it is evidence history, not a second queue authority.
 
 ## Handoff attestation
 
 A handoff must attest queue history without becoming a second source of truth:
 
 - selected slices and dependency closure were computed from slice JSON + daemon/run state;
-- every accepted plan revision is listed with evidence, authorizer, and applied diff summary;
-- rejected/deferred proposals are listed as non-applied findings/dispositions;
-- any remaining pending proposal blocks handoff readiness unless explicitly marked non-blocking by the operator.
+- every accepted plan revision is listed with evidence, authorizer, applied-at checkpoint, and before/after queue or slice-change summary;
+- rejected/deferred/superseded proposals are listed as non-applied findings/dispositions with rationale and revisit/replacement context where applicable;
+- any remaining pending proposal blocks handoff readiness unless explicitly marked non-blocking by the operator through an approved proposal/disposition decision.
 
 ## Cost of bounded repair authority
 
