@@ -893,7 +893,7 @@ if [ "$code" -ne 0 ]; then
 fi
 : > "$STDOUT"
 : > "$STDERR"
-{command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
+env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
 pid=$!
 printf '{{"state":"launched","pid":%s}}\n' "$pid" > "$STATUS"
 wait "$pid"
