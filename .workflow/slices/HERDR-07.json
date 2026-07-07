@@ -1,0 +1,51 @@
+{
+  "id": "HERDR-07",
+  "title": "Mid-run attention feedback callback",
+  "goal": "Reuse the HERDR-06 origin notification seam to notify the originating Herdr/Pi agent or pane when a live run needs operator attention, especially pending ask_operator questions and awaiting_replan proposal decisions.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-06"
+  ],
+  "areas": [
+    "src/workflow/cockpit.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/domain.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/state.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "extensions/khazad-monitor",
+    "docs/design/evidence/herdr-terminal-feedback-plan-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Mid-run notifications reuse the HERDR-06 origin target artifact and Cockpit notification seam; they do not add a second Herdr/Pi target discovery or delivery path.",
+    "The daemon can emit deduped, durable attention notifications when a run enters awaiting_operator for a worker question and when it enters awaiting_replan or records a pending replan proposal requiring operator decision.",
+    "Each attention notification is keyed to the concrete question id, proposal id, or attention transition, so repeated status polling, daemon restart, or resume does not spam duplicate notifications while new attention items still notify.",
+    "Payloads are declarative and command-oriented: run id, attention kind, question/proposal id, one-line reason, exact khazad-doom answer/replan commands, and status/monitor commands. They must not auto-answer, auto-approve, or instruct the receiving agent to decide intent.",
+    "Notification failures are non-fatal visibility incidents/events and do not change question state, proposal state, run status, slice status, worker timeout accounting, verification, merge, or handoff readiness.",
+    "Operator latency remains explicitly visible in status/watch/monitor and economics; HERDR-07 improves discovery but does not create an auto-approve tier or hidden planner authority.",
+    "Tests cover pending operator question notification, pending replan proposal notification, durable dedupe across daemon restart/resume, and no-op behavior when no origin target exists."
+  ],
+  "must_ask_if": [
+    "The implementation would answer operator questions, accept/reject/defer proposals, or approve findings automatically because a notification was sent.",
+    "The implementation would auto-submit text into the origin agent with Enter or pane run instead of using the inert HERDR-06 send path.",
+    "The implementation would create a new Herdr/Pi delivery path instead of reusing the Cockpit seam and origin target artifact from HERDR-06.",
+    "The implementation would hide or discount operator-wait time in economics/status because a notification was attempted.",
+    "The implementation would make Herdr/Pi required for ask_operator, replan, blocker answers, or headless operation."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test cockpit --quiet",
+    "cargo test attention_notification --quiet",
+    "cargo test ask_operator --quiet",
+    "cargo test replan --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet"
+  ],
+  "verify_timeout_seconds": 1200
+}

@@ -339,6 +339,14 @@ Follow-up tracking:
 
 Evidence and design constraints are recorded in `docs/design/evidence/herdr-live-pane-feedback-2026-07-07.md`.
 
+## Terminal and attention feedback follow-ups
+
+The next UX gap is that operators must manually ask for a run summary after terminal state. HERDR-06 adds a daemon-owned terminal feedback callback to the originating Herdr/Pi agent or pane through the `Cockpit` seam, using documented inert `herdr agent send` delivery only. Terminal feedback is declarative evidence, not an auto-submitted prompt.
+
+HERDR-07 is the planned successor for higher-value mid-run attention: pending `ask_operator` questions, `awaiting_replan`, and pending proposals. It must reuse HERDR-06's origin target and notification seam rather than rebuilding target plumbing.
+
+Evidence and design constraints are recorded in `docs/design/evidence/herdr-terminal-feedback-plan-2026-07-07.md`.
+
 ## Plan-level completion criteria
 
 The revision plan is complete when:

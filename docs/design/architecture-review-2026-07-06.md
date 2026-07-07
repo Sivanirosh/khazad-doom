@@ -154,3 +154,5 @@ After `kd-20260707-070851-bd30eb80`, Herdr panes proved operational but exposed 
 - `HERDR-05` follows with a read-only gate/repair activity painter over daemon-owned gate/shell output artifacts and feed data.
 
 Both preserve the architecture rejection that Herdr pane text, scrollback, and agent-status metadata are never correctness evidence.
+
+After `kd-20260707-091412-a77ab877`, the next cockpit UX issue is terminal and attention feedback back to the originating operator context. `HERDR-06` handles terminal transitions through daemon-owned detection and inert `herdr agent send` delivery wrapped by the `Cockpit` seam; `HERDR-07` reuses that seam for mid-run attention such as pending operator questions and replan proposals. These slices keep Herdr/Pi as optional notification sinks, not lifecycle owners.

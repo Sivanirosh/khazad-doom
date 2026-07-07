@@ -1,0 +1,52 @@
+{
+  "id": "HERDR-06",
+  "title": "Terminal run feedback callback",
+  "goal": "Send an optional, inert terminal-run feedback message back to the Herdr/Pi agent or pane that started a Khazad-Doom run, so operators see completed, blocked, failed, or cancelled outcomes without manually polling or asking for a summary.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-05"
+  ],
+  "areas": [
+    "src/workflow/cockpit.rs",
+    "src/workflow/manager.rs",
+    "src/artifact.rs",
+    "src/domain.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "extensions/khazad-monitor",
+    "docs/design/evidence/herdr-terminal-feedback-plan-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Run start can record an optional opaque origin notification target, suitable for Herdr agent names or legacy pane ids, in a daemon-owned run artifact such as .workflow/runs/<run>/origin.json; runs without an origin target preserve current behavior.",
+    "Terminal feedback is emitted from the daemon terminal-summary path only after durable terminal truth exists, for completed, blocked, failed, and cancelled transitions; interrupted is explicitly excluded in v1 because daemon-restart recovery may make the origin target stale.",
+    "Notification dedupe is durable and keyed per terminal transition, not per run, so a blocked run that later resumes and completes can produce separate blocked and completed notifications while repeated daemon/retry paths do not duplicate the same transition notification.",
+    "Herdr delivery is wrapped by the Cockpit seam and uses the documented inert surface herdr agent send <target> <text>; the implementation never uses pane run, Enter keystrokes, or any auto-submit path for terminal feedback.",
+    "The feedback payload is declarative evidence only: run id, terminal status, primary reason or feed summary, final SHA or handoff readiness when available, evidence artifact paths where useful, and next_commands. It must not contain imperative instructions asking the receiving agent to act, summarize, approve, answer, merge, or push.",
+    "Notification send failure, missing Herdr, missing origin target, or stale target records a non-fatal visibility event or incident and never changes run status, slice status, verification, merge, handoff readiness, or final SHA.",
+    "The notification entry point and origin-target artifact are shaped so later awaiting_operator, awaiting_replan, and pending-proposal notifications can reuse them without adding a second Herdr/Pi target plumbing path, but HERDR-06 does not implement mid-run attention notifications."
+  ],
+  "must_ask_if": [
+    "The implementation would auto-submit the notification so the origin agent processes it without operator action, including using pane run, send-keys Enter, or equivalent behavior.",
+    "The implementation would invoke Herdr agent/pane commands outside the Cockpit seam.",
+    "The implementation would make Herdr or Pi responsible for terminal-state detection, run lifetime, verification, merge, handoff, or blocker resolution.",
+    "The implementation would parse Herdr pane text, scrollback, or agent-status metadata as workflow truth or notification evidence.",
+    "The implementation would put imperative prompt text in the terminal feedback payload instead of declarative run evidence and next commands.",
+    "The implementation would add a state database schema migration for the origin target instead of a run artifact without first showing why the artifact is insufficient.",
+    "The implementation would notify interrupted runs in v1 despite restart/stale-origin risk."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test cockpit --quiet",
+    "cargo test terminal_notification --quiet",
+    "cargo test terminal_reason --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet",
+    "bash -lc '! rg -n \"pane run|send-keys|agent send|herdr agent\" src | rg -v \"src/workflow/cockpit.rs|tests\"'"
+  ],
+  "verify_timeout_seconds": 1200
+}
