@@ -47,7 +47,7 @@ Raw events remain available for drill-down through daemon artifacts and inspecti
 ## Follow-up slices
 
 - `FEED-02` — shared projection information design: altitude tiers, humanized feed lines, dedupe, semantic-progress wiring from wrapper-mode tool events, in-flight economics, and golden projection fixtures.
-- `HERDR-04B` — worker pane semantic painter: render typed Pi event payloads, suppress envelope noise, show coalesced assistant text/reasoning and tool identity/outcome, backed by recorded ndjson golden fixtures.
+- `HERDR-04B` — worker pane semantic painter: render typed Pi event payloads, suppress envelope noise, show coalesced assistant text/reasoning and tool identity/outcome, backed by recorded ndjson golden fixtures. Implemented at the Pi-contract formatter seam so wire-format recognition remains confined to `src/pi_contract.rs` and renderer output stays display-only.
 - `HERDR-05B` — gate pane semantic summary: active gate command state and gate-scoped idle summary over FEED-02 fields, backed by golden fixtures.
 
 ## Chain-of-thought fence

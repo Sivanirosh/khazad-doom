@@ -1463,6 +1463,7 @@ fn parse_optional_time(field: &str, value: &str) -> Result<Option<DateTime<Utc>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pi_contract::TOOL_EXECUTION_END_EVENT_TYPE;
     use chrono::Duration as ChronoDuration;
 
     fn run(id: &str, repo_path: &str, status: RunStatus, started_at: DateTime<Utc>) -> Run {
@@ -1504,7 +1505,7 @@ mod tests {
         )?;
         let line = include_str!("../tests/fixtures/projection_information_wrapper_stdout.ndjson")
             .lines()
-            .find(|line| line.contains("tool_execution_end"))
+            .find(|line| line.contains(TOOL_EXECUTION_END_EVENT_TYPE))
             .expect("tool execution fixture line");
 
         store.observe_worker_attempt(

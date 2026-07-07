@@ -104,8 +104,12 @@ pub fn observation(binary: &str, extra_args: &[String]) -> PiContractObservation
     }
 }
 
-const ACTIVITY_DELTA_FLUSH_EVENTS: usize = 100;
-const ACTIVITY_SNIPPET_CHARS: usize = 160;
+const TOOL_EXECUTION_START_EVENT_TYPE: &str = "tool_execution_start";
+const TOOL_EXECUTION_UPDATE_EVENT_TYPE: &str = "tool_execution_update";
+pub(crate) const TOOL_EXECUTION_END_EVENT_TYPE: &str = "tool_execution_end";
+const ACTIVITY_DELTA_FLUSH_CHARS: usize = 240;
+const ACTIVITY_SNIPPET_CHARS: usize = 200;
+const TOOL_DETAIL_CHARS: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiSemanticProgress {
@@ -119,9 +123,9 @@ pub fn semantic_progress_from_stdout_line(line: &str) -> Option<PiSemanticProgre
 
 fn semantic_progress_from_event(event: &Value) -> Option<PiSemanticProgress> {
     let action = match event.get("type").and_then(Value::as_str)? {
-        "tool_execution_start" => "started",
-        "tool_execution_update" => "running",
-        "tool_execution_end" => "finished",
+        TOOL_EXECUTION_START_EVENT_TYPE => "started",
+        TOOL_EXECUTION_UPDATE_EVENT_TYPE => "running",
+        TOOL_EXECUTION_END_EVENT_TYPE => "finished",
         _ => return None,
     };
     Some(PiSemanticProgress {
@@ -131,12 +135,9 @@ fn semantic_progress_from_event(event: &Value) -> Option<PiSemanticProgress> {
 
 #[derive(Debug, Default)]
 pub struct PiActivityFormatter {
-    text_delta_events: usize,
-    text_delta_chars: usize,
-    thinking_delta_events: usize,
-    thinking_delta_chars: usize,
-    toolcall_delta_events: usize,
-    toolcall_delta_chars: usize,
+    text_delta: DeltaDisplayBuffer,
+    reasoning_delta: DeltaDisplayBuffer,
+    toolcall_delta: DeltaDisplayBuffer,
     warned_unknown_event: bool,
     warned_future_version: bool,
 }
@@ -171,43 +172,19 @@ impl PiActivityFormatter {
                 lines.extend(self.flush_compacted());
                 lines.push("[pi] agent started".to_string());
             }
-            Some("turn_start") => {
+            Some("turn_start" | "message_start" | "message_end" | "turn_end") => {
                 lines.extend(self.flush_compacted());
-                lines.push("[pi] turn started".to_string());
-            }
-            Some("message_start") => {
-                lines.extend(self.flush_compacted());
-                let role = message_role(event.get("message"));
-                lines.push(format!("[pi] {role} message started"));
             }
             Some("message_update") => {
                 lines.extend(self.render_assistant_activity(event.get("assistantMessageEvent")));
             }
-            Some("message_end") => {
+            Some(TOOL_EXECUTION_START_EVENT_TYPE) | Some(TOOL_EXECUTION_UPDATE_EVENT_TYPE) => {
                 lines.extend(self.flush_compacted());
-                lines.extend(render_message_summary(
-                    event.get("message"),
-                    "message ended",
-                ));
+                lines.push(render_tool_activity(event, ToolDisplayState::Running));
             }
-            Some("tool_execution_start") => {
+            Some(TOOL_EXECUTION_END_EVENT_TYPE) => {
                 lines.extend(self.flush_compacted());
-                lines.push(format!("[pi] tool {} started", tool_label(event)));
-            }
-            Some("tool_execution_update") => {
-                lines.extend(self.flush_compacted());
-                lines.push(format!("[pi] tool {} running", tool_label(event)));
-            }
-            Some("tool_execution_end") => {
-                lines.extend(self.flush_compacted());
-                lines.push(format!("[pi] tool {} finished", tool_label(event)));
-            }
-            Some("turn_end") => {
-                lines.extend(self.flush_compacted());
-                lines.push(format!(
-                    "[pi] turn ended{}",
-                    usage_suffix(event.pointer("/message/usage"))
-                ));
+                lines.push(render_tool_activity(event, ToolDisplayState::Finished));
             }
             Some("agent_end") => {
                 lines.extend(self.flush_compacted());
@@ -256,61 +233,32 @@ impl PiActivityFormatter {
     fn render_assistant_activity(&mut self, raw: Option<&Value>) -> Vec<String> {
         let Some(event) = raw else { return Vec::new() };
         match event.get("type").and_then(Value::as_str) {
-            Some("thinking_start") => {
-                let mut lines = self.flush_compacted();
-                lines.push("[pi] assistant thinking started".to_string());
-                lines
-            }
+            Some("thinking_start") => self.begin_delta(DeltaKind::Reasoning),
             Some("thinking_delta") => self.record_delta(
-                "assistant thinking",
                 event.get("delta").and_then(Value::as_str),
-                DeltaKind::Thinking,
+                DeltaKind::Reasoning,
             ),
-            Some("thinking_end") => {
-                let mut lines = self.flush_compacted();
-                match event.get("content").and_then(Value::as_str) {
-                    Some(content) if !content.is_empty() => {
-                        lines.push(format!("[pi] assistant thinking: {}", snippet(content)))
-                    }
-                    _ => lines.push("[pi] assistant thinking ended".to_string()),
-                }
-                lines
+            Some("thinking_end") => self.finish_delta(
+                DeltaKind::Reasoning,
+                event.get("content").and_then(Value::as_str),
+            ),
+            Some("text_start") => self.begin_delta(DeltaKind::Text),
+            Some("text_delta") => {
+                self.record_delta(event.get("delta").and_then(Value::as_str), DeltaKind::Text)
             }
-            Some("text_start") => {
-                let mut lines = self.flush_compacted();
-                lines.push("[pi] assistant text started".to_string());
-                lines
-            }
-            Some("text_delta") => self.record_delta(
-                "assistant text",
-                event.get("delta").and_then(Value::as_str),
+            Some("text_end") => self.finish_delta(
                 DeltaKind::Text,
+                event.get("content").and_then(Value::as_str),
             ),
-            Some("text_end") => {
-                let mut lines = self.flush_compacted();
-                match event.get("content").and_then(Value::as_str) {
-                    Some(content) if !content.is_empty() => {
-                        lines.push(format!("[pi] assistant: {}", snippet(content)))
-                    }
-                    _ => lines.push("[pi] assistant text ended".to_string()),
-                }
-                lines
-            }
-            Some("toolcall_start") => {
-                let mut lines = self.flush_compacted();
-                lines.push("[pi] assistant tool call started".to_string());
-                lines
-            }
+            Some("toolcall_start") => self.begin_delta(DeltaKind::ToolCall),
             Some("toolcall_delta") => self.record_delta(
-                "assistant tool call",
                 event.get("delta").and_then(Value::as_str),
                 DeltaKind::ToolCall,
             ),
-            Some("toolcall_end") => {
-                let mut lines = self.flush_compacted();
-                lines.push("[pi] assistant tool call ended".to_string());
-                lines
-            }
+            Some("toolcall_end") => self.finish_delta(
+                DeltaKind::ToolCall,
+                event.get("content").and_then(Value::as_str),
+            ),
             Some(event_type) => {
                 let mut lines = self.flush_compacted();
                 if !KNOWN_ASSISTANT_EVENT_TYPES.contains(&event_type) && !self.warned_unknown_event
@@ -324,59 +272,82 @@ impl PiActivityFormatter {
         }
     }
 
-    fn record_delta(
-        &mut self,
-        label: &'static str,
-        delta: Option<&str>,
-        kind: DeltaKind,
-    ) -> Vec<String> {
-        let chars = delta.map(|value| value.chars().count()).unwrap_or(0);
-        let (events, total_chars) = match kind {
-            DeltaKind::Text => (&mut self.text_delta_events, &mut self.text_delta_chars),
-            DeltaKind::Thinking => (
-                &mut self.thinking_delta_events,
-                &mut self.thinking_delta_chars,
-            ),
-            DeltaKind::ToolCall => (
-                &mut self.toolcall_delta_events,
-                &mut self.toolcall_delta_chars,
-            ),
+    fn begin_delta(&mut self, kind: DeltaKind) -> Vec<String> {
+        let lines = self.flush_compacted();
+        self.buffer_mut(kind).reset();
+        lines
+    }
+
+    fn record_delta(&mut self, delta: Option<&str>, kind: DeltaKind) -> Vec<String> {
+        let mut lines = self.flush_except(kind);
+        let Some(delta) = delta.filter(|value| !value.is_empty()) else {
+            return lines;
         };
-        *events += 1;
-        *total_chars += chars;
-        if *events >= ACTIVITY_DELTA_FLUSH_EVENTS {
-            take_delta_line(label, events, total_chars)
-                .into_iter()
-                .collect()
-        } else {
-            Vec::new()
+        let buffer = self.buffer_mut(kind);
+        buffer.text.push_str(delta);
+        if buffer.text.chars().count() >= ACTIVITY_DELTA_FLUSH_CHARS {
+            lines.extend(self.take_delta_lines(kind));
         }
+        lines
+    }
+
+    fn finish_delta(&mut self, kind: DeltaKind, content: Option<&str>) -> Vec<String> {
+        let had_buffer = !self.buffer(kind).text.is_empty();
+        let had_emitted = self.buffer(kind).emitted;
+        let mut lines = self.take_delta_lines(kind);
+        if !had_buffer
+            && !had_emitted
+            && let Some(content) = content.filter(|value| !value.is_empty())
+        {
+            if let Some(line) = format_delta_line(kind, content) {
+                lines.push(line);
+            }
+        }
+        self.buffer_mut(kind).reset();
+        lines
     }
 
     fn flush_compacted(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
-        if let Some(line) = take_delta_line(
-            "assistant thinking",
-            &mut self.thinking_delta_events,
-            &mut self.thinking_delta_chars,
-        ) {
-            lines.push(line);
-        }
-        if let Some(line) = take_delta_line(
-            "assistant text",
-            &mut self.text_delta_events,
-            &mut self.text_delta_chars,
-        ) {
-            lines.push(line);
-        }
-        if let Some(line) = take_delta_line(
-            "assistant tool call",
-            &mut self.toolcall_delta_events,
-            &mut self.toolcall_delta_chars,
-        ) {
-            lines.push(line);
+        lines.extend(self.take_delta_lines(DeltaKind::Reasoning));
+        lines.extend(self.take_delta_lines(DeltaKind::Text));
+        lines.extend(self.take_delta_lines(DeltaKind::ToolCall));
+        lines
+    }
+
+    fn flush_except(&mut self, keep: DeltaKind) -> Vec<String> {
+        let mut lines = Vec::new();
+        for kind in [DeltaKind::Reasoning, DeltaKind::Text, DeltaKind::ToolCall] {
+            if kind != keep {
+                lines.extend(self.take_delta_lines(kind));
+            }
         }
         lines
+    }
+
+    fn take_delta_lines(&mut self, kind: DeltaKind) -> Vec<String> {
+        let text = std::mem::take(&mut self.buffer_mut(kind).text);
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.buffer_mut(kind).emitted = true;
+        format_delta_line(kind, &text).into_iter().collect()
+    }
+
+    fn buffer(&self, kind: DeltaKind) -> &DeltaDisplayBuffer {
+        match kind {
+            DeltaKind::Text => &self.text_delta,
+            DeltaKind::Reasoning => &self.reasoning_delta,
+            DeltaKind::ToolCall => &self.toolcall_delta,
+        }
+    }
+
+    fn buffer_mut(&mut self, kind: DeltaKind) -> &mut DeltaDisplayBuffer {
+        match kind {
+            DeltaKind::Text => &mut self.text_delta,
+            DeltaKind::Reasoning => &mut self.reasoning_delta,
+            DeltaKind::ToolCall => &mut self.toolcall_delta,
+        }
     }
 
     fn future_version_line(&mut self, event: &Value) -> Option<String> {
@@ -394,86 +365,234 @@ impl PiActivityFormatter {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default)]
+struct DeltaDisplayBuffer {
+    text: String,
+    emitted: bool,
+}
+
+impl DeltaDisplayBuffer {
+    fn reset(&mut self) {
+        self.text.clear();
+        self.emitted = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeltaKind {
     Text,
-    Thinking,
+    Reasoning,
     ToolCall,
 }
 
-fn take_delta_line(label: &str, events: &mut usize, chars: &mut usize) -> Option<String> {
-    if *events == 0 {
+#[derive(Debug, Clone, Copy)]
+enum ToolDisplayState {
+    Running,
+    Finished,
+}
+
+fn format_delta_line(kind: DeltaKind, text: &str) -> Option<String> {
+    let display = match kind {
+        DeltaKind::ToolCall => snippet(&redact_sensitive_text(text)),
+        _ => snippet(text),
+    };
+    if display.is_empty() {
         return None;
     }
-    let line = format!("[pi] {label} +{} chars in {} chunks", *chars, *events);
-    *events = 0;
-    *chars = 0;
-    Some(line)
-}
-
-fn message_role(raw: Option<&Value>) -> &str {
-    raw.and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-}
-
-fn render_message_summary(raw: Option<&Value>, fallback: &str) -> Vec<String> {
-    let Some(message) = raw else {
-        return vec![format!("[pi] {fallback}")];
+    let label = match kind {
+        DeltaKind::Text => "assistant",
+        DeltaKind::Reasoning => "reasoning/progress",
+        DeltaKind::ToolCall => "tool request",
     };
-    let role = message
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    if role == "assistant"
-        && let Some(text) = message_text(message)
-    {
-        return vec![format!(
-            "[pi] assistant: {}{}",
-            snippet(&text),
-            usage_suffix(message.get("usage"))
-        )];
-    }
-    vec![format!("[pi] {role} {fallback}")]
+    Some(format!("[pi] {label}: {display}"))
 }
 
-fn message_text(message: &Value) -> Option<String> {
-    let content = message.get("content").and_then(Value::as_array)?;
-    let parts: Vec<_> = content
+fn render_tool_activity(event: &Value, state: ToolDisplayState) -> String {
+    let detail = tool_detail(event)
+        .map(|detail| format!(" {detail}"))
+        .unwrap_or_default();
+    let outcome = match state {
+        ToolDisplayState::Running => "running".to_string(),
+        ToolDisplayState::Finished => tool_finish_outcome(event).to_string(),
+    };
+    format!(
+        "[pi] tool {}{detail} {outcome}{}",
+        tool_label(event),
+        duration_suffix(event)
+    )
+}
+
+fn tool_finish_outcome(event: &Value) -> &'static str {
+    if tool_failed(event) {
+        "failed"
+    } else if tool_succeeded(event) {
+        "ok"
+    } else {
+        "finished"
+    }
+}
+
+fn tool_failed(event: &Value) -> bool {
+    event.get("error").is_some()
+        || event.pointer("/result/error").is_some()
+        || numeric_field(event.pointer("/result/exit_code")).is_some_and(|code| code != 0.0)
+        || status_field(event.pointer("/result/status"))
+            .is_some_and(|status| matches!(status, "failed" | "failure" | "error"))
+}
+
+fn tool_succeeded(event: &Value) -> bool {
+    numeric_field(event.pointer("/result/exit_code")).is_some_and(|code| code == 0.0)
+        || event
+            .pointer("/result/success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || status_field(event.pointer("/result/status"))
+            .is_some_and(|status| matches!(status, "ok" | "success" | "succeeded" | "completed"))
+}
+
+fn status_field(value: Option<&Value>) -> Option<&str> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn duration_suffix(event: &Value) -> String {
+    let duration_ms = ["durationMs", "duration_ms", "elapsedMs", "elapsed_ms"]
         .iter()
-        .filter_map(|item| {
-            item.get("text")
-                .or_else(|| item.get("thinking"))
-                .and_then(Value::as_str)
-        })
-        .filter(|text| !text.is_empty())
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(" "))
+        .find_map(|key| numeric_field(event.get(*key)));
+    let Some(duration_ms) = duration_ms else {
+        return String::new();
+    };
+    if duration_ms >= 1000.0 {
+        format!(" in {:.1}s", duration_ms / 1000.0)
+    } else {
+        format!(" in {}ms", duration_ms.round() as u64)
+    }
 }
 
-fn usage_suffix(raw: Option<&Value>) -> String {
-    let input = raw
-        .and_then(|value| value.get("input"))
-        .and_then(Value::as_u64);
-    let output = raw
-        .and_then(|value| value.get("output"))
-        .and_then(Value::as_u64);
-    match (input, output) {
-        (Some(input), Some(output)) => format!(" ({input} in/{output} out)"),
-        _ => String::new(),
+fn numeric_field(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
     }
+}
+
+fn tool_detail(event: &Value) -> Option<String> {
+    event
+        .get("args")
+        .and_then(tool_args_summary)
+        .or_else(|| event.get("input").and_then(tool_args_summary))
+        .or_else(|| text_detail(event, "command"))
+        .or_else(|| text_detail(event, "path"))
+        .or_else(|| text_detail(event, "file"))
+}
+
+fn tool_args_summary(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => [
+            "command",
+            "cmd",
+            "path",
+            "file",
+            "file_path",
+            "filename",
+            "cwd",
+        ]
+        .iter()
+        .find_map(|key| {
+            map.get(*key)
+                .and_then(|value| display_arg_value(key, value))
+        }),
+        Value::String(text) => Some(format!("args={}", display_text_value("args", text))),
+        _ => None,
+    }
+}
+
+fn text_detail(event: &Value, key: &str) -> Option<String> {
+    event
+        .get(key)
+        .and_then(|value| display_arg_value(key, value))
+}
+
+fn display_arg_value(key: &str, value: &Value) -> Option<String> {
+    let rendered = match value {
+        Value::String(text) => display_text_value(key, text),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        _ => return None,
+    };
+    Some(format!("{key}={rendered}"))
+}
+
+fn display_text_value(key: &str, text: &str) -> String {
+    if sensitive_key(key) || sensitive_text(text) {
+        return "[redacted sensitive value]".to_string();
+    }
+    truncate_display(&snippet(text), TOOL_DETAIL_CHARS)
 }
 
 fn tool_label(event: &Value) -> String {
-    event
+    let raw = event
         .get("toolName")
         .or_else(|| event.get("tool_name"))
         .or_else(|| event.get("toolCallId"))
         .or_else(|| event.get("tool_call_id"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("unknown")
-        .to_string()
+        .unwrap_or("unknown");
+    truncate_display(raw, 48)
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "api_key",
+        "apikey",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn sensitive_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "token=",
+        "secret=",
+        "password=",
+        "api_key=",
+        "apikey=",
+        "authorization:",
+        "bearer ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    if sensitive_text(text) {
+        "[redacted sensitive value]".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn truncate_display(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn snippet(text: &str) -> String {
@@ -818,14 +937,32 @@ mod tests {
         let joined = rendered.join("\n");
 
         assert!(joined.contains("[pi] session 019f3b71-268e-74fa-ae5a-c0e225a75f04 started"));
-        assert!(joined.contains("[pi] turn started"));
-        assert!(joined.contains("[pi] tool read started"));
+        assert!(joined.contains("[pi] tool read path="));
         assert!(joined.contains("[pi] tool read finished"));
         assert!(joined.contains("[pi] assistant: hello world"));
+        assert!(joined.contains("[pi] reasoning/progress: looking"));
         assert!(joined.contains("[pi] future event contract v2 tolerated"));
         assert!(joined.contains("[pi] unknown event ignored: future_activity_event"));
-        assert!(joined.contains("[pi] turn ended (7 in/11 out)"));
         assert!(joined.contains("[pi] agent finished"));
+        assert!(!joined.contains("turn started"));
+        assert!(!joined.contains("turn ended"));
+        assert!(!joined.contains("message started"));
+        assert!(!joined.contains("message ended"));
+        assert!(!joined.contains("chunks"));
+    }
+
+    #[test]
+    fn worker_pane_golden_fixture_covers_semantic_display() {
+        let fixture = include_str!("../tests/fixtures/worker_pane_semantic.ndjson");
+        let expected = include_str!("../tests/fixtures/worker_pane_semantic.golden.txt").trim_end();
+        let mut formatter = PiActivityFormatter::default();
+        let mut rendered = Vec::new();
+        for line in fixture.lines() {
+            rendered.extend(formatter.render_line(line));
+        }
+        rendered.extend(formatter.flush());
+
+        assert_eq!(rendered.join("\n"), expected);
     }
 
     #[test]
@@ -849,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_activity_painter_compacts_high_volume_token_deltas() {
+    fn worker_activity_painter_coalesces_high_volume_token_deltas() {
         let mut formatter = PiActivityFormatter::default();
         let mut rendered = Vec::new();
         rendered.extend(formatter.render_line(
@@ -861,15 +998,15 @@ mod tests {
             ));
         }
         rendered.extend(formatter.flush());
-        let compacted: Vec<_> = rendered
+        let assistant_lines: Vec<_> = rendered
             .iter()
-            .filter(|line| line.contains("assistant text +"))
+            .filter(|line| line.starts_with("[pi] assistant:"))
             .collect();
 
-        assert_eq!(compacted.len(), 3);
-        assert!(compacted[0].contains("100 chunks"));
-        assert!(compacted[1].contains("100 chunks"));
-        assert!(compacted[2].contains("50 chunks"));
+        assert_eq!(assistant_lines.len(), 2);
+        assert!(assistant_lines[0].ends_with('…'));
+        assert_eq!(assistant_lines[1], "[pi] assistant: xxxxxxxxxx");
+        assert!(rendered.iter().all(|line| !line.contains("chunks")));
         assert!(rendered.len() < 10);
     }
 

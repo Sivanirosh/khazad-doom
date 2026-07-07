@@ -1,0 +1,9 @@
+[pi] session golden-worker started
+[pi] assistant: Inspecting worker events.
+[pi] reasoning/progress: checking fixture payload
+[pi] tool bash command=[redacted sensitive value] running
+[pi] tool bash running
+[pi] tool bash command=[redacted sensitive value] ok in 1.5s
+[pi] future event contract v2 tolerated by display parser
+[pi] unknown event ignored: future_activity_event
+[pi] agent finished

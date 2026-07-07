@@ -2030,7 +2030,8 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
 
         assert!(rendered.contains("read-only"));
-        assert!(rendered.contains("tool read started"));
+        assert!(rendered.contains("tool read path="));
+        assert!(rendered.contains("assistant: hello world"));
         assert!(rendered.contains("unknown event ignored"));
         assert!(rendered.contains("wrapper terminal artifacts observed"));
         Ok(())

@@ -1,0 +1,17 @@
+{"type":"session","id":"golden-worker","timestamp":"2026-07-07T00:00:00Z"}
+{"type":"turn_start","unknownEnvelopeField":true}
+{"type":"message_start","message":{"role":"assistant","content":[]}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Inspecting "}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"worker events."}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":1}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":1,"delta":"checking fixture payload"}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":1,"content":""}}
+{"type":"tool_execution_start","toolName":"bash","toolCallId":"call-golden","args":{"command":"KHAZAD_TOKEN=supersecret cargo test worker_pane_golden --quiet"}}
+{"type":"tool_execution_update","toolName":"bash","toolCallId":"call-golden","partialResult":{"status":"running"}}
+{"type":"tool_execution_end","toolName":"bash","toolCallId":"call-golden","args":{"command":"KHAZAD_TOKEN=supersecret cargo test worker_pane_golden --quiet"},"result":{"exit_code":0},"durationMs":1534}
+{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Inspecting worker events."}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Inspecting worker events."}],"usage":{"input":8,"output":13}}}
+{"type":"future_activity_event","contract_version":2,"payload":{"private_reasoning":"must not render"}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"Inspecting worker events."}],"usage":{"input":8,"output":13}}}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Inspecting worker events."}]}]}
