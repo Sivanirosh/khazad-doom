@@ -380,6 +380,20 @@ fn run_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
             StatusFeedRole::Dim,
         ),
     ];
+    if !details.worker_profile.profile_summary.trim().is_empty() {
+        lines.push(line(
+            format!("worker profile {}", details.worker_profile.profile_summary),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if details.worker_profile.worker_evidence_kind
+        == "deterministic_test_double_not_real_pi_worker_evidence"
+    {
+        lines.push(line(
+            details.worker_profile.worker_evidence_label.clone(),
+            StatusFeedRole::Warning,
+        ));
+    }
     let message = monitor_message(details);
     if !message.trim().is_empty() {
         lines.push(line(
@@ -543,6 +557,18 @@ fn economics_block(economics: &RunEconomics) -> StatusFeedBlock {
             StatusFeedRole::Info,
         ),
     ];
+    if let Some(fake_call) = economics.agent_calls.iter().find(|call| {
+        call.worker_evidence_kind() == "deterministic_test_double_not_real_pi_worker_evidence"
+    }) {
+        lines.push(line(
+            format!(
+                "Worker evidence: {} ({})",
+                fake_call.worker_evidence_kind(),
+                fake_call.worker_evidence_label()
+            ),
+            StatusFeedRole::Warning,
+        ));
+    }
     if !economics.sla_violations.is_empty() {
         lines.push(line(
             format!("SLA violations: {}", economics.sla_violations.join("; ")),
@@ -1254,6 +1280,7 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            worker_profile: Default::default(),
             slice_runs: vec![SliceRun {
                 run_id: "kd-test".to_string(),
                 slice_id: "slice-1".to_string(),
@@ -1295,6 +1322,7 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            worker_profile: Default::default(),
             slice_runs: Vec::new(),
             progress: None,
             incidents: Vec::new(),
@@ -1405,6 +1433,7 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            worker_profile: Default::default(),
             slice_runs: Vec::new(),
             progress: None,
             incidents: Vec::new(),

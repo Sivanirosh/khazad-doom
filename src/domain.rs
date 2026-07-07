@@ -387,6 +387,85 @@ pub struct Run {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorkerProfileEvidence {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_reasoning: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub launch_summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker_evidence_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker_evidence_label: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_attribution: BTreeMap<String, String>,
+}
+
+impl WorkerProfileEvidence {
+    pub fn is_empty(&self) -> bool {
+        self.agent.is_empty()
+            && self.agent_profile.is_empty()
+            && self.agent_provider.is_empty()
+            && self.agent_model.is_empty()
+            && self.agent_reasoning.is_empty()
+            && self.agent_mode.is_empty()
+            && self.profile_summary.is_empty()
+            && self.launch_summary.is_empty()
+            && self.worker_evidence_kind.is_empty()
+            && self.worker_evidence_label.is_empty()
+            && self.source_attribution.is_empty()
+    }
+
+    pub fn from_json_surface(value: &serde_json::Value) -> Option<Self> {
+        if let Some(worker_profile) = value.get("worker_profile")
+            && let Ok(profile) = serde_json::from_value::<Self>(worker_profile.clone())
+            && !profile.is_empty()
+        {
+            return Some(profile);
+        }
+        let mut profile = Self {
+            agent: json_string(value, "agent"),
+            agent_profile: json_string(value, "agent_profile"),
+            agent_provider: json_string(value, "agent_provider"),
+            agent_model: json_string(value, "agent_model"),
+            agent_reasoning: json_string(value, "agent_reasoning"),
+            agent_mode: json_string(value, "agent_mode"),
+            profile_summary: json_string(value, "profile_summary"),
+            launch_summary: json_string(value, "launch_summary"),
+            worker_evidence_kind: json_string(value, "worker_evidence_kind"),
+            worker_evidence_label: json_string(value, "worker_evidence_label"),
+            source_attribution: BTreeMap::new(),
+        };
+        if let Some(source) = value.get("profile_source_attribution")
+            && let Ok(map) = serde_json::from_value::<BTreeMap<String, String>>(source.clone())
+        {
+            profile.source_attribution = map;
+        }
+        (!profile.is_empty()).then_some(profile)
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handoff {
     pub run_id: String,
@@ -397,6 +476,8 @@ pub struct Handoff {
     pub slice: Slice,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub dependency_summary: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
+    pub worker_profile: WorkerProfileEvidence,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent_profile: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -553,7 +634,7 @@ pub struct PhaseDuration {
     pub duration_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct AgentCallEconomics {
     pub phase: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -585,6 +666,114 @@ pub struct AgentCallEconomics {
     pub input_tokens: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub output_tokens: usize,
+}
+
+impl AgentCallEconomics {
+    pub fn worker_evidence_kind(&self) -> &'static str {
+        agent_call_worker_evidence_kind(&self.runner)
+    }
+
+    pub fn worker_evidence_label(&self) -> &'static str {
+        agent_call_worker_evidence_label(&self.runner)
+    }
+}
+
+impl Serialize for AgentCallEconomics {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut field_count = 8;
+        for value in [
+            &self.slice_id,
+            &self.agent_profile,
+            &self.agent_provider,
+            &self.agent_model,
+            &self.agent_reasoning,
+            &self.agent_mode,
+            &self.profile_summary,
+            &self.launch_summary,
+            &self.error,
+        ] {
+            if !value.is_empty() {
+                field_count += 1;
+            }
+        }
+        if self.operator_pause_ms != 0 {
+            field_count += 1;
+        }
+        if self.input_tokens != 0 {
+            field_count += 1;
+        }
+        if self.output_tokens != 0 {
+            field_count += 1;
+        }
+
+        let mut state = serializer.serialize_struct("AgentCallEconomics", field_count)?;
+        state.serialize_field("phase", &self.phase)?;
+        if !self.slice_id.is_empty() {
+            state.serialize_field("slice_id", &self.slice_id)?;
+        }
+        state.serialize_field("attempt", &self.attempt)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("runner", &self.runner)?;
+        state.serialize_field("worker_evidence_kind", self.worker_evidence_kind())?;
+        state.serialize_field("worker_evidence_label", self.worker_evidence_label())?;
+        if !self.agent_profile.is_empty() {
+            state.serialize_field("agent_profile", &self.agent_profile)?;
+        }
+        if !self.agent_provider.is_empty() {
+            state.serialize_field("agent_provider", &self.agent_provider)?;
+        }
+        if !self.agent_model.is_empty() {
+            state.serialize_field("agent_model", &self.agent_model)?;
+        }
+        if !self.agent_reasoning.is_empty() {
+            state.serialize_field("agent_reasoning", &self.agent_reasoning)?;
+        }
+        if !self.agent_mode.is_empty() {
+            state.serialize_field("agent_mode", &self.agent_mode)?;
+        }
+        if !self.profile_summary.is_empty() {
+            state.serialize_field("profile_summary", &self.profile_summary)?;
+        }
+        if !self.launch_summary.is_empty() {
+            state.serialize_field("launch_summary", &self.launch_summary)?;
+        }
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("duration_ms", &self.duration_ms)?;
+        if self.operator_pause_ms != 0 {
+            state.serialize_field("operator_pause_ms", &self.operator_pause_ms)?;
+        }
+        if !self.error.is_empty() {
+            state.serialize_field("error", &self.error)?;
+        }
+        if self.input_tokens != 0 {
+            state.serialize_field("input_tokens", &self.input_tokens)?;
+        }
+        if self.output_tokens != 0 {
+            state.serialize_field("output_tokens", &self.output_tokens)?;
+        }
+        state.end()
+    }
+}
+
+fn agent_call_worker_evidence_kind(runner: &str) -> &'static str {
+    if runner.eq_ignore_ascii_case("fake") {
+        "deterministic_test_double_not_real_pi_worker_evidence"
+    } else {
+        "real_pi_worker"
+    }
+}
+
+fn agent_call_worker_evidence_label(runner: &str) -> &'static str {
+    if runner.eq_ignore_ascii_case("fake") {
+        "deterministic test-double evidence; not real Pi worker implementation evidence"
+    } else {
+        "real Pi worker implementation evidence"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -671,6 +860,8 @@ pub struct ImplementationSummary {
     pub base_sha: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub final_sha: String,
+    #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
+    pub worker_profile: WorkerProfileEvidence,
     pub completed_slices: Vec<WorkerResult>,
     pub checks: Vec<CheckResult>,
     pub integration_repair: RepairResult,
@@ -829,6 +1020,8 @@ pub struct WorkerQuestion {
     pub id: String,
     pub run_id: String,
     pub slice_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub attempt: usize,
     pub question: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -1024,6 +1217,8 @@ pub fn replan_decision_commands(run_id: &str, proposal_id: &str) -> Vec<String> 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
+    #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
+    pub worker_profile: WorkerProfileEvidence,
     pub slice_runs: Vec<SliceRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<RunProgress>,
@@ -1097,6 +1292,8 @@ pub struct BranchHandoff {
     pub base_sha: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub final_sha: String,
+    #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
+    pub worker_profile: WorkerProfileEvidence,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_slices: Vec<String>,
     #[serde(default)]

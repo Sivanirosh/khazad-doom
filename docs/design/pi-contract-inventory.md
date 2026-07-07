@@ -16,7 +16,7 @@ The effective worker profile resolver supplies profile args from the operator-wi
 --provider <provider> --model <model> --thinking <reasoning>
 ```
 
-`--mode json --no-session` are Khazad-owned contract flags added by `src/pi_contract.rs`. `preflight.json` records the binary, launch flags, supported contract version, and event vocabulary for each run.
+`--mode json --no-session` are Khazad-owned contract flags added by `src/pi_contract.rs`. `preflight.json` records the binary, launch flags, supported contract version, event vocabulary, and the effective worker-profile/evidence summary for each run. The same worker-profile summary is surfaced in `run_started`, worker handoff JSON, status/monitor feed, economics, implementation summaries, final reports, and branch handoff JSON.
 
 ## Stdout event vocabulary
 
@@ -86,6 +86,10 @@ Use /login to log into a provider via OAuth or API key.
 ```
 
 Classified auth failures are non-retryable, operator-action-required launch failures with `fix_commands` (currently `pi /login`). Unknown or ambiguous launch failures retain retry behavior.
+
+## Worker evidence attestation
+
+`fake` is a deterministic test double, not a real worker harness. Fake-runner metadata and economics use `worker_evidence_kind = deterministic_test_double_not_real_pi_worker_evidence`; real Pi launches use `worker_evidence_kind = real_pi_worker`. Reports and handoff artifacts must preserve that distinction so fake smoke evidence cannot be mistaken for Pi implementation evidence.
 
 ## Boundary rule
 

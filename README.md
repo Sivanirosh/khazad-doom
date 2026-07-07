@@ -203,7 +203,7 @@ khazad-doom questions --run <run-id>
 khazad-doom answer <run-id> <question-id> "your answer"
 ```
 
-The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk`. If no answer arrives before the tool timeout, the worker falls back to the existing blocked contract and the unanswered question remains visible as run evidence.
+The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, `KHAZAD_ATTEMPT`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk`. If no answer arrives before the tool timeout, the question is marked `timed_out` and the worker falls back to the existing blocked contract. If the daemon restarts while a question is pending, the stale question is marked `interrupted`; answering requires resuming the run and answering the fresh pending question for the active worker attempt.
 
 ### Replan proposals
 
@@ -229,7 +229,7 @@ pi install /path/to/khazad-doom
 pi -e /path/to/khazad-doom
 ```
 
-The monitor bridge also registers the `ask_operator` tool for daemon-launched Pi workers. It lets a worker pause at a slice `must_ask_if` fence, ask the operator through the daemon, and resume after an answer. The tool is unavailable outside a Khazad-Doom worker environment and degrades to the existing blocked-output contract. Operator answers are submitted through `khazad-doom answer` or `/khazad-answer`, not by manually typing into Herdr worker panes.
+The monitor bridge also registers the `ask_operator` tool for daemon-launched Pi workers. It lets a worker pause at a slice `must_ask_if` fence, ask the operator through the daemon, and resume after an answer. The tool is unavailable outside a Khazad-Doom worker environment and degrades to the existing blocked-output contract; timeouts and daemon restarts are recorded in daemon question state instead of being silently lost. Operator answers are submitted through `khazad-doom answer` or `/khazad-answer`, not by manually typing into Herdr worker panes.
 
 To install only the skill without the monitor bridge extension, use Pi package filters in settings:
 
@@ -291,7 +291,7 @@ KHAZAD_AGENT=fake khazad-doom run --all
 KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi --all
 ```
 
-`fake` is deliberately boring: it commits predictable fixture files and returns valid worker JSON. Use it for daemon tests, demos, and dogfooding the workflow itself.
+`fake` is deliberately boring: it commits predictable fixture files and returns valid worker JSON. Use it for daemon tests, demos, and dogfooding the workflow itself. Fake-runner artifacts, reports, status, and economics are labelled as deterministic test-double evidence, not real Pi worker implementation evidence.
 
 ## Repository config
 
@@ -327,7 +327,7 @@ A slice can reference `"verify_profile": "quick"` and still add inline `verify` 
 
 `cockpit` accepts `auto`, `herdr`, or `direct`. `auto` is the default: use Herdr when it is available and fall back to direct daemon execution when it is not. `herdr` forces an attempt but still records failures as non-fatal incidents; `direct` suppresses cockpit launch and worker panes. Herdr-backed workers still use the same Pi contract parser and JSON validation as direct workers because Khazad-Doom reads the wrapper's artifact files, not terminal text.
 
-Khazad-Doom stores the single worker launch profile source in `~/.khazad-doom/agents.toml` and applies it to every repository. Real Pi code-writing workers are launched through the required `implementer` profile; the default global profile uses the OpenAI Codex provider with `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. Repo-local workflow config remains policy-only; `.workflow/agents.toml` is not read. CLI/env overrides (`--pi-bin`, `--pi-args`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) still flow through the same effective-profile resolver. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, status projection, and economics snapshots report the same `profile_summary`/`launch_summary`. `preflight.json` also records the observed Pi contract (binary, launch flags, supported event vocabulary) for postmortems.
+Khazad-Doom stores the single worker launch profile source in `~/.khazad-doom/agents.toml` and applies it to every repository. Real Pi code-writing workers are launched through the required `implementer` profile; the default global profile uses the OpenAI Codex provider with `gpt-5.5`, `xhigh` reasoning, and `fast` mode metadata, while appending the matching Pi `--provider`, `--model`, and `--thinking` flags before worker start. Repo-local workflow config remains policy-only; `.workflow/agents.toml` is not read. CLI/env overrides (`--pi-bin`, `--pi-args`, `KHAZAD_PI_BIN`, `KHAZAD_PI_ARGS`) still flow through the same effective-profile resolver. The fake adapter is exempt for deterministic smoke tests. Worker handoff JSON, run events, status projection, economics snapshots, implementation summaries, final reports, and branch handoff JSON report the same `profile_summary`/`launch_summary` and worker-evidence kind. `preflight.json` also records the observed Pi contract (binary, launch flags, supported event vocabulary) for postmortems.
 
 Run start is clean-by-default: Khazad-Doom rejects a dirty source repo unless `--allow-dirty` is explicit, and every run writes `.workflow/runs/<run>/outputs/preflight.json` with base branch/SHA and dirty status. Worker changes are also checked against slice `areas` when areas are declared; outside-area changes block the slice as a scope violation.
 

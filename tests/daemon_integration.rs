@@ -248,6 +248,495 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
 }
 
 #[test]
+fn profile_and_fake_evidence_are_consistent_everywhere_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-fake-proof",
+            "title": "Fake proof slice",
+            "goal": "Create deterministic fake output with clear attestation.",
+            "acceptance": ["fake output exists"],
+            "verify": ["test -f slice-fake-proof.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add fake proof slice"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let status = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let run_dir = repo.path().join(".workflow/runs").join(&run_id);
+    let preflight: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("outputs/preflight.json"))?)?;
+    let handoff_slice: Value = serde_json::from_str(&fs::read_to_string(
+        run_dir.join("handoffs/slice-fake-proof.json"),
+    )?)?;
+    let final_report: Value = serde_json::from_str(&fs::read_to_string(
+        run_dir.join("outputs/final-report.json"),
+    )?)?;
+    let implementation_summary: Value = serde_json::from_str(&fs::read_to_string(
+        run_dir.join("outputs/implementation-summary.json"),
+    )?)?;
+    let branch_handoff = json_stdout(&kd_ok(&bin, home.path(), &["handoff", "--run", &run_id])?)?;
+
+    let expected_summary =
+        "fake: deterministic test-double evidence (not real Pi worker implementation evidence)";
+    let expected_kind = "deterministic_test_double_not_real_pi_worker_evidence";
+    let expected_label =
+        "deterministic test-double evidence; not real Pi worker implementation evidence";
+    for surface in [
+        &status["worker_profile"],
+        &preflight["worker_profile"],
+        &handoff_slice["worker_profile"],
+        &final_report["worker_profile"],
+        &implementation_summary["worker_profile"],
+        &branch_handoff["worker_profile"],
+    ] {
+        assert_eq!(surface["profile_summary"], expected_summary);
+        assert_eq!(surface["launch_summary"], expected_summary);
+        assert_eq!(surface["worker_evidence_kind"], expected_kind);
+        assert_eq!(surface["worker_evidence_label"], expected_label);
+    }
+    assert_eq!(preflight["worker_evidence_kind"], expected_kind);
+    assert_eq!(preflight["worker_evidence_label"], expected_label);
+    assert_eq!(
+        status["economics"]["agent_calls"][0]["worker_evidence_kind"],
+        expected_kind
+    );
+    assert_eq!(
+        status["economics"]["agent_calls"][0]["worker_evidence_label"],
+        expected_label
+    );
+    assert!(
+        final_report["evidence_attestation"]["basis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|basis| basis.as_str().unwrap_or_default().contains(expected_kind))
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn pi_contract_preflight_records_profile_launch_and_contract_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_quiet_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-pi-contract",
+            "title": "Pi contract slice",
+            "goal": "Exercise Pi launch contract recording.",
+            "acceptance": ["pi contract preflight is recorded"],
+            "verify": ["test -f slice-pi-contract.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add pi contract slice"])?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[
+            ("KHAZAD_PI_BIN", fake_pi_string.as_str()),
+            ("FAKE_PI_SLEEP", "0"),
+        ],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let status = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let preflight: Value = serde_json::from_str(&fs::read_to_string(
+        repo.path()
+            .join(".workflow/runs")
+            .join(&run_id)
+            .join("outputs/preflight.json"),
+    )?)?;
+    assert_eq!(preflight["pi_contract"]["binary"], fake_pi_string);
+    assert_eq!(preflight["pi_contract"]["supported_contract_version"], 1);
+    let flags = preflight["pi_contract"]["launch_flags"]
+        .as_array()
+        .expect("launch flags")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for flag in [
+        "--provider",
+        "--model",
+        "--thinking",
+        "--mode",
+        "json",
+        "--no-session",
+    ] {
+        assert!(
+            flags.contains(&flag),
+            "missing Pi launch flag {flag}: {flags:?}"
+        );
+    }
+    let profile_summary = preflight["worker_profile"]["profile_summary"]
+        .as_str()
+        .expect("profile summary");
+    assert_eq!(status["worker_profile"]["profile_summary"], profile_summary);
+    assert_eq!(preflight["worker_profile"]["agent"], "pi");
+    assert_eq!(
+        preflight["worker_profile"]["worker_evidence_kind"],
+        "real_pi_worker"
+    );
+    assert_eq!(
+        status["economics"]["agent_calls"][0]["worker_evidence_kind"],
+        "real_pi_worker"
+    );
+    assert!(
+        status["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["type"].as_str() == Some("run_started"))
+            .and_then(|event| event["payload"]["worker_profile"]["profile_summary"].as_str())
+            == Some(profile_summary)
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult {
+    let bin = binary_path();
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_operator_question_fake_pi(fake_bin.path())?;
+    let fake_pi_string = path(&fake_pi).to_string();
+
+    let home_answer = tempfile::tempdir()?;
+    let repo_answer = tempfile::tempdir()?;
+    init_git_repo(repo_answer.path())?;
+    let guard_answer = DaemonGuard::new(bin.clone(), home_answer.path().to_path_buf());
+    kd_ok(
+        &bin,
+        home_answer.path(),
+        &["init", "--repo", path(repo_answer.path())],
+    )?;
+    write_slice(
+        repo_answer.path(),
+        json!({
+            "id": "slice-ask-answer",
+            "title": "Ask answer slice",
+            "goal": "Wait for an operator answer and use it.",
+            "acceptance": ["operator answer is recorded"],
+            "verify": ["grep -q 'operator answer: alpha' slice-ask-answer.txt"]
+        }),
+    )?;
+    git(repo_answer.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo_answer.path(),
+        &["commit", "-m", "add ask answer slice"],
+    )?;
+    let started = kd_ok_with_env(
+        &bin,
+        home_answer.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &[
+            "run",
+            "--repo",
+            path(repo_answer.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let answer_run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let awaiting = wait_for_pending_question(&bin, home_answer.path(), &answer_run_id)?;
+    let question = awaiting["questions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|question| question["state"].as_str() == Some("pending"))
+        .expect("pending question");
+    assert_eq!(question["attempt"], 1);
+    let question_id = question["id"].as_str().unwrap().to_string();
+    assert!(
+        awaiting["feed"]["operator_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                command
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("answer {answer_run_id} {question_id}"))
+            })
+    );
+    let answered = json_stdout(&kd_ok(
+        &bin,
+        home_answer.path(),
+        &["answer", &answer_run_id, &question_id, "alpha"],
+    )?)?;
+    assert_eq!(answered["question"]["state"], "answered");
+    let completed = wait_for_status(&bin, home_answer.path(), &answer_run_id, "completed")?;
+    assert_eq!(completed["questions"][0]["answer"], "alpha");
+    guard_answer.stop();
+
+    let home_timeout = tempfile::tempdir()?;
+    let repo_timeout = tempfile::tempdir()?;
+    init_git_repo(repo_timeout.path())?;
+    let guard_timeout = DaemonGuard::new(bin.clone(), home_timeout.path().to_path_buf());
+    kd_ok(
+        &bin,
+        home_timeout.path(),
+        &["init", "--repo", path(repo_timeout.path())],
+    )?;
+    write_slice(
+        repo_timeout.path(),
+        json!({
+            "id": "slice-ask-timeout",
+            "title": "Ask timeout slice",
+            "goal": "Block when the operator does not answer.",
+            "acceptance": ["timeout becomes a blocked ask-user finding"]
+        }),
+    )?;
+    git(repo_timeout.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo_timeout.path(),
+        &["commit", "-m", "add ask timeout slice"],
+    )?;
+    let started = kd_ok_with_env(
+        &bin,
+        home_timeout.path(),
+        &[
+            ("KHAZAD_PI_BIN", fake_pi_string.as_str()),
+            ("KHAZAD_FAKE_PI_OPERATOR_TIMEOUT", "1"),
+        ],
+        &[
+            "run",
+            "--repo",
+            path(repo_timeout.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let timeout_run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let blocked = wait_for_terminal_status(&bin, home_timeout.path(), &timeout_run_id, "blocked")?;
+    assert_eq!(blocked["questions"][0]["state"], "timed_out");
+    assert!(
+        blocked["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ask_operator timed out")
+    );
+    guard_timeout.stop();
+
+    let home_unavailable = tempfile::tempdir()?;
+    let repo_unavailable = tempfile::tempdir()?;
+    init_git_repo(repo_unavailable.path())?;
+    let guard_unavailable = DaemonGuard::new(bin.clone(), home_unavailable.path().to_path_buf());
+    kd_ok(
+        &bin,
+        home_unavailable.path(),
+        &["init", "--repo", path(repo_unavailable.path())],
+    )?;
+    write_slice(
+        repo_unavailable.path(),
+        json!({
+            "id": "slice-ask-unavailable",
+            "title": "Ask unavailable slice",
+            "goal": "Block instead of inventing intent when ask_operator is unavailable.",
+            "acceptance": ["unavailable ask_operator becomes a blocked ask-user finding"]
+        }),
+    )?;
+    git(repo_unavailable.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo_unavailable.path(),
+        &["commit", "-m", "add ask unavailable slice"],
+    )?;
+    let started = kd_ok_with_env(
+        &bin,
+        home_unavailable.path(),
+        &[
+            ("KHAZAD_PI_BIN", fake_pi_string.as_str()),
+            ("KHAZAD_FAKE_PI_OPERATOR_MODE", "unavailable"),
+        ],
+        &[
+            "run",
+            "--repo",
+            path(repo_unavailable.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let unavailable_run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unavailable = wait_for_terminal_status(
+        &bin,
+        home_unavailable.path(),
+        &unavailable_run_id,
+        "blocked",
+    )?;
+    assert!(
+        unavailable["questions"]
+            .as_array()
+            .map(|questions| questions.is_empty())
+            .unwrap_or(true)
+    );
+    assert!(
+        unavailable["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ask_operator unavailable")
+    );
+    guard_unavailable.stop();
+
+    let home_restart = tempfile::tempdir()?;
+    let repo_restart = tempfile::tempdir()?;
+    init_git_repo(repo_restart.path())?;
+    let guard_restart = DaemonGuard::new(bin.clone(), home_restart.path().to_path_buf());
+    kd_ok(
+        &bin,
+        home_restart.path(),
+        &["init", "--repo", path(repo_restart.path())],
+    )?;
+    write_slice(
+        repo_restart.path(),
+        json!({
+            "id": "slice-ask-restart",
+            "title": "Ask restart slice",
+            "goal": "Recover an interrupted pending operator question safely.",
+            "acceptance": ["fresh operator answer completes after restart"],
+            "verify": ["grep -q 'operator answer: bravo' slice-ask-restart.txt"]
+        }),
+    )?;
+    git(repo_restart.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo_restart.path(),
+        &["commit", "-m", "add ask restart slice"],
+    )?;
+    let started = kd_ok_with_env(
+        &bin,
+        home_restart.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &[
+            "run",
+            "--repo",
+            path(repo_restart.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let restart_run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let awaiting = wait_for_pending_question(&bin, home_restart.path(), &restart_run_id)?;
+    let old_question_id = awaiting["questions"][0]["id"].as_str().unwrap().to_string();
+    kill_daemon(home_restart.path())?;
+    kd_ok(&bin, home_restart.path(), &["daemon", "start"])?;
+    let interrupted =
+        wait_for_terminal_status(&bin, home_restart.path(), &restart_run_id, "interrupted")?;
+    assert_eq!(interrupted["questions"][0]["state"], "interrupted");
+    let stale_answer = kd(
+        &bin,
+        home_restart.path(),
+        &["answer", &restart_run_id, &old_question_id, "alpha"],
+    )?;
+    assert!(!stale_answer.status.success());
+    assert!(String::from_utf8(stale_answer.stderr)?.contains("resume first before answering"));
+    kd_ok_with_env(
+        &bin,
+        home_restart.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &[
+            "resume",
+            "--run",
+            &restart_run_id,
+            "--agent",
+            "pi",
+            "--pi-bin",
+            fake_pi_string.as_str(),
+        ],
+    )?;
+    let awaiting_fresh = wait_for_pending_question(&bin, home_restart.path(), &restart_run_id)?;
+    let fresh_question = awaiting_fresh["questions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|question| question["state"].as_str() == Some("pending"))
+        .expect("fresh pending question");
+    let fresh_question_id = fresh_question["id"].as_str().unwrap().to_string();
+    assert_ne!(fresh_question_id, old_question_id);
+    kd_ok(
+        &bin,
+        home_restart.path(),
+        &["answer", &restart_run_id, &fresh_question_id, "bravo"],
+    )?;
+    wait_for_status(&bin, home_restart.path(), &restart_run_id, "completed")?;
+    guard_restart.stop();
+
+    Ok(())
+}
+
+#[test]
 fn cockpit_direct_cli_override_beats_durable_herdr_config() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -2548,6 +3037,41 @@ fn wait_for_status(bin: &Path, home: &Path, run_id: &str, wanted: &str) -> TestR
     }
 }
 
+fn wait_for_pending_question(bin: &Path, home: &Path, run_id: &str) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let output = kd_ok(bin, home, &["status", "--run", run_id])?;
+        let value = json_stdout(&output)?;
+        let progress = &value["progress"];
+        let progress_slice = progress["slice_id"].as_str().unwrap_or_default();
+        let progress_attempt = progress["attempt"].as_u64().unwrap_or(0);
+        let matching = value["questions"].as_array().is_some_and(|questions| {
+            questions.iter().any(|question| {
+                question["state"].as_str() == Some("pending")
+                    && question["slice_id"].as_str() == Some(progress_slice)
+                    && question["attempt"].as_u64().unwrap_or(0) == progress_attempt
+            })
+        });
+        if value["run"]["status"].as_str() == Some("running")
+            && progress["phase"].as_str() == Some("awaiting_operator")
+            && matching
+        {
+            return Ok(value);
+        }
+        if matches!(
+            value["run"]["status"].as_str(),
+            Some("failed" | "blocked" | "cancelled" | "interrupted" | "completed")
+        ) {
+            panic!("run reached terminal state before pending question was visible: {value:#}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for pending question"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn wait_for_terminal_status(
     bin: &Path,
     home: &Path,
@@ -3034,6 +3558,169 @@ event = {
     ],
 }
 print(json.dumps(event), flush=True)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
+}
+
+fn write_operator_question_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import time
+
+
+def emit(result):
+    event = {
+        "type": "agent_end",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": json.dumps(result)}],
+            }
+        ],
+    }
+    print(json.dumps(event), flush=True)
+
+
+def handoff_from_prompt(prompt):
+    lines = prompt.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == "Read this handoff JSON first:" and index + 1 < len(lines):
+            return lines[index + 1].strip()
+    return ""
+
+
+def daemon_call(method, params):
+    sock_path = os.environ.get("KHAZAD_DAEMON_SOCKET", "")
+    if not sock_path:
+        raise RuntimeError("KHAZAD_DAEMON_SOCKET is not available")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(sock_path)
+        request = {
+            "id": f"fake-pi-{time.time_ns()}",
+            "method": method,
+            "params": params,
+        }
+        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("daemon socket closed before workerAsk response")
+            data += chunk
+    response = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+    if response.get("error"):
+        raise RuntimeError(response["error"])
+    return response.get("result") or {}
+
+
+prompt = sys.stdin.read()
+handoff_path = handoff_from_prompt(prompt)
+if not handoff_path:
+    emit({"status": "no-op", "summary": "operator fake pi: no repair needed"})
+    sys.exit(0)
+
+with open(handoff_path, encoding="utf-8") as fh:
+    handoff = json.load(fh)
+
+mode = os.environ.get("KHAZAD_FAKE_PI_OPERATOR_MODE", "answer")
+slice_id = handoff["slice"]["id"]
+if mode == "answer" and "timeout" in slice_id:
+    mode = "timeout"
+if mode == "answer" and "unavailable" in slice_id:
+    mode = "unavailable"
+run_id = handoff["run_id"]
+attempt = int(os.environ.get("KHAZAD_ATTEMPT", "0") or "0")
+question_text = f"Which operator answer should {slice_id} use on attempt {attempt}?"
+
+if mode == "unavailable":
+    emit({
+        "slice_id": slice_id,
+        "status": "blocked",
+        "summary": "ask_operator unavailable fallback blocked the worker",
+        "findings": [{
+            "severity": "blocker",
+            "action": "ask-user",
+            "description": "ask_operator channel unavailable; worker produced blocked JSON instead of inventing operator intent",
+        }],
+    })
+    sys.exit(0)
+
+params = {
+    "run_id": run_id,
+    "slice_id": slice_id,
+    "attempt": attempt,
+    "token": os.environ.get("KHAZAD_WORKER_TOKEN", ""),
+    "question": question_text,
+    "options": ["alpha", "bravo"],
+    "timeout_seconds": 1 if mode == "timeout" else int(os.environ.get("KHAZAD_FAKE_PI_OPERATOR_TIMEOUT", "30")),
+}
+try:
+    result = daemon_call("workerAsk", params)
+except Exception as exc:
+    emit({
+        "slice_id": slice_id,
+        "status": "blocked",
+        "summary": "ask_operator unavailable fallback blocked the worker",
+        "findings": [{
+            "severity": "blocker",
+            "action": "ask-user",
+            "description": f"ask_operator channel unavailable: {exc}; worker produced blocked JSON instead of inventing operator intent",
+        }],
+    })
+    sys.exit(0)
+
+if result.get("timed_out"):
+    emit({
+        "slice_id": slice_id,
+        "status": "blocked",
+        "summary": "ask_operator timed out and worker blocked for operator intent",
+        "findings": [{
+            "severity": "blocker",
+            "action": "ask-user",
+            "description": f"operator answer timed out; workerAsk question {result.get('question_id')} timed out",
+        }],
+    })
+    sys.exit(0)
+
+answer = result.get("answer", "")
+Path(f"{slice_id}.txt").write_text(f"operator answer: {answer}\n", encoding="utf-8")
+subprocess.run(["git", "add", "."], check=True)
+subprocess.run(
+    ["git", "commit", "-m", f"fake pi operator answer {slice_id}"],
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+emit({
+    "slice_id": slice_id,
+    "status": "complete",
+    "summary": f"operator answered {answer}",
+    "commit_sha": sha,
+    "changed_files": [f"{slice_id}.txt"],
+    "tests_run": handoff["slice"].get("verify", []),
+    "acceptance_status": [
+        {
+            "criterion": criterion,
+            "status": "satisfied",
+            "evidence": f"operator answer {answer} recorded",
+        }
+        for criterion in handoff["slice"].get("acceptance", [])
+    ],
+})
 "#,
     )?;
     let mut perms = fs::metadata(&path)?.permissions();

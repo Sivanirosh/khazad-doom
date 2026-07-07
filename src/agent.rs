@@ -152,6 +152,28 @@ pub struct RunnerTranscript {
 }
 
 pub const AGENT_AUTH_REQUIRED_FAILURE_KIND: &str = "agent_auth_required";
+pub const REAL_PI_WORKER_EVIDENCE_KIND: &str = "real_pi_worker";
+pub const REAL_PI_WORKER_EVIDENCE_LABEL: &str = "real Pi worker implementation evidence";
+pub const FAKE_TEST_DOUBLE_EVIDENCE_KIND: &str =
+    "deterministic_test_double_not_real_pi_worker_evidence";
+pub const FAKE_TEST_DOUBLE_EVIDENCE_LABEL: &str =
+    "deterministic test-double evidence; not real Pi worker implementation evidence";
+
+pub fn worker_evidence_kind_for_runner(runner: &str) -> &'static str {
+    if runner.eq_ignore_ascii_case("fake") {
+        FAKE_TEST_DOUBLE_EVIDENCE_KIND
+    } else {
+        REAL_PI_WORKER_EVIDENCE_KIND
+    }
+}
+
+pub fn worker_evidence_label_for_runner(runner: &str) -> &'static str {
+    if runner.eq_ignore_ascii_case("fake") {
+        FAKE_TEST_DOUBLE_EVIDENCE_LABEL
+    } else {
+        REAL_PI_WORKER_EVIDENCE_LABEL
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerLaunchFailure {
@@ -1028,7 +1050,7 @@ impl Runner for FakeRunner {
             emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
             return Ok(ResultData {
                 output: Some(
-                    json!({ "status": "no-op", "summary": "fake runner: no repair needed" }),
+                    json!({ "status": "no-op", "summary": "fake runner deterministic test-double: no repair needed; not real Pi worker implementation evidence" }),
                 ),
                 usage: Usage::default(),
                 contract_warnings: Vec::new(),
@@ -1068,7 +1090,7 @@ impl Runner for FakeRunner {
                 json!({
                     "criterion": criterion,
                     "status": "satisfied",
-                    "evidence": format!("{} implemented by fake runner", handoff.slice.id),
+                    "evidence": format!("{} implemented by deterministic test-double fake runner; not real Pi worker implementation evidence", handoff.slice.id),
                 })
             })
             .collect::<Vec<_>>();
@@ -1077,7 +1099,7 @@ impl Runner for FakeRunner {
             output: Some(json!({
                 "slice_id": handoff.slice.id,
                 "status": "complete",
-                "summary": "fake runner completed deterministic slice implementation",
+                "summary": "fake runner completed deterministic test-double slice implementation; not real Pi worker implementation evidence",
                 "commit_sha": sha,
                 "changed_files": [
                     format!("{}.txt", handoff.slice.id),
@@ -1093,6 +1115,30 @@ impl Runner for FakeRunner {
 
     fn name(&self) -> &str {
         "fake"
+    }
+
+    fn metadata(&self) -> RunnerMetadata {
+        fake_runner_metadata()
+    }
+}
+
+pub fn fake_runner_metadata() -> RunnerMetadata {
+    let mut source_attribution = BTreeMap::new();
+    source_attribution.insert("agent".to_string(), "deterministic_test_double".to_string());
+    RunnerMetadata {
+        profile: "fake".to_string(),
+        provider: "deterministic-test-double".to_string(),
+        model: "deterministic-test-double".to_string(),
+        reasoning: "none".to_string(),
+        mode: "test".to_string(),
+        profile_summary:
+            "fake: deterministic test-double evidence (not real Pi worker implementation evidence)"
+                .to_string(),
+        launch_summary:
+            "fake: deterministic test-double evidence (not real Pi worker implementation evidence)"
+                .to_string(),
+        source_attribution,
+        ..RunnerMetadata::default()
     }
 }
 
