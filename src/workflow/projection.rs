@@ -91,22 +91,8 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
 
     let question_commands = pending_question_commands(details);
     let replan_commands = pending_replan_commands(details);
-    let mut attention = replan_attention(details);
-    attention.extend(
-        details
-            .questions
-            .iter()
-            .filter(|question| question.state == "pending")
-            .map(|question| {
-                line(
-                    format!(
-                        "{}: {} — answer with: khazad-doom answer {} {} <answer>",
-                        question.slice_id, question.question, question.run_id, question.id
-                    ),
-                    StatusFeedRole::Attention,
-                )
-            }),
-    );
+    let mut attention = pending_question_attention(details, now);
+    attention.extend(replan_attention(details));
     let operator_commands = operator_commands(details, &question_commands, &replan_commands);
     if !attention.is_empty() {
         blocks.insert(0, block("Attention", "", attention.clone()));
@@ -251,18 +237,79 @@ fn replan_source_label(proposal: &crate::domain::ReplanProposal) -> String {
     parts.join("/")
 }
 
+fn question_answer_command(question: &crate::domain::WorkerQuestion) -> String {
+    format!(
+        "khazad-doom answer {} {} <answer>",
+        question.run_id, question.id
+    )
+}
+
 fn pending_question_commands(details: &RunDetails) -> Vec<String> {
     details
         .questions
         .iter()
         .filter(|question| question.state == "pending")
-        .map(|question| {
-            format!(
-                "khazad-doom answer {} {} <answer>",
-                question.run_id, question.id
-            )
-        })
+        .map(question_answer_command)
         .collect()
+}
+
+fn pending_question_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<StatusFeedLine> {
+    let mut lines = Vec::new();
+    for question in details
+        .questions
+        .iter()
+        .filter(|question| question.state == "pending")
+    {
+        lines.push(line(
+            format!(
+                "Pending question {} • slice={} • attempt={}",
+                question.id, question.slice_id, question.attempt
+            ),
+            StatusFeedRole::Attention,
+        ));
+        lines.push(line(
+            format!("Question: {}", question.question),
+            StatusFeedRole::Attention,
+        ));
+        if question.options.is_empty() {
+            lines.push(line("Options: <none recorded>", StatusFeedRole::Attention));
+        } else {
+            for (index, option) in question.options.iter().enumerate() {
+                lines.push(line(
+                    format!("Option {}: {}", index + 1, option),
+                    StatusFeedRole::Attention,
+                ));
+            }
+        }
+        lines.push(line(
+            format!("Answer command: {}", question_answer_command(question)),
+            StatusFeedRole::Attention,
+        ));
+        lines.push(line(
+            question_deadline_label(question, now),
+            StatusFeedRole::Attention,
+        ));
+    }
+    lines
+}
+
+fn question_deadline_label(question: &crate::domain::WorkerQuestion, now: DateTime<Utc>) -> String {
+    if question.timeout_seconds == 0 {
+        return "Deadline: none configured; waiting indefinitely".to_string();
+    }
+    let deadline = question.asked_at + chrono::Duration::seconds(question.timeout_seconds as i64);
+    let remaining = if deadline >= now {
+        format!(
+            "remaining {}",
+            format_duration((deadline - now).to_std().unwrap_or_default())
+        )
+    } else {
+        format!(
+            "overdue by {}",
+            format_duration((now - deadline).to_std().unwrap_or_default())
+        )
+    };
+    format!("Deadline: {} ({remaining})", deadline.to_rfc3339())
 }
 
 fn pending_replan_commands(details: &RunDetails) -> Vec<String> {
@@ -275,28 +322,34 @@ fn pending_replan_commands(details: &RunDetails) -> Vec<String> {
 }
 
 fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
-    details
-        .replan
-        .pending
-        .iter()
-        .map(|proposal| {
-            let source = replan_source_label(proposal);
-            let summary = proposal
-                .proposed_changes
-                .first()
-                .map(|change| change.summary.as_str())
-                .unwrap_or("replan proposal needs an operator decision");
-            line(
+    let mut lines = Vec::new();
+    for proposal in &details.replan.pending {
+        let source = replan_source_label(proposal);
+        lines.push(line(
+            format!(
+                "Pending replan {} • {source} • risk={}",
+                proposal.id,
+                display_or_dash(&proposal.risk)
+            ),
+            StatusFeedRole::Attention,
+        ));
+        for change in &proposal.proposed_changes {
+            lines.push(line(
                 format!(
-                    "Awaiting replan decision {} ({source}, risk={}): {}",
-                    proposal.id,
-                    display_or_dash(&proposal.risk),
-                    truncate_display(summary, LINE_WIDTH)
+                    "Proposed change: {}:{} — {}",
+                    change.kind, change.target, change.summary
                 ),
                 StatusFeedRole::Attention,
-            )
-        })
-        .collect()
+            ));
+        }
+        for command in &proposal.decision_commands {
+            lines.push(line(
+                format!("Decision command: {command}"),
+                StatusFeedRole::Attention,
+            ));
+        }
+    }
+    lines
 }
 
 fn operator_commands(
@@ -1531,6 +1584,7 @@ mod tests {
                 attempt: 1,
                 question: "choose a path".to_string(),
                 options: Vec::new(),
+                timeout_seconds: 1800,
                 state: "pending".to_string(),
                 asked_at: now,
                 answered_at: None,
@@ -1831,7 +1885,7 @@ mod tests {
         assert!(
             feed.attention
                 .iter()
-                .any(|line| { line.text.contains("Awaiting replan decision rp-test-001") })
+                .any(|line| { line.text.contains("Pending replan rp-test-001") })
         );
         assert!(feed.operator_commands.iter().any(|command| {
             command == "khazad-doom replan accept kd-test rp-test-001 --reason <reason>"

@@ -48,6 +48,8 @@ pub struct WorkflowConfig {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_attempt_timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub worker_question_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_no_output_warning_seconds: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_termination_grace_seconds: u64,
@@ -76,6 +78,7 @@ impl Default for WorkflowConfig {
             parallelism: 3,
             verify_timeout_seconds: 600,
             worker_attempt_timeout_seconds: 0,
+            worker_question_timeout_seconds: 1800,
             worker_no_output_warning_seconds: 900,
             worker_termination_grace_seconds: 30,
             integration_repair: default_integration_repair_policy(),
@@ -1819,6 +1822,8 @@ pub struct WorkerQuestion {
     pub question: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeout_seconds: u64,
     pub state: String,
     pub asked_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1967,6 +1972,10 @@ pub struct PlanRevisionRecord {
     pub evidence: Vec<ReplanEvidenceLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposed_changes: Vec<ReplanProposedChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_class: String,
     pub risk: String,
     pub before_queue_or_slice_summary: String,
     pub after_queue_or_slice_summary: String,

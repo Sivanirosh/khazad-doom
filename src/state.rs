@@ -176,6 +176,7 @@ impl Store {
                 attempt INTEGER NOT NULL DEFAULT 0,
                 question TEXT NOT NULL,
                 options_json TEXT NOT NULL,
+                timeout_seconds INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL,
                 asked_at TEXT NOT NULL,
                 answered_at TEXT NOT NULL DEFAULT '',
@@ -254,6 +255,12 @@ impl Store {
             "worker_questions",
             "attempt",
             "attempt INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_questions",
+            "timeout_seconds",
+            "timeout_seconds INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
     }
@@ -393,6 +400,7 @@ impl Store {
         Ok(hash.is_some_and(|hash| hash == token_hash(token)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_worker_question(
         &self,
         id: &str,
@@ -401,13 +409,14 @@ impl Store {
         attempt: usize,
         question: &str,
         options: &[String],
+        timeout_seconds: u64,
     ) -> Result<WorkerQuestion> {
         let conn = self.conn()?;
         let now = Utc::now();
         conn.execute(
             r#"INSERT INTO worker_questions
-               (id, run_id, slice_id, attempt, question, options_json, state, asked_at, answered_at, answer)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, '', '')"#,
+               (id, run_id, slice_id, attempt, question, options_json, timeout_seconds, state, asked_at, answered_at, answer)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, '', '')"#,
             params![
                 id,
                 run_id,
@@ -415,6 +424,7 @@ impl Store {
                 attempt as i64,
                 question,
                 serde_json::to_string(options)?,
+                timeout_seconds as i64,
                 now.to_rfc3339()
             ],
         )?;
@@ -425,6 +435,7 @@ impl Store {
             attempt,
             question: question.to_string(),
             options: options.to_vec(),
+            timeout_seconds,
             state: "pending".to_string(),
             asked_at: now,
             answered_at: None,
@@ -436,7 +447,7 @@ impl Store {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
-                r#"SELECT id, run_id, slice_id, attempt, question, options_json, state, asked_at, answered_at, answer
+                r#"SELECT id, run_id, slice_id, attempt, question, options_json, timeout_seconds, state, asked_at, answered_at, answer
                FROM worker_questions WHERE id=?1"#,
                 params![id],
                 worker_question_from_row,
@@ -447,7 +458,7 @@ impl Store {
     pub fn list_worker_questions(&self, run_id: &str) -> Result<Vec<WorkerQuestion>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            r#"SELECT id, run_id, slice_id, attempt, question, options_json, state, asked_at, answered_at, answer
+            r#"SELECT id, run_id, slice_id, attempt, question, options_json, timeout_seconds, state, asked_at, answered_at, answer
                FROM worker_questions WHERE run_id=?1 ORDER BY asked_at ASC, id ASC"#,
         )?;
         let rows = stmt.query_map(params![run_id], worker_question_from_row)?;
@@ -461,7 +472,7 @@ impl Store {
     pub fn list_worker_questions_for_repo(&self, repo_path: &str) -> Result<Vec<WorkerQuestion>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            r#"SELECT q.id, q.run_id, q.slice_id, q.attempt, q.question, q.options_json, q.state, q.asked_at, q.answered_at, q.answer
+            r#"SELECT q.id, q.run_id, q.slice_id, q.attempt, q.question, q.options_json, q.timeout_seconds, q.state, q.asked_at, q.answered_at, q.answer
                FROM worker_questions q
                JOIN runs r ON r.id = q.run_id
                WHERE r.repo_path=?1
@@ -494,7 +505,7 @@ impl Store {
         let conn = self.conn()?;
         let existing = conn
             .query_row(
-                r#"SELECT id, run_id, slice_id, attempt, question, options_json, state, asked_at, answered_at, answer
+                r#"SELECT id, run_id, slice_id, attempt, question, options_json, timeout_seconds, state, asked_at, answered_at, answer
                    FROM worker_questions WHERE id=?1 AND run_id=?2"#,
                 params![question_id, run_id],
                 worker_question_from_row,
@@ -1354,8 +1365,9 @@ fn short_replan_run_id(run_id: &str) -> String {
 
 fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQuestion> {
     let options_json: String = row.get(5)?;
-    let asked_at: String = row.get(7)?;
-    let answered_at: String = row.get(8)?;
+    let timeout_seconds: i64 = row.get(6)?;
+    let asked_at: String = row.get(8)?;
+    let answered_at: String = row.get(9)?;
     let options = serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default();
     let attempt: i64 = row.get(3)?;
     Ok(WorkerQuestion {
@@ -1365,7 +1377,8 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
         attempt: attempt.max(0) as usize,
         question: row.get(4)?,
         options,
-        state: row.get(6)?,
+        timeout_seconds: timeout_seconds.max(0) as u64,
+        state: row.get(7)?,
         asked_at: DateTime::parse_from_rfc3339(&asked_at)
             .map(|time| time.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
@@ -1376,7 +1389,7 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
                 .map(|time| time.with_timezone(&Utc))
                 .ok()
         },
-        answer: row.get(9)?,
+        answer: row.get(10)?,
     })
 }
 
@@ -1751,8 +1764,10 @@ mod tests {
             2,
             "Which path?",
             &["A".to_string(), "B".to_string()],
+            3600,
         )?;
         assert_eq!(question.attempt, 2);
+        assert_eq!(question.timeout_seconds, 3600);
         assert_eq!(question.state, "pending");
         assert_eq!(store.list_worker_questions("run-1")?.len(), 1);
 

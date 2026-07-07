@@ -534,6 +534,17 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
         home_timeout.path(),
         &["init", "--repo", path(repo_timeout.path())],
     )?;
+    fs::write(
+        repo_timeout.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "pi",
+                "parallelism": 1,
+                "worker_question_timeout_seconds": 1
+            }))?
+        ),
+    )?;
     write_slice(
         repo_timeout.path(),
         json!({
@@ -2054,7 +2065,7 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
         ],
     )?;
     let monitored = String::from_utf8(monitored.stdout)?;
-    assert!(monitored.contains("Awaiting replan decision rp-pending"));
+    assert!(monitored.contains("Pending replan rp-pending"));
     assert!(monitored.contains("Replan (1 pending, 1 decided)"));
 
     kill_daemon(home.path())?;

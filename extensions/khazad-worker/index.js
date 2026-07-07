@@ -160,7 +160,7 @@ function renderRunFeed(details) {
 	}
 	const lines = [`Khazad-Doom ${runId}`, truncateLine(feed.summary_line || 'status feed')];
 	for (const item of feed.attention || []) {
-		lines.push(truncateLine(`! ${item.text || ''}`));
+		lines.push(`! ${item.text || ''}`);
 	}
 	for (const block of feed.blocks || []) {
 		if (lines.length >= 12) break;

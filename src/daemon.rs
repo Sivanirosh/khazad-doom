@@ -16,7 +16,8 @@ use crate::ipc::{
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
 use crate::workflow::{
-    GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions, project_run,
+    GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions,
+    focus_default_agent_target, project_run, send_default_agent_message,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -34,6 +35,23 @@ const CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const ACCEPT_LOOP_IDLE_SLEEP: Duration = Duration::from_millis(50);
+
+fn worker_question_answer_command(question: &WorkerQuestion) -> String {
+    format!(
+        "khazad-doom answer {} {} <answer>",
+        question.run_id, question.id
+    )
+}
+
+fn worker_question_deadline(question: &WorkerQuestion) -> Option<String> {
+    if question.timeout_seconds == 0 {
+        return None;
+    }
+    Some(
+        (question.asked_at + chrono::Duration::seconds(question.timeout_seconds as i64))
+            .to_rfc3339(),
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -332,6 +350,7 @@ impl Server {
             )?;
             bail!("worker token rejected for run {}", params.run_id);
         }
+        let timeout_seconds = self.worker_question_timeout_seconds(&params);
         let question_id = format!("q-{}", request_id());
         let question = self.store.insert_worker_question(
             &question_id,
@@ -340,7 +359,9 @@ impl Server {
             params.attempt,
             &params.question,
             &params.options,
+            timeout_seconds,
         )?;
+        let deadline_at = worker_question_deadline(&question);
         self.store.record_event(
             &params.run_id,
             "worker_question_asked",
@@ -350,7 +371,9 @@ impl Server {
                 "attempt": question.attempt,
                 "question": question.question,
                 "options": question.options,
-                "answer_command": format!("khazad-doom answer {} {} <answer>", params.run_id, question.id),
+                "timeout_seconds": question.timeout_seconds,
+                "deadline_at": deadline_at,
+                "answer_command": worker_question_answer_command(&question),
             }),
         )?;
         let _ = self.store.update_progress(
@@ -363,13 +386,14 @@ impl Server {
             "",
         );
 
-        let timeout = Duration::from_secs(if params.timeout_seconds == 0 {
-            1800
+        self.notify_attention_for_worker_question(&question);
+
+        let deadline = if timeout_seconds == 0 {
+            None
         } else {
-            params.timeout_seconds
-        });
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+            Some(Instant::now() + Duration::from_secs(timeout_seconds))
+        };
+        while deadline.is_none_or(|deadline| Instant::now() < deadline) {
             let Some(current) = self.store.get_worker_question(&question_id)? else {
                 bail!("question {question_id:?} disappeared");
             };
@@ -420,6 +444,112 @@ impl Server {
             answer: String::new(),
             timed_out: true,
         })
+    }
+
+    fn worker_question_timeout_seconds(&self, params: &WorkerAskParams) -> u64 {
+        self.store
+            .get_run(&params.run_id)
+            .ok()
+            .flatten()
+            .and_then(|run| artifact::Store::new(&run.repo_path).read_config().ok())
+            .map(|config| config.worker_question_timeout_seconds)
+            .unwrap_or_else(|| {
+                if params.timeout_seconds == 0 {
+                    1800
+                } else {
+                    params.timeout_seconds
+                }
+            })
+    }
+
+    fn notify_attention_for_worker_question(&self, question: &WorkerQuestion) {
+        let Ok(Some(run)) = self.store.get_run(&question.run_id) else {
+            return;
+        };
+        let store = artifact::Store::new(&run.repo_path);
+        let Ok(Some(origin)) = store.read_origin_notification_target(&run.id) else {
+            return;
+        };
+        if origin.target.trim().is_empty() {
+            return;
+        }
+        let payload = json!({
+            "schema_version": 1,
+            "kind": "worker_question_pending",
+            "run_id": question.run_id,
+            "slice_id": question.slice_id,
+            "attempt": question.attempt,
+            "question_id": question.id,
+            "question": question.question,
+            "options": question.options,
+            "timeout_seconds": question.timeout_seconds,
+            "deadline_at": worker_question_deadline(question),
+            "answer_command": worker_question_answer_command(question),
+            "source_of_truth": "daemon_worker_questions",
+        });
+        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+        match send_default_agent_message(&origin.target, &text) {
+            Ok(sent) => {
+                let _ = self.store.record_event(
+                    &run.id,
+                    "attention_notification_sent",
+                    &json!({
+                        "kind": "worker_question_pending",
+                        "question_id": question.id,
+                        "slice_id": question.slice_id,
+                        "adapter": sent.adapter,
+                        "surface": sent.surface,
+                        "target_kind": origin.target_kind,
+                    }),
+                );
+            }
+            Err(err) => {
+                let _ = self.store.record_event(
+                    &run.id,
+                    "run_incident",
+                    &json!({
+                        "severity": "warning",
+                        "kind": "attention_notification_failed",
+                        "visibility_kind": "delivery_failed",
+                        "message": format!("worker question notification was not delivered: {}", err.message),
+                        "question_id": question.id,
+                        "slice_id": question.slice_id,
+                        "source_of_truth": "daemon_worker_questions",
+                    }),
+                );
+            }
+        }
+        match focus_default_agent_target(&origin.target) {
+            Ok(focused) => {
+                let _ = self.store.record_event(
+                    &run.id,
+                    "attention_focus_sent",
+                    &json!({
+                        "kind": "worker_question_pending",
+                        "question_id": question.id,
+                        "slice_id": question.slice_id,
+                        "adapter": focused.adapter,
+                        "surface": focused.surface,
+                        "target_kind": origin.target_kind,
+                    }),
+                );
+            }
+            Err(err) => {
+                let _ = self.store.record_event(
+                    &run.id,
+                    "run_incident",
+                    &json!({
+                        "severity": "warning",
+                        "kind": "attention_focus_failed",
+                        "visibility_kind": "focus_failed",
+                        "message": format!("worker question focus was not delivered: {}", err.message),
+                        "question_id": question.id,
+                        "slice_id": question.slice_id,
+                        "source_of_truth": "daemon_worker_questions",
+                    }),
+                );
+            }
+        }
     }
 
     fn worker_question_is_currently_awaited(&self, question: &WorkerQuestion) -> Result<bool> {

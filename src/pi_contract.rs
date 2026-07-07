@@ -298,10 +298,9 @@ impl PiActivityFormatter {
         if !had_buffer
             && !had_emitted
             && let Some(content) = content.filter(|value| !value.is_empty())
+            && let Some(line) = format_delta_line(kind, content)
         {
-            if let Some(line) = format_delta_line(kind, content) {
-                lines.push(line);
-            }
+            lines.push(line);
         }
         self.buffer_mut(kind).reset();
         lines

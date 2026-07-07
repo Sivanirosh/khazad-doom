@@ -115,9 +115,11 @@ impl Store {
         self.run_dir(run_id).join("notifications")
     }
 
-    pub fn terminal_notification_path(&self, run_id: &str, terminal_status: &str) -> PathBuf {
-        self.notifications_dir(run_id)
-            .join(format!("terminal-{terminal_status}.json"))
+    pub fn terminal_notification_path(&self, run_id: &str, transition_key: &str) -> PathBuf {
+        self.notifications_dir(run_id).join(format!(
+            "terminal-{}.json",
+            safe_filename_segment(transition_key)
+        ))
     }
 
     pub fn ensure_run_dirs(&self, run_id: &str) -> Result<()> {
@@ -257,21 +259,21 @@ impl Store {
         read_json(path).map(Some)
     }
 
-    pub fn terminal_notification_exists(&self, run_id: &str, terminal_status: &str) -> bool {
-        self.terminal_notification_path(run_id, terminal_status)
+    pub fn terminal_notification_exists(&self, run_id: &str, transition_key: &str) -> bool {
+        self.terminal_notification_path(run_id, transition_key)
             .exists()
     }
 
     pub fn write_terminal_notification_record(
         &self,
         run_id: &str,
-        terminal_status: &str,
+        transition_key: &str,
         record: &TerminalNotificationRecord,
     ) -> Result<PathBuf> {
         self.ensure_run_dirs(run_id)?;
         let dir = self.notifications_dir(run_id);
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let path = self.terminal_notification_path(run_id, terminal_status);
+        let path = self.terminal_notification_path(run_id, transition_key);
         write_json(&path, record)?;
         Ok(path)
     }
@@ -439,6 +441,24 @@ impl Store {
         collect_report_entries(&mut entries, run_id, &self.reports_dir())?;
         entries.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
         Ok(entries)
+    }
+}
+
+fn safe_filename_segment(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.trim_matches('_').is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
     }
 }
 

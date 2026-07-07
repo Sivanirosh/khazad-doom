@@ -13,7 +13,8 @@ use std::error::Error;
 use std::fmt;
 
 pub(crate) use cockpit::{
-    CockpitOpenFocus, cockpit_mode_transport_arg, open_default_run_cockpit_for_operator,
+    CockpitOpenFocus, cockpit_mode_transport_arg, focus_default_agent_target,
+    open_default_run_cockpit_for_operator, send_default_agent_message,
     workspace_label_for_run as cockpit_workspace_label_for_run,
 };
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};

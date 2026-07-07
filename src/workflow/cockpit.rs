@@ -8,8 +8,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(crate) const RUN_STATUS_FEED_PANE: &str = "Run Status / Event Feed";
-pub(crate) const INTEGRATION_GATE_REPAIR_PANE: &str = "Integration Gate / Repair";
+pub(crate) const RUN_STATUS_FEED_PANE: &str = "Dashboard";
+pub(crate) const INTEGRATION_GATE_REPAIR_PANE: &str = "Operator";
 const COCKPIT_MODE_TRANSPORT_PREFIX: &str = "__khazad_cockpit_mode=";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -32,7 +32,7 @@ impl CockpitRunRequest {
             khazad_home: khazad_home.to_path_buf(),
             workspace_label: workspace_label_for_run(&run.id),
             feed_command: format!("{binary} monitor --run {run_id} --interval-ms 1000"),
-            phase_command: gate_activity_pane_command(&run.id),
+            phase_command: attend_pane_command(&run.id),
         }
     }
 }
@@ -115,6 +115,22 @@ pub(crate) struct CockpitAgentMessageSent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitAgentFocused {
+    pub adapter: String,
+    pub mode: CockpitMode,
+    pub target: String,
+    pub surface: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitAgentRenamed {
+    pub adapter: String,
+    pub mode: CockpitMode,
+    pub target: String,
+    pub surface: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CockpitUnavailable {
     pub mode: CockpitMode,
     pub adapter: String,
@@ -133,6 +149,7 @@ impl CockpitUnavailable {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn gate_activity_pane_command(run_id: &str) -> String {
     let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
     let painter_command = format!(
@@ -144,6 +161,15 @@ pub(crate) fn gate_activity_pane_command(run_id: &str) -> String {
         "{painter_command}; khazad_painter_status=$?; if [ \"$khazad_painter_status\" -ne 0 ]; then printf '%s\\n' '[khazad] gate/repair activity painter exited non-fatally; daemon gate artifacts remain authoritative' >&2; fi; exit 0"
     );
     format!("/bin/sh -c {}", shell_quote(&script))
+}
+
+pub(crate) fn attend_pane_command(run_id: &str) -> String {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
+    format!(
+        "{} attend --run {} --interval-ms 1000",
+        shell_quote(&binary.to_string_lossy()),
+        shell_quote(run_id),
+    )
 }
 
 pub(crate) fn worker_activity_pane_command(
@@ -188,6 +214,14 @@ pub(crate) trait CockpitAdapter {
     fn send_agent_message(&self, _target: &str, _text: &str) -> Result<()> {
         bail!("{} adapter does not support agent messages", self.name())
     }
+
+    fn focus_agent(&self, _target: &str) -> Result<()> {
+        bail!("{} adapter does not support agent focus", self.name())
+    }
+
+    fn rename_agent(&self, _target: &str, _name: &str) -> Result<()> {
+        bail!("{} adapter does not support agent rename", self.name())
+    }
 }
 
 #[derive(Debug)]
@@ -213,6 +247,13 @@ impl<A: CockpitAdapter> Cockpit<A> {
             ),
             ("KHAZAD_COCKPIT_READ_ONLY".to_string(), "1".to_string()),
         ];
+        let operator_env = vec![
+            (
+                "KHAZAD_HOME".to_string(),
+                request.khazad_home.to_string_lossy().to_string(),
+            ),
+            ("KHAZAD_OPERATOR_SURFACE".to_string(), "1".to_string()),
+        ];
         let feed = CockpitPaneRequest {
             label: RUN_STATUS_FEED_PANE.to_string(),
             command: request.feed_command.clone(),
@@ -224,7 +265,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
             label: INTEGRATION_GATE_REPAIR_PANE.to_string(),
             command: request.phase_command.clone(),
             cwd: request.repo_path.clone(),
-            env: pane_env,
+            env: operator_env,
         };
         self.adapter.create_read_only_pane(workspace, &phase)?;
         Ok(vec![feed.label, phase.label])
@@ -312,6 +353,32 @@ impl<A: CockpitAdapter> Cockpit<A> {
             surface: "herdr agent send".to_string(),
         })
     }
+
+    pub fn focus_agent(&self, target: &str) -> Result<CockpitAgentFocused> {
+        if self.mode == CockpitMode::Direct {
+            bail!("cockpit direct mode does not focus Herdr agents");
+        }
+        self.adapter.focus_agent(target)?;
+        Ok(CockpitAgentFocused {
+            adapter: self.adapter.name().to_string(),
+            mode: self.mode,
+            target: target.to_string(),
+            surface: "herdr agent focus".to_string(),
+        })
+    }
+
+    pub fn rename_agent(&self, target: &str, name: &str) -> Result<CockpitAgentRenamed> {
+        if self.mode == CockpitMode::Direct {
+            bail!("cockpit direct mode does not rename Herdr agents");
+        }
+        self.adapter.rename_agent(target, name)?;
+        Ok(CockpitAgentRenamed {
+            adapter: self.adapter.name().to_string(),
+            mode: self.mode,
+            target: target.to_string(),
+            surface: "herdr agent rename".to_string(),
+        })
+    }
 }
 
 pub(crate) fn open_default_run_cockpit(
@@ -386,6 +453,51 @@ pub(crate) fn send_default_agent_message(
     let adapter = HerdrCockpitAdapter::discover(mode)?;
     Cockpit::new(mode, adapter)
         .send_agent_message(target, text)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn focus_default_agent_target(
+    target: &str,
+) -> std::result::Result<CockpitAgentFocused, CockpitUnavailable> {
+    let mode = CockpitMode::Herdr;
+    #[cfg(test)]
+    if std::env::var("KHAZAD_UNIT_TEST_TERMINAL_FEEDBACK")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Err(CockpitUnavailable::new(
+            mode,
+            "herdr",
+            "Herdr agent focus is disabled in unit tests",
+        ));
+    }
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    Cockpit::new(mode, adapter)
+        .focus_agent(target)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn rename_default_agent_target(
+    target: &str,
+    name: &str,
+) -> std::result::Result<CockpitAgentRenamed, CockpitUnavailable> {
+    let mode = CockpitMode::Herdr;
+    #[cfg(test)]
+    if std::env::var("KHAZAD_UNIT_TEST_TERMINAL_FEEDBACK")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Err(CockpitUnavailable::new(
+            mode,
+            "herdr",
+            "Herdr agent rename is disabled in unit tests",
+        ));
+    }
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    Cockpit::new(mode, adapter)
+        .rename_agent(target, name)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
 }
 
@@ -555,7 +667,7 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         workspace: &CockpitWorkspaceRef,
         request: &CockpitPaneRequest,
     ) -> Result<CockpitPaneRef> {
-        let direction = if request.label == INTEGRATION_GATE_REPAIR_PANE {
+        let direction = if request.label.starts_with("Worker ") {
             "down"
         } else {
             "right"
@@ -608,6 +720,21 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             "send".to_string(),
             target.to_string(),
             text.to_string(),
+        ])?;
+        Ok(())
+    }
+
+    fn focus_agent(&self, target: &str) -> Result<()> {
+        self.run_command(&["agent".to_string(), "focus".to_string(), target.to_string()])?;
+        Ok(())
+    }
+
+    fn rename_agent(&self, target: &str, name: &str) -> Result<()> {
+        self.run_command(&[
+            "agent".to_string(),
+            "rename".to_string(),
+            target.to_string(),
+            name.to_string(),
         ])?;
         Ok(())
     }
@@ -834,8 +961,8 @@ mod tests {
         let calls = adapter.calls();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], "workspace:Khazad-Doom kd-test");
-        assert!(calls[1].starts_with("pane:Run Status / Event Feed:"));
-        assert!(calls[2].starts_with("pane:Integration Gate / Repair:"));
+        assert!(calls[1].starts_with("pane:Dashboard:"));
+        assert!(calls[2].starts_with("pane:Operator:"));
         assert!(
             calls
                 .iter()
@@ -985,16 +1112,7 @@ mod tests {
 
         assert_eq!(request.workspace_label, "Khazad-Doom kd-123");
         assert!(request.feed_command.contains("monitor --run kd-123"));
-        assert!(
-            request
-                .phase_command
-                .contains("cockpit paint-gate-activity --run kd-123")
-        );
-        assert!(
-            request
-                .phase_command
-                .contains("daemon gate artifacts remain authoritative")
-        );
+        assert!(request.phase_command.contains("attend --run kd-123"));
         assert!(!request.feed_command.to_lowercase().contains("planner"));
         assert!(!request.phase_command.to_lowercase().contains("planner"));
     }

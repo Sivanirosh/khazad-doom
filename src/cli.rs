@@ -232,6 +232,21 @@ enum CommandArgs {
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
+    /// Interactive operator attention surface over daemon-owned commands.
+    Attend {
+        /// Specific run id to attend.
+        #[arg(long, default_value = "")]
+        run: String,
+        /// Repository path used with --latest. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Attach to the latest run for the repository.
+        #[arg(long)]
+        latest: bool,
+        /// Poll interval in milliseconds after empty input.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+    },
     /// Watch a run with compact human-readable progress until it reaches a terminal state.
     Watch {
         #[arg(long)]
@@ -539,6 +554,12 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             events_limit,
             interval_ms,
         } => run_monitor(paths, run, repo, latest, once, events_limit, interval_ms),
+        CommandArgs::Attend {
+            run,
+            repo,
+            latest,
+            interval_ms,
+        } => run_attend(paths, run, repo, latest, interval_ms),
         CommandArgs::Watch { run, interval_ms } => run_watch(paths, run, interval_ms),
         CommandArgs::Cockpit { command } => run_cockpit(paths, command),
         CommandArgs::Questions { run, repo } => run_questions(paths, run, repo),
@@ -884,6 +905,215 @@ fn monitor_latest(
         }
         thread::sleep(interval);
     }
+}
+
+fn run_attend(
+    paths: Paths,
+    run_id: String,
+    repo: Option<PathBuf>,
+    latest: bool,
+    interval_ms: u64,
+) -> Result<()> {
+    if latest && !run_id.trim().is_empty() {
+        bail!("attend --latest cannot be combined with --run <run-id>");
+    }
+    if !latest && run_id.trim().is_empty() {
+        bail!("attend requires --run <run-id> or --latest");
+    }
+    if !latest && repo.is_some() {
+        bail!("attend --repo can only be used with --latest");
+    }
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths);
+    let repo_path = if latest {
+        Some(resolve_repo_path(
+            repo.unwrap_or_else(|| PathBuf::from(".")),
+        )?)
+    } else {
+        None
+    };
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let stdin = io::stdin();
+    loop {
+        let details = if latest {
+            let repo_path = repo_path.as_ref().expect("repo path for latest");
+            match fetch_latest_run(&client, &repo_path.to_string_lossy(), 50, false)? {
+                Some(details) => details,
+                None => {
+                    print!("\x1b[2J\x1b[H");
+                    println!("Khazad-Doom Attend");
+                    println!("No run found for {}", repo_path.display());
+                    println!("Press Enter to refresh or q to quit.");
+                    io::stdout().flush()?;
+                    let mut input = String::new();
+                    stdin.read_line(&mut input)?;
+                    if matches!(input.trim(), "q" | "quit" | "exit") {
+                        return Ok(());
+                    }
+                    thread::sleep(interval);
+                    continue;
+                }
+            }
+        } else {
+            fetch_run_details(&client, &run_id, 50)?
+        };
+        print!("\x1b[2J\x1b[H");
+        println!("Khazad-Doom Attend — {}", details.run.id);
+        println!();
+        render_run_monitor(&mut io::stdout(), &details)?;
+        println!();
+        println!(
+            "Commands: a <n> <answer> | answer <question-id> <answer> | accept <proposal-id> <reason> | reject <proposal-id> <reason> | defer <proposal-id> <condition> --reason <reason> | resume | q"
+        );
+        print!("attend> ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        stdin.read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() {
+            thread::sleep(interval);
+            continue;
+        }
+        if matches!(input, "q" | "quit" | "exit") {
+            return Ok(());
+        }
+        handle_attend_command(&client, &details, input)?;
+    }
+}
+
+fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> Result<()> {
+    let mut parts = input.split_whitespace();
+    let Some(command) = parts.next() else {
+        return Ok(());
+    };
+    match command {
+        "a" => {
+            let index: usize = parts
+                .next()
+                .context("usage: a <question-number> <answer>")?
+                .parse()
+                .context("question number must be an integer")?;
+            let answer = parts.collect::<Vec<_>>().join(" ");
+            if answer.trim().is_empty() {
+                bail!("usage: a <question-number> <answer>");
+            }
+            let pending = details
+                .questions
+                .iter()
+                .filter(|question| question.state == "pending")
+                .collect::<Vec<_>>();
+            let question = pending
+                .get(index.saturating_sub(1))
+                .ok_or_else(|| anyhow::anyhow!("pending question {index} not found"))?;
+            let _: AnswerQuestionResult = client.call(
+                "answerQuestion",
+                &AnswerQuestionParams {
+                    run_id: details.run.id.clone(),
+                    question_id: question.id.clone(),
+                    answer,
+                },
+            )?;
+        }
+        "answer" => {
+            let question_id = parts
+                .next()
+                .context("usage: answer <question-id> <answer>")?;
+            let answer = parts.collect::<Vec<_>>().join(" ");
+            if answer.trim().is_empty() {
+                bail!("usage: answer <question-id> <answer>");
+            }
+            let _: AnswerQuestionResult = client.call(
+                "answerQuestion",
+                &AnswerQuestionParams {
+                    run_id: details.run.id.clone(),
+                    question_id: question_id.to_string(),
+                    answer,
+                },
+            )?;
+        }
+        "accept" | "reject" => {
+            let proposal_id = parts
+                .next()
+                .context("usage: accept|reject <proposal-id> <reason>")?;
+            let reason = strip_reason_flag(&parts.collect::<Vec<_>>().join(" "));
+            if reason.trim().is_empty() {
+                bail!("usage: accept|reject <proposal-id> <reason>");
+            }
+            let decision = if command == "accept" {
+                "accepted"
+            } else {
+                "rejected"
+            };
+            let _: DecideReplanProposalResult = client.call(
+                "decideReplanProposal",
+                &DecideReplanProposalParams {
+                    run_id: details.run.id.clone(),
+                    proposal_id: proposal_id.to_string(),
+                    decision: decision.to_string(),
+                    rationale: reason,
+                    authorizer: String::new(),
+                    source: "attend".to_string(),
+                    replacement_id: String::new(),
+                    revisit_condition: String::new(),
+                },
+            )?;
+        }
+        "defer" => {
+            let proposal_id = parts
+                .next()
+                .context("usage: defer <proposal-id> <condition> --reason <reason>")?;
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let (condition, reason) = split_defer_condition_reason(&rest)?;
+            let _: DecideReplanProposalResult = client.call(
+                "decideReplanProposal",
+                &DecideReplanProposalParams {
+                    run_id: details.run.id.clone(),
+                    proposal_id: proposal_id.to_string(),
+                    decision: "deferred".to_string(),
+                    rationale: reason,
+                    authorizer: String::new(),
+                    source: "attend".to_string(),
+                    replacement_id: String::new(),
+                    revisit_condition: condition,
+                },
+            )?;
+        }
+        "resume" => {
+            let _: StartRunResult = client.call(
+                "resumeRun",
+                &ResumeRunParams {
+                    run_id: details.run.id.clone(),
+                    agent: String::new(),
+                    pi_bin: String::new(),
+                    pi_args: Vec::new(),
+                    parallelism: 1,
+                },
+            )?;
+        }
+        other => bail!("unknown attend command {other:?}"),
+    }
+    Ok(())
+}
+
+fn strip_reason_flag(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix("--reason ")
+        .unwrap_or(value.trim())
+        .trim_matches('"')
+        .to_string()
+}
+
+fn split_defer_condition_reason(value: &str) -> Result<(String, String)> {
+    let Some((condition, reason)) = value.split_once(" --reason ") else {
+        bail!("usage: defer <proposal-id> <condition> --reason <reason>");
+    };
+    let condition = condition.trim().trim_matches('"').to_string();
+    let reason = reason.trim().trim_matches('"').to_string();
+    if condition.is_empty() || reason.is_empty() {
+        bail!("usage: defer <proposal-id> <condition> --reason <reason>");
+    }
+    Ok((condition, reason))
 }
 
 fn fetch_run_details(client: &Client, run_id: &str, events_limit: usize) -> Result<RunDetails> {
@@ -1642,6 +1872,7 @@ fn render_feed_monitor(out: &mut impl Write, feed: &StatusFeed) -> Result<()> {
         }
         for line in &block.lines {
             match line.role {
+                StatusFeedRole::Attention => monitor_tree_unbounded(out, &line.text)?,
                 StatusFeedRole::Dim => monitor_tree_dim(out, &line.text)?,
                 _ => monitor_tree(out, &line.text)?,
             }
@@ -1718,6 +1949,11 @@ fn monitor_heading(out: &mut impl Write, label: &str, meta: &str) -> Result<()> 
 
 fn monitor_tree(out: &mut impl Write, text: &str) -> Result<()> {
     writeln!(out, "└ {}", truncate_display(text, MONITOR_LINE_WIDTH))?;
+    Ok(())
+}
+
+fn monitor_tree_unbounded(out: &mut impl Write, text: &str) -> Result<()> {
+    writeln!(out, "└ {text}")?;
     Ok(())
 }
 

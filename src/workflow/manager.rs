@@ -1,7 +1,7 @@
 use super::cockpit::{
-    CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, open_default_run_cockpit,
-    open_default_worker_pane, send_default_agent_message, take_cockpit_mode_transport_arg,
-    worker_activity_pane_command,
+    CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, focus_default_agent_target,
+    open_default_run_cockpit, open_default_worker_pane, rename_default_agent_target,
+    send_default_agent_message, take_cockpit_mode_transport_arg, worker_activity_pane_command,
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
@@ -325,11 +325,119 @@ impl Manager {
                 "decision_commands": commands,
             }),
         )?;
+        for proposal in &pending {
+            self.notify_attention_for_replan(run, proposal);
+        }
         Err(BlockedError::new(format!("{message}; decide with: {}", commands.join("; "))).into())
+    }
+
+    fn notify_attention_for_replan(&self, run: &Run, proposal: &ReplanProposal) {
+        let store = artifact::Store::new(&run.repo_path);
+        let Ok(Some(origin)) = store.read_origin_notification_target(&run.id) else {
+            return;
+        };
+        if origin.target.trim().is_empty() {
+            return;
+        }
+        let commands = replan_decision_commands(&run.id, &proposal.id);
+        let payload = json!({
+            "schema_version": 1,
+            "kind": "replan_decision_pending",
+            "run_id": run.id,
+            "proposal_id": proposal.id,
+            "source": proposal.source,
+            "risk": proposal.risk,
+            "proposed_changes": proposal.proposed_changes,
+            "decision_commands": commands,
+            "source_of_truth": "daemon_replan_proposals",
+        });
+        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+        match send_default_agent_message(&origin.target, &text) {
+            Ok(sent) => {
+                let _ = self.state.record_event(
+                    &run.id,
+                    "attention_notification_sent",
+                    &json!({
+                        "kind": "replan_decision_pending",
+                        "proposal_id": proposal.id,
+                        "adapter": sent.adapter,
+                        "surface": sent.surface,
+                        "target_kind": origin.target_kind,
+                    }),
+                );
+            }
+            Err(err) => {
+                let _ = self.state.record_event(
+                    &run.id,
+                    "run_incident",
+                    &json!({
+                        "severity": "warning",
+                        "kind": "attention_notification_failed",
+                        "visibility_kind": "delivery_failed",
+                        "message": format!("replan proposal notification was not delivered: {}", err.message),
+                        "proposal_id": proposal.id,
+                        "source_of_truth": "daemon_replan_proposals",
+                    }),
+                );
+            }
+        }
+        match focus_default_agent_target(&origin.target) {
+            Ok(focused) => {
+                let _ = self.state.record_event(
+                    &run.id,
+                    "attention_focus_sent",
+                    &json!({
+                        "kind": "replan_decision_pending",
+                        "proposal_id": proposal.id,
+                        "adapter": focused.adapter,
+                        "surface": focused.surface,
+                        "target_kind": origin.target_kind,
+                    }),
+                );
+            }
+            Err(err) => {
+                let _ = self.state.record_event(
+                    &run.id,
+                    "run_incident",
+                    &json!({
+                        "severity": "warning",
+                        "kind": "attention_focus_failed",
+                        "visibility_kind": "focus_failed",
+                        "message": format!("replan proposal focus was not delivered: {}", err.message),
+                        "proposal_id": proposal.id,
+                        "source_of_truth": "daemon_replan_proposals",
+                    }),
+                );
+            }
+        }
     }
 
     fn plan_revisions_for_run(&self, run: &Run) -> Result<PlanRevisions> {
         plan_revisions_from_proposals(run, self.state.list_replan_proposals(&run.id)?)
+    }
+
+    fn slice_areas_with_accepted_revision_grants(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+        slice_areas: &[String],
+    ) -> Result<Vec<String>> {
+        let proposals = self.state.list_replan_proposals(run_id)?;
+        let mut areas = slice_areas.to_vec();
+        for proposal in proposals {
+            if proposal.state != crate::domain::ReplanProposalState::Accepted {
+                continue;
+            }
+            if proposal.source.slice_id != slice_id {
+                continue;
+            }
+            for path in authorized_paths_from_proposal(&proposal) {
+                if !areas.iter().any(|area| area == &path) {
+                    areas.push(path);
+                }
+            }
+        }
+        Ok(areas)
     }
 
     fn write_worker_handoff_with_plan_revisions(
@@ -1620,7 +1728,9 @@ impl Manager {
             "terminal_summary_written",
             &json!({ "path": summary_path }),
         )?;
-        self.emit_terminal_run_feedback(run, status, &summary, &summary_path);
+        self.rename_worker_panes_for_terminal(run, &events, &slice_runs);
+        let transition_key = terminal_transition_key(status, progress.as_ref());
+        self.emit_terminal_run_feedback(run, status, &summary, &summary_path, &transition_key);
         Ok(())
     }
 
@@ -1630,16 +1740,16 @@ impl Manager {
         status: RunStatus,
         summary: &Value,
         summary_path: &Path,
+        transition_key: &str,
     ) {
         if !terminal_feedback_status_supported(status) {
             return;
         }
         let store = artifact::Store::new(&run.repo_path);
         let terminal_status = status.as_str();
-        if store.terminal_notification_exists(&run.id, terminal_status) {
+        if store.terminal_notification_exists(&run.id, transition_key) {
             return;
         }
-        let transition_key = format!("terminal:{terminal_status}");
         let created_at = Utc::now().to_rfc3339();
         let final_report_path = store.output_path(&run.id, "final-report.json");
         let implementation_summary_path = store.output_path(&run.id, "implementation-summary.json");
@@ -1662,7 +1772,7 @@ impl Manager {
                     &store,
                     run,
                     terminal_status,
-                    &transition_key,
+                    transition_key,
                     "skipped",
                     "",
                     "missing origin notification target",
@@ -1688,7 +1798,7 @@ impl Manager {
                     &store,
                     run,
                     terminal_status,
-                    &transition_key,
+                    transition_key,
                     "failed",
                     "",
                     &format!("origin target read failed: {err}"),
@@ -1698,7 +1808,7 @@ impl Manager {
                 self.record_terminal_notification_incident(
                     run,
                     terminal_status,
-                    &transition_key,
+                    transition_key,
                     "origin_target_read_failed",
                     &err.to_string(),
                 );
@@ -1709,7 +1819,7 @@ impl Manager {
             &store,
             run,
             terminal_status,
-            &transition_key,
+            transition_key,
             "pending",
             &origin.target,
             "",
@@ -1725,7 +1835,7 @@ impl Manager {
                     &store,
                     run,
                     terminal_status,
-                    &transition_key,
+                    transition_key,
                     "sent",
                     &origin.target,
                     "",
@@ -1749,7 +1859,7 @@ impl Manager {
                     &store,
                     run,
                     terminal_status,
-                    &transition_key,
+                    transition_key,
                     "failed",
                     &origin.target,
                     &err.message,
@@ -1759,7 +1869,7 @@ impl Manager {
                 self.record_terminal_notification_incident(
                     run,
                     terminal_status,
-                    &transition_key,
+                    transition_key,
                     "delivery_failed",
                     &err.message,
                 );
@@ -1793,8 +1903,7 @@ impl Manager {
             payload,
             created_at,
         };
-        if let Err(err) =
-            store.write_terminal_notification_record(&run.id, terminal_status, &record)
+        if let Err(err) = store.write_terminal_notification_record(&run.id, transition_key, &record)
         {
             self.record_terminal_notification_incident(
                 run,
@@ -1806,6 +1915,78 @@ impl Manager {
             return false;
         }
         true
+    }
+
+    fn rename_worker_panes_for_terminal(
+        &self,
+        run: &Run,
+        events: &[crate::domain::Event],
+        slice_runs: &[SliceRun],
+    ) {
+        let statuses = slice_runs
+            .iter()
+            .map(|slice| (slice.slice_id.as_str(), slice.status))
+            .collect::<BTreeMap<_, _>>();
+        let mut seen = BTreeSet::new();
+        for event in events
+            .iter()
+            .filter(|event| event.typ == "cockpit_worker_ready")
+        {
+            let pane_id = event
+                .payload
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let slice_id = event
+                .payload
+                .get("slice_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if pane_id.is_empty() || slice_id.is_empty() || !seen.insert(pane_id.to_string()) {
+                continue;
+            }
+            let status = statuses
+                .get(slice_id)
+                .copied()
+                .unwrap_or(SliceStatus::Pending);
+            let marker = match status {
+                SliceStatus::Merged => "✓",
+                SliceStatus::Blocked | SliceStatus::Failed | SliceStatus::Cancelled => "✗",
+                SliceStatus::Interrupted => "!",
+                _ => "◐",
+            };
+            let label = format!("{marker} {slice_id} {status}");
+            match rename_default_agent_target(pane_id, &label) {
+                Ok(renamed) => {
+                    let _ = self.state.record_event(
+                        &run.id,
+                        "cockpit_worker_renamed",
+                        &json!({
+                            "pane_id": pane_id,
+                            "slice_id": slice_id,
+                            "status": status,
+                            "label": label,
+                            "adapter": renamed.adapter,
+                            "surface": renamed.surface,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    let _ = self.state.record_event(
+                        &run.id,
+                        "run_incident",
+                        &json!({
+                            "severity": "warning",
+                            "kind": "cockpit_worker_rename_failed",
+                            "message": format!("worker pane rename failed for {slice_id}: {}", err.message),
+                            "pane_id": pane_id,
+                            "slice_id": slice_id,
+                            "source_of_truth": "daemon_terminal_summary",
+                        }),
+                    );
+                }
+            }
+        }
     }
 
     fn record_terminal_notification_incident(
@@ -3199,11 +3380,16 @@ impl Manager {
             return Ok(check);
         }
 
+        let authorized_areas = self.slice_areas_with_accepted_revision_grants(
+            ctx.run_id,
+            &ctx.slice.id,
+            &ctx.slice.areas,
+        )?;
         if let Some(outside) = changed_files_outside_slice_areas(
             ctx.worker_worktree,
             ctx.base_sha,
             &head,
-            &ctx.slice.areas,
+            &authorized_areas,
         )? {
             check.status = "failed".to_string();
             check.summary = format!(
@@ -3218,8 +3404,8 @@ impl Manager {
                 file: outside.first().cloned().unwrap_or_default(),
                 line: 0,
                 description: format!(
-                    "slice areas are [{}]; worker changed outside-area files: {}",
-                    ctx.slice.areas.join(", "),
+                    "slice areas/grants are [{}]; worker changed outside-area files: {}",
+                    authorized_areas.join(", "),
                     outside.join(", ")
                 ),
             });
@@ -3309,6 +3495,7 @@ impl Manager {
                     "summary": summary,
                 }),
             )?;
+            self.notify_attention_for_replan(run, &proposal);
         }
         Ok(())
     }
@@ -3370,6 +3557,7 @@ impl Manager {
                     "summary": summary,
                 }),
             )?;
+            self.notify_attention_for_replan(run, &proposal);
         }
         Ok(created)
     }
@@ -3428,6 +3616,7 @@ impl Manager {
                 "policy": "repair revisions outside slice areas or workflow policy require operator approval before application",
             }),
         )?;
+        self.notify_attention_for_replan(run, &proposal);
         Ok(proposal.id)
     }
 
@@ -4045,6 +4234,17 @@ fn terminal_feedback_status_supported(status: RunStatus) -> bool {
     )
 }
 
+fn terminal_transition_key(
+    status: RunStatus,
+    progress: Option<&crate::domain::RunProgress>,
+) -> String {
+    let phase_started_at = progress
+        .filter(|progress| progress.phase == status.as_str())
+        .map(|progress| progress.phase_started_at.to_rfc3339())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    format!("terminal:{}:{}", status.as_str(), phase_started_at)
+}
+
 fn terminal_handoff_evidence(final_report_path: &Path) -> (String, String) {
     let Ok(summary) = artifact::read_json::<ImplementationSummary>(final_report_path) else {
         return (String::new(), String::new());
@@ -4433,6 +4633,7 @@ fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevis
         .clone()
         .map(plan_revision_decision_summary)
         .transpose()?;
+    let authorized_paths = authorized_paths_from_proposal(&proposal);
     Ok(PlanRevisionRecord {
         proposal_id: proposal.id.clone(),
         state,
@@ -4440,6 +4641,8 @@ fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevis
         trigger_finding_ids: proposal.trigger_finding_ids.clone(),
         evidence: proposal.evidence.clone(),
         proposed_changes: proposal.proposed_changes.clone(),
+        authorized_paths,
+        action_class: plan_revision_action_class(&proposal),
         risk: proposal.risk.clone(),
         before_queue_or_slice_summary: plan_revision_before_summary(run, &proposal),
         after_queue_or_slice_summary: after,
@@ -4448,6 +4651,41 @@ fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevis
         created_at: proposal.created_at,
         updated_at: proposal.updated_at,
     })
+}
+
+fn authorized_paths_from_proposal(proposal: &ReplanProposal) -> Vec<String> {
+    if !matches!(
+        proposal
+            .operator_decision
+            .as_ref()
+            .map(|decision| decision.decision.as_str()),
+        Some("accepted")
+    ) {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    for change in &proposal.proposed_changes {
+        let target = change.target.trim();
+        if target.is_empty() || target == "integration" || target == proposal.source.slice_id {
+            continue;
+        }
+        if target.contains('/') || target.contains('.') {
+            paths.push(target.to_string());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn plan_revision_action_class(proposal: &ReplanProposal) -> String {
+    proposal
+        .proposed_changes
+        .iter()
+        .map(|change| change.kind.as_str())
+        .find(|kind| !kind.trim().is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn plan_revision_decision_summary(
@@ -5631,11 +5869,7 @@ mod tests {
                 .any(|artifact| artifact.name == "final-report.json")
         );
         assert!(!store.origin_path(&run.id).exists());
-        assert!(
-            !store
-                .terminal_notification_path(&run.id, "completed")
-                .exists()
-        );
+        assert!(!store.notifications_dir(&run.id).exists());
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
@@ -5685,10 +5919,9 @@ mod tests {
         assert_eq!(origin.target_kind, "opaque");
         assert_eq!(origin.delivery_adapter, "herdr");
         assert_eq!(origin.delivery_surface, "agent_send");
-        let record: TerminalNotificationRecord =
-            artifact::read_json(store.terminal_notification_path(&run.id, "completed"))?;
+        let record = terminal_notification_record_for_status(&store, &run.id, "completed")?;
         assert_eq!(record.terminal_status, "completed");
-        assert_eq!(record.transition_key, "terminal:completed");
+        assert!(record.transition_key.starts_with("terminal:completed:"));
         assert_eq!(record.delivery_status, "failed");
         assert_eq!(record.origin_target, "agent-1");
         assert_eq!(record.payload["kind"], "khazad_terminal_feedback");
@@ -5775,25 +6008,33 @@ mod tests {
         )?;
         let manager = Manager::new(paths, state.clone());
 
+        manager.mark_progress(&run.id, "blocked", "", 0, "", "blocked once");
         manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked once")?;
         manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked duplicate")?;
+        manager.mark_progress(&run.id, "completed", "", 0, "", "completed later");
         manager.write_terminal_run_summary(&run, RunStatus::Completed, "completed later")?;
+        manager.mark_progress(&run.id, "interrupted", "", 0, "", "interrupted");
         manager.write_terminal_run_summary(&run, RunStatus::Interrupted, "interrupted")?;
 
-        assert!(
-            store
-                .terminal_notification_path(&run.id, "blocked")
-                .exists()
+        let records = terminal_notification_records(&store, &run.id)?;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.terminal_status == "blocked")
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.terminal_status == "completed")
+                .count(),
+            1
         );
         assert!(
-            store
-                .terminal_notification_path(&run.id, "completed")
-                .exists()
-        );
-        assert!(
-            !store
-                .terminal_notification_path(&run.id, "interrupted")
-                .exists()
+            records
+                .iter()
+                .all(|record| record.terminal_status != "interrupted")
         );
         let events = state.get_events(&run.id, 200)?;
         let notification_incidents = events
@@ -5804,12 +6045,16 @@ mod tests {
             })
             .count();
         assert_eq!(notification_incidents, 2);
-        let blocked: TerminalNotificationRecord =
-            artifact::read_json(store.terminal_notification_path(&run.id, "blocked"))?;
-        let completed: TerminalNotificationRecord =
-            artifact::read_json(store.terminal_notification_path(&run.id, "completed"))?;
-        assert_eq!(blocked.transition_key, "terminal:blocked");
-        assert_eq!(completed.transition_key, "terminal:completed");
+        let blocked = records
+            .iter()
+            .find(|record| record.terminal_status == "blocked")
+            .expect("blocked record");
+        let completed = records
+            .iter()
+            .find(|record| record.terminal_status == "completed")
+            .expect("completed record");
+        assert!(blocked.transition_key.starts_with("terminal:blocked:"));
+        assert!(completed.transition_key.starts_with("terminal:completed:"));
         Ok(())
     }
 
@@ -6761,6 +7006,7 @@ mod tests {
                 parallelism: 1,
                 verify_timeout_seconds: 30,
                 worker_attempt_timeout_seconds: 0,
+                worker_question_timeout_seconds: 1800,
                 worker_no_output_warning_seconds: 900,
                 worker_termination_grace_seconds: 30,
                 integration_repair: "auto".to_string(),
@@ -6902,6 +7148,36 @@ mod tests {
                 .exists()
         );
         Ok(())
+    }
+
+    fn terminal_notification_records(
+        store: &ArtifactStore,
+        run_id: &str,
+    ) -> Result<Vec<TerminalNotificationRecord>> {
+        let dir = store.notifications_dir(run_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("terminal-") && name.ends_with(".json") {
+                records.push(artifact::read_json(entry.path())?);
+            }
+        }
+        Ok(records)
+    }
+
+    fn terminal_notification_record_for_status(
+        store: &ArtifactStore,
+        run_id: &str,
+        status: &str,
+    ) -> Result<TerminalNotificationRecord> {
+        terminal_notification_records(store, run_id)?
+            .into_iter()
+            .find(|record| record.terminal_status == status)
+            .ok_or_else(|| anyhow::anyhow!("missing terminal notification for {status}"))
     }
 
     fn wait_for_run(state: &StateStore, run_id: &str) -> Result<crate::domain::Run> {
