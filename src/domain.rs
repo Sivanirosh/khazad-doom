@@ -388,6 +388,36 @@ pub struct Run {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OriginNotificationTarget {
+    pub schema_version: u64,
+    pub target: String,
+    pub target_kind: String,
+    pub delivery_adapter: String,
+    pub delivery_surface: String,
+    pub source: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalNotificationRecord {
+    pub schema_version: u64,
+    pub run_id: String,
+    pub terminal_status: String,
+    pub transition_key: String,
+    pub delivery_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_target: String,
+    pub delivery_adapter: String,
+    pub delivery_surface: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub payload: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct WorkerProfileEvidence {
     #[serde(default, skip_serializing_if = "String::is_empty")]

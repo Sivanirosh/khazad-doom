@@ -107,6 +107,14 @@ pub(crate) enum CockpitWorkerLaunch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitAgentMessageSent {
+    pub adapter: String,
+    pub mode: CockpitMode,
+    pub target: String,
+    pub surface: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CockpitUnavailable {
     pub mode: CockpitMode,
     pub adapter: String,
@@ -175,6 +183,10 @@ pub(crate) trait CockpitAdapter {
         request: &CockpitPaneRequest,
     ) -> Result<CockpitPaneRef> {
         self.create_read_only_pane(workspace, request)
+    }
+
+    fn send_agent_message(&self, _target: &str, _text: &str) -> Result<()> {
+        bail!("{} adapter does not support agent messages", self.name())
     }
 }
 
@@ -287,6 +299,19 @@ impl<A: CockpitAdapter> Cockpit<A> {
             pane_id: pane_ref.id,
         }))
     }
+
+    pub fn send_agent_message(&self, target: &str, text: &str) -> Result<CockpitAgentMessageSent> {
+        if self.mode == CockpitMode::Direct {
+            bail!("cockpit direct mode does not send Herdr agent messages");
+        }
+        self.adapter.send_agent_message(target, text)?;
+        Ok(CockpitAgentMessageSent {
+            adapter: self.adapter.name().to_string(),
+            mode: self.mode,
+            target: target.to_string(),
+            surface: "herdr agent send".to_string(),
+        })
+    }
 }
 
 pub(crate) fn open_default_run_cockpit(
@@ -338,6 +363,29 @@ pub(crate) fn open_default_worker_pane(
     let request = CockpitRunRequest::for_run(run, khazad_home);
     Cockpit::new(mode, adapter)
         .open_worker_pane(&request, worker_request)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn send_default_agent_message(
+    target: &str,
+    text: &str,
+) -> std::result::Result<CockpitAgentMessageSent, CockpitUnavailable> {
+    let mode = CockpitMode::Herdr;
+    #[cfg(test)]
+    if std::env::var("KHAZAD_UNIT_TEST_TERMINAL_FEEDBACK")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Err(CockpitUnavailable::new(
+            mode,
+            "herdr",
+            "Herdr agent message delivery is disabled in unit tests",
+        ));
+    }
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    Cockpit::new(mode, adapter)
+        .send_agent_message(target, text)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
 }
 
@@ -553,6 +601,16 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         let _ = workspace.id.as_str();
         Ok(CockpitPaneRef { id: pane_id })
     }
+
+    fn send_agent_message(&self, target: &str, text: &str) -> Result<()> {
+        self.run_command(&[
+            "agent".to_string(),
+            "send".to_string(),
+            target.to_string(),
+            text.to_string(),
+        ])?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -719,6 +777,31 @@ mod tests {
                 id: format!("pane-{}", request.label.len()),
             })
         }
+
+        fn send_agent_message(&self, target: &str, text: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("agent_send:{target}:{text}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_notification_cockpit_uses_inert_agent_send_surface() {
+        let adapter = FakeCockpitAdapter::default();
+
+        let sent = Cockpit::new(CockpitMode::Herdr, adapter.clone())
+            .send_agent_message("agent-1", "{\"run_id\":\"kd-test\"}")
+            .unwrap();
+
+        assert_eq!(sent.adapter, "fake-herdr");
+        assert_eq!(sent.target, "agent-1");
+        assert_eq!(sent.surface, "herdr agent send");
+        assert_eq!(
+            adapter.calls(),
+            vec!["agent_send:agent-1:{\"run_id\":\"kd-test\"}".to_string()]
+        );
     }
 
     #[test]

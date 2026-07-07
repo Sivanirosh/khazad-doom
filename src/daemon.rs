@@ -456,6 +456,7 @@ impl Server {
                     pi_args: params.pi_args,
                     parallelism: params.parallelism,
                     allow_dirty: params.allow_dirty,
+                    origin_notification_target: params.origin_notification_target,
                 })?;
                 Ok(HandleOutcome::result(StartRunResult { run_id: run.id })?)
             }

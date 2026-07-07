@@ -52,6 +52,8 @@ pub struct StartRunParams {
     pub parallelism: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_dirty: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_notification_target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

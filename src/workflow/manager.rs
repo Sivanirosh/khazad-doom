@@ -1,6 +1,7 @@
 use super::cockpit::{
     CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, open_default_run_cockpit,
-    open_default_worker_pane, take_cockpit_mode_transport_arg, worker_activity_pane_command,
+    open_default_worker_pane, send_default_agent_message, take_cockpit_mode_transport_arg,
+    worker_activity_pane_command,
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::gate::{
@@ -22,10 +23,11 @@ use crate::artifact;
 use crate::domain::{
     AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
     FindingDisposition, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
-    ImplementationSummary, MergeConflictReport, PlanRevisionDecisionSummary, PlanRevisionRecord,
-    PlanRevisions, RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
-    ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState,
-    SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerProfileEvidence,
+    ImplementationSummary, MergeConflictReport, OriginNotificationTarget,
+    PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions, RepairResult,
+    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run,
+    RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun, SliceStatus,
+    SliceValidationReport, SliceWriteResult, TerminalNotificationRecord, WorkerProfileEvidence,
     WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
@@ -35,7 +37,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rand::RngCore;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -95,6 +97,22 @@ fn read_worker_profile_from_preflight(
         .and_then(|value| WorkerProfileEvidence::from_json_surface(&value))
 }
 
+fn origin_notification_target_from_start(target: &str) -> Option<OriginNotificationTarget> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(OriginNotificationTarget {
+        schema_version: 1,
+        target: target.to_string(),
+        target_kind: "opaque".to_string(),
+        delivery_adapter: "herdr".to_string(),
+        delivery_surface: "agent_send".to_string(),
+        source: "run_start".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+    })
+}
+
 #[derive(Clone)]
 pub struct Manager {
     pub paths: Paths,
@@ -113,6 +131,7 @@ pub struct StartOptions {
     pub pi_args: Vec<String>,
     pub parallelism: usize,
     pub allow_dirty: bool,
+    pub origin_notification_target: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1080,7 +1099,23 @@ impl Manager {
             updated_at: now,
         };
         self.state.insert_run(&run)?;
-        artifact::Store::new(&run.repo_path).ensure_run_dirs(&run.id)?;
+        let run_store = artifact::Store::new(&run.repo_path);
+        run_store.ensure_run_dirs(&run.id)?;
+        if let Some(origin) =
+            origin_notification_target_from_start(&opts.origin_notification_target)
+        {
+            let path = run_store.write_origin_notification_target(&run.id, &origin)?;
+            self.state.record_event(
+                &run.id,
+                "origin_notification_target_recorded",
+                &json!({
+                    "path": path,
+                    "target_kind": origin.target_kind,
+                    "delivery_adapter": origin.delivery_adapter,
+                    "delivery_surface": origin.delivery_surface,
+                }),
+            )?;
+        }
         let runner_metadata = runner.metadata();
         let worker_profile = worker_profile_evidence(runner.name(), &runner_metadata);
         let pi_contract = runner.pi_contract_observation();
@@ -1536,13 +1571,222 @@ impl Manager {
             "next_commands": terminal_next_commands(run, status),
             "created_at": Utc::now(),
         });
-        artifact::write_json(store.output_path(&run.id, "run-summary.json"), &summary)?;
+        let summary_path = store.output_path(&run.id, "run-summary.json");
+        artifact::write_json(&summary_path, &summary)?;
         self.state.record_event(
             &run.id,
             "terminal_summary_written",
-            &json!({ "path": store.output_path(&run.id, "run-summary.json") }),
+            &json!({ "path": summary_path }),
         )?;
+        self.emit_terminal_run_feedback(run, status, &summary, &summary_path);
         Ok(())
+    }
+
+    fn emit_terminal_run_feedback(
+        &self,
+        run: &Run,
+        status: RunStatus,
+        summary: &Value,
+        summary_path: &Path,
+    ) {
+        if !terminal_feedback_status_supported(status) {
+            return;
+        }
+        let store = artifact::Store::new(&run.repo_path);
+        let terminal_status = status.as_str();
+        if store.terminal_notification_exists(&run.id, terminal_status) {
+            return;
+        }
+        let transition_key = format!("terminal:{terminal_status}");
+        let created_at = Utc::now().to_rfc3339();
+        let final_report_path = store.output_path(&run.id, "final-report.json");
+        let implementation_summary_path = store.output_path(&run.id, "implementation-summary.json");
+        let payload = terminal_feedback_payload(
+            run,
+            status,
+            summary,
+            summary_path,
+            final_report_path
+                .exists()
+                .then_some(final_report_path.as_path()),
+            implementation_summary_path
+                .exists()
+                .then_some(implementation_summary_path.as_path()),
+        );
+        let origin = match store.read_origin_notification_target(&run.id) {
+            Ok(Some(origin)) if !origin.target.trim().is_empty() => origin,
+            Ok(Some(_)) => {
+                self.write_terminal_notification_record(
+                    &store,
+                    run,
+                    terminal_status,
+                    &transition_key,
+                    "skipped",
+                    "",
+                    "missing origin notification target",
+                    payload,
+                    created_at,
+                );
+                let _ = self.state.record_event(
+                    &run.id,
+                    "terminal_notification_skipped",
+                    &json!({
+                        "status": terminal_status,
+                        "transition_key": transition_key,
+                        "reason": "missing_origin_target",
+                    }),
+                );
+                return;
+            }
+            Ok(None) => {
+                return;
+            }
+            Err(err) => {
+                self.write_terminal_notification_record(
+                    &store,
+                    run,
+                    terminal_status,
+                    &transition_key,
+                    "failed",
+                    "",
+                    &format!("origin target read failed: {err}"),
+                    payload,
+                    created_at,
+                );
+                self.record_terminal_notification_incident(
+                    run,
+                    terminal_status,
+                    &transition_key,
+                    "origin_target_read_failed",
+                    &err.to_string(),
+                );
+                return;
+            }
+        };
+        if !self.write_terminal_notification_record(
+            &store,
+            run,
+            terminal_status,
+            &transition_key,
+            "pending",
+            &origin.target,
+            "",
+            payload.clone(),
+            created_at.clone(),
+        ) {
+            return;
+        }
+        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+        match send_default_agent_message(&origin.target, &text) {
+            Ok(sent) => {
+                self.write_terminal_notification_record(
+                    &store,
+                    run,
+                    terminal_status,
+                    &transition_key,
+                    "sent",
+                    &origin.target,
+                    "",
+                    payload,
+                    created_at,
+                );
+                let _ = self.state.record_event(
+                    &run.id,
+                    "terminal_notification_sent",
+                    &json!({
+                        "status": terminal_status,
+                        "transition_key": transition_key,
+                        "adapter": sent.adapter,
+                        "surface": sent.surface,
+                        "target_kind": origin.target_kind,
+                    }),
+                );
+            }
+            Err(err) => {
+                self.write_terminal_notification_record(
+                    &store,
+                    run,
+                    terminal_status,
+                    &transition_key,
+                    "failed",
+                    &origin.target,
+                    &err.message,
+                    payload,
+                    created_at,
+                );
+                self.record_terminal_notification_incident(
+                    run,
+                    terminal_status,
+                    &transition_key,
+                    "delivery_failed",
+                    &err.message,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_terminal_notification_record(
+        &self,
+        store: &artifact::Store,
+        run: &Run,
+        terminal_status: &str,
+        transition_key: &str,
+        delivery_status: &str,
+        origin_target: &str,
+        error: &str,
+        payload: Value,
+        created_at: String,
+    ) -> bool {
+        let record = TerminalNotificationRecord {
+            schema_version: 1,
+            run_id: run.id.clone(),
+            terminal_status: terminal_status.to_string(),
+            transition_key: transition_key.to_string(),
+            delivery_status: delivery_status.to_string(),
+            origin_target: origin_target.to_string(),
+            delivery_adapter: "herdr".to_string(),
+            delivery_surface: "agent_send".to_string(),
+            error: error.to_string(),
+            payload,
+            created_at,
+        };
+        if let Err(err) =
+            store.write_terminal_notification_record(&run.id, terminal_status, &record)
+        {
+            self.record_terminal_notification_incident(
+                run,
+                terminal_status,
+                transition_key,
+                "record_write_failed",
+                &err.to_string(),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn record_terminal_notification_incident(
+        &self,
+        run: &Run,
+        terminal_status: &str,
+        transition_key: &str,
+        failure_kind: &str,
+        message: &str,
+    ) {
+        let _ = self.state.record_event(
+            &run.id,
+            "run_incident",
+            &json!({
+                "severity": "warning",
+                "kind": "terminal_notification_failed",
+                "visibility_kind": failure_kind,
+                "message": format!("terminal notification for {terminal_status} was not delivered: {message}"),
+                "terminal_status": terminal_status,
+                "transition_key": transition_key,
+                "source_of_truth": "daemon_terminal_summary",
+            }),
+        );
     }
 
     fn run_worktree_snapshots(&self, run: &Run) -> Vec<serde_json::Value> {
@@ -3737,6 +3981,57 @@ fn terminal_next_commands(run: &Run, status: RunStatus) -> Vec<String> {
     }
 }
 
+fn terminal_feedback_status_supported(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::Blocked | RunStatus::Failed | RunStatus::Cancelled
+    )
+}
+
+fn terminal_handoff_evidence(final_report_path: &Path) -> (String, String) {
+    let Ok(summary) = artifact::read_json::<ImplementationSummary>(final_report_path) else {
+        return (String::new(), String::new());
+    };
+    (summary.final_sha, summary.exit_states.handoff)
+}
+
+fn terminal_feedback_payload(
+    run: &Run,
+    status: RunStatus,
+    summary: &Value,
+    summary_path: &Path,
+    final_report_path: Option<&Path>,
+    implementation_summary_path: Option<&Path>,
+) -> Value {
+    let (final_sha, handoff_readiness) = final_report_path
+        .map(terminal_handoff_evidence)
+        .unwrap_or_default();
+    let evidence_artifacts = [
+        Some(summary_path),
+        final_report_path,
+        implementation_summary_path,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|path| path.to_string_lossy().to_string())
+    .collect::<Vec<_>>();
+    json!({
+        "kind": "khazad_terminal_feedback",
+        "run_id": run.id,
+        "terminal_status": status.as_str(),
+        "repo_path": run.repo_path,
+        "integration_branch": run.integration_branch,
+        "selected_slice_id": run.selected_slice_id,
+        "message": summary.get("message").and_then(Value::as_str).unwrap_or_default(),
+        "primary_failure": summary.get("primary_failure").and_then(Value::as_str).unwrap_or_default(),
+        "cancel_reason": summary.get("cancel_reason").and_then(Value::as_str).unwrap_or_default(),
+        "final_sha": final_sha,
+        "handoff_readiness": handoff_readiness,
+        "evidence_artifacts": evidence_artifacts,
+        "next_commands": summary.get("next_commands").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
 fn git_output_or_empty(worktree: &Path, args: &[&str]) -> String {
     gitutil::run(worktree, args).unwrap_or_default()
 }
@@ -4863,9 +5158,10 @@ mod tests {
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         AcceptanceEvidence, CheckResult, CockpitMode, Finding, FindingDisposition, Handoff,
-        ImplementationSummary, RepairResult, ReplanEvidenceLink, ReplanProposalSource,
-        ReplanProposalState, ReplanProposedChange, Run, RunStatus, Slice, SliceRun, SliceStatus,
-        VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
+        ImplementationSummary, OriginNotificationTarget, RepairResult, ReplanEvidenceLink,
+        ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run, RunStatus, Slice,
+        SliceRun, SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile,
+        WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -5109,6 +5405,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 2,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5155,6 +5452,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5262,9 +5560,173 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.name == "final-report.json")
         );
+        assert!(!store.origin_path(&run.id).exists());
+        assert!(
+            !store
+                .terminal_notification_path(&run.id, "completed")
+                .exists()
+        );
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.typ.starts_with("terminal_notification_"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_notification_origin_target_is_artifact_and_delivery_is_nonfatal() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: "agent-1".to_string(),
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let origin: OriginNotificationTarget = artifact::read_json(store.origin_path(&run.id))?;
+        assert_eq!(origin.target, "agent-1");
+        assert_eq!(origin.target_kind, "opaque");
+        assert_eq!(origin.delivery_adapter, "herdr");
+        assert_eq!(origin.delivery_surface, "agent_send");
+        let record: TerminalNotificationRecord =
+            artifact::read_json(store.terminal_notification_path(&run.id, "completed"))?;
+        assert_eq!(record.terminal_status, "completed");
+        assert_eq!(record.transition_key, "terminal:completed");
+        assert_eq!(record.delivery_status, "failed");
+        assert_eq!(record.origin_target, "agent-1");
+        assert_eq!(record.payload["kind"], "khazad_terminal_feedback");
+        assert_eq!(record.payload["terminal_status"], "completed");
+        assert!(
+            record.payload["next_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("handoff --run"))
+        );
+        let after_notification = state.get_run(&run.id)?.expect("run remains present");
+        assert_eq!(after_notification.status, RunStatus::Completed);
+        let events = state.get_events(&run.id, 100)?;
+        assert!(events.iter().any(|event| {
+            event.typ == "origin_notification_target_recorded"
+                && event.payload["target_kind"] == "opaque"
+        }));
+        assert!(events.iter().any(|event| {
+            event.typ == "run_incident"
+                && event.payload["kind"] == "terminal_notification_failed"
+                && event.payload["terminal_status"] == "completed"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_notification_dedupe_is_per_terminal_transition_and_skips_interrupted() -> Result<()>
+    {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let now = Utc::now();
+        let run = Run {
+            id: "kd-terminal-notification".to_string(),
+            repo_id,
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-terminal-notification/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        store.ensure_run_dirs(&run.id)?;
+        store.write_origin_notification_target(
+            &run.id,
+            &OriginNotificationTarget {
+                schema_version: 1,
+                target: "agent-1".to_string(),
+                target_kind: "opaque".to_string(),
+                delivery_adapter: "herdr".to_string(),
+                delivery_surface: "agent_send".to_string(),
+                source: "run_start".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            },
+        )?;
+        let manager = Manager::new(paths, state.clone());
+
+        manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked once")?;
+        manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked duplicate")?;
+        manager.write_terminal_run_summary(&run, RunStatus::Completed, "completed later")?;
+        manager.write_terminal_run_summary(&run, RunStatus::Interrupted, "interrupted")?;
+
+        assert!(
+            store
+                .terminal_notification_path(&run.id, "blocked")
+                .exists()
+        );
+        assert!(
+            store
+                .terminal_notification_path(&run.id, "completed")
+                .exists()
+        );
+        assert!(
+            !store
+                .terminal_notification_path(&run.id, "interrupted")
+                .exists()
+        );
+        let events = state.get_events(&run.id, 200)?;
+        let notification_incidents = events
+            .iter()
+            .filter(|event| {
+                event.typ == "run_incident"
+                    && event.payload["kind"] == "terminal_notification_failed"
+            })
+            .count();
+        assert_eq!(notification_incidents, 2);
+        let blocked: TerminalNotificationRecord =
+            artifact::read_json(store.terminal_notification_path(&run.id, "blocked"))?;
+        let completed: TerminalNotificationRecord =
+            artifact::read_json(store.terminal_notification_path(&run.id, "completed"))?;
+        assert_eq!(blocked.transition_key, "terminal:blocked");
+        assert_eq!(completed.transition_key, "terminal:completed");
         Ok(())
     }
 
@@ -5302,6 +5764,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5388,6 +5851,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5430,6 +5894,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5579,6 +6044,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let blocked = wait_for_run(&state, &run.id)?;
@@ -5653,6 +6119,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5710,6 +6177,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let blocked = wait_for_run(&state, &run.id)?;
@@ -5772,6 +6240,7 @@ mod tests {
                 pi_args: Vec::new(),
                 parallelism: 1,
                 allow_dirty: false,
+                origin_notification_target: String::new(),
             })
             .unwrap_err();
         assert!(
@@ -5837,6 +6306,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let failed = wait_for_run(&state, &run.id)?;
@@ -5875,6 +6345,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: true,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5923,6 +6394,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -5977,6 +6449,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -6039,6 +6512,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -6091,6 +6565,7 @@ mod tests {
                 pi_args: Vec::new(),
                 parallelism: 1,
                 allow_dirty: false,
+                origin_notification_target: String::new(),
             })
             .unwrap_err();
         assert!(err.to_string().contains("is closed"));
@@ -6158,6 +6633,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 0,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -6193,6 +6669,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 1,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let err = manager
@@ -6205,6 +6682,7 @@ mod tests {
                 pi_args: Vec::new(),
                 parallelism: 1,
                 allow_dirty: false,
+                origin_notification_target: String::new(),
             })
             .unwrap_err();
         assert!(err.to_string().contains("already has active run"));
@@ -6246,6 +6724,7 @@ mod tests {
             pi_args: Vec::new(),
             parallelism: 2,
             allow_dirty: false,
+            origin_notification_target: String::new(),
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;

@@ -1,6 +1,7 @@
 use crate::domain::{
-    AgentProfilesConfig, ArtifactEntry, Handoff, ImplementationSummary, RunCheckpoint, Slice,
-    SliceSummary, SliceValidationIssue, SliceValidationReport, SliceWriteResult, WorkflowConfig,
+    AgentProfilesConfig, ArtifactEntry, Handoff, ImplementationSummary, OriginNotificationTarget,
+    RunCheckpoint, Slice, SliceSummary, SliceValidationIssue, SliceValidationReport,
+    SliceWriteResult, TerminalNotificationRecord, WorkflowConfig,
 };
 use crate::gitutil;
 use anyhow::{Context, Result, bail};
@@ -104,6 +105,19 @@ impl Store {
 
     pub fn output_dir(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("outputs")
+    }
+
+    pub fn origin_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("origin.json")
+    }
+
+    pub fn notifications_dir(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("notifications")
+    }
+
+    pub fn terminal_notification_path(&self, run_id: &str, terminal_status: &str) -> PathBuf {
+        self.notifications_dir(run_id)
+            .join(format!("terminal-{terminal_status}.json"))
     }
 
     pub fn ensure_run_dirs(&self, run_id: &str) -> Result<()> {
@@ -218,6 +232,47 @@ impl Store {
             .handoff_dir(run_id)
             .join(format!("{}.json", handoff.slice.id));
         write_json(&path, handoff)?;
+        Ok(path)
+    }
+
+    pub fn write_origin_notification_target(
+        &self,
+        run_id: &str,
+        origin: &OriginNotificationTarget,
+    ) -> Result<PathBuf> {
+        self.ensure_run_dirs(run_id)?;
+        let path = self.origin_path(run_id);
+        write_json(&path, origin)?;
+        Ok(path)
+    }
+
+    pub fn read_origin_notification_target(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<OriginNotificationTarget>> {
+        let path = self.origin_path(run_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(path).map(Some)
+    }
+
+    pub fn terminal_notification_exists(&self, run_id: &str, terminal_status: &str) -> bool {
+        self.terminal_notification_path(run_id, terminal_status)
+            .exists()
+    }
+
+    pub fn write_terminal_notification_record(
+        &self,
+        run_id: &str,
+        terminal_status: &str,
+        record: &TerminalNotificationRecord,
+    ) -> Result<PathBuf> {
+        self.ensure_run_dirs(run_id)?;
+        let dir = self.notifications_dir(run_id);
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = self.terminal_notification_path(run_id, terminal_status);
+        write_json(&path, record)?;
         Ok(path)
     }
 
