@@ -1256,7 +1256,21 @@ impl Manager {
             .filter(|id| !id.trim().is_empty())
             .map(str::to_string)
             .collect();
-        let selected_slices = artifact::topological_order(&all_slices, &requested)?;
+        let requested_set: BTreeSet<_> = requested.iter().cloned().collect();
+        let planned_slices = artifact::topological_order(&all_slices, &requested)?;
+        let mut selected_slices = Vec::new();
+        for slice in planned_slices {
+            if slice.status == crate::domain::SLICE_STATUS_CLOSED {
+                if requested_set.contains(&slice.id) {
+                    bail!(
+                        "slice {:?} is closed; create a follow-up slice instead of rerunning historical work",
+                        slice.id
+                    );
+                }
+                continue;
+            }
+            selected_slices.push(slice);
+        }
         let slice_runs = self.state.get_slice_runs(&run.id)?;
         let merged: BTreeSet<_> = slice_runs
             .iter()
@@ -6013,6 +6027,83 @@ mod tests {
                 .error
                 .contains("create existing integration worktree")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resume_skips_closed_historical_dependencies() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut closed_dep = slice("slice-001");
+        closed_dep.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        closed_dep.closed_by_run = "historical-run".to_string();
+        closed_dep.closed_at = Utc::now().to_rfc3339();
+        let mut requested = slice("slice-002");
+        requested.depends_on = vec!["slice-001".to_string()];
+        requested.verify = vec!["test -f slice-002.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &closed_dep)?;
+        artifact::write_json(store.slices_dir().join("slice-002.json"), &requested)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(
+            repo.path(),
+            &["commit", "-m", "add closed dependency and open slice"],
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-resume-skip-closed-deps".to_string();
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let integration_branch = format!("khazad/{run_id}/integration");
+        gitutil::run(repo.path(), &["branch", &integration_branch, &base_sha])?;
+        let now = Utc::now();
+        state.insert_run(&Run {
+            id: run_id.clone(),
+            repo_id,
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Blocked,
+            base_branch: "master".to_string(),
+            base_sha,
+            integration_branch: integration_branch.clone(),
+            selected_slice_id: "slice-002".to_string(),
+            error: "previous merge conflict".to_string(),
+            started_at: now,
+            updated_at: now,
+        })?;
+
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        manager.resume_run(super::ResumeOptions {
+            run_id: run_id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+        })?;
+
+        let completed = wait_for_run(&state, &run_id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let slice_runs = state.get_slice_runs(&run_id)?;
+        assert!(
+            slice_runs
+                .iter()
+                .all(|slice_run| slice_run.slice_id != "slice-001"),
+            "closed historical dependency must not be rerun: {slice_runs:?}"
+        );
+        assert!(slice_runs.iter().any(|slice_run| {
+            slice_run.slice_id == "slice-002" && slice_run.status == SliceStatus::Merged
+        }));
+        let tree_files = gitutil::run(
+            repo.path(),
+            &["ls-tree", "-r", "--name-only", &integration_branch],
+        )?;
+        assert!(!tree_files.contains("slice-001.txt"));
+        assert!(tree_files.contains("slice-002.txt"));
         Ok(())
     }
 
