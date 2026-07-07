@@ -683,6 +683,8 @@ pub struct ImplementationSummary {
     pub evidence_attestation: EvidenceAttestation,
     #[serde(default)]
     pub economics: RunEconomics,
+    #[serde(default)]
+    pub plan_revisions: PlanRevisions,
     pub created_at: DateTime<Utc>,
 }
 
@@ -954,6 +956,58 @@ pub struct ReplanStatus {
     pub auto_approvable: Vec<ReplanProposal>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PlanRevisions {
+    pub source_of_truth: String,
+    pub queue_summary: String,
+    pub unresolved_pending_blocks_handoff: bool,
+    pub pending: Vec<PlanRevisionRecord>,
+    pub accepted: Vec<PlanRevisionRecord>,
+    pub rejected: Vec<PlanRevisionRecord>,
+    pub deferred: Vec<PlanRevisionRecord>,
+    pub superseded: Vec<PlanRevisionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanRevisionRecord {
+    pub proposal_id: String,
+    pub state: String,
+    pub source: ReplanProposalSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_finding_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ReplanEvidenceLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_changes: Vec<ReplanProposedChange>,
+    pub risk: String,
+    pub before_queue_or_slice_summary: String,
+    pub after_queue_or_slice_summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<PlanRevisionDecisionSummary>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanRevisionDecisionSummary {
+    pub decision: String,
+    pub rationale: String,
+    pub authorizer: String,
+    pub source: String,
+    pub decided_at: DateTime<Utc>,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime<Utc>>,
+    pub applied_at_checkpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replacement_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revisit_condition: String,
+}
+
 pub fn replan_decision_commands(run_id: &str, proposal_id: &str) -> Vec<String> {
     vec![
         format!("khazad-doom replan accept {run_id} {proposal_id} --reason <reason>"),
@@ -1049,6 +1103,8 @@ pub struct BranchHandoff {
     pub exit_states: WorkflowExitStates,
     #[serde(default)]
     pub evidence_attestation: EvidenceAttestation,
+    #[serde(default)]
+    pub plan_revisions: PlanRevisions,
     pub summary_path: String,
     pub final_report_path: String,
     pub push_command: String,

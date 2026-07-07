@@ -10,6 +10,71 @@ use std::time::{Duration, Instant};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn roadmap_truth_lint_rejects_done_status_without_closed_slice_evidence() -> TestResult {
+    let repo = tempfile::tempdir()?;
+    write_roadmap_fixture(
+        repo.path(),
+        "| Product Decision | Required Feature | Slice ID | Status |\n|---|---|---|---|\n| D1 | Fixture | FIX-01 | `done` |\n",
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "FIX-01",
+            "title": "Fixture",
+            "goal": "Stay open.",
+            "acceptance": ["done"]
+        }),
+    )?;
+
+    let output = roadmap_truth_check(repo.path())?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("FIX-01"));
+    assert!(stderr.contains("not closed"));
+    Ok(())
+}
+
+#[test]
+fn roadmap_truth_lint_accepts_done_status_with_slice_and_run_evidence() -> TestResult {
+    let repo = tempfile::tempdir()?;
+    write_roadmap_fixture(
+        repo.path(),
+        "| Product Decision | Required Feature | Slice ID | Status |\n|---|---|---|---|\n| D1 | Fixture | FIX-01 | `done` |\n",
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "FIX-01",
+            "title": "Fixture",
+            "goal": "Closed with evidence.",
+            "status": "closed",
+            "closed_by_run": "kd-fixture",
+            "closed_at": "2026-07-07T00:00:00Z",
+            "acceptance": ["done"]
+        }),
+    )?;
+    fs::create_dir_all(repo.path().join(".workflow/reports"))?;
+    fs::write(
+        repo.path()
+            .join(".workflow/reports/kd-fixture-final-report.json"),
+        serde_json::to_string_pretty(&json!({
+            "run_id": "kd-fixture",
+            "completed_slices": [{"slice_id": "FIX-01", "status": "complete", "summary": "done"}],
+            "exit_states": {"run": "completed"}
+        }))?,
+    )?;
+
+    let output = roadmap_truth_check(repo.path())?;
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -95,6 +160,11 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
         handoff["evidence_attestation"]["worker_self_approved"],
         false
     );
+    assert_eq!(
+        handoff["plan_revisions"]["source_of_truth"].as_str(),
+        Some("daemon_replan_proposals")
+    );
+    assert!(handoff["plan_revisions"]["pending"].is_array());
     assert!(handoff["push_command"].as_str().unwrap().contains("git -C"));
     assert!(
         handoff["pr_command"]
@@ -117,6 +187,10 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
     );
     let final_report: Value = serde_json::from_str(&fs::read_to_string(final_report_path)?)?;
     assert_eq!(final_report["final_sha"].as_str(), Some(final_sha));
+    assert_eq!(
+        final_report["plan_revisions"]["source_of_truth"].as_str(),
+        Some("daemon_replan_proposals")
+    );
     let closed_slice_ref = format!("{final_sha}:.workflow/slices/slice-001.json");
     let closed_slice = git(repo.path(), &["show", &closed_slice_ref])?;
     assert!(closed_slice.contains("\"status\": \"closed\""));
@@ -2982,6 +3056,21 @@ fn write_slice(repo: &Path, value: Value) -> TestResult {
         format!("{}\n", serde_json::to_string_pretty(&value)?),
     )?;
     Ok(())
+}
+
+fn write_roadmap_fixture(repo: &Path, markdown: &str) -> TestResult {
+    let path = repo.join("docs/roadmap/pi-native/00-matrix.md");
+    let parent = path.parent().expect("matrix parent");
+    fs::create_dir_all(parent)?;
+    fs::write(path, markdown)?;
+    Ok(())
+}
+
+fn roadmap_truth_check(repo: &Path) -> TestResult<Output> {
+    Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/roadmap-truth-check"))
+        .arg(repo)
+        .output()
+        .map_err(Into::into)
 }
 
 fn init_git_repo(path: &Path) -> TestResult {

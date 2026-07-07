@@ -38,6 +38,7 @@ khazad-doom cockpit open --run <run-id>
 khazad-doom cockpit open --latest --repo .
 khazad-doom handoff --run <run-id>
 khazad-doom handoff --run <run-id> --dry-run
+scripts/roadmap-truth-check
 khazad-doom inspect --run <run-id>
 khazad-doom inspect --repo . --latest
 khazad-doom cancel --run <run-id>
@@ -71,7 +72,7 @@ khazad-doom daemon status
 - Merge conflicts are structured blocked artifacts; do not paper over them.
 - Runtime artifacts under `.workflow/runs/` are gitignored and include preflight snapshots, observed Pi contract/profile summaries, raw outputs, terminal run summaries, and bounded failed/cancelled attempt diagnostics.
 - Handoff prints by default; push/PR creation require explicit flags or config, and `--dry-run` suppresses configured actions.
-- Final reports and handoff JSON expose explicit `exit_states` and `evidence_attestation`; treat them as read-only summaries over existing lifecycle state, not extra gates.
+- Final reports and handoff JSON expose explicit `exit_states`, `evidence_attestation`, and `plan_revisions`; treat them as read-only summaries over existing lifecycle state, not extra gates. Pending replan proposals block handoff readiness until an operator records an accepted/rejected/deferred/superseded disposition.
 - The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, live progress snapshots, status projection, Herdr cockpit launch/fallback decisions, monitor output, handoff JSON, and artifact inspection.
 - Runs are daemon-owned durable sessions. A Pi tool call must start/control/observe a run, never define its lifetime.
 
@@ -113,4 +114,4 @@ I’ll stop polling unless you ask me to inspect or resume it.”
 
 If status/monitor shows an `Attention` line or pending worker question, ask the user for the answer and then run `khazad-doom answer <run-id> <question-id> "..."` (or `/khazad-answer <run-id> <question-id> "..."` in Pi) after normal command confirmation. Do not answer by typing into Herdr worker panes. If a run still blocks with an `ask-user` finding, relay the blocker with exact details and ask for a decision before resuming.
 
-If status/monitor shows `Awaiting replan decision`, use the exact `khazad-doom replan accept|reject|defer` command shown by the daemon feed. Replan v1 never auto-applies queue/slice/verification/policy mutations; accepted decisions record `applied=false` until a later authorized slice adds application semantics.
+If status/monitor shows `Awaiting replan decision`, use the exact `khazad-doom replan accept|reject|defer` command shown by the daemon feed. Replan v1 never auto-applies queue/slice/verification/policy mutations; accepted decisions record `applied=false` until a later authorized slice adds application semantics. Do not treat roadmap Markdown as the source of truth; use `scripts/roadmap-truth-check` to compare roadmap completion claims against slice JSON and daemon report evidence.

@@ -6,6 +6,8 @@ Scope: commit Khazad-Doom to Pi as the sole real worker harness and unlock Pi-na
 
 Phase 1 truth audit: `docs/design/roadmap-truth-audit-2026-07-06.md`. The audited statuses below reconcile implementation reality with required tests and slice/run evidence; they are not slice acceptance or closure.
 
+Roadmap Markdown is checked planning output, not workflow truth. `scripts/roadmap-truth-check` fails if a matrix row claims `done`, `closed`, `accepted`, `complete`, or `completed` while the referenced slice is not closed by JSON slice metadata plus named daemon report evidence.
+
 Every implementation task for this migration must reference a Slice ID from this matrix. When a slice moves to `ready`, convert its workpackage into a JSON Issue Slice under `.workflow/slices/` so Khazad-Doom can dogfood its own migration.
 
 ## Product decisions

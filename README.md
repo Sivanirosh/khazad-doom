@@ -215,7 +215,7 @@ khazad-doom replan reject <run-id> <proposal-id> --reason "..."
 khazad-doom replan defer <run-id> <proposal-id> --until "condition" --reason "..."
 ```
 
-Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, and an empty `replan.auto_approvable` tier. The shared feed projection renders pending/decided proposals and pauses resume/worker dispatch/repair at `awaiting_replan` while a pending proposal exists.
+Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, and an empty `replan.auto_approvable` tier. The shared feed projection renders pending/decided proposals and pauses resume/worker dispatch/repair at `awaiting_replan` while a pending proposal exists. Worker handoff JSON, final reports, implementation summaries, and branch handoffs include a `plan_revisions` queue-history section; any unresolved pending proposal blocks `khazad-doom handoff` until the operator records an accept/reject/defer/supersede disposition.
 
 ### The Pi package: skill and monitor bridge
 
@@ -370,10 +370,11 @@ If the daemon starts and finds active runs from a previous process, it marks the
 - base branch and base SHA
 - final SHA
 - summary and report paths
+- `plan_revisions` queue history from daemon replan proposal state
 - suggested `git push` command
 - suggested `gh pr create` command
 
-By default it does not push and does not open a PR. Add `--push --create-pr` when you want Khazad-Doom to run those commands explicitly. Use `--dry-run` to inspect commands and diagnostics even if repo config enables default handoff actions.
+By default it does not push and does not open a PR. Add `--push --create-pr` when you want Khazad-Doom to run those commands explicitly. Use `--dry-run` to inspect commands and diagnostics even if repo config enables default handoff actions. If pending replan proposals remain unresolved, handoff readiness fails until an operator records an approved disposition such as reject/defer/supersede or an accepted proposal record.
 
 ## Development
 
@@ -382,6 +383,7 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 bash -n scripts/install.sh scripts/package.sh
+scripts/roadmap-truth-check
 ```
 
 Run the daemon path through the fake runner:
