@@ -2,7 +2,9 @@
   "id": "RPL-01",
   "title": "Replan proposal store and projection",
   "goal": "Introduce the smallest daemon-owned replan proposal lifecycle justified by the RFC: durable proposal records, explicit operator decisions, and status/feed projection of pending decisions without autonomous queue mutation.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-070851-bd30eb80",
+  "closed_at": "2026-07-07T08:55:30.721430388+00:00",
   "depends_on": [
     "HERDR-01B"
   ],

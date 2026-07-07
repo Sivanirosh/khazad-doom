@@ -2,7 +2,9 @@
   "id": "RPL-03",
   "title": "Queue-history handoff and roadmap truth lint",
   "goal": "Make replan proposal history and roadmap truth mechanically visible: handoffs/reports include queue revisions and roadmap status cannot contradict slice/run evidence without a lint failure.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-070851-bd30eb80",
+  "closed_at": "2026-07-07T08:55:30.721430388+00:00",
   "depends_on": [
     "RPL-02"
   ],

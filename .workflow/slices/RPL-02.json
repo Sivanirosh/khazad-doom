@@ -2,7 +2,9 @@
   "id": "RPL-02",
   "title": "Finding disposition and repair-authority flow",
   "goal": "Make actionable findings and out-of-authority repairs end in explicit dispositions or replan proposals, while preserving invalid worker-output attempts as durable evidence before retry.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-070851-bd30eb80",
+  "closed_at": "2026-07-07T08:55:30.721430388+00:00",
   "depends_on": [
     "RPL-01"
   ],

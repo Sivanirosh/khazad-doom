@@ -2,7 +2,9 @@
   "id": "HERDR-01B",
   "title": "Delegate cockpit open to the Herdr seam",
   "goal": "Remove the duplicate Herdr protocol implementation from the operator-side cockpit open/focus command so Khazad-Doom has exactly one Herdr protocol layer behind the Cockpit seam.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-070851-bd30eb80",
+  "closed_at": "2026-07-07T08:55:30.721430388+00:00",
   "depends_on": [
     "HERDR-03"
   ],

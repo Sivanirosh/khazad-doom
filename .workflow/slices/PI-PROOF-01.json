@@ -2,7 +2,9 @@
   "id": "PI-PROOF-01",
   "title": "Pi-native acceptance evidence closure",
   "goal": "Close the remaining Pi-native roadmap evidence gaps with executable black-box proof: contract recording, profile-surface fidelity, fake-runner attestation, and ask_operator ask/answer/timeout/restart behavior.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-070851-bd30eb80",
+  "closed_at": "2026-07-07T08:55:30.721430388+00:00",
   "depends_on": [
     "RPL-03"
   ],
