@@ -62,13 +62,14 @@ khazad-doom daemon status
 - GitHub issues/PRDs carry rich human context, but the JSON slice wins on conflict.
 - Treat each open slice as bounded intent plus minimum evidence, not a frozen mini-spec: learning is allowed inside the fence; moving the fence requires approval. TDD-discovered cases directly implied by the slice goal or acceptance may be handled inline and reported; discoveries that alter intent or exceed declared `areas` require `ask-user` or a follow-up slice.
 - When authoring slices, include expected test/helper/doc paths in `areas`; narrow `areas` are intentional hard stops, not semantic hints.
-- Worker output is JSON-only.
+- Worker output is JSON-only. Invalid/missing/schema-invalid JSON is durable evidence and may use bounded envelope re-emission for the existing worker head without burning implementation attempts.
 - Worker `acceptance_status` is an evidence claim, not approval. Workers must not approve their own evidence; daemon checks/gates and later human review attest or reject it separately.
 - Worker commits are required before merge.
 - Runs are clean-by-default: starting from a dirty source repo requires explicit `--allow-dirty`, and the daemon writes a preflight snapshot with base branch/SHA and dirty status.
 - Verification/tooling failures such as missing commands, invalid verify cwd, shell spawn failures, and non-executable commands are daemon/operator environment failures, not worker auto-fix requests. Operator environment gate failures block instead of spending an integration-repair worker.
 - Declared slice `areas` are path guardrails: worker changes outside those areas block the slice as scope violations; do not add semantic scope-policing machinery.
-- Multiple open slices run in dependency order; independent open slices can run in parallel, then merge serially.
+- Mechanical daemon-owned slice verify failures may get at most one targeted in-scope slice-repair attempt after normal attempts would otherwise fail; scope violations are never auto-repaired or auto-authorized.
+- Multiple open slices run in dependency order; independent open slices can run in parallel, then merge serially. Ready siblings from a failed parallel layer stay preserved-but-unmerged evidence.
 - Pi is the sole real worker harness. `--agent fake` is deterministic and only for local tests/dogfooding; do not present it as portability or a second production harness. Fake-runner artifacts/status/reports are labelled as deterministic test-double evidence, not real Pi worker implementation evidence.
 - Interrupted daemon runs are marked `interrupted` on next startup; lost workers are not silently resumed. Pending worker questions from the lost attempt become stale/interrupted evidence; resume the run and answer the fresh pending question for the active attempt.
 - Merge conflicts are structured blocked artifacts; do not paper over them.

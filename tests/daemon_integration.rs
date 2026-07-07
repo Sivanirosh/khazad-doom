@@ -1,3 +1,5 @@
+mod daemon;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -503,18 +505,7 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
         .expect("pending question");
     assert_eq!(question["attempt"], 1);
     let question_id = question["id"].as_str().unwrap().to_string();
-    assert!(
-        awaiting["feed"]["operator_commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|command| {
-                command
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains(&format!("answer {answer_run_id} {question_id}"))
-            })
-    );
+    daemon::attention::assert_answer_command_is_advertised(&awaiting, &answer_run_id, &question_id);
     let answered = json_stdout(&kd_ok(
         &bin,
         home_answer.path(),
@@ -867,19 +858,7 @@ fn cockpit_herdr_failure_is_nonfatal_incident() -> TestResult {
     )?;
     let completed = json_stdout(&completed)?;
     assert_eq!(completed["run"]["status"].as_str(), Some("completed"));
-    let events = completed["events"].as_array().unwrap();
-    assert!(events.iter().any(|event| {
-        event["type"].as_str() == Some("run_incident")
-            && event["payload"]["kind"].as_str() == Some("cockpit_unavailable")
-            && event["payload"]["fallback"].as_str() == Some("direct")
-            && event["payload"]["remediation"].as_str().is_some()
-    }));
-    assert!(events.iter().any(|event| {
-        event["type"].as_str() == Some("run_incident")
-            && event["payload"]["kind"].as_str() == Some("cockpit_worker_fallback")
-            && event["payload"]["fallback"].as_str() == Some("direct")
-            && event["payload"]["slice_id"].as_str() == Some("COCKPIT-FALLBACK")
-    }));
+    daemon::cockpit::assert_herdr_failure_falls_back_to_direct(&completed, "COCKPIT-FALLBACK");
 
     guard.stop();
     Ok(())
@@ -1343,18 +1322,7 @@ fn final_sha_advertises_publication_commit_with_close_records() -> TestResult {
             &format!("{final_sha}:.workflow/reports/{run_id}-implementation-summary.json"),
         ],
     )?;
-    assert!(
-        handoff["push_command"]
-            .as_str()
-            .unwrap()
-            .contains(integration_branch)
-    );
-    assert!(
-        handoff["pr_command"]
-            .as_str()
-            .unwrap()
-            .contains(integration_branch)
-    );
+    daemon::publication::assert_handoff_targets_integration_branch(&handoff, integration_branch);
 
     guard.stop();
     Ok(())
@@ -2025,7 +1993,7 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
 
     let status = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
     let status = json_stdout(&status)?;
-    assert_eq!(status["replan"]["pending"][0]["id"], "rp-pending");
+    daemon::replan::assert_pending_replan(&status, "rp-pending");
     assert_eq!(status["replan"]["history"][0]["id"], "rp-accepted");
     assert_eq!(
         status["replan"]["history"][0]["operator_decision"]["applied"],
@@ -2132,7 +2100,7 @@ fn invalid_worker_output_pi_attempt_is_preserved_and_counted_black_box() -> Test
         .iter()
         .find(|slice_run| slice_run["slice_id"].as_str() == Some("slice-001"))
         .expect("slice run");
-    assert_eq!(slice_run["attempts"], 3);
+    assert_eq!(slice_run["attempts"], 1);
 
     let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
     let inspected = json_stdout(&inspected)?;
@@ -2158,15 +2126,18 @@ fn invalid_worker_output_pi_attempt_is_preserved_and_counted_black_box() -> Test
             .unwrap_or_default()
             .contains("invalid worker stderr tail")
     );
-    let invalid_schema_path =
-        artifact_path(&inspected, "slice-001.worker.attempt-2.invalid-output.json")?;
+    let invalid_schema_path = artifact_path(
+        &inspected,
+        "slice-001.worker.attempt-1.envelope-1.invalid-output.json",
+    )?;
     let invalid_schema: Value = serde_json::from_str(&fs::read_to_string(invalid_schema_path)?)?;
+    let invalid_schema_error = invalid_schema["parse_error"].as_str().unwrap_or_default();
     assert!(
-        invalid_schema["parse_error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("worker JSON did not match result model")
+        invalid_schema_error.contains("summary") || invalid_schema_error.contains("validation"),
+        "unexpected invalid schema error: {invalid_schema_error}"
     );
+    assert_eq!(invalid_schema["attempt"], 1);
+    assert_eq!(invalid_schema["envelope_retry"], 1);
     assert!(
         invalid_schema["raw_invalid_payload"]
             .to_string()

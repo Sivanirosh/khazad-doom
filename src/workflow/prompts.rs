@@ -40,6 +40,60 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt
 }
 
+pub fn worker_envelope_retry_prompt(
+    handoff_path: &str,
+    handoff: &Handoff,
+    previous_failure: &str,
+    invalid_output_artifact: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are a Khazad-Doom Worker Envelope Repairer.\n\n");
+    prompt.push_str("Read this handoff JSON first:\n");
+    prompt.push_str(handoff_path);
+    prompt.push_str("\n\nContract:\n");
+    prompt.push_str("- Do not broaden or redo implementation work.\n");
+    prompt.push_str("- Do not change files unless a tiny metadata correction is needed to make the JSON truthful.\n");
+    prompt.push_str("- Inspect the current worktree/HEAD and re-emit valid worker JSON for the existing worker evidence.\n");
+    prompt.push_str("- If the existing work is incomplete or outside authority, return status=failed or status=blocked with findings instead of inventing new work.\n");
+    prompt.push_str("- Include acceptance_status objects for every acceptance criterion with criterion, status, and evidence.\n");
+    prompt.push_str("- Return only JSON.\n");
+    prompt.push_str("\nInvalid output evidence artifact:\n");
+    prompt.push_str(invalid_output_artifact);
+    prompt.push_str("\n\nPrevious envelope failure:\n\n");
+    prompt.push_str(previous_failure);
+    prompt.push_str("\n\nSlice summary:\n");
+    prompt.push_str(&must_json(&handoff.slice));
+    prompt
+}
+
+pub fn slice_repair_prompt(
+    handoff_path: &str,
+    handoff: &Handoff,
+    check_summary: &str,
+    check_artifact: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are a Khazad-Doom Targeted Slice Repair Worker.\n\n");
+    prompt.push_str("Read this handoff JSON first:\n");
+    prompt.push_str(handoff_path);
+    prompt.push_str("\n\nContract:\n");
+    prompt.push_str("- Repair only the daemon-owned slice verification failure shown below.\n");
+    prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
+    prompt.push_str("- Stay inside the slice areas and accepted revision grants; do not auto-authorize out-of-area changes.\n");
+    prompt.push_str("- Do not change workflow policy, slice contracts, dependencies, worker profiles, or verification commands.\n");
+    prompt.push_str("- If the fix requires new intent or out-of-area authority, return status=blocked with an ask-user finding.\n");
+    prompt.push_str(
+        "- Commit any fix on the current branch, leave the worktree clean, and return only JSON.\n",
+    );
+    prompt.push_str("\nFailing check artifact:\n");
+    prompt.push_str(check_artifact);
+    prompt.push_str("\n\nExact failing command output:\n\n");
+    prompt.push_str(check_summary);
+    prompt.push_str("\n\nSlice summary:\n");
+    prompt.push_str(&must_json(&handoff.slice));
+    prompt
+}
+
 pub fn integration_repair_prompt(
     run_id: &str,
     integration_worktree: &str,

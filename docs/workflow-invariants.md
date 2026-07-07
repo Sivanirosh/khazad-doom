@@ -159,6 +159,12 @@ This section is the Phase 2 doctrine diff from `REVISION_PLAN.md`; it records wh
   - Enforcement mechanism: daemon writes `*.worker.attempt-N.invalid-output.json`, records `invalid_worker_output` events, and updates slice attempts before retry/fail.
   - Violation-detecting test: invalid JSON and schema retry fixture preserves artifacts/events and counts all attempts/economics.
   - Status: accepted; RPL-02 implemented.
+- **Bounded worker-attempt recovery separates evidence-envelope repair from implementation authority.**
+  - Proposed invariant text: invalid/missing/schema-invalid worker JSON may consume a small envelope re-emission budget against the existing worker head without burning implementation attempts; daemon-owned mechanical slice verify failures may get at most one targeted in-scope slice-repair attempt after normal attempts would otherwise become terminal; scope violations remain hard failures or RPL-02B proposal/grant cases, and ready siblings from a failed parallel layer remain preserved-but-unmerged evidence. A false positive that auto-repairs beyond authority is worse than a false negative that blocks.
+  - Ledger entries: F-015; dogfood run `kd-20260707-153202-9f41ac7c` terminal worker evidence-envelope failure; CPLX-03 ready sibling discarded under preserved layer atomicity; durable invalid-worker-output artifacts/events for CPLX-04.
+  - Enforcement mechanism: typed `worker_attempt_failure` events with attempt, slice id, evidence path, retry disposition, and repair disposition; default two envelope retries; one targeted slice-repair attempt only for `command_failed` slice checks; existing path guards for scope violations and RPL-02B accepted grants; parallel-layer failure outcomes include preserved-unmerged branch/commit evidence.
+  - Violation-detecting test: fake runner sequence invalid envelope output -> scope violation -> mechanical verify failure -> targeted repair succeeds, plus a final-envelope-failure fixture that preserves invalid-output artifacts/events through exhaustion.
+  - Status: accepted; REPAIR-01 implemented.
 - **Terminal blocked/failed states carry structured reason data.**
   - Proposed invariant text: `blocked`/`failed` are not enough; terminal artifacts include primary reason kind, resolution owner, retryability/operator-action flags where applicable, evidence links, and remediation/disposition links.
   - Ledger entries: F-004, F-006, F-009.

@@ -15,13 +15,14 @@ use super::gate::{
 use super::read_model::authorized_paths_from_proposal;
 use super::{
     CancelledError, REPAIR_RESULT_SCHEMA, RunReadModel, RunReadModelBuilder, RunReadModelOptions,
-    WORKER_RESULT_SCHEMA, check_cancelled, integration_repair_prompt, worker_prompt,
+    WORKER_RESULT_SCHEMA, check_cancelled, integration_repair_prompt, slice_repair_prompt,
+    worker_envelope_retry_prompt, worker_prompt,
 };
 use crate::agent::{
-    CancellationToken, Job, PiCommandSpec, PiWrapperArtifacts, Runner, RunnerError, RunnerEvent,
-    RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, RunnerTranscript,
-    collect_pi_wrapper_result, prepare_pi_wrapper_artifacts, runner_from_spec,
-    wait_for_pi_wrapper_launch, worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
+    CancellationToken, Job, PiCommandSpec, Runner, RunnerError, RunnerEvent, RunnerEventSink,
+    RunnerLaunchFailure, RunnerMetadata, RunnerTranscript, collect_pi_wrapper_result,
+    prepare_pi_wrapper_artifacts, runner_from_spec, wait_for_pi_wrapper_launch,
+    worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
 };
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
@@ -57,6 +58,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const MAX_WORKER_ATTEMPTS: usize = 3;
+pub const DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS: usize = 2;
+pub const DEFAULT_SLICE_REPAIR_ATTEMPTS: usize = 1;
 pub const DEFAULT_REPAIR_ATTEMPTS: usize = 1;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -214,6 +217,69 @@ struct AgentCallContext<'a> {
     phase: &'a str,
     slice_id: &'a str,
     attempt: usize,
+}
+
+enum WorkerAttemptRunResult {
+    Valid(Box<WorkerResult>),
+    Continue,
+}
+
+struct WorkerAttemptRunRequest<'a> {
+    run: &'a Run,
+    slice: &'a Slice,
+    attempt: usize,
+    runner: Arc<dyn Runner>,
+    runner_metadata: &'a RunnerMetadata,
+    handoff_path: &'a Path,
+    handoff: &'a Handoff,
+    prompt: String,
+    worker_worktree: &'a Path,
+    worker_branch: &'a str,
+    output_path: &'a Path,
+    config: &'a WorkflowConfig,
+    economics: &'a RunEconomicsRecorder,
+    cancel: &'a CancellationToken,
+    worker_token: &'a str,
+    cockpit_mode: CockpitMode,
+    primary_failure: &'a mut Option<String>,
+    secondary_failures: &'a mut Vec<String>,
+    last_failure: &'a mut String,
+}
+
+struct WorkerAttemptFailureRecord<'a> {
+    run: &'a Run,
+    slice: &'a Slice,
+    attempt: usize,
+    envelope_retry: usize,
+    phase: &'a str,
+    failure_kind: &'a str,
+    summary: &'a str,
+    evidence_path: &'a Path,
+    retry_disposition: &'a str,
+    repair_disposition: &'a str,
+    primary_failure: Option<&'a str>,
+    secondary_failures: &'a [String],
+}
+
+struct TargetedSliceRepairRequest<'a> {
+    run: &'a Run,
+    slice: &'a Slice,
+    attempt: usize,
+    runner: Arc<dyn Runner>,
+    handoff_path: &'a Path,
+    handoff: &'a Handoff,
+    worker_worktree: &'a Path,
+    worker_branch: &'a str,
+    slice_base_sha: &'a str,
+    check_path: &'a Path,
+    check: &'a CheckResult,
+    config: &'a WorkflowConfig,
+    economics: &'a RunEconomicsRecorder,
+    verification_cache: &'a VerificationCommandCache,
+    cancel: &'a CancellationToken,
+    worker_token: &'a str,
+    cockpit_mode: CockpitMode,
+    all_checks: &'a mut Vec<CheckResult>,
 }
 
 struct AgentLaunchIncidentContext<'a> {
@@ -736,7 +802,8 @@ impl Manager {
         if cancel.is_cancelled() {
             return Err(CockpitWorkerJobError::Worker(anyhow!("job cancelled")));
         }
-        let artifacts = PiWrapperArtifacts::for_output_path(output_path)
+        let artifacts = artifact::Store::new(&run.repo_path)
+            .pi_wrapper_artifacts_for_output_path(output_path)
             .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
         let wrapper_command = prepare_pi_wrapper_artifacts(spec, job, &artifacts)
             .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
@@ -2400,12 +2467,28 @@ impl Manager {
                     summary = slice_run.last_error.clone();
                 }
             }
-            outcomes.push(json!({
+            let preserved = results
+                .get(slice_id)
+                .and_then(|result| result.as_ref().ok())
+                .map(|outcome| {
+                    json!({
+                        "branch": &outcome.branch,
+                        "commit_sha": &outcome.result.commit_sha,
+                        "disposition": "preserved_unmerged_due_to_layer_atomicity",
+                    })
+                });
+            let mut outcome = json!({
                 "slice_id": slice_id,
                 "status": status,
                 "attempts": attempts,
                 "summary": &summary,
-            }));
+            });
+            if let Some(preserved) = preserved
+                && let Some(object) = outcome.as_object_mut()
+            {
+                object.insert("preserved_unmerged".to_string(), preserved);
+            }
+            outcomes.push(outcome);
         }
         Ok(outcomes)
     }
@@ -2592,217 +2675,31 @@ impl Manager {
                 runner.name(),
                 "slice worker is running",
             );
-            let result = match self.run_recorded_slice_worker_job(
-                runner.clone(),
-                Job {
-                    kind: "slice-worker".to_string(),
+            let mut worker_result =
+                match self.run_worker_attempt_with_envelope(WorkerAttemptRunRequest {
+                    run,
+                    slice,
+                    attempt,
+                    runner: runner.clone(),
+                    runner_metadata: &runner_metadata,
+                    handoff_path: &handoff_path,
+                    handoff: &handoff,
                     prompt,
-                    cwd: worker_worktree.clone(),
-                    json_schema: WORKER_RESULT_SCHEMA.to_string(),
-                    env: worker_job_env(&self.paths, run, &slice.id, attempt, &ctx.worker_token),
-                    termination_grace_seconds: 0,
-                },
-                cancel,
-                WorkerAttemptContext::new(&run.id, "worker_running", &slice.id, attempt, config),
-                &economics,
-                AgentCallContext {
-                    phase: "slice_worker",
-                    slice_id: &slice.id,
-                    attempt,
-                },
-                run,
-                ctx.cockpit_mode,
-                &output_path,
-            ) {
-                Ok(result) => result,
-                Err(err) => {
-                    let launch_failure =
-                        self.classify_runner_launch_failure(err.as_ref(), &runner_metadata);
-                    last_failure = launch_failure
-                        .as_ref()
-                        .map(|failure| failure.summary.clone())
-                        .unwrap_or_else(|| err.to_string());
-                    remember_attempt_failure(
-                        &mut primary_failure,
-                        &mut secondary_failures,
-                        &last_failure,
-                    );
-                    if invalid_worker_output_error(&last_failure) {
-                        let transcript = err
-                            .downcast_ref::<RunnerError>()
-                            .map(|err| err.transcript().clone())
-                            .unwrap_or_default();
-                        self.record_invalid_worker_output_attempt(
-                            run,
-                            slice,
-                            attempt,
-                            &last_failure,
-                            &worker_worktree,
-                            &output_path,
-                            None,
-                            transcript,
-                        )?;
-                        self.update_invalid_worker_attempt_status(
-                            run,
-                            slice,
-                            &worker_branch,
-                            &worker_worktree,
-                            attempt,
-                            primary_failure.as_deref(),
-                            &last_failure,
-                            &secondary_failures,
-                        )?;
-                        continue;
-                    }
-                    self.write_worker_attempt_failure_artifact(
-                        run,
-                        slice,
-                        attempt,
-                        "worker_error",
-                        &last_failure,
-                        &worker_worktree,
-                        &output_path,
-                        Some(err.as_ref()),
-                    )?;
-                    if cancel.is_cancelled() {
-                        return Err(CancelledError::new("run cancelled").into());
-                    }
-                    self.state.record_event(
-                        &run.id,
-                        "worker_error",
-                        &workflow_events::WorkerErrorPayload {
-                            slice_id: slice.id.clone(),
-                            attempt,
-                            error: last_failure.clone(),
-                            primary_failure: primary_failure.clone(),
-                            secondary_failures: secondary_failures.clone(),
-                            failure_kind: launch_failure
-                                .as_ref()
-                                .map(|failure| failure.failure_kind.clone())
-                                .unwrap_or_default(),
-                            retryable: launch_failure.as_ref().map(|failure| failure.retryable),
-                            operator_action_required: launch_failure
-                                .as_ref()
-                                .map(|failure| failure.operator_action_required),
-                        },
-                    )?;
-                    if let Some(launch_failure) = launch_failure {
-                        self.record_agent_launch_incident(
-                            AgentLaunchIncidentContext {
-                                run,
-                                phase: "worker_running",
-                                slice_id: &slice.id,
-                                attempt,
-                                runner_name: runner.name(),
-                                metadata: &runner_metadata,
-                            },
-                            &launch_failure,
-                        )?;
-                        self.state.upsert_slice_run(&SliceRun {
-                            run_id: run.id.clone(),
-                            slice_id: slice.id.clone(),
-                            status: SliceStatus::Blocked,
-                            branch: worker_branch.clone(),
-                            commit_sha: gitutil::head_sha(&worker_worktree).unwrap_or_default(),
-                            attempts: attempt,
-                            last_error: launch_failure.summary.clone(),
-                        })?;
-                        return Err(BlockedError::new(launch_failure.summary).into());
-                    }
-                    continue;
-                }
-            };
-
-            let Some(output) = result.output else {
-                last_failure = "worker returned no JSON output".to_string();
-                remember_attempt_failure(
-                    &mut primary_failure,
-                    &mut secondary_failures,
-                    &last_failure,
-                );
-                self.record_invalid_worker_output_attempt(
-                    run,
-                    slice,
-                    attempt,
-                    &last_failure,
-                    &worker_worktree,
-                    &output_path,
-                    None,
-                    RunnerTranscript::default(),
-                )?;
-                self.update_invalid_worker_attempt_status(
-                    run,
-                    slice,
-                    &worker_branch,
-                    &worker_worktree,
-                    attempt,
-                    primary_failure.as_deref(),
-                    &last_failure,
-                    &secondary_failures,
-                )?;
-                continue;
-            };
-            let mut worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
-                Ok(value) => value,
-                Err(err) => {
-                    last_failure = format!("worker JSON did not match result model: {err}");
-                    remember_attempt_failure(
-                        &mut primary_failure,
-                        &mut secondary_failures,
-                        &last_failure,
-                    );
-                    self.record_invalid_worker_output_attempt(
-                        run,
-                        slice,
-                        attempt,
-                        &last_failure,
-                        &worker_worktree,
-                        &output_path,
-                        Some(output),
-                        RunnerTranscript::default(),
-                    )?;
-                    self.update_invalid_worker_attempt_status(
-                        run,
-                        slice,
-                        &worker_branch,
-                        &worker_worktree,
-                        attempt,
-                        primary_failure.as_deref(),
-                        &last_failure,
-                        &secondary_failures,
-                    )?;
-                    continue;
-                }
-            };
-            if let Err(err) = validate_worker_result(&worker_result, slice) {
-                last_failure = format!("worker JSON failed validation: {err}");
-                remember_attempt_failure(
-                    &mut primary_failure,
-                    &mut secondary_failures,
-                    &last_failure,
-                );
-                self.record_invalid_worker_output_attempt(
-                    run,
-                    slice,
-                    attempt,
-                    &last_failure,
-                    &worker_worktree,
-                    &output_path,
-                    Some(serde_json::to_value(&worker_result).unwrap_or_default()),
-                    RunnerTranscript::default(),
-                )?;
-                self.update_invalid_worker_attempt_status(
-                    run,
-                    slice,
-                    &worker_branch,
-                    &worker_worktree,
-                    attempt,
-                    primary_failure.as_deref(),
-                    &last_failure,
-                    &secondary_failures,
-                )?;
-                continue;
-            }
+                    worker_worktree: &worker_worktree,
+                    worker_branch: &worker_branch,
+                    output_path: &output_path,
+                    config,
+                    economics: &economics,
+                    cancel,
+                    worker_token: &ctx.worker_token,
+                    cockpit_mode: ctx.cockpit_mode,
+                    primary_failure: &mut primary_failure,
+                    secondary_failures: &mut secondary_failures,
+                    last_failure: &mut last_failure,
+                })? {
+                    WorkerAttemptRunResult::Valid(worker_result) => *worker_result,
+                    WorkerAttemptRunResult::Continue => continue,
+                };
             self.create_worker_finding_replan_proposals(
                 run,
                 slice,
@@ -2846,13 +2743,11 @@ impl Manager {
                 },
                 cancel,
             )?;
-            artifact::write_json(
-                store.output_path(
-                    &run.id,
-                    &format!("{}.check.attempt-{attempt}.json", slice.id),
-                ),
-                &check,
-            )?;
+            let check_path = store.output_path(
+                &run.id,
+                &format!("{}.check.attempt-{attempt}.json", slice.id),
+            );
+            artifact::write_json(&check_path, &check)?;
             all_checks.push(check.clone());
 
             if check.status == "passed" && worker_result.status == "complete" {
@@ -2897,6 +2792,20 @@ impl Manager {
                     &mut secondary_failures,
                     &last_failure,
                 );
+                self.record_worker_attempt_failure(WorkerAttemptFailureRecord {
+                    run,
+                    slice,
+                    attempt,
+                    envelope_retry: 0,
+                    phase: "worker_verify",
+                    failure_kind: worker_attempt_failure_kind(&check, &worker_result),
+                    summary: &last_failure,
+                    evidence_path: &check_path,
+                    retry_disposition: worker_attempt_retry_disposition(attempt),
+                    repair_disposition: worker_attempt_repair_disposition(attempt, &check),
+                    primary_failure: primary_failure.as_deref(),
+                    secondary_failures: &secondary_failures,
+                })?;
             }
             if check_failure_needs_operator(&check) {
                 let message = final_attempt_failure_message(
@@ -2930,6 +2839,30 @@ impl Manager {
                 .into());
             }
             if attempt == MAX_WORKER_ATTEMPTS {
+                if let Some(outcome) =
+                    self.run_targeted_slice_repair(TargetedSliceRepairRequest {
+                        run,
+                        slice,
+                        attempt,
+                        runner: runner.clone(),
+                        handoff_path: &handoff_path,
+                        handoff: &handoff,
+                        worker_worktree: &worker_worktree,
+                        worker_branch: &worker_branch,
+                        slice_base_sha: &ctx.slice_base_sha,
+                        check_path: &check_path,
+                        check: &check,
+                        config,
+                        economics: &economics,
+                        verification_cache: &verification_cache,
+                        cancel,
+                        worker_token: &ctx.worker_token,
+                        cockpit_mode: ctx.cockpit_mode,
+                        all_checks: &mut all_checks,
+                    })?
+                {
+                    return Ok(outcome);
+                }
                 let message = final_attempt_failure_message(
                     &slice.id,
                     primary_failure.as_deref(),
@@ -3275,25 +3208,53 @@ impl Manager {
         Ok(proposal.id)
     }
 
+    fn record_worker_attempt_failure(&self, record: WorkerAttemptFailureRecord<'_>) -> Result<()> {
+        self.state.record_event(
+            &record.run.id,
+            workflow_events::WORKER_ATTEMPT_FAILURE,
+            &workflow_events::WorkerAttemptFailurePayload {
+                slice_id: record.slice.id.clone(),
+                attempt: record.attempt,
+                envelope_retry: record.envelope_retry,
+                phase: record.phase.to_string(),
+                failure_kind: record.failure_kind.to_string(),
+                summary: bounded_text(record.summary, 4_000),
+                evidence_path: record.evidence_path.to_string_lossy().to_string(),
+                retry_disposition: record.retry_disposition.to_string(),
+                repair_disposition: record.repair_disposition.to_string(),
+                primary_failure: record.primary_failure.map(str::to_string),
+                secondary_failures: record.secondary_failures.to_vec(),
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record_invalid_worker_output_attempt(
         &self,
         run: &Run,
         slice: &Slice,
         attempt: usize,
+        envelope_retry: usize,
         error: &str,
         worker_worktree: &Path,
         expected_output_path: &Path,
+        retry_disposition: &str,
+        repair_disposition: &str,
         raw_payload: Option<serde_json::Value>,
         transcript: RunnerTranscript,
     ) -> Result<PathBuf> {
         let store = artifact::Store::new(&run.repo_path);
         store.ensure_run_dirs(&run.id)?;
         let progress = self.state.get_progress(&run.id)?;
-        let invalid_output_path = store.output_path(
-            &run.id,
-            &format!("{}.worker.attempt-{attempt}.invalid-output.json", slice.id),
-        );
+        let invalid_output_name = if envelope_retry == 0 {
+            format!("{}.worker.attempt-{attempt}.invalid-output.json", slice.id)
+        } else {
+            format!(
+                "{}.worker.attempt-{attempt}.envelope-{envelope_retry}.invalid-output.json",
+                slice.id
+            )
+        };
+        let invalid_output_path = store.output_path(&run.id, &invalid_output_name);
         let raw_payload_text = raw_payload
             .as_ref()
             .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
@@ -3307,6 +3268,7 @@ impl Manager {
             "run_id": run.id,
             "slice_id": slice.id,
             "attempt": attempt,
+            "envelope_retry": envelope_retry,
             "phase": "invalid_worker_output",
             "parse_error": bounded_text(error, 20_000),
             "expected_output_path": expected_output_path.to_string_lossy(),
@@ -3328,6 +3290,7 @@ impl Manager {
             &json!({
                 "slice_id": slice.id,
                 "attempt": attempt,
+                "envelope_retry": envelope_retry,
                 "parse_error": bounded_text(error, 4_000),
                 "artifact_path": invalid_output_path,
                 "expected_output_path": expected_output_path,
@@ -3337,6 +3300,20 @@ impl Manager {
                 "assistant_tail": bounded_text(&transcript.assistant_tail, 4_000),
             }),
         )?;
+        self.record_worker_attempt_failure(WorkerAttemptFailureRecord {
+            run,
+            slice,
+            attempt,
+            envelope_retry,
+            phase: "invalid_worker_output",
+            failure_kind: "invalid_worker_output",
+            summary: error,
+            evidence_path: &invalid_output_path,
+            retry_disposition,
+            repair_disposition,
+            primary_failure: Some(error),
+            secondary_failures: &[],
+        })?;
         Ok(invalid_output_path)
     }
 
@@ -3431,6 +3408,647 @@ impl Manager {
         // Best-effort only: attempt artifacts are diagnostic and must not fail the workflow.
         gitutil::run(&run.repo_path, &["rev-parse", &run.integration_branch])
             .unwrap_or_else(|_| run.base_sha.clone())
+    }
+
+    fn run_worker_attempt_with_envelope(
+        &self,
+        request: WorkerAttemptRunRequest<'_>,
+    ) -> Result<WorkerAttemptRunResult> {
+        let run = request.run;
+        let slice = request.slice;
+        let attempt = request.attempt;
+        let result = match self.run_recorded_slice_worker_job(
+            request.runner.clone(),
+            Job {
+                kind: "slice-worker".to_string(),
+                prompt: request.prompt.clone(),
+                cwd: request.worker_worktree.to_path_buf(),
+                json_schema: WORKER_RESULT_SCHEMA.to_string(),
+                env: worker_job_env(&self.paths, run, &slice.id, attempt, request.worker_token),
+                termination_grace_seconds: 0,
+            },
+            request.cancel,
+            WorkerAttemptContext::new(
+                &run.id,
+                "worker_running",
+                &slice.id,
+                attempt,
+                request.config,
+            ),
+            request.economics,
+            AgentCallContext {
+                phase: "slice_worker",
+                slice_id: &slice.id,
+                attempt,
+            },
+            run,
+            request.cockpit_mode,
+            request.output_path,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                let launch_failure =
+                    self.classify_runner_launch_failure(err.as_ref(), request.runner_metadata);
+                *request.last_failure = launch_failure
+                    .as_ref()
+                    .map(|failure| failure.summary.clone())
+                    .unwrap_or_else(|| err.to_string());
+                remember_attempt_failure(
+                    request.primary_failure,
+                    request.secondary_failures,
+                    request.last_failure,
+                );
+                if invalid_worker_output_error(request.last_failure) {
+                    let transcript = err
+                        .downcast_ref::<RunnerError>()
+                        .map(|err| err.transcript().clone())
+                        .unwrap_or_default();
+                    let invalid_artifact = self.record_invalid_worker_output_attempt(
+                        run,
+                        slice,
+                        attempt,
+                        0,
+                        request.last_failure,
+                        request.worker_worktree,
+                        request.output_path,
+                        "envelope_retry_pending",
+                        "none",
+                        None,
+                        transcript,
+                    )?;
+                    return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
+                }
+                self.write_worker_attempt_failure_artifact(
+                    run,
+                    slice,
+                    attempt,
+                    "worker_error",
+                    request.last_failure,
+                    request.worker_worktree,
+                    request.output_path,
+                    Some(err.as_ref()),
+                )?;
+                if request.cancel.is_cancelled() {
+                    return Err(CancelledError::new("run cancelled").into());
+                }
+                self.state.record_event(
+                    &run.id,
+                    "worker_error",
+                    &workflow_events::WorkerErrorPayload {
+                        slice_id: slice.id.clone(),
+                        attempt,
+                        error: request.last_failure.clone(),
+                        primary_failure: (*request.primary_failure).clone(),
+                        secondary_failures: (*request.secondary_failures).clone(),
+                        failure_kind: launch_failure
+                            .as_ref()
+                            .map(|failure| failure.failure_kind.clone())
+                            .unwrap_or_default(),
+                        retryable: launch_failure.as_ref().map(|failure| failure.retryable),
+                        operator_action_required: launch_failure
+                            .as_ref()
+                            .map(|failure| failure.operator_action_required),
+                    },
+                )?;
+                if let Some(launch_failure) = launch_failure {
+                    self.record_agent_launch_incident(
+                        AgentLaunchIncidentContext {
+                            run,
+                            phase: "worker_running",
+                            slice_id: &slice.id,
+                            attempt,
+                            runner_name: request.runner.name(),
+                            metadata: request.runner_metadata,
+                        },
+                        &launch_failure,
+                    )?;
+                    self.state.upsert_slice_run(&SliceRun {
+                        run_id: run.id.clone(),
+                        slice_id: slice.id.clone(),
+                        status: SliceStatus::Blocked,
+                        branch: request.worker_branch.to_string(),
+                        commit_sha: gitutil::head_sha(request.worker_worktree).unwrap_or_default(),
+                        attempts: attempt,
+                        last_error: launch_failure.summary.clone(),
+                    })?;
+                    return Err(BlockedError::new(launch_failure.summary).into());
+                }
+                return Ok(WorkerAttemptRunResult::Continue);
+            }
+        };
+
+        let Some(output) = result.output else {
+            *request.last_failure = "worker returned no JSON output".to_string();
+            remember_attempt_failure(
+                request.primary_failure,
+                request.secondary_failures,
+                request.last_failure,
+            );
+            let invalid_artifact = self.record_invalid_worker_output_attempt(
+                run,
+                slice,
+                attempt,
+                0,
+                request.last_failure,
+                request.worker_worktree,
+                request.output_path,
+                "envelope_retry_pending",
+                "none",
+                None,
+                RunnerTranscript::default(),
+            )?;
+            return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
+        };
+        let worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
+            Ok(value) => value,
+            Err(err) => {
+                *request.last_failure = format!("worker JSON did not match result model: {err}");
+                remember_attempt_failure(
+                    request.primary_failure,
+                    request.secondary_failures,
+                    request.last_failure,
+                );
+                let invalid_artifact = self.record_invalid_worker_output_attempt(
+                    run,
+                    slice,
+                    attempt,
+                    0,
+                    request.last_failure,
+                    request.worker_worktree,
+                    request.output_path,
+                    "envelope_retry_pending",
+                    "none",
+                    Some(output),
+                    RunnerTranscript::default(),
+                )?;
+                return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
+            }
+        };
+        if let Err(err) = validate_worker_result(&worker_result, slice) {
+            *request.last_failure = format!("worker JSON failed validation: {err}");
+            remember_attempt_failure(
+                request.primary_failure,
+                request.secondary_failures,
+                request.last_failure,
+            );
+            let invalid_artifact = self.record_invalid_worker_output_attempt(
+                run,
+                slice,
+                attempt,
+                0,
+                request.last_failure,
+                request.worker_worktree,
+                request.output_path,
+                "envelope_retry_pending",
+                "none",
+                Some(serde_json::to_value(&worker_result).unwrap_or_default()),
+                RunnerTranscript::default(),
+            )?;
+            return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
+        }
+        Ok(WorkerAttemptRunResult::Valid(Box::new(worker_result)))
+    }
+
+    fn run_targeted_slice_repair(
+        &self,
+        request: TargetedSliceRepairRequest<'_>,
+    ) -> Result<Option<SliceWorkerOutcome>> {
+        if !check_failure_allows_targeted_slice_repair(request.check) {
+            return Ok(None);
+        }
+        for repair_attempt in 1..=DEFAULT_SLICE_REPAIR_ATTEMPTS {
+            check_cancelled(request.cancel)?;
+            let store = artifact::Store::new(&request.run.repo_path);
+            let repair_output_path = store.output_path(
+                &request.run.id,
+                &format!(
+                    "{}.worker.attempt-{}.slice-repair-{repair_attempt}.json",
+                    request.slice.id, request.attempt
+                ),
+            );
+            self.mark_progress(
+                &request.run.id,
+                "slice_repair",
+                &request.slice.id,
+                request.attempt,
+                request.runner.name(),
+                "targeted in-scope slice repair is running",
+            );
+            let prompt = slice_repair_prompt(
+                &request.handoff_path.to_string_lossy(),
+                request.handoff,
+                &request.check.summary,
+                &request.check_path.to_string_lossy(),
+            );
+            let agent_result = self.run_recorded_slice_worker_job(
+                request.runner.clone(),
+                Job {
+                    kind: "slice-repair".to_string(),
+                    prompt,
+                    cwd: request.worker_worktree.to_path_buf(),
+                    json_schema: WORKER_RESULT_SCHEMA.to_string(),
+                    env: worker_job_env(
+                        &self.paths,
+                        request.run,
+                        &request.slice.id,
+                        request.attempt,
+                        request.worker_token,
+                    ),
+                    termination_grace_seconds: request.config.worker_termination_grace_seconds,
+                },
+                request.cancel,
+                WorkerAttemptContext::new(
+                    &request.run.id,
+                    "slice_repair",
+                    &request.slice.id,
+                    request.attempt,
+                    request.config,
+                ),
+                request.economics,
+                AgentCallContext {
+                    phase: "slice_repair",
+                    slice_id: &request.slice.id,
+                    attempt: request.attempt,
+                },
+                request.run,
+                request.cockpit_mode,
+                &repair_output_path,
+            )?;
+            let Some(output) = agent_result.output else {
+                self.record_invalid_worker_output_attempt(
+                    request.run,
+                    request.slice,
+                    request.attempt,
+                    repair_attempt,
+                    "slice repair returned no JSON output",
+                    request.worker_worktree,
+                    &repair_output_path,
+                    "slice_repair_exhausted",
+                    "slice_repair_failed",
+                    None,
+                    RunnerTranscript::default(),
+                )?;
+                return Ok(None);
+            };
+            let mut worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.record_invalid_worker_output_attempt(
+                        request.run,
+                        request.slice,
+                        request.attempt,
+                        repair_attempt,
+                        &format!("slice repair JSON did not match result model: {err}"),
+                        request.worker_worktree,
+                        &repair_output_path,
+                        "slice_repair_exhausted",
+                        "slice_repair_failed",
+                        Some(output),
+                        RunnerTranscript::default(),
+                    )?;
+                    return Ok(None);
+                }
+            };
+            if let Err(err) = validate_worker_result(&worker_result, request.slice) {
+                self.record_invalid_worker_output_attempt(
+                    request.run,
+                    request.slice,
+                    request.attempt,
+                    repair_attempt,
+                    &format!("slice repair JSON failed validation: {err}"),
+                    request.worker_worktree,
+                    &repair_output_path,
+                    "slice_repair_exhausted",
+                    "slice_repair_failed",
+                    Some(serde_json::to_value(&worker_result).unwrap_or_default()),
+                    RunnerTranscript::default(),
+                )?;
+                return Ok(None);
+            }
+            self.create_worker_finding_replan_proposals(
+                request.run,
+                request.slice,
+                request.attempt,
+                &repair_output_path,
+                &mut worker_result,
+            )?;
+            artifact::write_json(&repair_output_path, &worker_result)?;
+            if worker_result.status == "blocked" {
+                self.state.update_slice_status(
+                    &request.run.id,
+                    &request.slice.id,
+                    SliceStatus::Blocked,
+                    &worker_result.summary,
+                )?;
+                return Err(BlockedError::new(format!(
+                    "slice repair reported blocked: {}",
+                    worker_result.summary
+                ))
+                .into());
+            }
+            if worker_result.status == "failed" {
+                return Ok(None);
+            }
+            self.run_worktree_setup(
+                request.run,
+                &request.slice.id,
+                request.attempt,
+                request.worker_worktree,
+                request.config,
+                request.economics.clone(),
+                request.verification_cache.clone(),
+                request.cancel,
+            )?;
+            let repair_check = self.lightweight_check(
+                LightweightCheckContext {
+                    run_id: &request.run.id,
+                    slice: request.slice,
+                    worker_worktree: request.worker_worktree,
+                    base_sha: request.slice_base_sha,
+                    attempt: request.attempt,
+                    config: request.config,
+                    economics: request.economics.clone(),
+                    verification_cache: request.verification_cache.clone(),
+                },
+                request.cancel,
+            )?;
+            let repair_check_path = store.output_path(
+                &request.run.id,
+                &format!(
+                    "{}.check.attempt-{}.slice-repair-{repair_attempt}.json",
+                    request.slice.id, request.attempt
+                ),
+            );
+            artifact::write_json(&repair_check_path, &repair_check)?;
+            request.all_checks.push(repair_check.clone());
+            if repair_check.status == "passed" && worker_result.status == "complete" {
+                if worker_result.commit_sha.is_empty() {
+                    worker_result.commit_sha = repair_check.worker_head.clone();
+                }
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: request.run.id.clone(),
+                    slice_id: request.slice.id.clone(),
+                    status: SliceStatus::ReadyToMerge,
+                    branch: request.worker_branch.to_string(),
+                    commit_sha: worker_result.commit_sha.clone(),
+                    attempts: request.attempt,
+                    last_error: String::new(),
+                })?;
+                self.state.record_event(
+                    &request.run.id,
+                    "slice_repair_completed",
+                    &json!({
+                        "slice_id": request.slice.id,
+                        "attempt": request.attempt,
+                        "repair_attempt": repair_attempt,
+                        "status": "fixed",
+                        "trigger_failure_kind": request.check.failure_kind,
+                        "check_path": repair_check_path,
+                        "output_path": repair_output_path,
+                    }),
+                )?;
+                return Ok(Some(SliceWorkerOutcome {
+                    slice: request.slice.clone(),
+                    result: worker_result,
+                    checks: request.all_checks.clone(),
+                    branch: request.worker_branch.to_string(),
+                    attempts: request.attempt,
+                }));
+            }
+            self.record_worker_attempt_failure(WorkerAttemptFailureRecord {
+                run: request.run,
+                slice: request.slice,
+                attempt: request.attempt,
+                envelope_retry: 0,
+                phase: "slice_repair_verify",
+                failure_kind: worker_attempt_failure_kind(&repair_check, &worker_result),
+                summary: &repair_check.summary,
+                evidence_path: &repair_check_path,
+                retry_disposition: "terminal",
+                repair_disposition: "slice_repair_exhausted",
+                primary_failure: Some(&request.check.summary),
+                secondary_failures: &[],
+            })?;
+        }
+        Ok(None)
+    }
+
+    fn finish_invalid_worker_output_or_reemit(
+        &self,
+        request: WorkerAttemptRunRequest<'_>,
+        invalid_artifact: &Path,
+    ) -> Result<WorkerAttemptRunResult> {
+        if let Some(worker_result) = self.retry_worker_envelope_reemission(
+            request.run,
+            request.slice,
+            request.attempt,
+            request.runner.clone(),
+            request.handoff_path,
+            request.handoff,
+            request.worker_worktree,
+            request.config,
+            request.economics,
+            request.cancel,
+            request.worker_token,
+            request.cockpit_mode,
+            request.last_failure,
+            invalid_artifact,
+            request.primary_failure,
+            request.secondary_failures,
+        )? {
+            return Ok(WorkerAttemptRunResult::Valid(Box::new(worker_result)));
+        }
+        self.update_invalid_worker_attempt_status(
+            request.run,
+            request.slice,
+            request.worker_branch,
+            request.worker_worktree,
+            request.attempt,
+            request.primary_failure.as_deref(),
+            request.last_failure,
+            request.secondary_failures,
+        )?;
+        Ok(WorkerAttemptRunResult::Continue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retry_worker_envelope_reemission(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        attempt: usize,
+        runner: Arc<dyn Runner>,
+        handoff_path: &Path,
+        handoff: &Handoff,
+        worker_worktree: &Path,
+        config: &WorkflowConfig,
+        economics: &RunEconomicsRecorder,
+        cancel: &CancellationToken,
+        worker_token: &str,
+        cockpit_mode: CockpitMode,
+        initial_failure: &str,
+        initial_invalid_artifact: &Path,
+        primary_failure: &mut Option<String>,
+        secondary_failures: &mut Vec<String>,
+    ) -> Result<Option<WorkerResult>> {
+        let store = artifact::Store::new(&run.repo_path);
+        let mut last_failure = initial_failure.to_string();
+        let mut last_artifact = initial_invalid_artifact.to_path_buf();
+        for envelope_retry in 1..=DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS {
+            check_cancelled(cancel)?;
+            let retry_output_path = store.output_path(
+                &run.id,
+                &format!(
+                    "{}.worker.attempt-{attempt}.envelope-{envelope_retry}.json",
+                    slice.id
+                ),
+            );
+            self.mark_progress(
+                &run.id,
+                "worker_envelope_retry",
+                &slice.id,
+                attempt,
+                runner.name(),
+                "worker is re-emitting a valid JSON envelope for existing evidence",
+            );
+            let prompt = worker_envelope_retry_prompt(
+                &handoff_path.to_string_lossy(),
+                handoff,
+                &last_failure,
+                &last_artifact.to_string_lossy(),
+            );
+            let result = self.run_recorded_slice_worker_job(
+                runner.clone(),
+                Job {
+                    kind: "slice-envelope-retry".to_string(),
+                    prompt,
+                    cwd: worker_worktree.to_path_buf(),
+                    json_schema: WORKER_RESULT_SCHEMA.to_string(),
+                    env: worker_job_env(&self.paths, run, &slice.id, attempt, worker_token),
+                    termination_grace_seconds: config.worker_termination_grace_seconds,
+                },
+                cancel,
+                WorkerAttemptContext::new(
+                    &run.id,
+                    "worker_envelope_retry",
+                    &slice.id,
+                    attempt,
+                    config,
+                ),
+                economics,
+                AgentCallContext {
+                    phase: "slice_worker_envelope_retry",
+                    slice_id: &slice.id,
+                    attempt,
+                },
+                run,
+                cockpit_mode,
+                &retry_output_path,
+            );
+            let retry_disposition = if envelope_retry == DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS {
+                "envelope_retry_exhausted"
+            } else {
+                "envelope_retry_pending"
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    last_failure = err.to_string();
+                    remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                    let transcript = err
+                        .downcast_ref::<RunnerError>()
+                        .map(|err| err.transcript().clone())
+                        .unwrap_or_default();
+                    last_artifact = self.record_invalid_worker_output_attempt(
+                        run,
+                        slice,
+                        attempt,
+                        envelope_retry,
+                        &last_failure,
+                        worker_worktree,
+                        &retry_output_path,
+                        retry_disposition,
+                        "none",
+                        None,
+                        transcript,
+                    )?;
+                    continue;
+                }
+            };
+            let Some(output) = result.output else {
+                last_failure = "worker envelope retry returned no JSON output".to_string();
+                remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                last_artifact = self.record_invalid_worker_output_attempt(
+                    run,
+                    slice,
+                    attempt,
+                    envelope_retry,
+                    &last_failure,
+                    worker_worktree,
+                    &retry_output_path,
+                    retry_disposition,
+                    "none",
+                    None,
+                    RunnerTranscript::default(),
+                )?;
+                continue;
+            };
+            let worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    last_failure =
+                        format!("worker envelope JSON did not match result model: {err}");
+                    remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                    last_artifact = self.record_invalid_worker_output_attempt(
+                        run,
+                        slice,
+                        attempt,
+                        envelope_retry,
+                        &last_failure,
+                        worker_worktree,
+                        &retry_output_path,
+                        retry_disposition,
+                        "none",
+                        Some(output),
+                        RunnerTranscript::default(),
+                    )?;
+                    continue;
+                }
+            };
+            if let Err(err) = validate_worker_result(&worker_result, slice) {
+                last_failure = format!("worker envelope JSON failed validation: {err}");
+                remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                last_artifact = self.record_invalid_worker_output_attempt(
+                    run,
+                    slice,
+                    attempt,
+                    envelope_retry,
+                    &last_failure,
+                    worker_worktree,
+                    &retry_output_path,
+                    retry_disposition,
+                    "none",
+                    Some(serde_json::to_value(&worker_result).unwrap_or_default()),
+                    RunnerTranscript::default(),
+                )?;
+                continue;
+            }
+            artifact::write_json(&retry_output_path, &worker_result)?;
+            self.state.record_event(
+                &run.id,
+                workflow_events::WORKER_ENVELOPE_RETRY_SUCCEEDED,
+                &json!({
+                    "slice_id": slice.id,
+                    "attempt": attempt,
+                    "envelope_retry": envelope_retry,
+                    "output_path": retry_output_path,
+                    "previous_invalid_output": initial_invalid_artifact,
+                    "disposition": "valid_envelope_reemitted_existing_worker_head",
+                }),
+            )?;
+            return Ok(Some(worker_result));
+        }
+        Ok(None)
     }
 
     fn integration_repair(&self, context: IntegrationRepairContext<'_>) -> Result<RepairResult> {
@@ -3798,6 +4416,38 @@ fn check_failure_needs_operator(check: &CheckResult) -> bool {
             .any(|finding| finding.action == "operator-fix")
 }
 
+fn check_failure_allows_targeted_slice_repair(check: &CheckResult) -> bool {
+    check.status == "failed" && check.failure_kind == "command_failed"
+}
+
+fn worker_attempt_failure_kind<'a>(check: &'a CheckResult, result: &'a WorkerResult) -> &'a str {
+    if !check.failure_kind.trim().is_empty() {
+        &check.failure_kind
+    } else if result.status == "failed" {
+        "worker_reported_failed"
+    } else {
+        "worker_attempt_failed"
+    }
+}
+
+fn worker_attempt_retry_disposition(attempt: usize) -> &'static str {
+    if attempt < MAX_WORKER_ATTEMPTS {
+        "next_worker_attempt"
+    } else {
+        "normal_worker_attempts_exhausted"
+    }
+}
+
+fn worker_attempt_repair_disposition(attempt: usize, check: &CheckResult) -> &'static str {
+    if check.failure_kind == "scope_violation" {
+        "scope_violation_requires_replan_grant"
+    } else if attempt == MAX_WORKER_ATTEMPTS && check_failure_allows_targeted_slice_repair(check) {
+        "targeted_slice_repair_pending"
+    } else {
+        "none"
+    }
+}
+
 fn gate_needs_operator(gate: &GateResult) -> bool {
     gate.commands
         .iter()
@@ -4007,10 +4657,17 @@ fn parallel_layer_failure_summary(outcomes: &[serde_json::Value]) -> String {
                 .get("summary")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
+            let preserved = outcome
+                .get("preserved_unmerged")
+                .and_then(|preserved| preserved.get("commit_sha"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|commit| !commit.trim().is_empty())
+                .map(|commit| format!(" preserved-unmerged@{commit}"))
+                .unwrap_or_default();
             if summary.trim().is_empty() {
-                format!("{slice_id}={status}")
+                format!("{slice_id}={status}{preserved}")
             } else {
-                format!("{slice_id}={status} ({summary})")
+                format!("{slice_id}={status}{preserved} ({summary})")
             }
         })
         .collect::<Vec<_>>()
@@ -4849,8 +5506,8 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Manager, RunReadModelOptions, StartOptions, repair_authority_violations,
-        validate_repair_result, validate_worker_result,
+        MAX_WORKER_ATTEMPTS, Manager, RunReadModelOptions, StartOptions,
+        repair_authority_violations, validate_repair_result, validate_worker_result,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
@@ -4870,7 +5527,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -5114,6 +5774,76 @@ mod tests {
             slice_runs
                 .iter()
                 .all(|slice_run| slice_run.status == SliceStatus::Merged)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_layer_failure_reports_ready_sibling_as_preserved_unmerged() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["false".to_string()];
+        let mut second = slice("slice-002");
+        second.verify = vec!["test -f slice-002.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add parallel slices"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths.clone(),
+            state.clone(),
+            Arc::new(ReadySiblingFailRunner),
+        );
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: Vec::new(),
+            all: true,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 2,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+        })?;
+
+        let failed = wait_for_run(&state, &run.id)?;
+        assert_eq!(failed.status, RunStatus::Failed);
+        let events = state.get_events(&run.id, 200)?;
+        let failed_event = events
+            .iter()
+            .find(|event| event.typ == "parallel_layer_failed")
+            .expect("parallel_layer_failed event");
+        let outcomes = failed_event.payload["outcomes"].as_array().unwrap();
+        let ready = outcomes
+            .iter()
+            .find(|outcome| outcome["slice_id"].as_str() == Some("slice-002"))
+            .expect("ready sibling outcome");
+        assert_eq!(ready["status"].as_str(), Some("ready_to_merge"));
+        assert_eq!(
+            ready["preserved_unmerged"]["disposition"].as_str(),
+            Some("preserved_unmerged_due_to_layer_atomicity")
+        );
+        assert!(
+            ready["preserved_unmerged"]["branch"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("slice-002")
+        );
+        assert!(
+            !ready["preserved_unmerged"]["commit_sha"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
         );
         Ok(())
     }
@@ -6732,6 +7462,153 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn worker_attempt_failure_sequence_uses_envelope_retry_and_targeted_repair() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut test_slice = slice("slice-001");
+        test_slice.areas = vec!["slice-001.txt".to_string()];
+        test_slice.verify = vec!["grep '^repaired$' slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &test_slice)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add repair slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths,
+            state.clone(),
+            Arc::new(EnvelopeScopeVerifyRepairRunner::default()),
+        );
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert_eq!(slice_runs[0].status, SliceStatus::Merged);
+        assert_eq!(slice_runs[0].attempts, 3);
+        assert!(
+            store
+                .output_path(&run.id, "slice-001.worker.attempt-1.invalid-output.json")
+                .exists()
+        );
+        assert!(
+            store
+                .output_path(&run.id, "slice-001.worker.attempt-1.envelope-1.json")
+                .exists()
+        );
+        assert!(
+            store
+                .output_path(&run.id, "slice-001.check.attempt-3.slice-repair-1.json")
+                .exists()
+        );
+        let events = state.get_events(&run.id, 500)?;
+        assert!(events.iter().any(|event| {
+            event.typ == "worker_envelope_retry_succeeded"
+                && event.payload["slice_id"].as_str() == Some("slice-001")
+        }));
+        assert!(events.iter().any(|event| {
+            event.typ == "worker_attempt_failure"
+                && event.payload["failure_kind"].as_str() == Some("invalid_worker_output")
+        }));
+        assert!(events.iter().any(|event| {
+            event.typ == "worker_attempt_failure"
+                && event.payload["failure_kind"].as_str() == Some("scope_violation")
+                && event.payload["repair_disposition"].as_str()
+                    == Some("scope_violation_requires_replan_grant")
+        }));
+        assert!(events.iter().any(|event| {
+            event.typ == "worker_attempt_failure"
+                && event.payload["failure_kind"].as_str() == Some("command_failed")
+                && event.payload["repair_disposition"].as_str()
+                    == Some("targeted_slice_repair_pending")
+        }));
+        assert!(events.iter().any(|event| {
+            event.typ == "slice_repair_completed"
+                && event.payload["status"].as_str() == Some("fixed")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_worker_output_final_envelope_failure_preserves_terminal_artifacts() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        artifact::write_json(
+            store.slices_dir().join("slice-001.json"),
+            &slice("slice-001"),
+        )?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add invalid slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths,
+            state.clone(),
+            Arc::new(AlwaysInvalidEnvelopeRunner::default()),
+        );
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+        })?;
+
+        let failed = wait_for_run(&state, &run.id)?;
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert!(
+            store
+                .output_path(
+                    &run.id,
+                    "slice-001.worker.attempt-3.envelope-2.invalid-output.json",
+                )
+                .exists()
+        );
+        let events = state.get_events(&run.id, 500)?;
+        let invalid_events = events
+            .iter()
+            .filter(|event| event.typ == "invalid_worker_output")
+            .count();
+        assert_eq!(invalid_events, MAX_WORKER_ATTEMPTS * 3);
+        assert!(events.iter().any(|event| {
+            event.typ == "worker_attempt_failure"
+                && event.payload["retry_disposition"].as_str() == Some("envelope_retry_exhausted")
+                && event.payload["attempt"].as_u64() == Some(3)
+        }));
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert_eq!(slice_runs[0].status, SliceStatus::Failed);
+        assert!(slice_runs[0].last_error.contains("did not become ready"));
+        Ok(())
+    }
+
     fn terminal_notification_records(
         store: &ArtifactStore,
         run_id: &str,
@@ -6789,6 +7666,173 @@ mod tests {
         gitutil::run(path, &["add", "README.md"])?;
         gitutil::run(path, &["commit", "-m", "initial"])?;
         Ok(())
+    }
+
+    struct ReadySiblingFailRunner;
+
+    impl Runner for ReadySiblingFailRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            if handoff.slice.id == "slice-001" {
+                thread::sleep(Duration::from_millis(200));
+            }
+            fs::write(
+                job.cwd.join(format!("{}.txt", handoff.slice.id)),
+                format!("{}\n", handoff.slice.id),
+            )?;
+            gitutil::run(&job.cwd, &["add", "."])?;
+            gitutil::run(
+                &job.cwd,
+                &["commit", "-m", &format!("implement {}", handoff.slice.id)],
+            )?;
+            Ok(ResultData {
+                output: Some(valid_worker_output(&handoff, &job.cwd)?),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[derive(Default)]
+    struct EnvelopeScopeVerifyRepairRunner {
+        worker_calls: AtomicUsize,
+    }
+
+    impl Runner for EnvelopeScopeVerifyRepairRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            if job.kind == "slice-envelope-retry" {
+                return Ok(ResultData {
+                    output: Some(valid_worker_output(&handoff, &job.cwd)?),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            if job.kind == "slice-repair" {
+                fs::write(job.cwd.join("slice-001.txt"), "repaired\n")?;
+                gitutil::run(&job.cwd, &["add", "-A"])?;
+                gitutil::run(&job.cwd, &["commit", "-m", "targeted slice repair"])?;
+                return Ok(ResultData {
+                    output: Some(valid_worker_output(&handoff, &job.cwd)?),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            let call = self.worker_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            match call {
+                1 => {
+                    fs::write(job.cwd.join("slice-001.txt"), "scope violation attempt\n")?;
+                    fs::write(job.cwd.join("outside.txt"), "outside area\n")?;
+                    gitutil::run(&job.cwd, &["add", "-A"])?;
+                    gitutil::run(&job.cwd, &["commit", "-m", "invalid envelope scope work"])?;
+                    Ok(ResultData {
+                        output: Some(json!({
+                            "slice_id": handoff.slice.id,
+                            "summary": "missing status forces envelope retry"
+                        })),
+                        usage: Usage::default(),
+                        contract_warnings: Vec::new(),
+                    })
+                }
+                2 => {
+                    let _ = fs::remove_file(job.cwd.join("outside.txt"));
+                    fs::write(job.cwd.join("slice-001.txt"), "broken\n")?;
+                    gitutil::run(&job.cwd, &["add", "-A"])?;
+                    gitutil::run(&job.cwd, &["commit", "-m", "repair scope only"])?;
+                    Ok(ResultData {
+                        output: Some(valid_worker_output(&handoff, &job.cwd)?),
+                        usage: Usage::default(),
+                        contract_warnings: Vec::new(),
+                    })
+                }
+                _ => {
+                    fs::write(job.cwd.join("slice-001.txt"), "still failing\n")?;
+                    gitutil::run(&job.cwd, &["add", "-A"])?;
+                    gitutil::run(&job.cwd, &["commit", "-m", "still failing verify"])?;
+                    Ok(ResultData {
+                        output: Some(valid_worker_output(&handoff, &job.cwd)?),
+                        usage: Usage::default(),
+                        contract_warnings: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[derive(Default)]
+    struct AlwaysInvalidEnvelopeRunner {
+        calls: AtomicUsize,
+    }
+
+    impl Runner for AlwaysInvalidEnvelopeRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if job.kind == "slice-worker" {
+                let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+                let handoff: Handoff = artifact::read_json(&handoff_path)?;
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                fs::write(
+                    job.cwd.join(format!("{}-{call}.txt", handoff.slice.id)),
+                    format!("invalid {call}\n"),
+                )?;
+                gitutil::run(&job.cwd, &["add", "-A"])?;
+                gitutil::run(&job.cwd, &["commit", "-m", &format!("invalid {call}")])?;
+            }
+            Ok(ResultData {
+                output: Some(json!({"slice_id": "slice-001", "summary": "still invalid"})),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    fn valid_worker_output(handoff: &Handoff, cwd: &Path) -> Result<Value> {
+        let sha = gitutil::head_sha(cwd)?;
+        Ok(json!({
+            "slice_id": handoff.slice.id,
+            "status": "complete",
+            "summary": "worker output valid for current head",
+            "commit_sha": sha,
+            "changed_files": [format!("{}.txt", handoff.slice.id)],
+            "acceptance_status": acceptance_status_json(&handoff.slice)
+        }))
     }
 
     struct FakeRunner;

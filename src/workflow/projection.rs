@@ -6,8 +6,9 @@ use super::events::{
     ParallelLayerPayload, ProgressEventPayload, RUN_COMPLETED, RUN_INCIDENT, RUN_STARTED,
     RunIncidentPayload, SLICE_MERGED, SLICE_STARTED, SliceMergedPayload, SliceStartedPayload,
     TERMINAL_NOTIFICATION_SENT, TERMINAL_NOTIFICATION_SKIPPED, TERMINAL_SUMMARY_WRITTEN,
-    TerminalNotificationPayload, TerminalSummaryWrittenPayload, WORKER_QUESTION_ANSWERED,
-    WORKER_QUESTION_ASKED, WORKTREES_CLEANED, WorkerQuestionAskedPayload,
+    TerminalNotificationPayload, TerminalSummaryWrittenPayload, WORKER_ATTEMPT_FAILURE,
+    WORKER_QUESTION_ANSWERED, WORKER_QUESTION_ASKED, WORKTREES_CLEANED,
+    WorkerAttemptFailurePayload, WorkerQuestionAskedPayload,
 };
 use crate::domain::{
     Event, GateCommandResult, GateResult, RepairResult, ReplanProposalState, RunDetails,
@@ -1657,6 +1658,7 @@ fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
         typ if typ == TERMINAL_NOTIFICATION_SKIPPED => {
             terminal_notification_line(&event.payload, "skipped")
         }
+        typ if typ == WORKER_ATTEMPT_FAILURE => worker_attempt_failure_line(&event.payload),
         typ if typ == CHECKPOINT_WRITTEN => checkpoint_line(&event.payload),
         typ if typ == WORKER_QUESTION_ASKED => {
             let payload = WorkerQuestionAskedPayload::from_value(&event.payload);
@@ -1682,6 +1684,19 @@ fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {
             }
         }
     }
+}
+
+fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {
+    let payload = WorkerAttemptFailurePayload::from_value(payload);
+    Some(format!(
+        "Worker: {} attempt {} failed ({}) • retry={} • repair={} • evidence={}",
+        payload.slice_id,
+        payload.attempt,
+        payload.failure_kind,
+        payload.retry_disposition,
+        payload.repair_disposition,
+        payload.evidence_path
+    ))
 }
 
 fn run_incident_line(payload: &serde_json::Value) -> Option<String> {

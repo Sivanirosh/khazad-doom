@@ -18,6 +18,19 @@ pub struct Store {
     repo_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PiWrapperArtifacts {
+    pub prompt_path: PathBuf,
+    pub env_path: PathBuf,
+    pub wrapper_path: PathBuf,
+    pub command_path: PathBuf,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+    pub exit_path: PathBuf,
+    pub status_path: PathBuf,
+    pub result_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SliceClosureIncident {
     pub severity: String,
@@ -105,6 +118,32 @@ impl Store {
 
     pub fn output_dir(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("outputs")
+    }
+
+    pub(crate) fn pi_wrapper_artifacts_for_output_path(
+        &self,
+        output_path: &Path,
+    ) -> Result<PiWrapperArtifacts> {
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("worker output path has no parent"))?;
+        let file_name = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("worker output path is not UTF-8"))?;
+        let prefix = file_name.strip_suffix(".json").unwrap_or(file_name);
+        let path = |suffix: &str| parent.join(format!("{prefix}.herdr.{suffix}"));
+        Ok(PiWrapperArtifacts {
+            prompt_path: path("prompt.txt"),
+            env_path: path("env.sh"),
+            wrapper_path: path("wrapper.sh"),
+            command_path: path("command.json"),
+            stdout_path: path("stdout.ndjson"),
+            stderr_path: path("stderr.log"),
+            exit_path: path("exit.json"),
+            status_path: path("status.json"),
+            result_path: path("result.json"),
+        })
     }
 
     pub fn origin_path(&self, run_id: &str) -> PathBuf {

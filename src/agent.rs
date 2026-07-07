@@ -1,3 +1,4 @@
+use crate::artifact::PiWrapperArtifacts;
 use crate::domain::Handoff;
 use crate::pi_contract::{self, PiContractObservation, PiContractWarning, PiParser};
 use crate::{artifact, gitutil};
@@ -573,44 +574,6 @@ fn request_child_kill(pid: u32) {
 
 #[cfg(not(unix))]
 fn request_child_kill(_pid: u32) {}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PiWrapperArtifacts {
-    pub prompt_path: PathBuf,
-    pub env_path: PathBuf,
-    pub wrapper_path: PathBuf,
-    pub command_path: PathBuf,
-    pub stdout_path: PathBuf,
-    pub stderr_path: PathBuf,
-    pub exit_path: PathBuf,
-    pub status_path: PathBuf,
-    pub result_path: PathBuf,
-}
-
-impl PiWrapperArtifacts {
-    pub fn for_output_path(output_path: &Path) -> Result<Self> {
-        let parent = output_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("worker output path has no parent"))?;
-        let file_name = output_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("worker output path is not UTF-8"))?;
-        let prefix = file_name.strip_suffix(".json").unwrap_or(file_name);
-        let path = |suffix: &str| parent.join(format!("{prefix}.herdr.{suffix}"));
-        Ok(Self {
-            prompt_path: path("prompt.txt"),
-            env_path: path("env.sh"),
-            wrapper_path: path("wrapper.sh"),
-            command_path: path("command.json"),
-            stdout_path: path("stdout.ndjson"),
-            stderr_path: path("stderr.log"),
-            exit_path: path("exit.json"),
-            status_path: path("status.json"),
-            result_path: path("result.json"),
-        })
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 struct PiWrapperStatus {

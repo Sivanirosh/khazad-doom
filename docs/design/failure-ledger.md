@@ -187,6 +187,17 @@ Bounded evidence scope for this ledger:
 - **Remaining design gap:** Roadmap status must derive from slice/run state or be linted against it; docs must not become a second status ledger.
 - **Disposition:** Phase 1 roadmap truth audit. Candidate structural invariant: one live status source for roadmap work.
 
+### F-015 — Pre-merge worker failures exhausted attempts before repair could run
+
+- **Evidence grade:** A.
+- **Sources:** Dogfood run `kd-20260707-153202-9f41ac7c`; `.workflow/runs/kd-20260707-153202-9f41ac7c/outputs/CPLX-04.worker.attempt-1.invalid-output.json`; `CPLX-04.check.attempt-2.json`; `CPLX-04.check.attempt-3.json`; worker commits `6f9c79f` and `146d014` preserved on run branches.
+- **Symptom:** CPLX-04 produced an invalid worker evidence envelope, then scope-violation and clippy mechanical check failures. The slice never became `ready_to_merge`, so `integration_repair=auto` did not run. CPLX-03 reached `ready_to_merge` in the same failed layer but was correctly not merged because layer atomicity is load-bearing.
+- **Root-cause class:** design complexity.
+- **Invariant involved:** Invalid worker output and scope violations were preserved, but D2's “failures must not burn retries or masquerade as implementation failures” doctrine did not yet distinguish evidence-envelope repair from new implementation attempts.
+- **Current regression coverage:** REPAIR-01 adds typed `worker_attempt_failure` events, bounded envelope re-emission, one targeted in-scope slice repair for daemon-owned mechanical verify failures, scope-violation no-auto-repair disposition, and final-envelope-failure artifact preservation tests.
+- **Remaining design gap:** This is not evidence for broad autonomous repair. Unknown classes still keep existing retry/block behavior, and out-of-area changes require the RPL-02B proposal/grant path.
+- **Disposition:** Accepted as the motivating evidence for bounded pre-merge worker recovery. A false positive that auto-repairs beyond authority is worse than a false negative that blocks.
+
 ## Scoped commit accounting
 
 Post-`2a6fc7c` commits through the freeze boundary are accounted below. `Bypass/failure` means the work did not run through Khazad-Doom and is evidence for F-001 even if the change itself was useful.

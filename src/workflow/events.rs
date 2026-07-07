@@ -29,6 +29,8 @@ pub(crate) const SLICE_STARTED: &str = "slice_started";
 pub(crate) const TERMINAL_NOTIFICATION_SENT: &str = "terminal_notification_sent";
 pub(crate) const TERMINAL_NOTIFICATION_SKIPPED: &str = "terminal_notification_skipped";
 pub(crate) const TERMINAL_SUMMARY_WRITTEN: &str = "terminal_summary_written";
+pub(crate) const WORKER_ATTEMPT_FAILURE: &str = "worker_attempt_failure";
+pub(crate) const WORKER_ENVELOPE_RETRY_SUCCEEDED: &str = "worker_envelope_retry_succeeded";
 pub(crate) const WORKER_QUESTION_ANSWERED: &str = "worker_question_answered";
 pub(crate) const WORKER_QUESTION_ASKED: &str = "worker_question_asked";
 pub(crate) const WORKTREES_CLEANED: &str = "worktrees_cleaned";
@@ -611,6 +613,32 @@ impl WorkerAttemptTimeoutPayload {
             timeout_seconds,
             message: message.into(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct WorkerAttemptFailurePayload {
+    pub slice_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub envelope_retry: usize,
+    pub phase: String,
+    pub failure_kind: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence_path: String,
+    pub retry_disposition: String,
+    pub repair_disposition: String,
+    #[serde(default)]
+    pub primary_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_failures: Vec<String>,
+}
+
+impl WorkerAttemptFailurePayload {
+    pub(crate) fn from_value(value: &Value) -> Self {
+        decode_or_default(value)
     }
 }
 

@@ -127,7 +127,7 @@ Strict does not mean frozen. Acceptance criteria are minimum evidence, not an ex
 | Dependency order | Requested open slices include open dependencies, skip closed dependencies, and reject cycles. |
 | Worktree isolation | Parallel workers cannot trample the same checkout. |
 | Parallel layer safety | Every spawned worker in a parallel batch is joined and recorded before success/failure; integration starts only after the whole layer succeeds. |
-| Structured output | Worker and repair results must be machine-readable JSON. |
+| Structured output | Worker and repair results must be machine-readable JSON; malformed worker envelopes are preserved and may use a bounded re-emission budget without burning implementation attempts. |
 | Evidence separation | Workers produce acceptance evidence claims; daemon checks/gates attest or reject them. Workers do not approve their own evidence. |
 | Committed handoff | Completed slice work must be committed with a clean worktree. |
 | Verification | Slice commands and profile commands run before integration completes. |
@@ -143,6 +143,8 @@ Behavior-preserving refactor guardrails are collected in [`docs/workflow-invaria
 Slices use a small issue-style lifecycle. New slices are `open` by default. A successful daemon run closes completed slice JSON in the integration branch with `status: "closed"`, `closed_by_run`, and `closed_at`. Future runs skip closed dependencies instead of launching historical work again, and explicitly requesting a closed slice is rejected; create a follow-up slice for new work.
 
 Final reports and handoff JSON include explicit `exit_states` plus `evidence_attestation`. These are read-only summaries over existing worker, slice, gate, and handoff states; they do not add another gate or let a worker approve its own evidence.
+
+Pre-merge recovery is deliberately narrow: invalid or missing worker JSON gets bounded envelope re-emission for the existing worker head; daemon-owned mechanical slice verify failures can get one targeted in-scope repair after normal attempts would otherwise fail; scope violations still require the existing proposal/grant path. Ready siblings from a failed parallel layer stay preserved-but-unmerged evidence.
 
 ## Live progress
 
