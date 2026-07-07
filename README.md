@@ -205,6 +205,18 @@ khazad-doom answer <run-id> <question-id> "your answer"
 
 The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk`. If no answer arrives before the tool timeout, the worker falls back to the existing blocked contract and the unanswered question remains visible as run evidence.
 
+### Replan proposals
+
+Replan v1 is proposal-only. The daemon can persist pending proposals with source, findings, evidence links, proposed changes, risk, and exact decision commands, but it does not auto-apply queue/slice/verification/policy changes. Operators decide explicitly:
+
+```bash
+khazad-doom replan accept <run-id> <proposal-id> --reason "..."
+khazad-doom replan reject <run-id> <proposal-id> --reason "..."
+khazad-doom replan defer <run-id> <proposal-id> --until "condition" --reason "..."
+```
+
+Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, and an empty `replan.auto_approvable` tier. The shared feed projection renders pending/decided proposals and pauses resume/worker dispatch/repair at `awaiting_replan` while a pending proposal exists.
+
 ### The Pi package: skill and monitor bridge
 
 This repository is also a Pi package. Its `package.json` declares the `khazad-doom` skill and `extensions/khazad-monitor`, a thin bridge for the jobs Pi is good at: starting or shaping daemon CLI workflows from chat, explaining daemon feed/handoff data, answering blockers through daemon commands, and opening/focusing Herdr. It does not ship the old rich Pi monitor overlay or emulate a live multi-agent cockpit; core observability stays in daemon-owned `status`, `watch`, and `monitor`, while Herdr shows the live workspace and agents when available.
@@ -256,6 +268,9 @@ To install only the skill without the monitor bridge extension, use Pi package f
 | `khazad-doom watch --run <id>` | Plain text fallback for one specific run. |
 | `khazad-doom questions --run <id>` | List worker operator-escalation questions for a run. |
 | `khazad-doom answer <run> <question> "text"` | Answer a pending worker question. |
+| `khazad-doom replan list <run>` | List durable replan proposals for a run. |
+| `khazad-doom replan propose <run> --change kind:target:summary ...` | Record a pending proposal without applying it. |
+| `khazad-doom replan accept\|reject\|defer\|supersede <run> <proposal> ...` | Record an explicit operator decision and rationale; v1 records `applied=false`. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom inspect --repo . --latest` | Inspect the latest run for a repo, including terminal runs. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |
@@ -342,7 +357,7 @@ Retries preserve attempt history and should be treated as at-least-once executio
 | `.workflow/reports/` | Reports committed to integration branches. |
 | `.workflow/runs/` | Transient handoffs, preflight snapshots, terminal run summaries, attempt diagnostics, and raw outputs; gitignored. |
 | `~/.khazad-doom/socket` | Daemon IPC socket. |
-| `~/.khazad-doom/state.sqlite` | Run, slice, event, and live progress state. |
+| `~/.khazad-doom/state.sqlite` | Run, slice, event, live progress, worker question, and replan proposal state. |
 | `~/.khazad-doom/worktrees/` | Daemon-managed temporary worktrees. |
 
 If the daemon starts and finds active runs from a previous process, it marks them `interrupted`, records recovery events, and cleans daemon worktrees where possible. `khazad-doom resume --run <id>` is explicit: it reuses the integration branch and checkpoint state for remaining slices.

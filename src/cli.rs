@@ -1,12 +1,15 @@
 use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
-    BranchHandoff, RunDetails, RunInspection, RunStatus, SliceValidationReport, SliceWriteResult,
-    StatusFeed, StatusFeedRole,
+    BranchHandoff, ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState,
+    ReplanProposedChange, RunDetails, RunInspection, RunStatus, SliceValidationReport,
+    SliceWriteResult, StatusFeed, StatusFeedRole,
 };
 use crate::ipc::{
-    AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult, HandoffParams,
-    InitRepoParams, InitRepoResult, InspectRunParams, ListQuestionsParams, ListQuestionsResult,
+    AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
+    CreateReplanProposalParams, CreateReplanProposalResult, DecideReplanProposalParams,
+    DecideReplanProposalResult, HandoffParams, InitRepoParams, InitRepoResult, InspectRunParams,
+    ListQuestionsParams, ListQuestionsResult, ListReplanProposalsParams, ListReplanProposalsResult,
     ListSlicesResult, ResumeRunParams, SliceImportGithubParams, SliceNewParams, SlicesParams,
     StartRunParams, StartRunResult, StatusParams,
 };
@@ -237,6 +240,11 @@ enum CommandArgs {
         question: String,
         answer: String,
     },
+    /// Record and decide daemon-owned replan proposals.
+    Replan {
+        #[command(subcommand)]
+        command: ReplanCommand,
+    },
     /// Inspect repo-local JSON Issue Slices.
     Slices {
         #[command(subcommand)]
@@ -262,6 +270,77 @@ enum CockpitCommand {
         /// Open/focus the latest daemon-owned run for the repository, including terminal runs.
         #[arg(long)]
         latest: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReplanCommand {
+    /// List replan proposals for a run.
+    List { run: String },
+    /// Create a durable pending replan proposal without applying it.
+    Propose {
+        run: String,
+        #[arg(long, default_value = "")]
+        id: String,
+        #[arg(long, default_value = "operator")]
+        source_kind: String,
+        #[arg(long, default_value = "")]
+        source_slice: String,
+        #[arg(long, default_value = "")]
+        source_phase: String,
+        #[arg(long, default_value_t = 0)]
+        source_attempt: usize,
+        #[arg(long, default_value = "")]
+        source_summary: String,
+        #[arg(long = "finding")]
+        findings: Vec<String>,
+        /// Evidence as kind:path[:summary]. Repeat for multiple links.
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        /// Proposed change as kind:target:summary. Repeat for multiple changes.
+        #[arg(long = "change")]
+        changes: Vec<String>,
+        #[arg(long, default_value = "operator_review")]
+        risk: String,
+    },
+    /// Mark a pending proposal accepted. V1 records applied=false and does not mutate the queue.
+    Accept {
+        run: String,
+        proposal: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "")]
+        authorizer: String,
+    },
+    /// Mark a pending proposal rejected.
+    Reject {
+        run: String,
+        proposal: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "")]
+        authorizer: String,
+    },
+    /// Mark a pending proposal deferred with a revisit condition.
+    Defer {
+        run: String,
+        proposal: String,
+        #[arg(long = "until")]
+        revisit_condition: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "")]
+        authorizer: String,
+    },
+    /// Mark a pending proposal superseded by another proposal id.
+    Supersede {
+        run: String,
+        proposal: String,
+        replacement: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "")]
+        authorizer: String,
     },
 }
 
@@ -428,6 +507,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             question,
             answer,
         } => run_answer(paths, run, question, answer),
+        CommandArgs::Replan { command } => run_replan(paths, command),
         CommandArgs::Slices { command } => run_slices(paths, command),
         CommandArgs::Daemon { command } => run_daemon(paths, command),
     }
@@ -930,6 +1010,203 @@ fn run_answer(paths: Paths, run_id: String, question_id: String, answer: String)
         },
     )?;
     print_json(&result)
+}
+
+fn run_replan(paths: Paths, command: ReplanCommand) -> Result<()> {
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths);
+    match command {
+        ReplanCommand::List { run } => {
+            let result: ListReplanProposalsResult = client.call(
+                "listReplanProposals",
+                &ListReplanProposalsParams { run_id: run },
+            )?;
+            print_json(&result)
+        }
+        ReplanCommand::Propose {
+            run,
+            id,
+            source_kind,
+            source_slice,
+            source_phase,
+            source_attempt,
+            source_summary,
+            findings,
+            evidence,
+            changes,
+            risk,
+        } => {
+            let proposed_changes = parse_replan_changes(&changes)?;
+            let evidence = parse_replan_evidence(&evidence)?;
+            let result: CreateReplanProposalResult = client.call(
+                "createReplanProposal",
+                &CreateReplanProposalParams {
+                    run_id: run,
+                    id,
+                    source: ReplanProposalSource {
+                        kind: source_kind,
+                        slice_id: source_slice,
+                        phase: source_phase,
+                        attempt: source_attempt,
+                        summary: source_summary,
+                    },
+                    trigger_finding_ids: findings,
+                    evidence,
+                    proposed_changes,
+                    risk,
+                },
+            )?;
+            print_json(&result)
+        }
+        ReplanCommand::Accept {
+            run,
+            proposal,
+            reason,
+            authorizer,
+        } => decide_replan(
+            &client,
+            ReplanDecisionRequest {
+                run_id: run,
+                proposal_id: proposal,
+                state: ReplanProposalState::Accepted,
+                rationale: reason,
+                authorizer,
+                replacement_id: String::new(),
+                revisit_condition: String::new(),
+            },
+        ),
+        ReplanCommand::Reject {
+            run,
+            proposal,
+            reason,
+            authorizer,
+        } => decide_replan(
+            &client,
+            ReplanDecisionRequest {
+                run_id: run,
+                proposal_id: proposal,
+                state: ReplanProposalState::Rejected,
+                rationale: reason,
+                authorizer,
+                replacement_id: String::new(),
+                revisit_condition: String::new(),
+            },
+        ),
+        ReplanCommand::Defer {
+            run,
+            proposal,
+            revisit_condition,
+            reason,
+            authorizer,
+        } => decide_replan(
+            &client,
+            ReplanDecisionRequest {
+                run_id: run,
+                proposal_id: proposal,
+                state: ReplanProposalState::Deferred,
+                rationale: reason,
+                authorizer,
+                replacement_id: String::new(),
+                revisit_condition,
+            },
+        ),
+        ReplanCommand::Supersede {
+            run,
+            proposal,
+            replacement,
+            reason,
+            authorizer,
+        } => decide_replan(
+            &client,
+            ReplanDecisionRequest {
+                run_id: run,
+                proposal_id: proposal,
+                state: ReplanProposalState::Superseded,
+                rationale: reason,
+                authorizer,
+                replacement_id: replacement,
+                revisit_condition: String::new(),
+            },
+        ),
+    }
+}
+
+struct ReplanDecisionRequest {
+    run_id: String,
+    proposal_id: String,
+    state: ReplanProposalState,
+    rationale: String,
+    authorizer: String,
+    replacement_id: String,
+    revisit_condition: String,
+}
+
+fn decide_replan(client: &Client, request: ReplanDecisionRequest) -> Result<()> {
+    let result: DecideReplanProposalResult = client.call(
+        "decideReplanProposal",
+        &DecideReplanProposalParams {
+            run_id: request.run_id,
+            proposal_id: request.proposal_id,
+            decision: request.state.as_str().to_string(),
+            rationale: request.rationale,
+            authorizer: default_authorizer(request.authorizer),
+            source: "cli".to_string(),
+            replacement_id: request.replacement_id,
+            revisit_condition: request.revisit_condition,
+        },
+    )?;
+    print_json(&result)
+}
+
+fn parse_replan_evidence(values: &[String]) -> Result<Vec<ReplanEvidenceLink>> {
+    values
+        .iter()
+        .map(|value| {
+            let mut parts = value.splitn(3, ':');
+            let kind = parts.next().unwrap_or_default().trim();
+            let path = parts.next().unwrap_or_default().trim();
+            let summary = parts.next().unwrap_or_default().trim();
+            if kind.is_empty() || path.is_empty() {
+                bail!("replan evidence must be kind:path[:summary], got {value:?}");
+            }
+            Ok(ReplanEvidenceLink {
+                kind: kind.to_string(),
+                path: path.to_string(),
+                event_id: 0,
+                summary: summary.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_replan_changes(values: &[String]) -> Result<Vec<ReplanProposedChange>> {
+    if values.is_empty() {
+        bail!("replan propose requires at least one --change kind:target:summary");
+    }
+    values
+        .iter()
+        .map(|value| {
+            let mut parts = value.splitn(3, ':');
+            let kind = parts.next().unwrap_or_default().trim();
+            let target = parts.next().unwrap_or_default().trim();
+            let summary = parts.next().unwrap_or_default().trim();
+            if kind.is_empty() || target.is_empty() || summary.is_empty() {
+                bail!("replan change must be kind:target:summary, got {value:?}");
+            }
+            Ok(ReplanProposedChange {
+                kind: kind.to_string(),
+                target: target.to_string(),
+                summary: summary.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn default_authorizer(value: String) -> String {
+    if !value.trim().is_empty() {
+        return value;
+    }
+    std::env::var("USER").unwrap_or_else(|_| "operator".to_string())
 }
 
 fn run_slices(paths: Paths, command: SlicesCommand) -> Result<()> {

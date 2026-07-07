@@ -1319,6 +1319,201 @@ fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> Test
 }
 
 #[test]
+fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_quiet_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+    let fake_pi_string = path(&fake_pi).to_string();
+
+    kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("FAKE_PI_SLEEP", "20")],
+        &["init", "--repo", path(repo.path())],
+    )?;
+    fs::write(
+        repo.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "pi",
+                "parallelism": 1,
+                "worker_attempt_timeout_seconds": 0,
+                "worker_no_output_warning_seconds": 60,
+                "worker_termination_grace_seconds": 1
+            }))?
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-001",
+            "title": "Replan pending slice",
+            "goal": "Stay active long enough to record a replan proposal.",
+            "acceptance": ["slice-001.txt exists"],
+            "verify": ["test -f slice-001.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add replan fixture slice"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--pi-bin",
+            fake_pi_string.as_str(),
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_worker_supervision(&bin, home.path(), &run_id)?;
+
+    let accepted = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "replan",
+            "propose",
+            &run_id,
+            "--id",
+            "rp-accepted",
+            "--source-kind",
+            "worker",
+            "--source-slice",
+            "slice-001",
+            "--source-phase",
+            "worker_running",
+            "--source-summary",
+            "worker identified an already-covered follow-up",
+            "--evidence",
+            "worker_output:.workflow/runs/example/outputs/slice-001.worker.json:worker evidence",
+            "--change",
+            "mark_duplicate:slice-001-followup:proposal is a duplicate",
+            "--risk",
+            "operator_review",
+        ],
+    )?;
+    assert_eq!(json_stdout(&accepted)?["proposal"]["state"], "pending");
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "replan",
+            "accept",
+            &run_id,
+            "rp-accepted",
+            "--reason",
+            "recorded but not applied in v1",
+        ],
+    )?;
+
+    let pending = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "replan",
+            "propose",
+            &run_id,
+            "--id",
+            "rp-pending",
+            "--source-kind",
+            "worker",
+            "--source-slice",
+            "slice-001",
+            "--source-phase",
+            "worker_running",
+            "--source-summary",
+            "worker needs operator intent before queue mutation",
+            "--finding",
+            "finding-queue",
+            "--evidence",
+            "worker_output:.workflow/runs/example/outputs/slice-001.worker.json:worker evidence",
+            "--change",
+            "add_followup_slice:slice-001-followup:needs an explicit follow-up slice",
+            "--risk",
+            "intent_affecting",
+        ],
+    )?;
+    assert_eq!(json_stdout(&pending)?["proposal"]["state"], "pending");
+
+    let status = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
+    let status = json_stdout(&status)?;
+    assert_eq!(status["replan"]["pending"][0]["id"], "rp-pending");
+    assert_eq!(status["replan"]["history"][0]["id"], "rp-accepted");
+    assert_eq!(
+        status["replan"]["history"][0]["operator_decision"]["applied"],
+        false
+    );
+    assert!(
+        status["replan"]["auto_approvable"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        status["replan"]["pending_attention_reason"]
+            .as_str()
+            .unwrap()
+            .contains("rp-pending")
+    );
+    let accept_command = format!("khazad-doom replan accept {run_id} rp-pending --reason <reason>");
+    assert!(
+        status["feed"]["operator_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str() == Some(accept_command.as_str()))
+    );
+
+    let monitored = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "monitor",
+            "--run",
+            &run_id,
+            "--once",
+            "--interval-ms",
+            "100",
+        ],
+    )?;
+    let monitored = String::from_utf8(monitored.stdout)?;
+    assert!(monitored.contains("Awaiting replan decision rp-pending"));
+    assert!(monitored.contains("Replan (1 pending, 1 decided)"));
+
+    kill_daemon(home.path())?;
+    kd_ok(&bin, home.path(), &["daemon", "start"])?;
+    let restarted = wait_for_terminal_status(&bin, home.path(), &run_id, "interrupted")?;
+    assert_eq!(restarted["replan"]["pending"][0]["id"], "rp-pending");
+
+    let resume = kd(&bin, home.path(), &["resume", "--run", &run_id])?;
+    assert!(!resume.status.success());
+    let stderr = String::from_utf8(resume.stderr)?;
+    assert!(stderr.contains("awaiting replan decision for rp-pending before resume"));
+    let blocked_resume = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
+    let blocked_resume = json_stdout(&blocked_resume)?;
+    assert_eq!(blocked_resume["run"]["status"], "interrupted");
+    assert_eq!(blocked_resume["progress"]["phase"], "awaiting_replan");
+    assert_eq!(blocked_resume["replan"]["pending"][0]["id"], "rp-pending");
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;

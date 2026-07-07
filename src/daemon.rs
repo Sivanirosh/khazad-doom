@@ -1,12 +1,14 @@
 use crate::artifact;
 use crate::domain::{
-    BranchHandoff, Event, ImplementationSummary, Run, RunDetails, RunEconomics, RunIncident,
-    RunInspection, RunProgress, RunStatus, SliceRun, SliceStatus, SliceWriteResult, TerminalReason,
-    WorkerQuestion,
+    BranchHandoff, Event, ImplementationSummary, ReplanProposal, ReplanProposalState, ReplanStatus,
+    Run, RunDetails, RunEconomics, RunIncident, RunInspection, RunProgress, RunStatus, SliceRun,
+    SliceStatus, SliceWriteResult, TerminalReason, WorkerQuestion, replan_decision_commands,
 };
 use crate::ipc::{
-    AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult, HandoffParams,
-    InitRepoParams, InitRepoResult, InspectRunParams, ListQuestionsParams, ListQuestionsResult,
+    AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
+    CreateReplanProposalParams, CreateReplanProposalResult, DecideReplanProposalParams,
+    DecideReplanProposalResult, HandoffParams, InitRepoParams, InitRepoResult, InspectRunParams,
+    ListQuestionsParams, ListQuestionsResult, ListReplanProposalsParams, ListReplanProposalsResult,
     ListSlicesResult, Request, Response, ResumeRunParams, SliceImportGithubParams, SliceNewParams,
     SlicesParams, StartRunParams, StartRunResult, StatusParams, WorkerAskParams, WorkerAskResult,
 };
@@ -280,6 +282,7 @@ impl Server {
             .store
             .list_worker_questions(&run_id)
             .unwrap_or_default();
+        let replan = self.replan_status(&run_id).unwrap_or_default();
         let primary_terminal_reason = primary_terminal_reason(
             &run,
             &slice_runs,
@@ -293,6 +296,7 @@ impl Server {
             progress,
             incidents,
             questions,
+            replan,
             events,
             economics,
             primary_terminal_reason,
@@ -301,6 +305,11 @@ impl Server {
         };
         details.feed = Some(project_run(&details));
         Ok(details)
+    }
+
+    fn replan_status(&self, run_id: &str) -> Result<ReplanStatus> {
+        let proposals = self.store.list_replan_proposals(run_id)?;
+        Ok(replan_status_from_proposals(run_id, proposals))
     }
 
     fn handle_worker_ask(&self, params: WorkerAskParams) -> Result<WorkerAskResult> {
@@ -579,6 +588,71 @@ impl Server {
                 )?;
                 Ok(HandleOutcome::result(AnswerQuestionResult { question })?)
             }
+            "listReplanProposals" => {
+                let params: ListReplanProposalsParams = decode_params(raw)?;
+                if params.run_id.trim().is_empty() {
+                    bail!("listReplanProposals requires run_id");
+                }
+                let status = self.replan_status(&params.run_id)?;
+                let proposals = status.pending.into_iter().chain(status.history).collect();
+                Ok(HandleOutcome::result(ListReplanProposalsResult {
+                    proposals,
+                })?)
+            }
+            "createReplanProposal" => {
+                let params: CreateReplanProposalParams = decode_params(raw)?;
+                let proposal = self.store.create_replan_proposal(
+                    &params.run_id,
+                    &params.id,
+                    params.source,
+                    params.trigger_finding_ids,
+                    params.evidence,
+                    params.proposed_changes,
+                    &params.risk,
+                )?;
+                let proposal = enrich_replan_proposal(&params.run_id, proposal);
+                self.store.record_event(
+                    &params.run_id,
+                    "replan_proposal_created",
+                    &json!({
+                        "proposal_id": proposal.id,
+                        "state": proposal.state,
+                        "risk": proposal.risk,
+                        "source": proposal.source,
+                        "proposed_changes": proposal.proposed_changes,
+                        "decision_commands": proposal.decision_commands,
+                    }),
+                )?;
+                Ok(HandleOutcome::result(CreateReplanProposalResult {
+                    proposal,
+                })?)
+            }
+            "decideReplanProposal" => {
+                let params: DecideReplanProposalParams = decode_params(raw)?;
+                let state = replan_decision_state(&params.decision)?;
+                let proposal = self.store.decide_replan_proposal(
+                    &params.run_id,
+                    &params.proposal_id,
+                    state,
+                    &params.rationale,
+                    &params.authorizer,
+                    &params.source,
+                    &params.replacement_id,
+                    &params.revisit_condition,
+                )?;
+                self.store.record_event(
+                    &params.run_id,
+                    "replan_proposal_decided",
+                    &json!({
+                        "proposal_id": proposal.id,
+                        "state": proposal.state,
+                        "decision": proposal.operator_decision,
+                    }),
+                )?;
+                Ok(HandleOutcome::result(DecideReplanProposalResult {
+                    proposal,
+                })?)
+            }
             "inspectRun" => {
                 let params: InspectRunParams = decode_params(raw)?;
                 let inspection: RunInspection = self
@@ -606,6 +680,56 @@ impl Server {
             }
             _ => bail!("unknown method {method:?}"),
         }
+    }
+}
+
+fn replan_status_from_proposals(run_id: &str, proposals: Vec<ReplanProposal>) -> ReplanStatus {
+    let mut pending = Vec::new();
+    let mut history = Vec::new();
+    for proposal in proposals {
+        let proposal = enrich_replan_proposal(run_id, proposal);
+        if proposal.state == ReplanProposalState::Pending {
+            pending.push(proposal);
+        } else {
+            history.push(proposal);
+        }
+    }
+    let pending_attention_reason = if pending.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "awaiting replan decision for {}",
+            pending
+                .iter()
+                .map(|proposal| proposal.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    ReplanStatus {
+        pending_attention_reason,
+        pending,
+        history,
+        auto_approvable: Vec::new(),
+    }
+}
+
+fn enrich_replan_proposal(run_id: &str, mut proposal: ReplanProposal) -> ReplanProposal {
+    proposal.decision_commands = if proposal.state == ReplanProposalState::Pending {
+        replan_decision_commands(run_id, &proposal.id)
+    } else {
+        Vec::new()
+    };
+    proposal
+}
+
+fn replan_decision_state(value: &str) -> Result<ReplanProposalState> {
+    match value {
+        "accepted" | "accept" => Ok(ReplanProposalState::Accepted),
+        "rejected" | "reject" => Ok(ReplanProposalState::Rejected),
+        "deferred" | "defer" => Ok(ReplanProposalState::Deferred),
+        "superseded" | "supersede" => Ok(ReplanProposalState::Superseded),
+        other => bail!("unknown replan decision {other:?}"),
     }
 }
 
@@ -1065,7 +1189,10 @@ impl HandleOutcome {
 }
 
 fn method_allows_concurrent_handling(method: &str) -> bool {
-    matches!(method, "workerAsk" | "answerQuestion" | "listQuestions")
+    matches!(
+        method,
+        "workerAsk" | "answerQuestion" | "listQuestions" | "listReplanProposals"
+    )
 }
 
 fn decode_params<T: DeserializeOwned>(raw: Option<serde_json::Value>) -> Result<T> {
