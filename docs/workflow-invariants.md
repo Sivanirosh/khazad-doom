@@ -89,13 +89,13 @@ Standing rejections:
 
 - The daemon/state store is the source of truth for run status, slice states, events, and live progress snapshots.
 - `status`, `watch`, and `monitor` render the same daemon state. They must not own workflow state or infer cancellation from UI/session shutdown.
-- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths and Pi `/khazad-attach` adapter paint `RunDetails.feed`; when feed data is unavailable, they report feed unavailability rather than rebuilding workflow wording from raw events.
+- Status interpretation is centralized daemon-side in the status feed projection. Renderers are painters: they may choose layout/color, but not invent different wording or re-interpret daemon event payloads independently. The CLI monitor/watch paths and explicit Pi `/khazad-attach` / `/khazad-explain` adapter actions paint `RunDetails.feed`; when feed data is unavailable, they report feed unavailability rather than rebuilding workflow wording from raw events.
 - `monitor --latest` must not make terminal runs disappear. When no active run exists, it keeps the latest terminal run summary visible, including incidents and handoff readiness.
 - Progress output may distinguish supervisor liveness, worker process state, last output event, last semantic progress, configured timeouts, and advisory quiet-worker warnings.
 - When a parallel worker layer is active, status/watch/monitor output exposes the layer explicitly and lists the active slice IDs in deterministic order.
 - The Herdr cockpit adapter, when enabled, may open/focus run workspaces and named read-only panes for daemon feed and integration gate/repair phase visibility. It may also open deterministically named worker panes tied to run id, slice id, and attempt. Herdr absence, cockpit startup failure, worker pane startup failure, or wrapper handoff failure before Pi launches falls back to direct execution by default and records non-fatal evidence; it must not by itself change run/slice status, worker authorization, verification, merge, or handoff readiness. The Planner Pi pane remains explicitly deferred until RPL planner authority exists.
 - Herdr worker panes are not an interactive authority channel. They execute a Khazad-owned wrapper that launches the same resolved Pi command/env/prompt/schema as the direct runner, writes stdout/stderr/exit/result artifacts under `.workflow/runs/<run>/outputs/`, and feeds the same daemon worker-attempt supervision. Khazad-Doom never reads worker JSON from pane text, scrollback, or Herdr agent-status metadata. Normal operator control means observe, focus, and request daemon-owned actions such as cancel or answer; any manual takeover must be explicit evidence, not silent accepted worker output.
-- The Pi feedback adapter is a thin bridge over the daemon projection and Herdr open/focus actions, cleans up all session-bound resources on Pi session replacement/reload, and is never required for core monitoring.
+- The Pi feedback adapter is a thin bridge over daemon commands/data and Herdr open/focus actions: start/shape via the CLI, explain from `RunDetails.feed`, summarize handoff JSON, answer blockers through daemon `answerQuestion`, and delegate Herdr focus/open to `khazad-doom cockpit open`. It cleans up all session-bound resources on Pi session replacement/reload, never infers run lifecycle from Pi sessions, never renders a full live multi-agent cockpit, and is never required for core monitoring or headless operation.
 
 ## Artifacts, handoffs, and remotes
 
@@ -107,10 +107,10 @@ Standing rejections:
 ## Phase 5 scope amendment record
 
 - **Herdr is the optional-default live cockpit, not a workflow owner.**
-  - Proposed invariant text: Herdr may open/focus visible run workspaces and read-only feed/phase panes when available, but daemon state remains authoritative; direct execution remains fallback; Pi becomes a thin bridge/explainer rather than a rich live dashboard, and planner panes wait for RPL planner authority.
+  - Accepted invariant text: Herdr may open/focus visible run workspaces and read-only feed/phase panes when available, but daemon state remains authoritative; direct execution remains fallback; Pi is a thin bridge/explainer rather than a rich live dashboard, and planner panes wait for RPL planner authority.
   - Ledger entries: F-013; Phase 1 PI-05 status/monitor drift; rich Pi monitor overlay/feed-widget churn; PUB-01B-era operator scope decision.
   - Enforcement mechanism: FEED-01 projection authority, HERDR-01 cockpit config/fallback, HERDR-02 KD-owned wrapper/result capture, HERDR-03 Pi bridge only.
-  - Violation-detecting tests: real-Herdr gated workspace/pane smoke; fallback incident test; worker wrapper artifact-capture e2e; grep/parity guard that prevents Pi adapter raw-event interpretation.
+  - Violation-detecting tests: real-Herdr gated workspace/pane smoke; explicit `cockpit open` real/fallback tests; worker wrapper artifact-capture e2e; package extension tests that ensure Pi adapter feed rendering comes from the daemon projection instead of raw event interpretation.
   - Status: accepted for Phase 5 slices.
 
 ## Phase 2 invariant amendment record

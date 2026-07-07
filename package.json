@@ -1,26 +1,28 @@
 {
   "name": "khazad-doom",
   "version": "0.1.0",
-  "description": "Local agentic workflow daemon for JSON Issue Slices",
+  "description": "Local daemon for JSON Issue Slice workflows; Pi bridges starts/explanations while Herdr shows live cockpits",
   "license": "MIT",
   "type": "commonjs",
   "keywords": [
     "pi-package",
     "khazad-doom",
     "agentic-workflow",
-    "pi-extension"
+    "pi-extension",
+    "herdr-cockpit",
+    "daemon-feed"
   ],
   "scripts": {
-    "check:extension": "node --check extensions/khazad-worker/index.js",
+    "check:extension": "node --check extensions/khazad-monitor/index.js",
     "test": "npm run test:extension",
-    "test:extension": "node --test tests/khazad-worker-extension.test.mjs"
+    "test:extension": "node --test extensions/khazad-monitor/index.test.mjs"
   },
   "pi": {
     "skills": [
       "./skills"
     ],
     "extensions": [
-      "./extensions/khazad-worker"
+      "./extensions/khazad-monitor"
     ]
   }
 }

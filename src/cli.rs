@@ -16,14 +16,19 @@ use crate::workflow::cockpit_mode_transport_arg;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use std::ffi::OsString;
+use serde_json::Value;
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const RUN_STATUS_FEED_PANE: &str = "Run Status / Event Feed";
+const INTEGRATION_GATE_REPAIR_PANE: &str = "Integration Gate / Repair";
 
 #[derive(Debug, Serialize)]
 struct RunStartOutput {
@@ -31,6 +36,21 @@ struct RunStartOutput {
     pub repo_path: String,
     pub monitor_command: String,
     pub run_monitor_command: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CockpitOpenOutput {
+    pub run_id: String,
+    pub repo_path: String,
+    pub workspace_label: String,
+    pub adapter: String,
+    pub opened: bool,
+    pub action: String,
+    pub pane_labels: Vec<String>,
+    pub fallback: String,
+    pub remediation: String,
+    pub message: String,
+    pub operator_commands: Vec<String>,
 }
 
 impl RunStartOutput {
@@ -201,6 +221,11 @@ enum CommandArgs {
         #[arg(long, default_value_t = 2000)]
         interval_ms: u64,
     },
+    /// Open or focus optional cockpit surfaces for daemon-owned runs.
+    Cockpit {
+        #[command(subcommand)]
+        command: CockpitCommand,
+    },
     /// List pending/answered worker questions.
     Questions {
         #[arg(long, default_value = "")]
@@ -223,6 +248,22 @@ enum CommandArgs {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CockpitCommand {
+    /// Open or focus the Herdr workspace for a run without changing daemon workflow state.
+    Open {
+        /// Specific run id to open/focus.
+        #[arg(long, default_value = "")]
+        run: String,
+        /// Repository path used with --latest. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Open/focus the latest daemon-owned run for the repository, including terminal runs.
+        #[arg(long)]
+        latest: bool,
     },
 }
 
@@ -382,6 +423,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             interval_ms,
         } => run_monitor(paths, run, repo, latest, once, events_limit, interval_ms),
         CommandArgs::Watch { run, interval_ms } => run_watch(paths, run, interval_ms),
+        CommandArgs::Cockpit { command } => run_cockpit(paths, command),
         CommandArgs::Questions { run, repo } => run_questions(paths, run, repo),
         CommandArgs::Answer {
             run,
@@ -750,6 +792,141 @@ fn fetch_latest_run(
     )
 }
 
+fn open_or_focus_herdr_cockpit(paths: &Paths, details: &RunDetails) -> Result<CockpitOpenOutput> {
+    let run = &details.run;
+    let workspace_label = workspace_label_for_run(&run.id);
+    let operator_commands = vec![
+        format!("khazad-doom monitor --run {}", shell_quote_arg(&run.id)),
+        format!("khazad-doom watch --run {}", shell_quote_arg(&run.id)),
+        format!("khazad-doom status --run {}", shell_quote_arg(&run.id)),
+    ];
+    let Some(herdr) = find_executable_in_path("herdr") else {
+        return Ok(cockpit_unavailable_output(
+            run,
+            workspace_label,
+            "herdr binary was not found on PATH".to_string(),
+            operator_commands,
+        ));
+    };
+    if let Err(err) = run_herdr_command(&herdr, &["--version".to_string()]) {
+        return Ok(cockpit_unavailable_output(
+            run,
+            workspace_label,
+            err.to_string(),
+            operator_commands,
+        ));
+    }
+
+    let workspaces = match run_herdr_json(&herdr, &["workspace".to_string(), "list".to_string()]) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(cockpit_unavailable_output(
+                run,
+                workspace_label,
+                err.to_string(),
+                operator_commands,
+            ));
+        }
+    };
+    if let Some(workspace_id) = find_herdr_workspace_id(&workspaces, &workspace_label) {
+        if let Err(err) = run_herdr_json(
+            &herdr,
+            &[
+                "workspace".to_string(),
+                "focus".to_string(),
+                workspace_id.clone(),
+            ],
+        ) {
+            return Ok(cockpit_unavailable_output(
+                run,
+                workspace_label,
+                err.to_string(),
+                operator_commands,
+            ));
+        }
+        return Ok(CockpitOpenOutput {
+            run_id: run.id.clone(),
+            repo_path: run.repo_path.clone(),
+            workspace_label,
+            adapter: "herdr".to_string(),
+            opened: true,
+            action: "focused_existing".to_string(),
+            pane_labels: Vec::new(),
+            fallback: String::new(),
+            remediation: String::new(),
+            message: "focused existing Herdr cockpit workspace".to_string(),
+            operator_commands,
+        });
+    }
+
+    let created = match create_herdr_workspace(&herdr, paths, run, &workspace_label) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(cockpit_unavailable_output(
+                run,
+                workspace_label,
+                err.to_string(),
+                operator_commands,
+            ));
+        }
+    };
+    let Some(root_pane) = created
+        .pointer("/result/root_pane/pane_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(cockpit_unavailable_output(
+            run,
+            workspace_label,
+            "herdr workspace create omitted root_pane.pane_id".to_string(),
+            operator_commands,
+        ));
+    };
+    let feed_command = format!(
+        "{} monitor --run {} --interval-ms 1000",
+        current_khazad_binary(),
+        shell_quote_arg(&run.id)
+    );
+    let phase_command = format!(
+        "{} status --run {} --follow --interval-ms 1000",
+        current_khazad_binary(),
+        shell_quote_arg(&run.id)
+    );
+    for (label, direction, command) in [
+        (RUN_STATUS_FEED_PANE, "right", feed_command),
+        (INTEGRATION_GATE_REPAIR_PANE, "down", phase_command),
+    ] {
+        if let Err(err) =
+            create_herdr_read_only_pane(&herdr, paths, run, &root_pane, label, direction, &command)
+        {
+            return Ok(cockpit_unavailable_output(
+                run,
+                workspace_label,
+                err.to_string(),
+                operator_commands,
+            ));
+        }
+    }
+
+    Ok(CockpitOpenOutput {
+        run_id: run.id.clone(),
+        repo_path: run.repo_path.clone(),
+        workspace_label,
+        adapter: "herdr".to_string(),
+        opened: true,
+        action: "opened".to_string(),
+        pane_labels: vec![
+            RUN_STATUS_FEED_PANE.to_string(),
+            INTEGRATION_GATE_REPAIR_PANE.to_string(),
+        ],
+        fallback: String::new(),
+        remediation: String::new(),
+        message: "opened Herdr cockpit workspace backed by daemon monitor/status commands"
+            .to_string(),
+        operator_commands,
+    })
+}
+
 fn monitor_once_result(details: &RunDetails) -> Result<()> {
     match details.run.status {
         RunStatus::Failed | RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => {
@@ -781,6 +958,42 @@ fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
             _ => thread::sleep(interval),
         }
     }
+}
+
+fn run_cockpit(paths: Paths, command: CockpitCommand) -> Result<()> {
+    match command {
+        CockpitCommand::Open { run, repo, latest } => run_cockpit_open(paths, run, repo, latest),
+    }
+}
+
+fn run_cockpit_open(
+    paths: Paths,
+    run_id: String,
+    repo: Option<PathBuf>,
+    latest: bool,
+) -> Result<()> {
+    if !run_id.is_empty() && latest {
+        bail!("cockpit open --latest cannot be combined with --run <run-id>");
+    }
+    if run_id.is_empty() && !latest {
+        bail!("cockpit open requires --run <run-id> or --latest");
+    }
+    if !run_id.is_empty() && repo.is_some() {
+        bail!("cockpit open --repo can only be used with --latest");
+    }
+
+    ensure_daemon(&paths)?;
+    let client = Client::new(paths.clone());
+    let details = if latest {
+        let repo = resolve_repo_path(repo.unwrap_or_else(|| PathBuf::from(".")))?;
+        let repo_path = repo.to_string_lossy().to_string();
+        fetch_latest_run(&client, &repo_path, 20, false)?
+            .ok_or_else(|| anyhow::anyhow!("no runs found for repo {repo_path}"))?
+    } else {
+        fetch_run_details(&client, &run_id, 20)?
+    };
+    let output = open_or_focus_herdr_cockpit(&paths, &details)?;
+    print_json(&output)
 }
 
 fn run_questions(paths: Paths, run_id: String, repo: Option<PathBuf>) -> Result<()> {
@@ -1188,6 +1401,227 @@ fn wait_run(client: &Client, run_id: &str) -> Result<()> {
             | RunStatus::Interrupted => return terminal_run_error(&details),
             _ => thread::sleep(Duration::from_secs(2)),
         }
+    }
+}
+
+fn cockpit_unavailable_output(
+    run: &crate::domain::Run,
+    workspace_label: String,
+    message: String,
+    operator_commands: Vec<String>,
+) -> CockpitOpenOutput {
+    CockpitOpenOutput {
+        run_id: run.id.clone(),
+        repo_path: run.repo_path.clone(),
+        workspace_label,
+        adapter: "herdr".to_string(),
+        opened: false,
+        action: "fallback".to_string(),
+        pane_labels: Vec::new(),
+        fallback: "Herdr cockpit was not opened; continue with daemon-owned status/watch/monitor, handoff, and answer commands.".to_string(),
+        remediation: "Install a usable herdr binary on PATH, fix the Herdr command failure, or keep using khazad-doom monitor/watch/status for headless operation.".to_string(),
+        message,
+        operator_commands,
+    }
+}
+
+fn create_herdr_workspace(
+    herdr: &Path,
+    paths: &Paths,
+    run: &crate::domain::Run,
+    workspace_label: &str,
+) -> Result<Value> {
+    run_herdr_json(
+        herdr,
+        &[
+            "workspace".to_string(),
+            "create".to_string(),
+            "--cwd".to_string(),
+            run.repo_path.clone(),
+            "--label".to_string(),
+            workspace_label.to_string(),
+            "--env".to_string(),
+            format!("KHAZAD_HOME={}", paths.root.to_string_lossy()),
+            "--focus".to_string(),
+        ],
+    )
+}
+
+fn create_herdr_read_only_pane(
+    herdr: &Path,
+    paths: &Paths,
+    run: &crate::domain::Run,
+    root_pane: &str,
+    label: &str,
+    direction: &str,
+    command: &str,
+) -> Result<()> {
+    let split = run_herdr_json(
+        herdr,
+        &[
+            "pane".to_string(),
+            "split".to_string(),
+            root_pane.to_string(),
+            "--direction".to_string(),
+            direction.to_string(),
+            "--ratio".to_string(),
+            "0.5".to_string(),
+            "--cwd".to_string(),
+            run.repo_path.clone(),
+            "--env".to_string(),
+            format!("KHAZAD_HOME={}", paths.root.to_string_lossy()),
+            "--env".to_string(),
+            "KHAZAD_COCKPIT_READ_ONLY=1".to_string(),
+            "--no-focus".to_string(),
+        ],
+    )?;
+    let pane_id = split
+        .pointer("/result/pane/pane_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("herdr pane split omitted pane_id"))?;
+    run_herdr_json(
+        herdr,
+        &[
+            "pane".to_string(),
+            "rename".to_string(),
+            pane_id.to_string(),
+            label.to_string(),
+        ],
+    )?;
+    run_herdr_command(
+        herdr,
+        &[
+            "pane".to_string(),
+            "run".to_string(),
+            pane_id.to_string(),
+            command.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_herdr_workspace_id(value: &Value, workspace_label: &str) -> Option<String> {
+    value
+        .pointer("/result/workspaces")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|workspace| workspace.get("label").and_then(Value::as_str) == Some(workspace_label))
+        .and_then(|workspace| workspace.get("workspace_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn workspace_label_for_run(run_id: &str) -> String {
+    format!("Khazad-Doom {run_id}")
+}
+
+fn current_khazad_binary() -> String {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
+    shell_quote_arg(&binary.to_string_lossy())
+}
+
+fn run_herdr_json(herdr: &Path, args: &[String]) -> Result<Value> {
+    let output = run_herdr_command(herdr, args)?;
+    serde_json::from_str(&output.stdout).with_context(|| {
+        format!(
+            "herdr {} did not return JSON: {}{}{}",
+            display_args(args),
+            bounded(&output.stdout),
+            if output.stdout.is_empty() || output.stderr.is_empty() {
+                ""
+            } else {
+                " | "
+            },
+            bounded(&output.stderr)
+        )
+    })
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+fn run_herdr_command(herdr: &Path, args: &[String]) -> Result<CommandOutput> {
+    let mut child = Command::new(herdr)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn herdr {}", display_args(args)))?;
+    let deadline = Instant::now() + HERDR_COMMAND_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if output.status.success() {
+                return Ok(CommandOutput { stdout, stderr });
+            }
+            bail!(
+                "herdr {} exited with {}: {}{}{}",
+                display_args(args),
+                output.status,
+                bounded(&stdout),
+                if stdout.is_empty() || stderr.is_empty() {
+                    ""
+                } else {
+                    " | "
+                },
+                bounded(&stderr)
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(
+                "herdr {} timed out after {}s: {}{}{}",
+                display_args(args),
+                HERDR_COMMAND_TIMEOUT.as_secs(),
+                bounded(&stdout),
+                if stdout.is_empty() || stderr.is_empty() {
+                    ""
+                } else {
+                    " | "
+                },
+                bounded(&stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let name = OsStr::new(name);
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn display_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bounded(value: &str) -> String {
+    const LIMIT: usize = 500;
+    if value.len() <= LIMIT {
+        value.to_string()
+    } else {
+        let prefix: String = value.chars().take(LIMIT).collect();
+        format!("{prefix}…")
     }
 }
 
