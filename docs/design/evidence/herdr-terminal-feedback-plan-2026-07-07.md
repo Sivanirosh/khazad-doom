@@ -38,6 +38,10 @@ Design consequence: terminal notification can fire after durable terminal truth 
 - V1 terminal states: completed, blocked, failed, cancelled. Exclude interrupted in v1 because restart recovery implies stale-origin risk and the operator is already involved.
 - Failure behavior: notification-send failure is a non-fatal visibility incident/event and never changes run status, verification, merge, or handoff readiness.
 
+## Implemented shape
+
+HERDR-06 records the optional origin target at run start in `.workflow/runs/<run>/origin.json` from `--origin-notification-target` / `KHAZAD_ORIGIN_NOTIFICATION_TARGET`. Terminal feedback writes per-transition dedupe records under `.workflow/runs/<run>/notifications/terminal-<status>.json` after `outputs/run-summary.json` exists, then sends declarative JSON evidence through the Cockpit Herdr `agent send` seam. The v1 statuses are completed, blocked, failed, and cancelled; interrupted remains excluded. Runs without an origin target do not notify. Delivery failure, missing Herdr, malformed/stale recorded target evidence is visibility-only.
+
 ## Follow-up
 
 `HERDR-07` should reuse the same origin target and notification seam for mid-run attention states: awaiting operator questions, awaiting replan, and pending proposals. This is higher-value than terminal feedback for long runs because unseen questions/proposals can stall the run for hours, but it should not widen HERDR-06.

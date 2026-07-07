@@ -127,6 +127,9 @@ enum CommandArgs {
         /// Allow starting from a dirty source repo; recorded in preflight artifacts.
         #[arg(long)]
         allow_dirty: bool,
+        /// Optional opaque Herdr/Pi target for inert terminal-run feedback.
+        #[arg(long = "origin-notification-target", default_value = "")]
+        origin_notification_target: String,
         #[arg(long)]
         wait: bool,
     },
@@ -457,6 +460,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             cockpit,
             parallel,
             allow_dirty,
+            origin_notification_target,
             wait,
         } => run_start(
             paths,
@@ -470,6 +474,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
                 cockpit,
                 parallel,
                 allow_dirty,
+                origin_notification_target,
                 wait,
             },
         ),
@@ -571,6 +576,7 @@ struct RunStartOptions {
     cockpit: Option<String>,
     parallel: usize,
     allow_dirty: bool,
+    origin_notification_target: String,
     wait: bool,
 }
 
@@ -601,6 +607,10 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
             pi_args,
             parallelism: parallel,
             allow_dirty: opts.allow_dirty,
+            origin_notification_target: effective_request_text(
+                opts.origin_notification_target,
+                "KHAZAD_ORIGIN_NOTIFICATION_TARGET",
+            ),
         },
     )?;
     let output = RunStartOutput::new(result.run_id, repo_path);

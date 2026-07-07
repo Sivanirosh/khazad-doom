@@ -156,6 +156,8 @@ khazad-doom monitor --repo . --latest
 
 Run the command above from the repo checkout; from elsewhere, use the absolute `monitor_command` printed by `khazad-doom run`. `khazad-doom run` returns JSON with `run_id`, absolute `repo_path`, `monitor_command`, and `run_monitor_command`, so whatever started the run can display those commands directly instead of guessing how to launch user-visible progress.
 
+A starter can also pass `--origin-notification-target <target>` (or `KHAZAD_ORIGIN_NOTIFICATION_TARGET`) to store an opaque target in `.workflow/runs/<run>/origin.json`. After `.workflow/runs/<run>/outputs/run-summary.json` exists, completed, blocked, failed, and cancelled transitions try to send inert JSON evidence back through `herdr agent send <target> <text>`; interrupted is excluded. Runs without an origin target do not notify. Missing Herdr, a malformed/stale recorded target, or send failures record non-fatal visibility evidence and never change verification, merge, handoff readiness, status, or final SHA.
+
 The default cockpit mode is `auto`: if a usable `herdr` binary is on `PATH`, run start asks Herdr to create or focus a `Khazad-Doom <run-id>` workspace with read-only `Run Status / Event Feed` and `Integration Gate / Repair` panes. The feed pane is backed by daemon `monitor`; the gate/repair pane paints daemon status feed and bounded shell progress for active gate or repair commands, then falls back to the feed/status summary when no such command is active. Pi slice workers may also appear in deterministic panes named from the run id, slice id, and attempt. Those panes launch a Khazad-owned wrapper that captures stdout, stderr, exit status, and parsed-result artifacts under `.workflow/runs/<run>/outputs/`, then run a read-only activity painter over the wrapper stdout artifact so the pane shows live Pi activity. The painters are display-only: pane text, scrollback, Herdr agent metadata, and typed input are never correctness inputs, and answers/cancels still go through daemon commands. If Herdr is missing, cockpit commands fail, a painter exits, or a worker pane/wrapper handoff fails before Pi launches, Khazad-Doom records or displays only non-fatal visibility/fallback evidence and continues through daemon-owned artifacts or direct Pi execution. Override per run with `--cockpit auto|herdr|direct`, or set durable repo policy with `"cockpit": "auto"`, `"herdr"`, or `"direct"` in `.workflow/khazad.json`. Herdr never owns workflow truth, cancellation, authorization, verification, merge, or handoff. The Planner Pi pane is explicitly deferred until RPL planner authority exists.
 
 To focus Herdr after a run already exists, use `khazad-doom cockpit open --run <run-id>` or `khazad-doom cockpit open --latest --repo .`. The command reads daemon status to identify the run, opens or focuses the Herdr workspace, and returns JSON with a clear `fallback`, `remediation`, and `operator_commands` list when Herdr is unavailable; headless `status`, `watch`, `monitor`, `answer`, and `handoff` flows do not require Herdr.
@@ -256,6 +258,7 @@ To install only the skill without the monitor bridge extension, use Pi package f
 | `khazad-doom run --all --parallel <n>` | Run all open slices; independent workers may run concurrently, then integrate only after the whole parallel layer succeeds. |
 | `khazad-doom run --allow-dirty ...` | Explicitly allow a dirty source repo; the preflight artifact records the dirty snapshot. |
 | `khazad-doom run --cockpit auto|herdr|direct ...` | Override the live cockpit for one run; Herdr failures remain non-fatal. |
+| `khazad-doom run --origin-notification-target <target> ...` | Record an opaque origin target and send inert terminal feedback after completed/blocked/failed/cancelled summaries. |
 | `khazad-doom cockpit open --run <id>` | Open or focus the Herdr cockpit for one daemon-owned run; reports monitor/watch/status fallback when Herdr is unavailable. |
 | `khazad-doom cockpit open --latest --repo .` | Open or focus the Herdr cockpit for the latest run in a repo, including terminal runs. |
 | `khazad-doom resume --run <id>` | Continue an interrupted, failed, or cancelled run from checkpoint. |
@@ -355,7 +358,7 @@ Retries preserve attempt history and should be treated as at-least-once executio
 | `.workflow/schema/slice.schema.json` | JSON Schema for editor/CI validation. |
 | `.workflow/plans/` | Optional planning artifacts. |
 | `.workflow/reports/` | Reports committed to integration branches. |
-| `.workflow/runs/` | Transient handoffs, preflight snapshots, terminal run summaries, attempt diagnostics, and raw outputs; gitignored. |
+| `.workflow/runs/` | Transient handoffs, optional `origin.json` feedback target artifacts, terminal run summaries, notification dedupe records, attempt diagnostics, and raw outputs; gitignored. |
 | `~/.khazad-doom/socket` | Daemon IPC socket. |
 | `~/.khazad-doom/state.sqlite` | Run, slice, event, live progress, worker question, and replan proposal state. |
 | `~/.khazad-doom/worktrees/` | Daemon-managed temporary worktrees. |
