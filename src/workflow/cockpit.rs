@@ -125,6 +125,26 @@ impl CockpitUnavailable {
     }
 }
 
+pub(crate) fn worker_activity_pane_command(
+    wrapper_command: &str,
+    stdout_path: &Path,
+    status_path: &Path,
+    exit_path: &Path,
+) -> String {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
+    let painter_command = format!(
+        "{} cockpit paint-worker-activity --stdout {} --status {} --exit {}",
+        shell_quote(&binary.to_string_lossy()),
+        shell_quote(&stdout_path.to_string_lossy()),
+        shell_quote(&status_path.to_string_lossy()),
+        shell_quote(&exit_path.to_string_lossy()),
+    );
+    let script = format!(
+        "({wrapper_command}) & khazad_wrapper_pid=$!; {painter_command}; khazad_painter_status=$?; if [ \"$khazad_painter_status\" -ne 0 ]; then printf '%s\\n' '[khazad] worker activity painter exited non-fatally; wrapper artifacts remain authoritative' >&2; fi; wait \"$khazad_wrapper_pid\"; exit $?"
+    );
+    format!("/bin/sh -c {}", shell_quote(&script))
+}
+
 pub(crate) trait CockpitAdapter {
     fn name(&self) -> &'static str;
     fn open_or_focus_run_workspace(
@@ -802,6 +822,24 @@ mod tests {
         let calls = adapter.calls();
         assert_eq!(calls[0], "workspace:Khazad-Doom kd-run");
         assert!(calls[1].starts_with("pane:Worker kd-run/SLICE-1 attempt 2:/bin/sh wrapper.sh"));
+    }
+
+    #[test]
+    fn worker_activity_painter_command_waits_for_wrapper_after_painter_exit() {
+        let command = worker_activity_pane_command(
+            "/bin/sh /tmp/kd-wrapper.sh",
+            Path::new("/tmp/kd.stdout.ndjson"),
+            Path::new("/tmp/kd.status.json"),
+            Path::new("/tmp/kd.exit.json"),
+        );
+
+        assert!(command.contains("paint-worker-activity"));
+        assert!(command.contains("/tmp/kd-wrapper.sh"));
+        assert!(command.contains("/tmp/kd.stdout.ndjson"));
+        assert!(command.contains("/tmp/kd.status.json"));
+        assert!(command.contains("/tmp/kd.exit.json"));
+        assert!(command.contains("wait \"$khazad_wrapper_pid\""));
+        assert!(command.contains("wrapper artifacts remain authoritative"));
     }
 
     #[test]

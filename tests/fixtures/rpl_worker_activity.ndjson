@@ -1,0 +1,18 @@
+{"type":"session","version":3,"id":"019f3b71-268e-74fa-ae5a-c0e225a75f04","timestamp":"2026-07-07T07:18:19.022Z","cwd":"/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260707-070851-bd30eb80/RPL-01"}
+{"type":"agent_start","dogfood_fixture":"RPL-01.worker.attempt-1.herdr.stdout.ndjson"}
+{"type":"turn_start","unknownFieldForTolerance":true}
+{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"fixture prompt from RPL dogfood artifact"}],"timestamp":1783408699241}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"looking"}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0,"content":"looked"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"hello "}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"world"}}
+{"type":"tool_execution_start","toolCallId":"call_AMbiLgFvgCkucO79yvthcVee","toolName":"read","args":{"path":"/home/sivanirosh/git_repos/khazad-doom/.workflow/runs/kd-20260707-070851-bd30eb80/handoffs/RPL-01.json"}}
+{"type":"tool_execution_update","toolCallId":"call_AMbiLgFvgCkucO79yvthcVee","toolName":"read","partialResult":{"content":[]}}
+{"type":"tool_execution_end","toolCallId":"call_AMbiLgFvgCkucO79yvthcVee","toolName":"read","result":{"content":[{"type":"text","text":"bounded fixture result"}]}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"hello world"},"message":{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input":7,"output":11}}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input":7,"output":11}}}
+{"type":"future_activity_event","contract_version":2,"payload":{"ignored":true}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input":7,"output":11}}}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input":7,"output":11}}],"willRetry":false}
