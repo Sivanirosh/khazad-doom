@@ -2,7 +2,9 @@
   "id": "HERDR-06",
   "title": "Terminal run feedback callback",
   "goal": "Send an optional, inert terminal-run feedback message back to the Herdr/Pi agent or pane that started a Khazad-Doom run, so operators see completed, blocked, failed, or cancelled outcomes without manually polling or asking for a summary.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260707-101926-2782be8c",
+  "closed_at": "2026-07-07T10:44:43.537811950+00:00",
   "depends_on": [
     "HERDR-05"
   ],
