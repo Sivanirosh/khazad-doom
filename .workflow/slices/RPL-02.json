@@ -1,0 +1,47 @@
+{
+  "id": "RPL-02",
+  "title": "Finding disposition and repair-authority flow",
+  "goal": "Make actionable findings and out-of-authority repairs end in explicit dispositions or replan proposals, while preserving invalid worker-output attempts as durable evidence before retry.",
+  "status": "open",
+  "depends_on": [
+    "RPL-01"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/agent.rs",
+    "src/artifact.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/schema.rs",
+    "src/workflow/economics.rs",
+    "tests/daemon_integration.rs",
+    "docs/design/replan-checkpoints.md",
+    "docs/design/architecture-review-2026-07-06.md",
+    "docs/design/evidence/herdr-dogfood-review-2026-07-07.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Worker and repair outputs that contain actionable findings must give each finding a terminal disposition or an associated pending replan proposal before the run can be advertised as handoff-ready.",
+    "Out-of-area or workflow-policy repair needs are converted into proposal evidence instead of being applied silently by a repair worker.",
+    "Accepting a repair/finding proposal applies only the approved revision or follow-up; rejecting or deferring preserves the finding, rationale, and evidence in status/report/handoff surfaces.",
+    "Invalid worker output is preserved as a durable attempt artifact/event before retry, including the raw invalid payload or bounded parse error, attempt number, slice id, and transcript/output tails where available.",
+    "Runtime economics and attempt history count invalid-output attempts accurately instead of making the retry look like a single successful agent call.",
+    "The HERDR/FEED invalid-output evidence gap is covered by regression tests: invalid JSON/schema output preserves evidence, while check-failed attempts continue preserving their existing artifacts."
+  ],
+  "must_ask_if": [
+    "The implementation would allow repair workers to mutate workflow policy, profiles, verification commands, slice contracts, dependencies, or paths outside authorized areas without an operator-approved proposal.",
+    "The implementation would drop or overwrite invalid worker-output evidence during retry.",
+    "The implementation would let workers approve their own evidence or mark actionable findings resolved without a disposition/proposal.",
+    "The implementation would broaden worker output authority beyond the existing JSON Issue Slice fence."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test finding --quiet",
+    "cargo test repair --quiet",
+    "cargo test invalid_worker_output --quiet"
+  ],
+  "verify_timeout_seconds": 900
+}

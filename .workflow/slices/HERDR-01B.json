@@ -1,0 +1,42 @@
+{
+  "id": "HERDR-01B",
+  "title": "Delegate cockpit open to the Herdr seam",
+  "goal": "Remove the duplicate Herdr protocol implementation from the operator-side cockpit open/focus command so Khazad-Doom has exactly one Herdr protocol layer behind the Cockpit seam.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-03"
+  ],
+  "areas": [
+    "src/cli.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/mod.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "docs/design/evidence/herdr-dogfood-review-2026-07-07.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "The operator-side cockpit open/focus command delegates to the same Cockpit/CockpitAdapter seam used by daemon run and worker-pane launch paths.",
+    "src/cli.rs no longer implements Herdr protocol details directly: no Herdr workspace list/create/focus JSON protocol parsing, no root_pane.pane_id extraction, and no standalone Herdr version probe outside the cockpit seam.",
+    "The explicit cockpit open/focus command preserves its JSON output shape, fallback/remediation behavior, latest-run lookup behavior, and operator command suggestions.",
+    "There is one Herdr protocol implementation in the crate, localized to src/workflow/cockpit.rs or a strictly internal child of that seam.",
+    "A regression test or grep guard would catch reintroducing direct Herdr protocol helpers in src/cli.rs.",
+    "No workflow truth path changes: Herdr remains optional observability/focus only, and daemon-owned state remains authoritative for run status, verification, merge, and handoff."
+  ],
+  "must_ask_if": [
+    "The implementation would add a second Herdr adapter or compatibility layer instead of deleting/delegating the duplicate CLI protocol code.",
+    "The implementation would make Herdr required for status, handoff, blocker answers, verification, or headless operation.",
+    "The implementation would parse Herdr pane text, scrollback, or agent-status metadata as correctness evidence.",
+    "The implementation would change the public JSON contract of khazad-doom cockpit open in a way not implied by delegating to the Cockpit seam."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test cockpit --quiet",
+    "cargo test herdr_open_focus_reports_fallback_when_unavailable --quiet",
+    "HERDR_E2E=1 cargo test herdr_open_focus_real --quiet",
+    "bash -lc '! rg -n \"\\b(run_herdr|create_herdr|find_herdr_workspace_id|root_pane|pane_id)\\b\" src/cli.rs'"
+  ],
+  "verify_timeout_seconds": 900
+}

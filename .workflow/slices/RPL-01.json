@@ -1,0 +1,46 @@
+{
+  "id": "RPL-01",
+  "title": "Replan proposal store and projection",
+  "goal": "Introduce the smallest daemon-owned replan proposal lifecycle justified by the RFC: durable proposal records, explicit operator decisions, and status/feed projection of pending decisions without autonomous queue mutation.",
+  "status": "open",
+  "depends_on": [
+    "HERDR-01B"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "docs/design/replan-checkpoints.md",
+    "docs/design/architecture-review-2026-07-06.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Daemon state can persist replan proposals with stable ids, source/evidence links, proposed changes, risk, and states pending, accepted, rejected, deferred, and superseded.",
+    "Operator decisions are explicit daemon commands or IPC actions that record rationale, authorizer/source, timestamps, and whether a proposal was applied, rejected, deferred, or superseded.",
+    "Status JSON and the daemon feed projection render pending/decided proposal state, exact decision commands, and the run's pending-attention reason without adding new RunStatus or SliceStatus enum values.",
+    "Interrupted/restarted daemon state preserves pending proposals and does not silently dispatch new workers or repairs against an unknown queue while a required proposal is pending.",
+    "No proposal is auto-applied in v1; the auto-approvable tier remains empty unless a later slice changes it with explicit evidence and approval.",
+    "Existing runs without proposals preserve current status/watch/monitor behavior except for additive empty proposal/history fields where needed."
+  ],
+  "must_ask_if": [
+    "The implementation would introduce an autonomous planner or background replan pass when no finding/proposal exists.",
+    "The implementation would auto-apply a queue, slice, verification, or policy change without operator authorization.",
+    "The implementation would add a new terminal run status or slice status instead of using projection/pending-attention state.",
+    "The implementation would silently edit .workflow/slices during an active run without a durable proposal/revision record."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test replan --quiet",
+    "cargo test projection --quiet",
+    "cargo test status_and_watch_expose_live_progress_for_long_verification --quiet"
+  ],
+  "verify_timeout_seconds": 900
+}

@@ -1,0 +1,55 @@
+{
+  "id": "PI-PROOF-01",
+  "title": "Pi-native acceptance evidence closure",
+  "goal": "Close the remaining Pi-native roadmap evidence gaps with executable black-box proof: contract recording, profile-surface fidelity, fake-runner attestation, and ask_operator ask/answer/timeout/restart behavior.",
+  "status": "open",
+  "depends_on": [
+    "RPL-03"
+  ],
+  "areas": [
+    "src/pi_contract.rs",
+    "src/agent_profile.rs",
+    "src/agent.rs",
+    "src/domain.rs",
+    "src/daemon.rs",
+    "src/state.rs",
+    "src/ipc.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "extensions/khazad-worker",
+    "extensions/khazad-monitor",
+    "tests/daemon_integration.rs",
+    "docs/roadmap/pi-native/00-matrix.md",
+    "docs/design/pi-contract-inventory.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Run preflight or equivalent run artifacts record the Pi contract/profile evidence needed to prove which Pi CLI/event surface and worker profile the daemon used.",
+    "The effective worker profile summary is identical across run_started/status, final report, handoff JSON, implementation summary, and economics/attestation surfaces.",
+    "Fake-runner executions are unmistakably labeled as deterministic test-double evidence in status/report/handoff/economics and cannot be mistaken for real Pi worker implementation evidence.",
+    "A black-box ask_operator workflow test proves worker asks a question, daemon persists pending state, status/watch/monitor show the exact answer command, operator answers through daemon state, and the worker continues to completion.",
+    "Timeout/unavailable ask_operator behavior falls back to blocked ask-user evidence with durable artifacts instead of losing the question or inventing intent.",
+    "Daemon restart/interruption while a question is pending is covered: the question remains inspectable and answering either applies on resume or is rejected with clear resume guidance; it is never silently lost.",
+    "PI-02, PI-03, and PI-04 roadmap rows are updated only to states backed by the new executable evidence; any remaining gap is explicitly deferred with a revisit condition."
+  ],
+  "must_ask_if": [
+    "The implementation would add a second real worker harness, fallback model failover, or provider auto-login/credential mutation.",
+    "The implementation would satisfy ask_operator proof through white-box unit tests only, without a black-box daemon/worker workflow case.",
+    "The implementation would make Herdr or the Pi UI extension required for answering blockers or headless operation.",
+    "The implementation would mark roadmap rows done without slice/run evidence and declared tests."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test pi_contract --quiet",
+    "cargo test profile --quiet",
+    "cargo test operator_question --quiet",
+    "cargo test ask_operator --quiet",
+    "npm test"
+  ],
+  "verify_timeout_seconds": 1200
+}

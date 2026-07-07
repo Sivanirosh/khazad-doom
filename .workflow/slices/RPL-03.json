@@ -1,0 +1,46 @@
+{
+  "id": "RPL-03",
+  "title": "Queue-history handoff and roadmap truth lint",
+  "goal": "Make replan proposal history and roadmap truth mechanically visible: handoffs/reports include queue revisions and roadmap status cannot contradict slice/run evidence without a lint failure.",
+  "status": "open",
+  "depends_on": [
+    "RPL-02"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "src/artifact.rs",
+    "tests/daemon_integration.rs",
+    "scripts",
+    "docs/roadmap/pi-native/00-matrix.md",
+    "docs/design/architecture-review-2026-07-06.md",
+    "docs/design/replan-checkpoints.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Final reports, implementation summaries, and handoff JSON include a plan_revisions or equivalent queue-history section covering pending, accepted, rejected, deferred, and superseded proposals relevant to the run.",
+    "Accepted revisions are attested with evidence, authorizer, applied-at checkpoint, and before/after queue or slice-change summary; rejected/deferred proposals remain visible with rationale and revisit condition where applicable.",
+    "Unresolved pending proposals block handoff readiness unless the operator explicitly marks them non-blocking through the approved proposal/disposition mechanism.",
+    "A roadmap/matrix truth lint or generator checks that roadmap statuses cannot claim acceptance/closure contradicting .workflow slice JSON and named daemon run evidence.",
+    "The lint catches a fixture where a matrix row says done while the corresponding slice remains open or lacks completed-run closure evidence.",
+    "The implementation does not make roadmap Markdown authoritative; Markdown remains a summary over slice/run evidence or a checked planning note."
+  ],
+  "must_ask_if": [
+    "The implementation would make docs/roadmap Markdown the source of truth instead of checking it against slice JSON and daemon/run evidence.",
+    "The implementation would silently suppress pending replan proposals from handoff/report output.",
+    "The implementation would auto-close slices or rewrite roadmap state without daemon completion evidence or operator-approved revision records.",
+    "The implementation would add a rich planning UI instead of the bounded lint/report/handoff surfaces declared by this slice."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test handoff --quiet",
+    "cargo test roadmap --quiet",
+    "bash -lc 'if [ -x scripts/roadmap-truth-check ]; then scripts/roadmap-truth-check; elif [ -x scripts/roadmap_truth_check.py ]; then scripts/roadmap_truth_check.py; else cargo test roadmap_truth --quiet; fi'"
+  ],
+  "verify_timeout_seconds": 900
+}

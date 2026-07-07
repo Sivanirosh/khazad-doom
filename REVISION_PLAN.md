@@ -316,14 +316,17 @@ Accepted scope decisions:
 - The existing Pi extension becomes a thin bridge: start/explain/answer/summarize/open Herdr cockpit; it does not emulate a live multi-agent dashboard.
 - Real Herdr smoke/e2e evidence is required for Herdr slices, but normal `cargo test` must remain portable when Herdr is not installed; Herdr-specific checks are explicitly gated.
 
-Revised Phase 5 order after publication truth:
+Revised Phase 5 order after publication truth and first Herdr dogfood review:
 
 1. FEED-01 — terminal reason and projection authority.
 2. HERDR-01 — cockpit contract, config, default workspace, read-only feed/phase panes.
 3. HERDR-02 — Herdr worker panes with KD-owned wrapper/result capture and direct fallback.
 4. HERDR-03 — Pi bridge opens/focuses Herdr cockpit and stays a painter/explainer.
-5. RPL-01, RPL-02, RPL-03 — replan proposal/store/disposition/history.
-6. PI-PROOF-01 — Pi-native acceptance evidence closure.
+5. HERDR-01B — one Herdr protocol implementation; CLI cockpit open delegates to the `Cockpit` seam.
+6. RPL-01, RPL-02, RPL-03 — replan proposal/store/disposition/history. RPL-02 also owns the confirmed invalid-output attempt evidence gap from FEED-01/HERDR-01.
+7. PI-PROOF-01 — Pi-native acceptance evidence closure, including black-box `ask_operator` proof.
+
+Post-Herdr dogfood review evidence is recorded in `docs/design/evidence/herdr-dogfood-review-2026-07-07.md`.
 
 ## Plan-level completion criteria
 
