@@ -465,10 +465,16 @@ impl Runner for PiRunner {
         let output = if job.json_schema.trim().is_empty() {
             None
         } else {
-            Some(
-                extract_json_object(&text)
-                    .with_context(|| format!("parse pi JSON output from {text:?}"))?,
-            )
+            match extract_json_object(&text) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    let message = format!(
+                        "parse pi JSON output failed: {err}; output_tail={:?}",
+                        tail_text(&text, 2000)
+                    );
+                    return Err(RunnerError::new(message, parser.transcript(&stderr)).into());
+                }
+            }
         };
         Ok(ResultData {
             output,
@@ -782,10 +788,16 @@ fn parse_pi_artifact_result(
     let output = if job.json_schema.trim().is_empty() {
         None
     } else {
-        Some(
-            extract_json_object(&text)
-                .with_context(|| format!("parse pi JSON output from {text:?}"))?,
-        )
+        match extract_json_object(&text) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                let message = format!(
+                    "parse pi JSON output failed: {err}; output_tail={:?}",
+                    tail_text(&text, 2000)
+                );
+                return Err(RunnerError::new(message, parser.transcript(&stderr)).into());
+            }
+        }
     };
     Ok(ResultData {
         output,

@@ -141,15 +141,21 @@ This section is the Phase 2 doctrine diff from `REVISION_PLAN.md`; it records wh
 - **Actionable findings need terminal disposition.**
   - Proposed invariant text: findings that ask for intent or propose scope/verification/queue/policy changes end as answered, folded into a slice/revision, explicitly deferred, or rejected.
   - Ledger entries: F-003, F-006, F-008.
-  - Enforcement mechanism: worker-output/replan schemas plus final-report and handoff validation for unresolved actionable findings.
+  - Enforcement mechanism: worker-output/repair-output schemas require `finding_dispositions`; successful outputs with actionable findings and no terminal disposition or pending daemon-created proposal fail validation before handoff readiness.
   - Violation-detecting test: a worker or repair output with an actionable finding and no disposition fails validation or marks the run/handoff as unresolved.
-  - Status: accepted.
+  - Status: accepted; RPL-02 enforcement implemented for worker and integration-repair outputs.
 - **Repair authority is bounded by existing authorization.**
   - Proposed invariant text: repair workers may not mutate workflow policy, profiles, verification, slice contracts, dependencies, or paths outside authorized areas without an operator-approved revision/follow-up.
   - Ledger entries: F-003.
-  - Enforcement mechanism: repair prompt contract, repair change-scope checks against authorized slice areas and protected workflow paths, and operator-approved revision records for exceptions.
+  - Enforcement mechanism: repair prompt contract, repair change-scope checks against authorized slice areas and protected workflow paths, daemon-created replan proposal records for exceptions, and reset of unapplied repair revisions.
   - Violation-detecting test: an integration repair fixture that changes `.workflow/khazad.json`, profiles, slice JSON, or out-of-area files is blocked unless paired with an approved revision.
-  - Status: accepted.
+  - Status: accepted; RPL-02 records proposal evidence instead of applying out-of-authority repair mutations.
+- **Invalid worker outputs are durable attempt evidence.**
+  - Proposed invariant text: invalid worker JSON, schema mismatches, and missing output are preserved before retry with attempt number, slice id, bounded raw payload or parse error, and transcript/output tails when available.
+  - Ledger entries: F-006; post-Herdr invalid-output evidence gap.
+  - Enforcement mechanism: daemon writes `*.worker.attempt-N.invalid-output.json`, records `invalid_worker_output` events, and updates slice attempts before retry/fail.
+  - Violation-detecting test: invalid JSON and schema retry fixture preserves artifacts/events and counts all attempts/economics.
+  - Status: accepted; RPL-02 implemented.
 - **Terminal blocked/failed states carry structured reason data.**
   - Proposed invariant text: `blocked`/`failed` are not enough; terminal artifacts include primary reason kind, resolution owner, retryability/operator-action flags where applicable, evidence links, and remediation/disposition links.
   - Ledger entries: F-004, F-006, F-009.
