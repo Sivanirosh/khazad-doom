@@ -1,0 +1,57 @@
+{
+  "id": "REPAIR-01",
+  "title": "Bounded worker-envelope and slice repair policy",
+  "goal": "Use daemon-recorded per-attempt failure evidence from kd-20260707-153202-9f41ac7c to make pre-merge worker recovery typed and bounded: invalid or missing worker JSON gets envelope re-emission against the existing worker head, mechanical verify failures get one targeted in-scope slice repair with tool output as evidence, scope violations stay in the RPL-02B proposal/grant path, and parallel layer atomicity is preserved. This is not an open-ended mandate to complete all recoverable work autonomously; unknown classes keep existing blocking/retry behavior.",
+  "status": "open",
+  "depends_on": [
+    "RPL-02"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/agent.rs",
+    "src/artifact.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/schema.rs",
+    "src/workflow/economics.rs",
+    "src/workflow/gate.rs",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "docs/workflow-invariants.md",
+    "docs/design/failure-ledger.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "The observed audit from kd-20260707-153202-9f41ac7c is encoded in implementation docs or invariant text: terminal worker evidence-envelope failure, discarded ready sibling CPLX-03 under preserved layer atomicity, and durable invalid_worker_output artifacts/events are the motivating evidence for this slice.",
+    "Worker attempt diagnostics record a typed per-attempt failure trail for the classes exercised here rather than only a final prose error: invalid worker output, scope violation, and mechanical verify command failure are visible in daemon state/status/artifacts with attempt number, slice id, primary evidence link, and retry/repair disposition.",
+    "Invalid, missing, or schema-invalid worker JSON uses a separate small envelope-retry budget, defaulting to two attempts, that asks the worker to re-emit valid JSON for the existing worker head/output evidence instead of launching a broad implementation rewrite; exhausted envelope retries still terminate with invalid-output artifacts/events cited in terminal evidence.",
+    "Envelope retries do not consume the bounded code-attempt or slice-repair budget, but they do remain counted in economics/attempt history so silent retries cannot return.",
+    "Mechanical verify failures produced by daemon-owned slice checks, including fmt, clippy, and test command failures, get at most one targeted in-scope slice-repair attempt after the normal worker attempt would otherwise become terminal; the repair prompt includes the exact failing command output, and daemon checks rerun before ready_to_merge.",
+    "Scope violations are not auto-repaired or auto-authorized by this path: mistaken out-of-area changes remain hard failures with evidence, and genuinely needed out-of-area edits require the existing RPL-02B accepted proposal/grant path before daemon path guards allow them.",
+    "Parallel layer atomicity remains load-bearing: a ready sibling is not merged after another sibling fails, but status/feed/economics explicitly name the ready sibling branch/commit as preserved-but-unmerged evidence so the cost of the failed layer is visible.",
+    "The existing failure_kind/check classification path is extended only for the observed classes; do not build a broad new classifier unless the implementation demonstrates it removes duplicated classification logic without changing public behavior.",
+    "docs/workflow-invariants.md adds a Phase 2 amendment entry using the existing five-field template - Proposed invariant text, Ledger entries, Enforcement mechanism, Violation-detecting test, Status - describing bounded typed worker-attempt recovery as a genuine extension of D2's 'failures must not burn retries or masquerade as implementation failures' doctrine.",
+    "The repair authority maxim appears verbatim in this slice's implementation evidence or docs: 'A false positive that auto-repairs beyond authority is worse than a false negative that blocks.'",
+    "Regression coverage includes a fake-runner sequence equivalent to invalid envelope output -> scope violation -> mechanical verify failure -> targeted repair succeeds, and a separate final-envelope-failure case that preserves/re-emits invalid-output artifacts as terminal evidence.",
+    "Existing projection snapshots, parity fixtures, and golden output tests remain behavior-preserving unless an intentional divergence is explicitly documented in this slice output."
+  ],
+  "must_ask_if": [
+    "The implementation would soften parallel layer atomicity by merging or publishing ready siblings from a failed layer.",
+    "The implementation would auto-repair, auto-revert, or auto-authorize out-of-area changes without an accepted RPL-02B-style grant.",
+    "The implementation would introduce open-ended autonomy such as unbounded retries, generic 'all recoverable failures' language, or repair for unknown failure classes.",
+    "The implementation would hide, overwrite, or stop emitting invalid_worker_output artifacts/events for malformed or missing worker JSON.",
+    "The implementation would create a broad new failure-classifier module without first showing that multiple existing failure domains would otherwise duplicate the same classification logic.",
+    "The implementation would change worker/slice verification policy or allow workers to approve their own acceptance evidence."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test invalid_worker_output --quiet",
+    "cargo test repair --quiet",
+    "cargo test worker_attempt_failure --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}
