@@ -1,7 +1,10 @@
 {
   "id": "TUI-RETRY-01",
   "title": "Native Pi TUI invalid result retry proof",
-  "goal": "Prove that native Pi TUI worker attempts use the same bounded invalid-output evidence and envelope retry behavior as the wrapper path, without parsing terminal text as a fallback result.",
+  "goal": "Prove native Pi TUI invalid-result retry with a real daemon run. On the initial slice-worker attempt, update docs/design/evidence/tui-worker-retry-proof-2026-07-08.md with the proof boundary, commit that change, then deliberately submit a daemon-invalid complete result through submit_worker_result by omitting acceptance evidence (empty acceptance_status is enough). On the envelope retry for the same attempt, do not change files; re-emit a valid complete result for the already-committed evidence with acceptance_status for every criterion.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-080118-a741f423",
+  "closed_at": "2026-07-08T08:05:41.764169682+00:00",
   "depends_on": [
     "LAYOUT-05"
   ],
@@ -10,18 +13,20 @@
     "docs/design/evidence/tui-worker-retry-proof-2026-07-08.md"
   ],
   "acceptance": [
-    "Document an adversarial native Pi TUI run or deterministic test where a TUI result artifact exists but its result payload is invalid for the worker result model, producing preserved invalid-output evidence.",
-    "Evidence includes the invalid-output artifact path, invalid_worker_output or worker_attempt_failure event, retry disposition, bounded retry count, and final terminal outcome.",
-    "Evidence shows terminal text, Herdr scrollback, Herdr metadata, and Pi display state were not parsed as fallback result evidence.",
-    "The proof document states what retry behavior proves and does not prove."
+    "A real native Pi TUI worker attempt writes a kd_tui_result_artifact via submit_worker_result whose result payload is daemon-invalid, producing preserved invalid_worker_output evidence.",
+    "The same attempt gets a bounded envelope retry that launches through native Pi TUI again, re-emits valid worker JSON for the existing committed evidence, and reaches a terminal successful outcome.",
+    "Evidence includes cockpit_worker_ready for the initial worker and the envelope retry with source_of_truth = kd_tui_result_artifact, the invalid-output artifact path, invalid_worker_output event, retry disposition, bounded retry count, and final terminal outcome.",
+    "The proof document states that terminal text, Herdr scrollback, Herdr metadata, and Pi display state were not parsed as fallback result evidence, and states what retry behavior proves and does not prove."
   ],
   "must_ask_if": [
     "The proof would require weakening submit_worker_result validation in production code.",
-    "The proof can only be obtained by reading terminal text as output."
+    "The proof can only be obtained by reading terminal text as output.",
+    "The retry needs to change files instead of only re-emitting valid worker JSON for the existing committed evidence."
   ],
   "verify": [
     "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
     "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+    "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
     "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
     "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md"
   ]

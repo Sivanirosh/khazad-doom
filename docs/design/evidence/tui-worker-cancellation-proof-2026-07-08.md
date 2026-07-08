@@ -4,7 +4,7 @@
 
 Sacrificial cancellation run: `kd-20260708-025730-90360651`.
 
-This was a real Khazad-Doom daemon run launched with the experimental native Pi TUI worker path and then cancelled through KD daemon IPC. Herdr is observability only. Terminal text, Herdr scrollback, screenshots, pane labels, and Pi display state are not correctness evidence.
+This was a real Khazad-Doom daemon run launched with the then-experimental native Pi TUI worker path and then cancelled through KD daemon IPC. Herdr is observability only. Terminal text, Herdr scrollback, screenshots, pane labels, and Pi display state are not correctness evidence.
 
 ## Command and cancellation
 
@@ -89,7 +89,7 @@ This is no slice merge evidence for the cancelled proof run.
 
 ## Blocker relation
 
-Cancellation cleanup closed the worker pane and prevented merge. The timeout proof in `kd-20260708-025608-0b5ce10e` separately showed that closing the slot-1 TUI pane can leave the v2 layout unable to launch another native TUI worker in that slot. That lifecycle gap remains a blocker before native TUI default promotion.
+Cancellation cleanup closed the worker pane and prevented merge. Earlier timeout/multi-worker proofs exposed a stale-anchor slot recreation blocker, but `COCKPIT-ANCHOR-01` and follow-up runs `kd-20260708-075931-ea500eb4` and `kd-20260708-082104-2724f3e9` supersede that blocker for timeout retries and four-worker placement.
 
 ## What this proves
 
@@ -101,5 +101,4 @@ Cancellation cleanup closed the worker pane and prevented merge. The timeout pro
 ## What this does not prove
 
 - It does not prove retry after cancellation.
-- It does not prove native TUI timeout, invalid-result retry, targeted repair, or multi-worker placement.
-- It does not remove the slot recreation blocker found by the timeout/multi-worker proofs.
+- It does not prove native TUI timeout, invalid-result retry, targeted repair, or multi-worker placement; those are covered by separate proof runs.

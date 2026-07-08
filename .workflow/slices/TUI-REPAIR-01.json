@@ -1,7 +1,10 @@
 {
   "id": "TUI-REPAIR-01",
   "title": "Native Pi TUI targeted repair proof",
-  "goal": "Prove that a native Pi TUI worker result can fail slice verification, trigger bounded targeted repair, rerun verification, and merge only after post-repair verification passes.",
+  "goal": "Prove native Pi TUI targeted slice repair with a real daemon run. If the prompt says Khazad-Doom Slice Worker, including retry attempts after a previous verification failure, update docs/design/evidence/tui-worker-repair-proof-2026-07-08.md and commit it, then submit a valid complete result through submit_worker_result, but deliberately omit the exact string native-tui-targeted-repair-marker from the document so daemon-owned slice verification fails. Only a prompt that says Khazad-Doom Targeted Slice Repair Worker is authorized to add native-tui-targeted-repair-marker; that targeted repair worker must add the marker to the same proof document, commit the repair, submit a valid result, and let post-repair verification pass.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-081133-0b908fed",
+  "closed_at": "2026-07-08T08:19:28.558018006+00:00",
   "depends_on": [
     "LAYOUT-05"
   ],
@@ -10,18 +13,21 @@
     "docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
   ],
   "acceptance": [
-    "Document a native Pi TUI proof where the first accepted worker result artifact fails a slice verify command and KD records the check failure.",
-    "Evidence includes targeted slice repair attempt launch, repair output from a KD-owned artifact path, verify rerun, post-repair pass, and merge only after post-repair verification passes.",
-    "The proof document distinguishes slice repair from integration repair and states what repair behavior proves and does not prove."
+    "Each normal native Pi TUI slice-worker attempt is accepted from a kd_tui_result_artifact and then fails daemon-owned slice verification because the committed proof document intentionally omits native-tui-targeted-repair-marker.",
+    "After normal attempts are exhausted, Khazad-Doom launches a targeted slice-repair worker through native Pi TUI, records repair output from a KD-owned artifact path, and the repair commit adds native-tui-targeted-repair-marker in scope.",
+    "Post-repair verification reruns and passes, and the slice merges only after the post-repair pass.",
+    "The proof document distinguishes targeted slice repair from integration repair and states what repair behavior proves and does not prove."
   ],
   "must_ask_if": [
     "The repair proof would require authorizing paths outside the proof slice areas or weakening path guards.",
-    "The worker tries to change workflow policy, profiles, verification commands, or unrelated slices as part of repair."
+    "The worker tries to change workflow policy, profiles, verification commands, or unrelated slices as part of repair.",
+    "A normal slice-worker prompt cannot omit native-tui-targeted-repair-marker without inventing a different proof mechanism."
   ],
   "verify": [
     "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
     "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
     "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
-    "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+    "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+    "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
   ]
 }

@@ -121,9 +121,12 @@ enum CommandArgs {
         /// Live cockpit mode for this run: auto, herdr, or direct. Defaults to repo config.
         #[arg(long, value_parser = ["auto", "herdr", "direct"])]
         cockpit: Option<String>,
-        /// Experimental: launch Pi workers as native Herdr-hosted TUI agents.
+        /// Deprecated compatibility flag; native Herdr-hosted Pi TUI workers are now the default.
         #[arg(long = "experimental-pi-tui-worker")]
         experimental_pi_tui_worker: bool,
+        /// Force the legacy JSON wrapper worker even when Herdr cockpit is available.
+        #[arg(long = "json-wrapper-worker")]
+        json_wrapper_worker: bool,
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
@@ -152,9 +155,12 @@ enum CommandArgs {
         /// Live cockpit mode for resumed execution: auto, herdr, or direct. Defaults to repo config.
         #[arg(long, value_parser = ["auto", "herdr", "direct"])]
         cockpit: Option<String>,
-        /// Experimental: launch Pi workers as native Herdr-hosted TUI agents.
+        /// Deprecated compatibility flag; native Herdr-hosted Pi TUI workers are now the default.
         #[arg(long = "experimental-pi-tui-worker")]
         experimental_pi_tui_worker: bool,
+        /// Force the legacy JSON wrapper worker even when Herdr cockpit is available.
+        #[arg(long = "json-wrapper-worker")]
+        json_wrapper_worker: bool,
         /// Run independent slice workers concurrently, then merge serially.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
@@ -480,6 +486,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             pi_args,
             cockpit,
             experimental_pi_tui_worker,
+            json_wrapper_worker,
             parallel,
             allow_dirty,
             origin_notification_target,
@@ -495,6 +502,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
                 pi_args,
                 cockpit,
                 experimental_pi_tui_worker,
+                json_wrapper_worker,
                 parallel,
                 allow_dirty,
                 origin_notification_target,
@@ -508,6 +516,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             pi_args,
             cockpit,
             experimental_pi_tui_worker,
+            json_wrapper_worker,
             parallel,
             wait,
         } => run_resume(
@@ -519,6 +528,7 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
                 pi_args,
                 cockpit,
                 experimental_pi_tui_worker,
+                json_wrapper_worker,
                 parallel,
                 wait,
             },
@@ -606,6 +616,7 @@ struct RunStartOptions {
     pi_args: Vec<String>,
     cockpit: Option<String>,
     experimental_pi_tui_worker: bool,
+    json_wrapper_worker: bool,
     parallel: usize,
     allow_dirty: bool,
     origin_notification_target: String,
@@ -639,6 +650,7 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
             pi_args,
             experimental_pi_tui_worker: experimental_pi_tui_worker_requested(
                 opts.experimental_pi_tui_worker,
+                opts.json_wrapper_worker,
             ),
             parallelism: parallel,
             allow_dirty: opts.allow_dirty,
@@ -662,6 +674,7 @@ struct ResumeCliOptions {
     pi_args: Vec<String>,
     cockpit: Option<String>,
     experimental_pi_tui_worker: bool,
+    json_wrapper_worker: bool,
     parallel: usize,
     wait: bool,
 }
@@ -678,6 +691,7 @@ fn run_resume(paths: Paths, opts: ResumeCliOptions) -> Result<()> {
             pi_args: effective_request_args_with_cockpit(opts.pi_args, opts.cockpit.as_deref())?,
             experimental_pi_tui_worker: experimental_pi_tui_worker_requested(
                 opts.experimental_pi_tui_worker,
+                opts.json_wrapper_worker,
             ),
             parallelism: opts.parallel,
         },
@@ -2110,11 +2124,26 @@ fn effective_request_args(values: Vec<String>, env_key: &str) -> Vec<String> {
     split_arg_values(vec![std::env::var(env_key).unwrap_or_default()])
 }
 
-fn experimental_pi_tui_worker_requested(cli_flag: bool) -> bool {
-    cli_flag
-        || std::env::var("KHAZAD_EXPERIMENTAL_PI_TUI_WORKER")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
+fn experimental_pi_tui_worker_requested(cli_flag: bool, json_wrapper_flag: bool) -> bool {
+    if json_wrapper_flag
+        || env_flag_enabled("KHAZAD_JSON_WRAPPER_WORKER")
+        || env_flag_enabled("KHAZAD_DISABLE_PI_TUI_WORKER")
+    {
+        return false;
+    }
+    if cli_flag {
+        return true;
+    }
+    if let Ok(value) = std::env::var("KHAZAD_EXPERIMENTAL_PI_TUI_WORKER") {
+        return !matches!(value.trim(), "0" | "false" | "no" | "off");
+    }
+    true
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn effective_request_args_with_cockpit(

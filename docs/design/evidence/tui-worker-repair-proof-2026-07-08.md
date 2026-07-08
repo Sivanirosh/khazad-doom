@@ -2,57 +2,59 @@
 
 ## Scope and evidence boundary
 
-This proof category is **not promotion-ready** as of 2026-07-08.
+Authoritative targeted-repair proof run: `kd-20260708-081133-0b908fed`.
 
-The daemon's shared targeted slice repair path is covered by deterministic regression tests, but a native Pi TUI run that accepts an initial TUI result artifact, fails slice verification, launches a targeted repair worker, reruns verification, and merges only after post-repair pass has not yet been proven. Live native TUI timeout and multi-worker proofs found a pane-slot lifecycle blocker first.
+This was a real Khazad-Doom daemon run launched through native Pi TUI workers. Herdr is observability/focus only. Correctness evidence comes from KD daemon state, events, and artifacts. Terminal text, Herdr scrollback, screenshots, pane labels, and Pi display state are not correctness evidence.
 
-Terminal text, Herdr scrollback, screenshots, pane labels, and Pi display state are not correctness evidence.
-
-## Evidence that shared targeted repair still works
-
-Commands run:
+## Command
 
 ```bash
-cargo test -q worker_attempt_failure_sequence_uses_envelope_retry_and_targeted_repair
-cargo test -q repair
+target/debug/khazad-doom run --allow-dirty --cockpit herdr --experimental-pi-tui-worker --slice TUI-REPAIR-01
 ```
 
-Results: passed.
+The slice intentionally failed normal verification until the targeted slice repair path added marker `native-tui-targeted-repair-marker`.
 
-The focused repair regression exercises the daemon-owned failure sequence for invalid output, scope/verification failures, targeted in-scope slice repair, verify rerun, and post-repair success. The broader `repair` test filter also passed.
+## Daemon-owned repair evidence
 
-These tests prove the downstream daemon repair policy remains covered, including bounded repair and post-repair verification. They do not prove native TUI placement/lifecycle for the repair worker.
+`khazad-doom status --run kd-20260708-081133-0b908fed --events-limit 1000` reported terminal status `completed`.
 
-## Native TUI-specific blocker
+The daemon emitted four native `cockpit_worker_ready` events with `source_of_truth: "kd_tui_result_artifact"`:
 
-A full native TUI targeted-repair proof would require at least two native TUI worker launches in one slice lifecycle:
+```text
+normal attempt 1 pane w49:p4 source_of_truth kd_tui_result_artifact
+normal attempt 2 pane w49:p6 source_of_truth kd_tui_result_artifact
+normal attempt 3 pane w49:p8 source_of_truth kd_tui_result_artifact
+slice repair 1 pane w49:pA source_of_truth kd_tui_result_artifact
+```
 
-1. initial slice worker returns an accepted `kd_tui_result_artifact`;
-2. slice verify fails;
-3. targeted slice repair launches as a native TUI worker;
-4. post-repair verify passes;
-5. merge happens only after post-repair verification.
+Targeted repair evidence:
 
-The timeout proof run `kd-20260708-025608-0b5ce10e` showed that after the first native TUI pane closed, later attempts could not reopen slot 1 and recorded `cockpit_worker_fallback` with `cockpit layout root pane is not available for TUI worker slot 1`.
+```text
+.workflow/runs/kd-20260708-081133-0b908fed/outputs/TUI-REPAIR-01.worker.attempt-3.slice-repair-1.herdr-tui.result.json
+.workflow/runs/kd-20260708-081133-0b908fed/outputs/TUI-REPAIR-01.worker.attempt-3.slice-repair-1.json
+.workflow/runs/kd-20260708-081133-0b908fed/outputs/TUI-REPAIR-01.check.attempt-3.slice-repair-1.json
+```
 
-The multi-worker run `kd-20260708-030047-bc43bb8c` similarly completed only one of four workers through a live `kd_tui_result_artifact`; other workers used fallback after Herdr placement failures.
+The repair artifact used the native submit contract:
 
-Because targeted repair depends on reliable subsequent worker launches, native TUI repair remains blocked by the same lifecycle/layout issue.
+```json
+{
+  "source": "khazad_worker_submit_worker_result_v1"
+}
+```
 
-## Current conclusion
+The daemon emitted `slice_repair_completed` with `status: "fixed"`, then merged `TUI-REPAIR-01` at repair commit `3082a220b2faa3b4fa48a1c70140d8230423eaf0` (`Add targeted TUI repair marker`).
 
-- Targeted slice repair and post-repair verification are still covered in daemon tests.
-- Native TUI targeted repair has not been proven end-to-end.
-- Default promotion must wait for a follow-up fix and a real proof showing targeted repair output from a KD-owned native TUI artifact path, verify rerun, post-repair pass, and merge after post-repair verification.
+No `cockpit_worker_fallback` incident was emitted for this run.
 
 ## What this proves
 
-- Shared daemon targeted repair behavior remains regression-covered.
-- The current evidence distinguishes slice repair from integration repair.
-- The native TUI path is not ready for default promotion without a repair-specific proof.
+- Accepted native TUI worker results can flow into normal slice verification.
+- Repeated verify failures can lead to a targeted slice repair worker launched through native Pi TUI.
+- The repair result is daemon-owned via `submit_worker_result` / `kd_tui_result_artifact`.
+- KD reruns verification after repair and merges only after post-repair success.
+- Terminal text, Herdr scrollback, Herdr metadata, and Pi display state were not used as correctness evidence.
 
 ## What this does not prove
 
-- It does not prove native Pi TUI targeted repair end-to-end.
-- It does not prove that repair workers can reliably launch in the v2 Herdr layout after a failed first attempt.
-- It does not prove promotion readiness; it records the blocker.
+- It does not prove timeout handling, invalid-result retry, or multi-worker geometry; those are covered by separate proof runs.

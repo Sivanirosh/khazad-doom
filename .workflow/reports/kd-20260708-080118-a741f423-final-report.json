@@ -1,0 +1,381 @@
+{
+  "run_id": "kd-20260708-080118-a741f423",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260708-080118-a741f423/integration",
+  "base_sha": "8c452e6b711408f95b30e36f5cf5eb8accbee4cd",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "workflow_config",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "TUI-RETRY-01",
+      "status": "complete",
+      "summary": "Envelope retry inspected the committed proof boundary and re-emits a valid complete result without changing files. The initial daemon-invalid kd_tui_result_artifact and preserved invalid_worker_output evidence are present for commit 67765ba323efcb33ff26c345dfeaab91bc49b8ea.",
+      "commit_sha": "67765ba323efcb33ff26c345dfeaab91bc49b8ea",
+      "commit_message": "Document native TUI retry proof boundary",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-retry-proof-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "git status --short",
+        "khazad-doom status --run kd-20260708-080118-a741f423 --repo /home/sivanirosh/git_repos/khazad-doom"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "A real native Pi TUI worker attempt writes a kd_tui_result_artifact via submit_worker_result whose result payload is daemon-invalid, producing preserved invalid_worker_output evidence.",
+          "status": "satisfied",
+          "evidence": "Initial native Pi TUI event 2493 is cockpit_worker_ready for TUI-RETRY-01 attempt 1 with source_of_truth=kd_tui_result_artifact. The submitted artifact /home/sivanirosh/git_repos/khazad-doom/.workflow/runs/kd-20260708-080118-a741f423/outputs/TUI-RETRY-01.worker.attempt-1.herdr-tui.result.json has source khazad_worker_submit_worker_result_v1 and acceptance_status: []. The daemon preserved /home/sivanirosh/git_repos/khazad-doom/.workflow/runs/kd-20260708-080118-a741f423/outputs/TUI-RETRY-01.worker.attempt-1.invalid-output.json with phase invalid_worker_output and parse_error for missing acceptance evidence."
+        },
+        {
+          "criterion": "The same attempt gets a bounded envelope retry that launches through native Pi TUI again, re-emits valid worker JSON for the existing committed evidence, and reaches a terminal successful outcome.",
+          "status": "satisfied",
+          "evidence": "Daemon status shows progress phase worker_envelope_retry for attempt 1 and event 2497 cockpit_worker_ready for the envelope retry with source_of_truth=kd_tui_result_artifact. HEAD remains the committed evidence 67765ba323efcb33ff26c345dfeaab91bc49b8ea, git status --short is clean, and this submit_worker_result re-emits valid complete JSON with acceptance evidence for every criterion without file changes. The daemon terminal success is produced by accepting this valid envelope retry artifact."
+        },
+        {
+          "criterion": "Evidence includes cockpit_worker_ready for the initial worker and the envelope retry with source_of_truth = kd_tui_result_artifact, the invalid-output artifact path, invalid_worker_output event, retry disposition, bounded retry count, and final terminal outcome.",
+          "status": "satisfied",
+          "evidence": "khazad-doom status reports cockpit_worker_ready event 2493 for the initial worker and event 2497 for the envelope retry, both with source_of_truth=kd_tui_result_artifact. It also reports invalid_worker_output event 2494 with artifact_path /home/sivanirosh/git_repos/khazad-doom/.workflow/runs/kd-20260708-080118-a741f423/outputs/TUI-RETRY-01.worker.attempt-1.invalid-output.json, worker_attempt_failure event 2495 with retry_disposition=envelope_retry_pending, progress event 2496 phase worker_envelope_retry, and the proof document records the bounded retry budget DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS = 2. This valid envelope result is the final complete payload for the daemon to record the terminal successful outcome."
+        },
+        {
+          "criterion": "The proof document states that terminal text, Herdr scrollback, Herdr metadata, and Pi display state were not parsed as fallback result evidence, and states what retry behavior proves and does not prove.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/tui-worker-retry-proof-2026-07-08.md contains an Excluded fallback evidence section stating terminal text, Herdr scrollback, Herdr metadata, screenshots, pane labels, and Pi display state are not parsed as fallback worker-result evidence. It also contains What this proves and What this does not prove sections covering the retry behavior boundary."
+        }
+      ],
+      "assumptions": [
+        "No production submit_worker_result validation was weakened.",
+        "No terminal text, Herdr scrollback, Herdr metadata, or Pi display state was used as fallback result evidence.",
+        "The final terminal outcome is daemon-owned evidence produced after this valid kd_tui_result_artifact is consumed."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "TUI-RETRY-01",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "67765ba323efcb33ff26c345dfeaab91bc49b8ea",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "duration_ms": 100
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "TUI-RETRY-01",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 2,
+    "command_execution_count": 10,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 10,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 146369
+      },
+      {
+        "phase": "slice_worker_envelope_retry",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "kind": "slice-envelope-retry",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 115310
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 664
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 23
+      },
+      "worker_layer:TUI-RETRY-01": {
+        "phase": "worker_layer:TUI-RETRY-01",
+        "duration_ms": 262523
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/TUI-RETRY-01\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "command": "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/TUI-RETRY-01\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "command": "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/TUI-RETRY-01\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/TUI-RETRY-01\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-RETRY-01",
+        "attempt": 1,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/TUI-RETRY-01\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/integration\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/integration\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/integration\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/integration\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "tree_sha": "7bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-080118-a741f423/integration\u00007bf7a180d9b6f25f755d44ee5e092b88ba8cbd1e\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: TUI-RETRY-01",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-08T08:05:41.764943053Z"
+}

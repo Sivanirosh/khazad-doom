@@ -31,7 +31,7 @@ The fake adapter missed the class because it models no pane lifecycle: static pa
 - Worker region is always placeable: live worker panes, a placeholder/empty pane, or Dashboard only as a safe split base.
 - `pane_not_found` → one re-inspect/re-resolve → else existing CockpitUnavailable fallback.
 
-Regression seam: the unit suite now includes a stateful fake Herdr CLI fixture with pane registry, close semantics, and Herdr-shaped `pane_not_found`/`target_pane_not_found` failures. The three named COCKPIT-ANCHOR-01 regression tests exercise the production `HerdrCockpitAdapter` logic through that fixture; real-Herdr gated multi-slot and retry proofs still need to be rerun after the fix.
+Regression seam: the unit suite now includes a stateful fake Herdr CLI fixture with pane registry, close semantics, and Herdr-shaped `pane_not_found`/`target_pane_not_found` failures. The three named COCKPIT-ANCHOR-01 regression tests exercise the production `HerdrCockpitAdapter` logic through that fixture. Real-Herdr follow-up proofs passed after the fix: timeout retries in `kd-20260708-075931-ea500eb4` launched three native TUI attempts with no fallback, and four-worker run `kd-20260708-082104-2724f3e9` launched four native TUI workers with no fallback.
 
 ## Implementation notes
 

@@ -659,7 +659,7 @@ pub(crate) fn prepare_pi_tui_worker_artifacts(
 
     let mut argv = Vec::new();
     argv.push(spec.bin.clone());
-    argv.extend(pi_tui_args_from_json_spec(&spec.args));
+    argv.extend(pi_contract::remove_json_mode_flags(&spec.args));
     argv.extend([
         "--no-extensions".to_string(),
         "--extension".to_string(),
@@ -709,24 +709,6 @@ pub(crate) fn parse_pi_tui_worker_result_artifact(
         usage: Usage::default(),
         contract_warnings: Vec::new(),
     })
-}
-
-fn pi_tui_args_from_json_spec(args: &[String]) -> Vec<String> {
-    let mut filtered = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        if args[index] == "--mode" && args.get(index + 1).is_some_and(|value| value == "json") {
-            index += 2;
-            continue;
-        }
-        if args[index] == "--no-session" {
-            index += 1;
-            continue;
-        }
-        filtered.push(args[index].clone());
-        index += 1;
-    }
-    filtered
 }
 
 pub(crate) fn wait_for_pi_wrapper_launch(

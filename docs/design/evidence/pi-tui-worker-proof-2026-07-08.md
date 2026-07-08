@@ -93,14 +93,17 @@ The artifact had `source: "khazad_worker_submit_worker_result_v1"`, `run_id: "kd
 - A KD worker result can be submitted through an explicit artifact channel without reading terminal output.
 - `ask_operator` remains a daemon IPC tool when the KD worker environment is present, and timeout responses remain a blocked-contract signal.
 
-## What remains unproven before production replacement
+## Superseded proof status
 
-- Daemon-owned cancellation of a Herdr-hosted interactive Pi process/session.
-- Daemon-owned worker attempt timeout semantics for an interactive Pi session.
-- Full worker attempt lifecycle integration: attempt events, invalid-output preservation, envelope retries, scope checks, verification gates, repair budget, and merge/handoff.
-- Packaging/install policy for the worker extension if KD wants it available outside explicit `pi --extension` launches.
-- Whether `herdr agent start` should replace the current `pane split`/`pane run` cockpit adapter for worker panes, or only be used by the experimental TUI runner.
+This document was the initial code-level proof for the native TUI runner. Later daemon-owned proofs covered the production-replacement gaps:
+
+- Timeout/retry after pane cleanup: `kd-20260708-075931-ea500eb4`.
+- Invalid-result preservation and envelope retry: `kd-20260708-080118-a741f423`.
+- Targeted repair and post-repair verification: `kd-20260708-081133-0b908fed`.
+- Four-worker parallel native TUI placement: `kd-20260708-082104-2724f3e9`.
+- Default selection without `--experimental-pi-tui-worker`: `kd-20260708-084311-c6b24386`.
+- Per-attempt packaging policy: `docs/design/evidence/tui-worker-packaging-proof-2026-07-08.md`.
 
 ## Safety conclusion
 
-This proof justifies continuing toward an experimental native-TUI worker runner, but it does not justify replacing the current JSON-wrapper path yet. The wrapper remains the fallback and production path until daemon-owned TUI supervision and lifecycle integration are proven.
+Native Pi TUI workers are now the default when Herdr cockpit placement is available. The JSON wrapper remains an explicit compatibility/fallback path, and daemon-owned artifacts remain the only correctness evidence.

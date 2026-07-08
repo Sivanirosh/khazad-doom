@@ -2,7 +2,7 @@
 
 ## Scope and evidence boundary
 
-This proof covers packaging/release policy for the experimental native Pi TUI worker extension. It does not claim native TUI default-promotion readiness; timeout/multi-worker lifecycle proofs found blockers.
+This proof covers packaging/release policy for the native Pi TUI worker extension. Default promotion is justified by the separate timeout, invalid-result retry, targeted-repair, and four-worker lifecycle proofs; this document only proves the extension remains packaged as a per-attempt artifact, not globally registered.
 
 ## Policy checked
 
@@ -48,13 +48,13 @@ That command artifact records:
 
 and the argv includes `--no-extensions --extension .../.herdr-tui.extension ...`, proving per-attempt loading rather than global registration.
 
-The multi-worker run also generated per-attempt extension directories, for example:
+The post-anchor multi-worker proof run also generated per-attempt extension directories, for example:
 
 ```text
-.workflow/runs/kd-20260708-030047-bc43bb8c/outputs/TUI-MULTI-01A.worker.attempt-1.herdr-tui.extension/index.js
-.workflow/runs/kd-20260708-030047-bc43bb8c/outputs/TUI-MULTI-01B.worker.attempt-1.herdr-tui.extension/index.js
-.workflow/runs/kd-20260708-030047-bc43bb8c/outputs/TUI-MULTI-01C.worker.attempt-1.herdr-tui.extension/index.js
-.workflow/runs/kd-20260708-030047-bc43bb8c/outputs/TUI-MULTI-01D.worker.attempt-1.herdr-tui.extension/index.js
+.workflow/runs/kd-20260708-082104-2724f3e9/outputs/TUI-MULTI-02A.worker.attempt-1.herdr-tui.extension/index.js
+.workflow/runs/kd-20260708-082104-2724f3e9/outputs/TUI-MULTI-02B.worker.attempt-1.herdr-tui.extension/index.js
+.workflow/runs/kd-20260708-082104-2724f3e9/outputs/TUI-MULTI-02C.worker.attempt-1.herdr-tui.extension/index.js
+.workflow/runs/kd-20260708-082104-2724f3e9/outputs/TUI-MULTI-02D.worker.attempt-1.herdr-tui.extension/index.js
 ```
 
 ## Release checks run
@@ -90,6 +90,5 @@ Captured local outputs were stored under `/tmp/khazad-proof-checks/` during this
 
 ## What this does not prove
 
-- It does not prove native TUI timeout, cancellation, retry, repair, or multi-worker lifecycle readiness.
-- It does not prove default promotion readiness.
-- It does not prove package consumers can use native TUI by default; the path remains explicit/experimental.
+- It does not by itself prove native TUI timeout, cancellation, retry, repair, or multi-worker lifecycle readiness; those are separate daemon proof runs.
+- It does not make Herdr or the Pi UI extension authoritative for correctness.

@@ -1,0 +1,301 @@
+{
+  "run_id": "kd-20260708-084311-c6b24386",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260708-084311-c6b24386/integration",
+  "base_sha": "8c452e6b711408f95b30e36f5cf5eb8accbee4cd",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "workflow_config",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "TUI-DEFAULT-01",
+      "status": "complete",
+      "summary": "Created the default-promotion evidence note documenting that this run intentionally omitted --experimental-pi-tui-worker and that KD-owned submit_worker_result artifacts, not terminal text, are authoritative.",
+      "commit_sha": "fc376ea10d9c844d494eeba3ff19ded15794b8e2",
+      "commit_message": "Add native TUI default worker proof",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-default-proof-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md && grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md && grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md && grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Create docs/design/evidence/tui-worker-default-proof-2026-07-08.md stating that this default-promotion proof intentionally omitted --experimental-pi-tui-worker and that KD-owned submit_worker_result artifacts are authoritative, not terminal text.",
+          "status": "satisfied",
+          "evidence": "Created docs/design/evidence/tui-worker-default-proof-2026-07-08.md with both required statements; verification greps for --experimental-pi-tui-worker, submit_worker_result, and 'terminal text' passed."
+        }
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "TUI-DEFAULT-01",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "fc376ea10d9c844d494eeba3ff19ded15794b8e2",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "duration_ms": 100
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "TUI-DEFAULT-01",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 1,
+    "command_execution_count": 8,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 8,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-DEFAULT-01",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 43934
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 532
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 23
+      },
+      "worker_layer:TUI-DEFAULT-01": {
+        "phase": "worker_layer:TUI-DEFAULT-01",
+        "duration_ms": 44594
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-DEFAULT-01",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/TUI-DEFAULT-01\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-DEFAULT-01",
+        "attempt": 1,
+        "command": "grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/TUI-DEFAULT-01\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-DEFAULT-01",
+        "attempt": 1,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/TUI-DEFAULT-01\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-DEFAULT-01",
+        "attempt": 1,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/TUI-DEFAULT-01\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/integration\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/integration\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/integration\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "tree_sha": "dc64f86f40c85363bda4d53ee88704cda8a62303",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-084311-c6b24386/integration\u0000dc64f86f40c85363bda4d53ee88704cda8a62303\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: TUI-DEFAULT-01",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-08T08:43:57.423305200Z"
+}

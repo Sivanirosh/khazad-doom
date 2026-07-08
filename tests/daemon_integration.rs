@@ -1748,15 +1748,13 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
     let monitored_once = String::from_utf8(monitored_once.stdout)?;
     assert!(monitored_once.contains("Khazad-Doom Monitor"));
     assert!(monitored_once.contains(&run_id));
-    assert!(monitored_once.contains("Todos"));
+    assert!(monitored_once.contains("Workers"));
     assert!(monitored_once.contains("Run ● running"));
     assert!(monitored_once.contains("phase worker_verify"));
-    assert!(monitored_once.contains("slice slice-001"));
-    assert!(monitored_once.contains("Shell"));
+    assert!(monitored_once.contains("slice-001"));
+    assert!(monitored_once.contains("Checks"));
     assert!(monitored_once.contains("elapsed"));
-    assert!(monitored_once.contains("Activity"));
-    assert!(monitored_once.contains("Tail"));
-    assert!(monitored_once.contains("started-progress"));
+    assert!(monitored_once.contains("tail started-progress"));
 
     wait_for_status(&bin, home.path(), &run_id, "completed")?;
     let monitored_completed = kd_ok(
@@ -1846,7 +1844,7 @@ fn monitor_exposes_quiet_pi_worker_supervision_without_default_timeout() -> Test
             "Supervisor: alive, observed child",
             "Process: running pid=",
             "Last worker event: none",
-            "Last semantic progress: unknown",
+            "semantic unknown",
             "Timeout: disabled",
             "worker is quiet",
             "wait, inspect, or cancel explicitly",
@@ -2034,7 +2032,8 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
     )?;
     let monitored = String::from_utf8(monitored.stdout)?;
     assert!(monitored.contains("Pending replan rp-pending"));
-    assert!(monitored.contains("Replan (1 pending, 1 decided)"));
+    assert!(monitored.contains("Decision command:"));
+    assert!(monitored.contains("Commands"));
 
     kill_daemon(home.path())?;
     kd_ok(&bin, home.path(), &["daemon", "start"])?;
@@ -2290,8 +2289,13 @@ fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult
             .unwrap()
             .iter()
             .any(|block| {
-                block["label"].as_str() == Some("Terminal")
-                    && block["meta"].as_str() == Some("agent_auth_required")
+                block["label"].as_str() == Some("Attention")
+                    && block["lines"].as_array().unwrap().iter().any(|line| {
+                        line["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("kind=agent_auth_required")
+                    })
             })
     );
 
@@ -2474,7 +2478,7 @@ fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> Test
         "monitor should show parallel phase; output:\n{monitored}"
     );
     assert!(
-        monitored.contains("Parallel layer: slice-001, slice-002"),
+        monitored.contains("active parallel slice-001, slice-002"),
         "monitor should show active parallel layer; output:\n{monitored}"
     );
 
@@ -2571,7 +2575,7 @@ fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult
     let stderr = String::from_utf8_lossy(&monitored.stderr);
     assert!(stdout.contains(&run_id));
     assert!(stdout.contains("Run ✗ failed"));
-    assert!(stdout.contains("Terminal failed"));
+    assert!(stdout.contains("Terminal reason: kind=failed"));
     assert!(stderr.contains("run ended with status failed"));
 
     let failed = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
@@ -2704,7 +2708,7 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
     assert!(latest_monitor.contains("Khazad-Doom Monitor"));
     assert!(latest_monitor.contains(&run_a));
     assert!(latest_monitor.contains("Run ● running"));
-    assert!(latest_monitor.contains("Activity"));
+    assert!(latest_monitor.contains("Workers"));
 
     let started_b = kd_ok(
         &bin,

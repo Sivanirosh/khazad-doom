@@ -2,12 +2,12 @@
 
 ## Scope
 
-This note records the next native-Pi-TUI proof step after the result-channel smoke proof. It does **not** replace the production JSON-wrapper worker path. It adds an opt-in experimental path that lets the daemon launch a Herdr-hosted native Pi TUI worker while preserving Khazad-Doom-owned truth.
+This note records the native-Pi-TUI lifecycle proof step after the result-channel smoke proof. It was originally introduced as an opt-in experimental path; after the later timeout, invalid-result retry, targeted-repair, and four-worker proofs, native Herdr-hosted Pi TUI workers are the default when cockpit placement is available. Khazad-Doom-owned artifacts remain the only truth.
 
 ## Mechanism proven in code
 
-- The production wrapper path remains the default.
-- `khazad-doom run --experimental-pi-tui-worker ...` selects the experimental path only when a real Pi command spec is available and cockpit mode is not direct. `KHAZAD_EXPERIMENTAL_PI_TUI_WORKER=1` is interpreted by the CLI and sent to the daemon as an explicit run parameter, not read from ambient daemon process state.
+- Native Pi TUI workers are the default when a real Pi command spec is available and cockpit mode is not direct.
+- `--experimental-pi-tui-worker` remains as a deprecated compatibility flag; `--json-wrapper-worker`, `KHAZAD_JSON_WRAPPER_WORKER=1`, or `KHAZAD_DISABLE_PI_TUI_WORKER=1` select the legacy wrapper path. Run intent is interpreted by the CLI and sent to the daemon as an explicit run parameter, not read from ambient daemon process state.
 - The daemon prepares per-attempt TUI artifacts next to the normal worker output:
   - prompt markdown
   - launch command JSON
@@ -21,7 +21,7 @@ This note records the next native-Pi-TUI proof step after the result-channel smo
 
 ## Lifecycle integration retained
 
-The experimental path is inside `run_recorded_slice_worker_job` and returns the same `ResultData` shape as the wrapper runner. That means the existing daemon-owned lifecycle remains downstream of the result artifact:
+The native TUI path is inside `run_recorded_slice_worker_job` and returns the same `ResultData` shape as the wrapper runner. That means the existing daemon-owned lifecycle remains downstream of the result artifact:
 
 - worker result schema parsing and validation
 - scope checks against authorized paths
@@ -35,7 +35,7 @@ No result is accepted from Herdr pane text, scrollback, agent metadata, Pi TUI d
 
 ## Packaging policy
 
-`extensions/khazad-worker` remains **not** listed in `package.json` `pi.extensions`. It is not a global/operator extension. For the experimental worker path, Khazad-Doom copies the worker extension source into the per-attempt artifact directory and passes it explicitly to Pi for that one launch.
+`extensions/khazad-worker` remains **not** listed in `package.json` `pi.extensions`. It is not a global/operator extension. For the native worker path, Khazad-Doom copies the worker extension source into the per-attempt artifact directory and passes it explicitly to Pi for that one launch.
 
 Rationale:
 

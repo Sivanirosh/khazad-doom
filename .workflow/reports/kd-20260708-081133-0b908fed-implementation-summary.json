@@ -1,0 +1,695 @@
+{
+  "run_id": "kd-20260708-081133-0b908fed",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260708-081133-0b908fed/integration",
+  "base_sha": "8c452e6b711408f95b30e36f5cf5eb8accbee4cd",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "workflow_config",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "TUI-REPAIR-01",
+      "status": "complete",
+      "summary": "Added the targeted repair sentinel to the in-scope proof document and committed the repair. The slice verification commands now pass locally.",
+      "commit_sha": "3082a220b2faa3b4fa48a1c70140d8230423eaf0",
+      "commit_message": "Add targeted TUI repair marker",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Each normal native Pi TUI slice-worker attempt is accepted from a kd_tui_result_artifact and then fails daemon-owned slice verification because the committed proof document intentionally omits native-tui-targeted-repair-marker.",
+          "status": "satisfied",
+          "evidence": "The targeted-repair prompt and handoff identify this repair as following exhausted normal attempts and show the daemon-owned verification failure on the missing native-tui-targeted-repair-marker. This repair did not change normal-worker behavior or workflow policy."
+        },
+        {
+          "criterion": "After normal attempts are exhausted, Khazad-Doom launches a targeted slice-repair worker through native Pi TUI, records repair output from a KD-owned artifact path, and the repair commit adds native-tui-targeted-repair-marker in scope.",
+          "status": "satisfied",
+          "evidence": "This session is a Khazad-Doom Targeted Slice Repair Worker. Commit 3082a220b2faa3b4fa48a1c70140d8230423eaf0 adds native-tui-targeted-repair-marker only to docs/design/evidence/tui-worker-repair-proof-2026-07-08.md, an in-scope slice area."
+        },
+        {
+          "criterion": "Post-repair verification reruns and passes, and the slice merges only after the post-repair pass.",
+          "status": "satisfied",
+          "evidence": "Local rerun of all slice verify commands passed after the repair commit, including the marker grep. Daemon post-repair rerun and merge gating are left to Khazad-Doom attestation."
+        },
+        {
+          "criterion": "The proof document distinguishes targeted slice repair from integration repair and states what repair behavior proves and does not prove.",
+          "status": "satisfied",
+          "evidence": "The proof document contains sections for targeted slice repair versus integration repair, What this proves, and What this does not prove; the repair preserved those sections."
+        }
+      ],
+      "assumptions": [
+        "Khazad-Doom will record this submit_worker_result artifact and perform daemon-owned post-repair verification and merge gating."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "TUI-REPAIR-01",
+      "status": "failed",
+      "summary": "verify command failed: grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+      ],
+      "findings": [
+        {
+          "severity": "error",
+          "action": "auto-fix",
+          "description": "verify command failed: grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+        }
+      ],
+      "attempt": 1,
+      "worker_head": "a4cafc4267c3a5df0785803003ab471218e42595",
+      "worktree_clean": true,
+      "commit_found": true,
+      "failure_kind": "command_failed"
+    },
+    {
+      "slice_id": "TUI-REPAIR-01",
+      "status": "failed",
+      "summary": "verify command failed: grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+      ],
+      "findings": [
+        {
+          "severity": "error",
+          "action": "auto-fix",
+          "description": "verify command failed: grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+        }
+      ],
+      "attempt": 2,
+      "worker_head": "3a37bc14dc4b63247bcba80da064c964bb386017",
+      "worktree_clean": true,
+      "commit_found": true,
+      "failure_kind": "command_failed"
+    },
+    {
+      "slice_id": "TUI-REPAIR-01",
+      "status": "failed",
+      "summary": "verify command failed: grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+      ],
+      "findings": [
+        {
+          "severity": "error",
+          "action": "auto-fix",
+          "description": "verify command failed: grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+        }
+      ],
+      "attempt": 3,
+      "worker_head": "7977164bb3c643e5cb48e189bbed406239f6e3d3",
+      "worktree_clean": true,
+      "commit_found": true,
+      "failure_kind": "command_failed"
+    },
+    {
+      "slice_id": "TUI-REPAIR-01",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+      ],
+      "attempt": 3,
+      "worker_head": "3082a220b2faa3b4fa48a1c70140d8230423eaf0",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "duration_ms": 101
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "TUI-REPAIR-01",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 4,
+    "command_execution_count": 25,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 25,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 156587
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 2,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 150569
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 105957
+      },
+      {
+        "phase": "slice_repair",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "kind": "slice-repair",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 58353
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 666
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 23
+      },
+      "worker_layer:TUI-REPAIR-01": {
+        "phase": "worker_layer:TUI-REPAIR-01",
+        "duration_ms": 474314
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7a6e9063f98afc9480ebf197008ca6a962208aeb",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007a6e9063f98afc9480ebf197008ca6a962208aeb\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 1,
+        "command": "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7a6e9063f98afc9480ebf197008ca6a962208aeb",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007a6e9063f98afc9480ebf197008ca6a962208aeb\u0000\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 1,
+        "command": "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7a6e9063f98afc9480ebf197008ca6a962208aeb",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007a6e9063f98afc9480ebf197008ca6a962208aeb\u0000\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 1,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7a6e9063f98afc9480ebf197008ca6a962208aeb",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007a6e9063f98afc9480ebf197008ca6a962208aeb\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 1,
+        "command": "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "failed",
+        "exit_code": 1,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7a6e9063f98afc9480ebf197008ca6a962208aeb",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007a6e9063f98afc9480ebf197008ca6a962208aeb\u0000\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 2,
+        "command": "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7141f9900edb2b2065585dcba55c48a71bedf719",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007141f9900edb2b2065585dcba55c48a71bedf719\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 2,
+        "command": "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7141f9900edb2b2065585dcba55c48a71bedf719",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007141f9900edb2b2065585dcba55c48a71bedf719\u0000\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 2,
+        "command": "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7141f9900edb2b2065585dcba55c48a71bedf719",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007141f9900edb2b2065585dcba55c48a71bedf719\u0000\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 2,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7141f9900edb2b2065585dcba55c48a71bedf719",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007141f9900edb2b2065585dcba55c48a71bedf719\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 2,
+        "command": "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "failed",
+        "exit_code": 1,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "7141f9900edb2b2065585dcba55c48a71bedf719",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00007141f9900edb2b2065585dcba55c48a71bedf719\u0000\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "3cc6927493070be11eb88019c59c25ff368c2767",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00003cc6927493070be11eb88019c59c25ff368c2767\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "3cc6927493070be11eb88019c59c25ff368c2767",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00003cc6927493070be11eb88019c59c25ff368c2767\u0000\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "3cc6927493070be11eb88019c59c25ff368c2767",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00003cc6927493070be11eb88019c59c25ff368c2767\u0000\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "3cc6927493070be11eb88019c59c25ff368c2767",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00003cc6927493070be11eb88019c59c25ff368c2767\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "failed",
+        "exit_code": 1,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "3cc6927493070be11eb88019c59c25ff368c2767",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u00003cc6927493070be11eb88019c59c25ff368c2767\u0000\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-REPAIR-01",
+        "attempt": 3,
+        "command": "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/TUI-REPAIR-01\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/integration\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/integration\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/integration\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/integration\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "tree_sha": "02a8f6c65ce75731a447f3dba7d86aa90b055cc2",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-081133-0b908fed/integration\u000002a8f6c65ce75731a447f3dba7d86aa90b055cc2\u0000\u0000\u0000grep -q 'native-tui-targeted-repair-marker' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: TUI-REPAIR-01",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-08T08:19:28.559057749Z"
+}

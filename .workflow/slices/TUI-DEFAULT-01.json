@@ -1,0 +1,24 @@
+{
+  "id": "TUI-DEFAULT-01",
+  "title": "Native Pi TUI default worker proof",
+  "goal": "Create one tiny evidence note proving that native Pi TUI workers are the default after promotion. The note must state that this run intentionally omitted --experimental-pi-tui-worker and that KD-owned submit_worker_result artifacts remain authoritative, not terminal text.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-084311-c6b24386",
+  "closed_at": "2026-07-08T08:43:57.423305200Z",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-DEFAULT-01.json",
+    "docs/design/evidence/tui-worker-default-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Create docs/design/evidence/tui-worker-default-proof-2026-07-08.md stating that this default-promotion proof intentionally omitted --experimental-pi-tui-worker and that KD-owned submit_worker_result artifacts are authoritative, not terminal text."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+    "grep -q -- '--experimental-pi-tui-worker' docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+    "grep -q submit_worker_result docs/design/evidence/tui-worker-default-proof-2026-07-08.md",
+    "grep -q 'terminal text' docs/design/evidence/tui-worker-default-proof-2026-07-08.md"
+  ]
+}

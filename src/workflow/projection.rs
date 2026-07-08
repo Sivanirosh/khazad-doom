@@ -1164,14 +1164,15 @@ fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
         if let Some(active_line) = active_worker_line(details, progress, now) {
             lines.push(active_line);
         }
-        if let Some(worker) = &progress.worker
-            && let Some(warning) = worker_quiet_warning(worker, now)
-        {
-            lines.push(line(warning, StatusFeedRole::Warning));
-            lines.push(line(
-                "wait, inspect, or cancel explicitly",
-                StatusFeedRole::Dim,
-            ));
+        if let Some(worker) = &progress.worker {
+            lines.extend(worker_supervision_lines(worker, now));
+            if let Some(warning) = worker_quiet_warning(worker, now) {
+                lines.push(line(warning, StatusFeedRole::Warning));
+                lines.push(line(
+                    "wait, inspect, or cancel explicitly",
+                    StatusFeedRole::Dim,
+                ));
+            }
         }
     }
 
@@ -1196,6 +1197,29 @@ fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
         format!("({active} active / {} total)", items.len()),
         lines,
     )
+}
+
+fn worker_supervision_lines(
+    worker: &WorkerAttemptProgress,
+    now: DateTime<Utc>,
+) -> Vec<StatusFeedLine> {
+    vec![
+        line(
+            format!("Process: {}", worker_process_label(worker)),
+            StatusFeedRole::Info,
+        ),
+        line(
+            format!(
+                "Last worker event: {}",
+                last_worker_event_label(worker, now)
+            ),
+            StatusFeedRole::Info,
+        ),
+        line(
+            format!("Timeout: {}", timeout_label(worker, now)),
+            StatusFeedRole::Dim,
+        ),
+    ]
 }
 
 fn active_worker_count(details: &RunDetails, items: &[SliceRun]) -> usize {
@@ -1223,7 +1247,7 @@ fn active_worker_line(
         return None;
     }
     let target = if progress.parallel_layer && !progress.parallel_slices.is_empty() {
-        format!("parallel {}", progress.parallel_slices.join(","))
+        format!("parallel {}", progress.parallel_slices.join(", "))
     } else if !progress.slice_id.trim().is_empty() {
         progress.slice_id.clone()
     } else {
@@ -1239,7 +1263,7 @@ fn active_worker_line(
         since_time(progress.phase_started_at, now)
     );
     if let Some(worker) = &progress.worker {
-        text.push_str(&format!(" • {}", supervisor_label(worker, now)));
+        text.push_str(&format!(" • Supervisor: {}", supervisor_label(worker, now)));
     }
     if !progress.message.trim().is_empty() {
         text.push_str(&format!(
@@ -1297,6 +1321,15 @@ fn checks_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
                     format!(
                         "message {}",
                         truncate_display(&progress.message, LINE_WIDTH)
+                    ),
+                    StatusFeedRole::Info,
+                ));
+            }
+            if !progress.output_tail.trim().is_empty() {
+                lines.push(line(
+                    format!(
+                        "tail {}",
+                        truncate_display(&progress.output_tail, LINE_WIDTH)
                     ),
                     StatusFeedRole::Info,
                 ));
@@ -1706,7 +1739,11 @@ fn active_command_count(details: &RunDetails) -> usize {
 fn is_worker_agent_phase(phase: &str) -> bool {
     matches!(
         phase,
-        "worker_running" | "integration_repair" | "awaiting_operator"
+        "worker_started"
+            | "worker_running"
+            | "parallel_worker_layer"
+            | "integration_repair"
+            | "awaiting_operator"
     )
 }
 

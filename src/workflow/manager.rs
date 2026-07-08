@@ -780,29 +780,30 @@ impl Manager {
         cockpit_mode: CockpitMode,
         output_path: &Path,
     ) -> Result<crate::agent::ResultData> {
-        let result = if context.experimental_pi_tui_worker {
-            self.try_run_herdr_tui_worker_job(
-                &spec,
-                &job,
-                cancel.clone(),
-                events.clone(),
-                context,
-                run,
-                cockpit_mode,
-                output_path,
-            )
-        } else {
-            self.try_run_herdr_worker_job(
-                &spec,
-                &job,
-                cancel.clone(),
-                events.clone(),
-                context,
-                run,
-                cockpit_mode,
-                output_path,
-            )
-        };
+        let result =
+            if context.experimental_pi_tui_worker && !matches!(cockpit_mode, CockpitMode::Direct) {
+                self.try_run_herdr_tui_worker_job(
+                    &spec,
+                    &job,
+                    cancel.clone(),
+                    events.clone(),
+                    context,
+                    run,
+                    cockpit_mode,
+                    output_path,
+                )
+            } else {
+                self.try_run_herdr_worker_job(
+                    &spec,
+                    &job,
+                    cancel.clone(),
+                    events.clone(),
+                    context,
+                    run,
+                    cockpit_mode,
+                    output_path,
+                )
+            };
         match result {
             Ok(data) => Ok(data),
             Err(CockpitWorkerJobError::Fallback(message)) => {
@@ -1277,7 +1278,8 @@ impl Manager {
         }
         let runner = self.runner_for_options(&opts, &config)?;
         let parallelism = effective_parallelism(opts.parallelism, &config);
-        let experimental_pi_tui_worker = opts.experimental_pi_tui_worker;
+        let experimental_pi_tui_worker =
+            opts.experimental_pi_tui_worker && !matches!(cockpit_mode, CockpitMode::Direct);
         let base_branch = if config.base_branch.trim().is_empty() {
             gitutil::current_branch(&repo.path).unwrap_or_default()
         } else {
@@ -1344,6 +1346,7 @@ impl Manager {
                 "status_porcelain": dirty_status,
                 "selected_slices": &selected_ids,
                 "experimental_pi_tui_worker": experimental_pi_tui_worker,
+                "native_pi_tui_worker": experimental_pi_tui_worker,
                 "worker_interface": if experimental_pi_tui_worker { "native_pi_tui" } else { "json_wrapper" },
                 "daemon_path": std::env::var("PATH").unwrap_or_default(),
                 "created_at": now,
@@ -1507,19 +1510,21 @@ impl Manager {
             })?;
         }
         self.state.update_run(&run.id, RunStatus::Running, "")?;
-        let experimental_pi_tui_worker =
-            opts.experimental_pi_tui_worker || run_preflight_experimental_pi_tui_worker(&run);
+        let config = store.read_config()?;
+        let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
+        let experimental_pi_tui_worker = (opts.experimental_pi_tui_worker
+            || run_preflight_experimental_pi_tui_worker(&run))
+            && !matches!(cockpit_mode, CockpitMode::Direct);
         self.state.record_event(
             &run.id,
             "run_resumed",
             &json!({
                 "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>(),
                 "experimental_pi_tui_worker": experimental_pi_tui_worker,
+                "native_pi_tui_worker": experimental_pi_tui_worker,
             }),
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
-        let config = store.read_config()?;
-        let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
         let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
         self.record_cockpit_launch(&run, cockpit_mode)?;
         let worker_token = new_worker_token();

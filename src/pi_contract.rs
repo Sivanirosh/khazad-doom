@@ -86,6 +86,28 @@ pub fn launch_args(extra_args: &[String]) -> Vec<String> {
     args
 }
 
+pub fn remove_json_mode_flags(args: &[String]) -> Vec<String> {
+    let mode_flag = PI_JSON_MODE_FLAGS[0];
+    let mode_value = PI_JSON_MODE_FLAGS[1];
+    let no_session_flag = PI_JSON_MODE_FLAGS[2];
+    let mut filtered = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == mode_flag && args.get(index + 1).is_some_and(|value| value == mode_value)
+        {
+            index += 2;
+            continue;
+        }
+        if args[index] == no_session_flag {
+            index += 1;
+            continue;
+        }
+        filtered.push(args[index].clone());
+        index += 1;
+    }
+    filtered
+}
+
 pub fn observation(binary: &str, extra_args: &[String]) -> PiContractObservation {
     PiContractObservation {
         binary: if binary.trim().is_empty() {
@@ -871,6 +893,29 @@ mod tests {
     use super::*;
     use crate::agent::RunnerMetadata;
     use std::io::Cursor;
+
+    #[test]
+    fn removes_json_mode_flags_for_tui_worker_launch() {
+        let args = vec![
+            "--provider".to_string(),
+            "openai-codex".to_string(),
+            "--mode".to_string(),
+            "json".to_string(),
+            "--no-session".to_string(),
+            "--name".to_string(),
+            "worker".to_string(),
+        ];
+
+        assert_eq!(
+            remove_json_mode_flags(&args),
+            vec![
+                "--provider".to_string(),
+                "openai-codex".to_string(),
+                "--name".to_string(),
+                "worker".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn parses_current_pi_event_shapes_and_usage() {
