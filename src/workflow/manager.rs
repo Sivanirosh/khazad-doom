@@ -467,7 +467,7 @@ impl Manager {
                     workspace: opened.workspace_label,
                     panes: opened.pane_labels,
                     source_of_truth: "daemon_state".to_string(),
-                    planner: "deferred_until_rpl_planner_authority".to_string(),
+                    planner: "cockpit_layout_v2_observability_only".to_string(),
                 },
             ),
             Ok(CockpitLaunch::SkippedDirect) => Ok(()),
@@ -482,6 +482,7 @@ impl Manager {
                 .with_extra("mode", unavailable.mode.as_str())
                 .with_extra("remediation", unavailable.remediation)
                 .with_extra("fallback", "direct")
+                .with_extra("layout", "cockpit_layout_v2_observability_only")
                 .with_extra("source_of_truth", "daemon_state"),
             ),
         }
@@ -986,6 +987,7 @@ impl Manager {
                 .with_extra("slice_id", &context.slice_id)
                 .with_extra("attempt", context.attempt)
                 .with_extra("fallback", "direct")
+                .with_extra("layout", "cockpit_layout_v2_observability_only")
                 .with_extra("source_of_truth", "kd_artifact_files"),
         )
     }

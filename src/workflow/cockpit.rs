@@ -9,7 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) const RUN_STATUS_FEED_PANE: &str = "Dashboard";
-pub(crate) const INTEGRATION_GATE_REPAIR_PANE: &str = "Operator";
+const WORKER_REGION_PLACEHOLDER_PANE: &str = "Worker region (pending)";
+const COCKPIT_LAYOUT_MAX_WORKERS: usize = 4;
+const COCKPIT_LAYOUT_WORKER_REGION_RATIO: &str = "0.68";
+const COCKPIT_LAYOUT_WORKER_SPLIT_RATIO: &str = "0.50";
 const COCKPIT_MODE_TRANSPORT_PREFIX: &str = "__khazad_cockpit_mode=";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -19,7 +22,6 @@ pub(crate) struct CockpitRunRequest {
     pub khazad_home: PathBuf,
     pub workspace_label: String,
     pub feed_command: String,
-    pub phase_command: String,
 }
 
 impl CockpitRunRequest {
@@ -32,7 +34,6 @@ impl CockpitRunRequest {
             khazad_home: khazad_home.to_path_buf(),
             workspace_label: workspace_label_for_run(&run.id),
             feed_command: format!("{binary} monitor --run {run_id} --interval-ms 1000"),
-            phase_command: attend_pane_command(&run.id),
         }
     }
 }
@@ -78,6 +79,196 @@ pub(crate) struct CockpitPaneRef {
     id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CockpitLayoutDirection {
+    Right,
+    Down,
+}
+
+impl CockpitLayoutDirection {
+    fn as_herdr_arg(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Down => "down",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitDashboardLayout {
+    pub name: String,
+    pub region: String,
+    pub split_from_slot: String,
+    pub direction: CockpitLayoutDirection,
+    pub ratio: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitWorkerSplit {
+    pub anchor_slot: String,
+    pub direction: CockpitLayoutDirection,
+    pub ratio: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitWorkerSlot {
+    pub index: usize,
+    pub name: String,
+    pub region: String,
+    pub split: Option<CockpitWorkerSplit>,
+}
+
+impl CockpitWorkerSlot {
+    fn pane_label(&self, worker_label: &str) -> String {
+        format!("{}: {worker_label}", self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitLayoutPlan {
+    pub worker_count: usize,
+    pub dashboard: CockpitDashboardLayout,
+    pub worker_slots: Vec<CockpitWorkerSlot>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CockpitLayoutPlanner;
+
+impl CockpitLayoutPlanner {
+    pub fn plan(&self, worker_count: usize) -> Result<CockpitLayoutPlan> {
+        if !(1..=COCKPIT_LAYOUT_MAX_WORKERS).contains(&worker_count) {
+            bail!(
+                "cockpit layout v2 supports 1-{COCKPIT_LAYOUT_MAX_WORKERS} workers, got {worker_count}"
+            );
+        }
+
+        let mut worker_slots = vec![CockpitWorkerSlot {
+            index: 1,
+            name: "worker-1".to_string(),
+            region: "left-worker-region".to_string(),
+            split: None,
+        }];
+        if worker_count >= 2 {
+            worker_slots.push(CockpitWorkerSlot {
+                index: 2,
+                name: "worker-2".to_string(),
+                region: "left-worker-region".to_string(),
+                split: Some(CockpitWorkerSplit {
+                    anchor_slot: "worker-1".to_string(),
+                    direction: CockpitLayoutDirection::Right,
+                    ratio: COCKPIT_LAYOUT_WORKER_SPLIT_RATIO.to_string(),
+                }),
+            });
+        }
+        if worker_count >= 3 {
+            worker_slots.push(CockpitWorkerSlot {
+                index: 3,
+                name: "worker-3".to_string(),
+                region: "left-worker-region".to_string(),
+                split: Some(CockpitWorkerSplit {
+                    anchor_slot: "worker-1".to_string(),
+                    direction: CockpitLayoutDirection::Down,
+                    ratio: COCKPIT_LAYOUT_WORKER_SPLIT_RATIO.to_string(),
+                }),
+            });
+        }
+        if worker_count >= 4 {
+            worker_slots.push(CockpitWorkerSlot {
+                index: 4,
+                name: "worker-4".to_string(),
+                region: "left-worker-region".to_string(),
+                split: Some(CockpitWorkerSplit {
+                    anchor_slot: "worker-2".to_string(),
+                    direction: CockpitLayoutDirection::Down,
+                    ratio: COCKPIT_LAYOUT_WORKER_SPLIT_RATIO.to_string(),
+                }),
+            });
+        }
+
+        Ok(CockpitLayoutPlan {
+            worker_count,
+            dashboard: CockpitDashboardLayout {
+                name: RUN_STATUS_FEED_PANE.to_string(),
+                region: "right-dashboard".to_string(),
+                split_from_slot: "worker-1".to_string(),
+                direction: CockpitLayoutDirection::Right,
+                ratio: COCKPIT_LAYOUT_WORKER_REGION_RATIO.to_string(),
+            },
+            worker_slots,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CockpitLayoutPane {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CockpitLayoutInspection {
+    pub root_pane_id: Option<String>,
+    pub panes: Vec<CockpitLayoutPane>,
+}
+
+impl CockpitLayoutInspection {
+    fn dashboard_pane_id(&self) -> Option<&str> {
+        self.panes
+            .iter()
+            .find(|pane| pane.label == RUN_STATUS_FEED_PANE)
+            .map(|pane| pane.id.as_str())
+    }
+
+    fn worker_slot_count(&self) -> usize {
+        self.panes
+            .iter()
+            .filter_map(|pane| worker_slot_index_from_label(&pane.label))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn worker_slot_pane_id(&self, slot_name: &str) -> Option<&str> {
+        let prefix = format!("{slot_name}: ");
+        self.panes
+            .iter()
+            .find(|pane| pane.label.starts_with(&prefix))
+            .map(|pane| pane.id.as_str())
+    }
+
+    fn label_for_pane(&self, pane_id: &str) -> Option<&str> {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .map(|pane| pane.label.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitWorkerPlacement {
+    pub pane: CockpitPaneRef,
+    pub slot_name: String,
+    pub pane_label: String,
+}
+
+fn worker_slot_index_from_label(label: &str) -> Option<usize> {
+    let rest = label.strip_prefix("worker-")?;
+    let (index, _) = rest.split_once(':')?;
+    index.parse().ok()
+}
+
+fn pane_command_with_env(request: &CockpitPaneRequest) -> String {
+    if request.env.is_empty() {
+        return request.command.clone();
+    }
+    let assignments = request
+        .env
+        .iter()
+        .map(|(key, value)| shell_quote(&format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("env {assignments} {}", request.command)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CockpitOpened {
     pub adapter: String,
@@ -109,6 +300,7 @@ pub(crate) struct CockpitWorkerOpened {
     pub workspace_label: String,
     pub pane_label: String,
     pub pane_id: String,
+    pub slot_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,15 +382,6 @@ pub(crate) fn gate_activity_pane_command(run_id: &str) -> String {
     format!("/bin/sh -c {}", shell_quote(&script))
 }
 
-pub(crate) fn attend_pane_command(run_id: &str) -> String {
-    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("khazad-doom"));
-    format!(
-        "{} attend --run {} --interval-ms 1000",
-        shell_quote(&binary.to_string_lossy()),
-        shell_quote(run_id),
-    )
-}
-
 pub(crate) fn worker_activity_pane_command(
     wrapper_command: &str,
     stdout_path: &Path,
@@ -238,6 +421,46 @@ pub(crate) trait CockpitAdapter {
         self.create_read_only_pane(workspace, request)
     }
 
+    fn inspect_layout(&self, _workspace: &CockpitWorkspaceRef) -> Result<CockpitLayoutInspection> {
+        bail!(
+            "{} adapter does not support cockpit layout inspection",
+            self.name()
+        )
+    }
+
+    fn ensure_dashboard_pane(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        _dashboard: &CockpitDashboardLayout,
+        request: &CockpitPaneRequest,
+    ) -> Result<CockpitPaneRef> {
+        self.create_read_only_pane(workspace, request)
+    }
+
+    fn cleanup_placeholder_root_pane(
+        &self,
+        _workspace: &CockpitWorkspaceRef,
+        _slot: &CockpitWorkerSlot,
+        _replacement_label: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn place_worker_slot_pane(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        _plan: &CockpitLayoutPlan,
+        slot: &CockpitWorkerSlot,
+        request: &CockpitPaneRequest,
+    ) -> Result<CockpitWorkerPlacement> {
+        let pane = self.create_worker_pane(workspace, request)?;
+        Ok(CockpitWorkerPlacement {
+            pane,
+            slot_name: slot.name.clone(),
+            pane_label: request.label.clone(),
+        })
+    }
+
     fn start_tui_worker_agent(
         &self,
         _workspace: &CockpitWorkspaceRef,
@@ -274,40 +497,36 @@ impl<A: CockpitAdapter> Cockpit<A> {
         Self { mode, adapter }
     }
 
+    fn dashboard_pane_request(&self, request: &CockpitRunRequest) -> CockpitPaneRequest {
+        CockpitPaneRequest {
+            label: RUN_STATUS_FEED_PANE.to_string(),
+            command: request.feed_command.clone(),
+            cwd: request.repo_path.clone(),
+            env: vec![
+                (
+                    "KHAZAD_HOME".to_string(),
+                    request.khazad_home.to_string_lossy().to_string(),
+                ),
+                ("KHAZAD_COCKPIT_READ_ONLY".to_string(), "1".to_string()),
+                (
+                    "KHAZAD_COCKPIT_SOURCE_OF_TRUTH".to_string(),
+                    "daemon_state".to_string(),
+                ),
+            ],
+        }
+    }
+
     fn create_run_panes(
         &self,
         workspace: &CockpitWorkspaceRef,
         request: &CockpitRunRequest,
     ) -> Result<Vec<String>> {
-        let pane_env = vec![
-            (
-                "KHAZAD_HOME".to_string(),
-                request.khazad_home.to_string_lossy().to_string(),
-            ),
-            ("KHAZAD_COCKPIT_READ_ONLY".to_string(), "1".to_string()),
-        ];
-        let operator_env = vec![
-            (
-                "KHAZAD_HOME".to_string(),
-                request.khazad_home.to_string_lossy().to_string(),
-            ),
-            ("KHAZAD_OPERATOR_SURFACE".to_string(), "1".to_string()),
-        ];
-        let feed = CockpitPaneRequest {
-            label: RUN_STATUS_FEED_PANE.to_string(),
-            command: request.feed_command.clone(),
-            cwd: request.repo_path.clone(),
-            env: pane_env.clone(),
-        };
-        self.adapter.create_read_only_pane(workspace, &feed)?;
-        let phase = CockpitPaneRequest {
-            label: INTEGRATION_GATE_REPAIR_PANE.to_string(),
-            command: request.phase_command.clone(),
-            cwd: request.repo_path.clone(),
-            env: operator_env,
-        };
-        self.adapter.create_read_only_pane(workspace, &phase)?;
-        Ok(vec![feed.label, phase.label])
+        let plan = CockpitLayoutPlanner::default().plan(1)?;
+        let dashboard = self.dashboard_pane_request(request);
+        self.adapter.inspect_layout(workspace)?;
+        self.adapter
+            .ensure_dashboard_pane(workspace, &plan.dashboard, &dashboard)?;
+        Ok(vec![dashboard.label])
     }
 
     pub fn open_run(&self, request: &CockpitRunRequest) -> Result<CockpitLaunch> {
@@ -360,6 +579,15 @@ impl<A: CockpitAdapter> Cockpit<A> {
             return Ok(CockpitWorkerLaunch::SkippedDirect);
         }
         let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
+        let inspection = self.adapter.inspect_layout(&workspace)?;
+        let plan = CockpitLayoutPlanner::default().plan(inspection.worker_slot_count() + 1)?;
+        let dashboard = self.dashboard_pane_request(run_request);
+        self.adapter
+            .ensure_dashboard_pane(&workspace, &plan.dashboard, &dashboard)?;
+        let slot = plan
+            .worker_slots
+            .last()
+            .ok_or_else(|| anyhow!("cockpit layout plan omitted worker slot"))?;
         let pane = CockpitPaneRequest {
             label: worker_pane_label(
                 &worker_request.run_id,
@@ -370,13 +598,19 @@ impl<A: CockpitAdapter> Cockpit<A> {
             cwd: worker_request.cwd.clone(),
             env: worker_request.env.clone(),
         };
-        let pane_ref = self.adapter.create_worker_pane(&workspace, &pane)?;
+        let stable_label = slot.pane_label(&pane.label);
+        self.adapter
+            .cleanup_placeholder_root_pane(&workspace, slot, &stable_label)?;
+        let placement = self
+            .adapter
+            .place_worker_slot_pane(&workspace, &plan, slot, &pane)?;
         Ok(CockpitWorkerLaunch::Opened(CockpitWorkerOpened {
             adapter: self.adapter.name().to_string(),
             mode: self.mode,
             workspace_label: run_request.workspace_label.clone(),
-            pane_label: pane.label,
-            pane_id: pane_ref.id,
+            pane_label: placement.pane_label,
+            pane_id: placement.pane.id,
+            slot_name: placement.slot_name,
         }))
     }
 
@@ -666,25 +900,118 @@ impl HerdrCockpitAdapter {
         run_command_with_timeout(&self.bin, args, HERDR_COMMAND_TIMEOUT)
     }
 
-    fn first_pane_in_workspace(&self, workspace_id: &str) -> Result<CockpitPaneRef> {
+    fn pane_list(&self, workspace_id: &str) -> Result<Vec<CockpitLayoutPane>> {
         let value = self.run_json(&[
             "pane".to_string(),
             "list".to_string(),
             "--workspace".to_string(),
             workspace_id.to_string(),
         ])?;
-        let pane_id = value
+        Ok(value
             .pointer("/result/panes")
             .and_then(Value::as_array)
-            .and_then(|panes| panes.first())
-            .and_then(|pane| pane.get("pane_id"))
-            .and_then(Value::as_str)
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter_map(|pane| {
+                        let id = pane.get("pane_id").and_then(Value::as_str)?;
+                        let label = pane
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        Some(CockpitLayoutPane {
+                            id: id.to_string(),
+                            label: label.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn first_pane_in_workspace(&self, workspace_id: &str) -> Result<CockpitPaneRef> {
+        let pane_id = self
+            .pane_list(workspace_id)?
+            .into_iter()
+            .next()
+            .map(|pane| pane.id)
             .ok_or_else(|| {
                 anyhow!("herdr workspace {workspace_id} has no pane to anchor cockpit panes")
             })?;
-        Ok(CockpitPaneRef {
-            id: pane_id.to_string(),
-        })
+        Ok(CockpitPaneRef { id: pane_id })
+    }
+
+    fn root_pane_id(&self, workspace: &CockpitWorkspaceRef) -> Result<String> {
+        if let Some(pane) = &workspace.anchor_pane {
+            return Ok(pane.id.clone());
+        }
+        Ok(self.first_pane_in_workspace(&workspace.id)?.id)
+    }
+
+    fn split_pane(
+        &self,
+        anchor_pane_id: &str,
+        direction: CockpitLayoutDirection,
+        ratio: &str,
+        request: &CockpitPaneRequest,
+    ) -> Result<CockpitPaneRef> {
+        let mut args = vec![
+            "pane".to_string(),
+            "split".to_string(),
+            anchor_pane_id.to_string(),
+            "--direction".to_string(),
+            direction.as_herdr_arg().to_string(),
+            "--ratio".to_string(),
+            ratio.to_string(),
+            "--cwd".to_string(),
+            request.cwd.to_string_lossy().to_string(),
+        ];
+        for (key, value) in &request.env {
+            args.push("--env".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--no-focus".to_string());
+        let split = self.run_json(&args)?;
+        let pane_id = split
+            .pointer("/result/pane/pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("herdr pane split omitted pane_id"))?
+            .to_string();
+        Ok(CockpitPaneRef { id: pane_id })
+    }
+
+    fn rename_pane(&self, pane_id: &str, label: &str) -> Result<()> {
+        self.run_json(&[
+            "pane".to_string(),
+            "rename".to_string(),
+            pane_id.to_string(),
+            label.to_string(),
+        ])?;
+        Ok(())
+    }
+
+    fn run_pane(&self, pane_id: &str, command: &str) -> Result<()> {
+        self.run_command(&[
+            "pane".to_string(),
+            "run".to_string(),
+            pane_id.to_string(),
+            command.to_string(),
+        ])?;
+        Ok(())
+    }
+
+    fn run_pane_request(&self, pane_id: &str, request: &CockpitPaneRequest) -> Result<()> {
+        self.run_pane_request_with_label(pane_id, &request.label, request)
+    }
+
+    fn run_pane_request_with_label(
+        &self,
+        pane_id: &str,
+        label: &str,
+        request: &CockpitPaneRequest,
+    ) -> Result<()> {
+        self.rename_pane(pane_id, label)?;
+        self.run_pane(pane_id, &pane_command_with_env(request))
     }
 }
 
@@ -759,50 +1086,116 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         request: &CockpitPaneRequest,
     ) -> Result<CockpitPaneRef> {
         let direction = if request.label.starts_with("Worker ") {
-            "down"
+            CockpitLayoutDirection::Down
         } else {
-            "right"
+            CockpitLayoutDirection::Right
         };
-        let anchor_pane_id = match &workspace.anchor_pane {
-            Some(pane) => pane.id.clone(),
-            None => self.first_pane_in_workspace(&workspace.id)?.id,
-        };
-        let mut args = vec![
-            "pane".to_string(),
-            "split".to_string(),
-            anchor_pane_id,
-            "--direction".to_string(),
-            direction.to_string(),
-            "--ratio".to_string(),
-            "0.5".to_string(),
-            "--cwd".to_string(),
-            request.cwd.to_string_lossy().to_string(),
-        ];
-        for (key, value) in &request.env {
-            args.push("--env".to_string());
-            args.push(format!("{key}={value}"));
-        }
-        args.push("--no-focus".to_string());
-        let split = self.run_json(&args)?;
-        let pane_id = split
-            .pointer("/result/pane/pane_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("herdr pane split omitted pane_id"))?
-            .to_string();
+        let anchor_pane_id = self.root_pane_id(workspace)?;
+        let pane = self.split_pane(&anchor_pane_id, direction, "0.5", request)?;
+        self.run_pane_request(&pane.id, request)?;
+        Ok(pane)
+    }
+
+    fn inspect_layout(&self, workspace: &CockpitWorkspaceRef) -> Result<CockpitLayoutInspection> {
+        let root_pane_id = self.root_pane_id(workspace)?;
+        let panes = self.pane_list(&workspace.id)?;
         self.run_json(&[
             "pane".to_string(),
-            "rename".to_string(),
-            pane_id.clone(),
-            request.label.clone(),
+            "layout".to_string(),
+            "--pane".to_string(),
+            root_pane_id.clone(),
         ])?;
-        self.run_command(&[
-            "pane".to_string(),
-            "run".to_string(),
-            pane_id.clone(),
-            request.command.clone(),
-        ])?;
-        let _ = workspace.id.as_str();
-        Ok(CockpitPaneRef { id: pane_id })
+        Ok(CockpitLayoutInspection {
+            root_pane_id: Some(root_pane_id),
+            panes,
+        })
+    }
+
+    fn ensure_dashboard_pane(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        dashboard: &CockpitDashboardLayout,
+        request: &CockpitPaneRequest,
+    ) -> Result<CockpitPaneRef> {
+        let inspection = self.inspect_layout(workspace)?;
+        if let Some(pane_id) = inspection.dashboard_pane_id() {
+            return Ok(CockpitPaneRef {
+                id: pane_id.to_string(),
+            });
+        }
+        let root_pane_id = inspection
+            .root_pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("cockpit layout inspection omitted root pane"))?;
+        let pane = self.split_pane(root_pane_id, dashboard.direction, &dashboard.ratio, request)?;
+        self.run_pane_request(&pane.id, request)?;
+        let root_label = inspection.label_for_pane(root_pane_id).unwrap_or_default();
+        if root_label.trim().is_empty() {
+            self.rename_pane(root_pane_id, WORKER_REGION_PLACEHOLDER_PANE)?;
+        }
+        Ok(pane)
+    }
+
+    fn cleanup_placeholder_root_pane(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        slot: &CockpitWorkerSlot,
+        replacement_label: &str,
+    ) -> Result<()> {
+        if slot.index != 1 {
+            return Ok(());
+        }
+        let inspection = self.inspect_layout(workspace)?;
+        let root_pane_id = inspection
+            .root_pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("cockpit layout inspection omitted root pane"))?;
+        let root_label = inspection.label_for_pane(root_pane_id).unwrap_or_default();
+        if root_label.trim().is_empty() || root_label == WORKER_REGION_PLACEHOLDER_PANE {
+            self.rename_pane(root_pane_id, replacement_label)?;
+        }
+        Ok(())
+    }
+
+    fn place_worker_slot_pane(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        _plan: &CockpitLayoutPlan,
+        slot: &CockpitWorkerSlot,
+        request: &CockpitPaneRequest,
+    ) -> Result<CockpitWorkerPlacement> {
+        let pane_label = slot.pane_label(&request.label);
+        if slot.index == 1 {
+            let root_pane_id = self.root_pane_id(workspace)?;
+            self.run_pane_request_with_label(&root_pane_id, &pane_label, request)?;
+            return Ok(CockpitWorkerPlacement {
+                pane: CockpitPaneRef { id: root_pane_id },
+                slot_name: slot.name.clone(),
+                pane_label,
+            });
+        }
+
+        let split = slot
+            .split
+            .as_ref()
+            .ok_or_else(|| anyhow!("cockpit layout slot {} omitted split", slot.name))?;
+        let inspection = self.inspect_layout(workspace)?;
+        let anchor_pane_id = inspection
+            .worker_slot_pane_id(&split.anchor_slot)
+            .ok_or_else(|| {
+                anyhow!(
+                    "cockpit layout slot {} could not find anchor {}",
+                    slot.name,
+                    split.anchor_slot
+                )
+            })?;
+        let pane = self.split_pane(anchor_pane_id, split.direction, &split.ratio, request)?;
+        self.run_pane_request_with_label(&pane.id, &pane_label, request)?;
+        Ok(CockpitWorkerPlacement {
+            pane,
+            slot_name: slot.name.clone(),
+            pane_label,
+        })
     }
 
     fn start_tui_worker_agent(
@@ -996,10 +1389,27 @@ mod tests {
     use chrono::Utc;
     use std::sync::{Arc, Mutex};
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct FakeCockpitAdapter {
         calls: Arc<Mutex<Vec<String>>>,
+        layout: Arc<Mutex<FakeLayoutState>>,
         workspace_existed: bool,
+    }
+
+    #[derive(Default)]
+    struct FakeLayoutState {
+        dashboard: bool,
+        worker_slots: Vec<String>,
+    }
+
+    impl Default for FakeCockpitAdapter {
+        fn default() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                layout: Arc::new(Mutex::new(FakeLayoutState::default())),
+                workspace_existed: false,
+            }
+        }
     }
 
     impl FakeCockpitAdapter {
@@ -1048,6 +1458,94 @@ mod tests {
                 .push(format!("pane:{}:{}", request.label, request.command));
             Ok(CockpitPaneRef {
                 id: format!("pane-{}", request.label.len()),
+            })
+        }
+
+        fn inspect_layout(
+            &self,
+            _workspace: &CockpitWorkspaceRef,
+        ) -> Result<CockpitLayoutInspection> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("layout:inspect".to_string());
+            let layout = self.layout.lock().unwrap();
+            let mut panes = vec![CockpitLayoutPane {
+                id: "pane-1".to_string(),
+                label: WORKER_REGION_PLACEHOLDER_PANE.to_string(),
+            }];
+            if layout.dashboard {
+                panes.push(CockpitLayoutPane {
+                    id: "pane-dashboard".to_string(),
+                    label: RUN_STATUS_FEED_PANE.to_string(),
+                });
+            }
+            for slot in &layout.worker_slots {
+                panes.push(CockpitLayoutPane {
+                    id: format!("pane-{slot}"),
+                    label: format!("{slot}: fake worker"),
+                });
+            }
+            Ok(CockpitLayoutInspection {
+                root_pane_id: Some("pane-1".to_string()),
+                panes,
+            })
+        }
+
+        fn ensure_dashboard_pane(
+            &self,
+            _workspace: &CockpitWorkspaceRef,
+            dashboard: &CockpitDashboardLayout,
+            request: &CockpitPaneRequest,
+        ) -> Result<CockpitPaneRef> {
+            self.calls.lock().unwrap().push(format!(
+                "layout:dashboard:{}:{}:{}",
+                request.label,
+                dashboard.direction.as_herdr_arg(),
+                dashboard.ratio
+            ));
+            self.layout.lock().unwrap().dashboard = true;
+            Ok(CockpitPaneRef {
+                id: "pane-dashboard".to_string(),
+            })
+        }
+
+        fn cleanup_placeholder_root_pane(
+            &self,
+            _workspace: &CockpitWorkspaceRef,
+            slot: &CockpitWorkerSlot,
+            replacement_label: &str,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "layout:cleanup-root:{}:{}",
+                slot.name, replacement_label
+            ));
+            Ok(())
+        }
+
+        fn place_worker_slot_pane(
+            &self,
+            _workspace: &CockpitWorkspaceRef,
+            _plan: &CockpitLayoutPlan,
+            slot: &CockpitWorkerSlot,
+            request: &CockpitPaneRequest,
+        ) -> Result<CockpitWorkerPlacement> {
+            let pane_label = slot.pane_label(&request.label);
+            self.calls.lock().unwrap().push(format!(
+                "layout:worker-slot:{}:{}:{}",
+                slot.name, pane_label, request.command
+            ));
+            self.layout
+                .lock()
+                .unwrap()
+                .worker_slots
+                .push(slot.name.clone());
+            Ok(CockpitWorkerPlacement {
+                pane: CockpitPaneRef {
+                    id: format!("pane-{}", slot.name),
+                },
+                slot_name: slot.name.clone(),
+                pane_label,
             })
         }
 
@@ -1110,14 +1608,75 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_opens_default_workspace_and_read_only_panes_without_planner() {
+    fn cockpit_layout_planner_places_dashboard_right_workers_left_for_one_to_four_workers() {
+        let planner = CockpitLayoutPlanner::default();
+
+        for workers in 1..=4 {
+            let plan = planner.plan(workers).unwrap();
+
+            assert_eq!(plan.worker_count, workers);
+            assert_eq!(plan.dashboard.region, "right-dashboard");
+            assert_eq!(plan.dashboard.split_from_slot, "worker-1");
+            assert_eq!(plan.dashboard.direction, CockpitLayoutDirection::Right);
+            assert_eq!(plan.dashboard.ratio, "0.68");
+            assert!(
+                plan.worker_slots
+                    .iter()
+                    .all(|slot| slot.region == "left-worker-region")
+            );
+            assert!(
+                plan.worker_slots
+                    .iter()
+                    .all(|slot| !slot.name.to_lowercase().contains("operator"))
+            );
+        }
+    }
+
+    #[test]
+    fn cockpit_layout_planner_uses_stable_worker_slots_and_v2_three_worker_fallback() {
+        let planner = CockpitLayoutPlanner::default();
+        let plan = planner.plan(4).unwrap();
+        let names = plan
+            .worker_slots
+            .iter()
+            .map(|slot| slot.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["worker-1", "worker-2", "worker-3", "worker-4"]);
+        assert_eq!(
+            plan.worker_slots[1].split.as_ref().unwrap().anchor_slot,
+            "worker-1"
+        );
+        assert_eq!(
+            plan.worker_slots[1].split.as_ref().unwrap().direction,
+            CockpitLayoutDirection::Right
+        );
+        assert_eq!(
+            plan.worker_slots[2].split.as_ref().unwrap().anchor_slot,
+            "worker-1"
+        );
+        assert_eq!(
+            plan.worker_slots[2].split.as_ref().unwrap().direction,
+            CockpitLayoutDirection::Down
+        );
+        assert_eq!(
+            plan.worker_slots[3].split.as_ref().unwrap().anchor_slot,
+            "worker-2"
+        );
+        assert_eq!(
+            plan.worker_slots[3].split.as_ref().unwrap().direction,
+            CockpitLayoutDirection::Down
+        );
+    }
+
+    #[test]
+    fn cockpit_layout_opens_dashboard_without_default_operator_column() {
         let adapter = FakeCockpitAdapter::default();
         let request = CockpitRunRequest {
             repo_path: PathBuf::from("/repo"),
             khazad_home: PathBuf::from("/khazad-home"),
             workspace_label: workspace_label_for_run("kd-test"),
             feed_command: "khazad-doom monitor --run kd-test".to_string(),
-            phase_command: "khazad-doom status --run kd-test --follow".to_string(),
         };
 
         let opened = Cockpit::new(CockpitMode::Auto, adapter.clone())
@@ -1130,22 +1689,19 @@ mod tests {
                 adapter: "fake-herdr".to_string(),
                 mode: CockpitMode::Auto,
                 workspace_label: "Khazad-Doom kd-test".to_string(),
-                pane_labels: vec![
-                    RUN_STATUS_FEED_PANE.to_string(),
-                    INTEGRATION_GATE_REPAIR_PANE.to_string(),
-                ],
+                pane_labels: vec![RUN_STATUS_FEED_PANE.to_string()],
             })
         );
         let calls = adapter.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "workspace:Khazad-Doom kd-test");
-        assert!(calls[1].starts_with("pane:Dashboard:"));
-        assert!(calls[2].starts_with("pane:Operator:"));
-        assert!(
-            calls
-                .iter()
-                .all(|call| !call.to_lowercase().contains("planner"))
+        assert_eq!(
+            calls,
+            vec![
+                "workspace:Khazad-Doom kd-test".to_string(),
+                "layout:inspect".to_string(),
+                "layout:dashboard:Dashboard:right:0.68".to_string(),
+            ]
         );
+        assert!(calls.iter().all(|call| !call.contains("Operator")));
     }
 
     #[test]
@@ -1156,7 +1712,6 @@ mod tests {
             khazad_home: PathBuf::from("/khazad-home"),
             workspace_label: workspace_label_for_run("kd-test"),
             feed_command: "khazad-doom monitor --run kd-test".to_string(),
-            phase_command: "khazad-doom status --run kd-test --follow".to_string(),
         };
 
         let opened = Cockpit::new(CockpitMode::Herdr, adapter.clone())
@@ -1176,7 +1731,6 @@ mod tests {
             khazad_home: PathBuf::from("/khazad-home"),
             workspace_label: workspace_label_for_run("kd-test"),
             feed_command: "feed".to_string(),
-            phase_command: "phase".to_string(),
         };
 
         let launched = Cockpit::new(CockpitMode::Direct, adapter.clone())
@@ -1188,14 +1742,13 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_worker_pane_uses_deterministic_run_and_slice_label() {
+    fn cockpit_layout_worker_pane_uses_deterministic_slot_and_run_slice_label() {
         let adapter = FakeCockpitAdapter::default();
         let request = CockpitRunRequest {
             repo_path: PathBuf::from("/repo"),
             khazad_home: PathBuf::from("/khazad-home"),
             workspace_label: workspace_label_for_run("kd-run"),
             feed_command: "feed".to_string(),
-            phase_command: "phase".to_string(),
         };
         let worker = CockpitWorkerPaneRequest {
             run_id: "kd-run".to_string(),
@@ -1216,13 +1769,60 @@ mod tests {
                 adapter: "fake-herdr".to_string(),
                 mode: CockpitMode::Herdr,
                 workspace_label: "Khazad-Doom kd-run".to_string(),
-                pane_label: "Worker kd-run/SLICE-1 attempt 2".to_string(),
-                pane_id: "pane-31".to_string(),
+                pane_label: "worker-1: Worker kd-run/SLICE-1 attempt 2".to_string(),
+                pane_id: "pane-worker-1".to_string(),
+                slot_name: "worker-1".to_string(),
             })
         );
         let calls = adapter.calls();
         assert_eq!(calls[0], "workspace:Khazad-Doom kd-run");
-        assert!(calls[1].starts_with("pane:Worker kd-run/SLICE-1 attempt 2:/bin/sh wrapper.sh"));
+        assert!(calls.contains(&"layout:dashboard:Dashboard:right:0.68".to_string()));
+        assert!(calls.iter().any(|call| call.starts_with(
+            "layout:worker-slot:worker-1:worker-1: Worker kd-run/SLICE-1 attempt 2:/bin/sh wrapper.sh"
+        )));
+    }
+
+    #[test]
+    fn cockpit_layout_worker_panes_advance_to_next_stable_slot() {
+        let adapter = FakeCockpitAdapter::default();
+        let request = CockpitRunRequest {
+            repo_path: PathBuf::from("/repo"),
+            khazad_home: PathBuf::from("/khazad-home"),
+            workspace_label: workspace_label_for_run("kd-run"),
+            feed_command: "feed".to_string(),
+        };
+        let first = CockpitWorkerPaneRequest {
+            run_id: "kd-run".to_string(),
+            slice_id: "SLICE-1".to_string(),
+            attempt: 1,
+            command: "first".to_string(),
+            cwd: PathBuf::from("/repo/worker-1"),
+            env: Vec::new(),
+        };
+        let second = CockpitWorkerPaneRequest {
+            run_id: "kd-run".to_string(),
+            slice_id: "SLICE-2".to_string(),
+            attempt: 1,
+            command: "second".to_string(),
+            cwd: PathBuf::from("/repo/worker-2"),
+            env: Vec::new(),
+        };
+        let cockpit = Cockpit::new(CockpitMode::Herdr, adapter.clone());
+
+        cockpit.open_worker_pane(&request, &first).unwrap();
+        let opened = cockpit.open_worker_pane(&request, &second).unwrap();
+
+        assert_eq!(
+            opened,
+            CockpitWorkerLaunch::Opened(CockpitWorkerOpened {
+                adapter: "fake-herdr".to_string(),
+                mode: CockpitMode::Herdr,
+                workspace_label: "Khazad-Doom kd-run".to_string(),
+                pane_label: "worker-2: Worker kd-run/SLICE-2 attempt 1".to_string(),
+                pane_id: "pane-worker-2".to_string(),
+                slot_name: "worker-2".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1233,7 +1833,6 @@ mod tests {
             khazad_home: PathBuf::from("/khazad-home"),
             workspace_label: workspace_label_for_run("kd-run"),
             feed_command: "feed".to_string(),
-            phase_command: "phase".to_string(),
         };
         let worker = CockpitTuiWorkerRequest {
             run_id: "kd-run".to_string(),
@@ -1343,8 +1942,6 @@ mod tests {
 
         assert_eq!(request.workspace_label, "Khazad-Doom kd-123");
         assert!(request.feed_command.contains("monitor --run kd-123"));
-        assert!(request.phase_command.contains("attend --run kd-123"));
         assert!(!request.feed_command.to_lowercase().contains("planner"));
-        assert!(!request.phase_command.to_lowercase().contains("planner"));
     }
 }
