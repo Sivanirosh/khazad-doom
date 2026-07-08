@@ -2,6 +2,9 @@
   "id": "LAYOUT-02",
   "title": "Cockpit layout planner and Herdr adapter methods",
   "goal": "Introduce a small cockpit layout planning interface and Herdr adapter methods that can place dashboard and worker panes intentionally instead of relying on ad hoc split order.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-011930-c21b036d",
+  "closed_at": "2026-07-08T02:10:07.099297255+00:00",
   "depends_on": [
     "LAYOUT-01"
   ],

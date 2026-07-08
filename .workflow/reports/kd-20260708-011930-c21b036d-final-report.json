@@ -1,0 +1,1024 @@
+{
+  "run_id": "kd-20260708-011930-c21b036d",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260708-011930-c21b036d/integration",
+  "base_sha": "af87cce3dcf08dbef7024aba9d5eadacd09bf16a",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "workflow_config",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "LAYOUT-01",
+      "status": "complete",
+      "summary": "Added the scratch Herdr layout v2 proof script and evidence note. The script supports dry-run and real modes, uses harmless shell commands in scratch Herdr workspaces, exercises split/move/close/layout primitives, and documents 1-4 worker geometry including the 3-worker Herdr-backed fallback. No daemon runtime files were changed.",
+      "commit_sha": "fbd5ba4f0ea90ed45187302fa1a8b330a8c06fe0",
+      "commit_message": "Add Herdr layout v2 proof",
+      "changed_files": [
+        "scripts/proof-herdr-layout-v2",
+        "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+      ],
+      "public_interfaces_changed": [
+        "scripts/proof-herdr-layout-v2"
+      ],
+      "tests_run": [
+        "bash -n scripts/proof-herdr-layout-v2",
+        "scripts/proof-herdr-layout-v2 --dry-run",
+        "test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "KHAZAD_HERDR_LAYOUT_PROOF_SLEEP=1 scripts/proof-herdr-layout-v2 --workers 1",
+        "KHAZAD_HERDR_LAYOUT_PROOF_SLEEP=1 scripts/proof-herdr-layout-v2 --workers 2",
+        "KHAZAD_HERDR_LAYOUT_PROOF_SLEEP=1 scripts/proof-herdr-layout-v2 --workers 3",
+        "KHAZAD_HERDR_LAYOUT_PROOF_SLEEP=1 scripts/proof-herdr-layout-v2 --workers 4"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Add scripts/proof-herdr-layout-v2 with a dry-run mode and a real mode that uses harmless shell commands, not KD workers, to exercise Herdr pane split/move/close/layout mechanics for the v2 cockpit shape.",
+          "status": "satisfied",
+          "evidence": "scripts/proof-herdr-layout-v2 was added executable. Dry-run prints the Herdr command plan without invoking Herdr; real mode creates scratch workspaces, uses pane run with printf/sleep commands, and exercises tab create, pane move, pane close, pane split, and pane layout. bash -n and dry-run passed; real smoke runs for workers 1-4 passed with KHAZAD_HERDR_LAYOUT_PROOF_SLEEP=1."
+        },
+        {
+          "criterion": "The proof defines the target layout as a left worker region and a right full-height dashboard, with 1 worker filling the worker region, 2 workers side-by-side, and 3-4 workers arranged as a 2x2 grid or a documented Herdr-backed fallback.",
+          "status": "satisfied",
+          "evidence": "The script target banner/geometry notes and docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md define the left worker region plus right full-height dashboard. The evidence doc's worker-count table documents 1-worker, 2-worker, 4-worker 2x2, and the 3-worker Herdr-backed fallback that avoids an unused spacer pane."
+        },
+        {
+          "criterion": "Write docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md with commands, observed Herdr capabilities, limitations, and explicit confirmation that pane layout/scrollback is observability only and not KD correctness evidence.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md was added with Commands, Observed Herdr capabilities, Worker-count geometry, and Limitations and fallback sections. It explicitly states: 'Pane layout/scrollback is observability only and not KD correctness evidence.' Required grep checks passed."
+        },
+        {
+          "criterion": "Do not change daemon runtime behavior in this slice.",
+          "status": "satisfied",
+          "evidence": "Only scripts/proof-herdr-layout-v2 and docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md changed; no src/, Cargo, daemon config, or runtime workflow files were modified. git status was clean after commit fbd5ba4f0ea90ed45187302fa1a8b330a8c06fe0."
+        }
+      ],
+      "assumptions": [
+        "The 3-worker fallback is within the acceptance grant for a documented Herdr-backed fallback because it preserves the top-level left worker region/right full-height dashboard and avoids adding a non-worker spacer or idle shell.",
+        "Real proof mode confines move/close operations to scratch workspaces created by scripts/proof-herdr-layout-v2 and addressed by returned Herdr ids."
+      ]
+    },
+    {
+      "slice_id": "LAYOUT-02",
+      "status": "complete",
+      "summary": "Implemented internal cockpit layout v2 planning and Herdr adapter layout hooks. The default run cockpit now plans only a right Dashboard and left worker region, worker panes are assigned stable worker-1..worker-4 slots, Herdr layout failures remain visibility-only fallback incidents, and the layout proof note documents the runtime seam.",
+      "commit_sha": "4ea37579d1f34047d4d0c95d932cbdbd66aa0c24",
+      "commit_message": "Add cockpit layout v2 planner",
+      "changed_files": [
+        "src/workflow/cockpit.rs",
+        "src/workflow/manager.rs",
+        "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+      ],
+      "public_interfaces_changed": [
+        "Internal Rust cockpit interfaces changed: CockpitAdapter gained layout inspection/dashboard/slot-placement hooks, CockpitWorkerOpened now reports slot_name, and CockpitRunRequest no longer carries the removed default Operator/attend pane command. No CLI or persistent config surface was added."
+      ],
+      "tests_run": [
+        "cargo test -q cockpit_layout",
+        "cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "cargo check -q",
+        "git diff --check"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Add a tested layout planner for the v2 cockpit contract: dashboard right, worker region left, stable worker slot names for 1-4 workers, and no default Operator column.",
+          "status": "satisfied",
+          "evidence": "src/workflow/cockpit.rs adds CockpitLayoutPlanner with Dashboard as right-dashboard split from worker-1, left-worker-region slots worker-1 through worker-4, and no Operator pane creation. Tests matching cargo test -q cockpit_layout cover dashboard/right + worker/left geometry, stable 1-4 slot names, slot advancement, and no default Operator pane."
+        },
+        {
+          "criterion": "Add Herdr adapter operations needed by the planner, such as dashboard pane creation or reuse, placeholder/root-pane cleanup, worker pane movement or slot placement, and layout inspection, while keeping the adapter as the only Herdr-specific implementation seam.",
+          "status": "satisfied",
+          "evidence": "CockpitAdapter now exposes inspect_layout, ensure_dashboard_pane, cleanup_placeholder_root_pane, and place_worker_slot_pane. HerdrCockpitAdapter implements them with pane list/layout, split, rename/run, Dashboard reuse, root-pane reuse for worker-1, and planned worker-slot splits; manager code still calls only workflow::cockpit helpers."
+        },
+        {
+          "criterion": "Existing cockpit open/fallback semantics remain non-fatal visibility behavior; Herdr layout failures must not change worker authorization, verification, merge, handoff readiness, or run terminal status by themselves.",
+          "status": "satisfied",
+          "evidence": "Layout errors flow through the existing CockpitUnavailable/cockpit_unavailable run incident and cockpit_worker_fallback-to-direct paths in manager.rs; authorization, verification, merge, handoff, and terminal status logic were not changed. cargo check -q passed."
+        },
+        {
+          "criterion": "Record layout-related incidents/events as observability metadata only; do not make Herdr pane text, scrollback, metadata, or Pi display state correctness evidence.",
+          "status": "satisfied",
+          "evidence": "manager.rs now tags cockpit_ready and cockpit fallback incidents with cockpit_layout_v2_observability_only while retaining source_of_truth as daemon_state or kd_artifact_files. The evidence note explicitly states pane text, scrollback, labels, and Pi display state are visibility aids only, with worker artifacts and verification gates remaining authoritative."
+        }
+      ],
+      "assumptions": [
+        "No public CLI or persistent config change was needed or added.",
+        "Herdr pane labels are used only to choose visual worker slots inside the cockpit adapter; they are not workflow correctness evidence.",
+        "Worker slot planning is intentionally bounded to the accepted 1-4 worker contract; attempts beyond that surface as non-fatal Herdr cockpit fallback to direct execution."
+      ]
+    },
+    {
+      "slice_id": "LAYOUT-03",
+      "status": "complete",
+      "summary": "Implemented compact dashboard v2 feed projection with Run, Workers, Attention, actionable Commands, Checks, Economics, and incident sections; shortened worker profile display; kept attention/terminal/operator-command text daemon-fed and untruncated; documented before/after and attach-only observability invariant.",
+      "commit_sha": "ce6ca249bda51a3fc21d205b28cae7bdfc03155b",
+      "commit_message": "Polish compact dashboard v2 projection",
+      "changed_files": [
+        "docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "src/cli.rs",
+        "src/workflow/projection.rs",
+        "tests/fixtures/projection_information_feed_golden.json"
+      ],
+      "tests_run": [
+        "cargo test -q dashboard_v2",
+        "cargo test -q render_monitor",
+        "cargo check -q",
+        "test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "git diff --check"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Add or update a compact dashboard/feed projection that fits the right panel without long profile-line wrapping and without duplicating worker blocks.",
+          "status": "satisfied",
+          "evidence": "src/workflow/projection.rs now projects compact Run/Workers/Attention/Checks/Economics sections, uses compact worker profile text, and dashboard_v2 tests assert old Todos/Worker/Progress/Activity/Tail duplicate block labels are absent."
+        },
+        {
+          "criterion": "Dashboard v2 includes concise sections for Run, Workers, Attention, Checks, Economics, Incidents when present, and Commands when actionable.",
+          "status": "satisfied",
+          "evidence": "project_run_at builds Run, Workers, Attention, optional Commands, Checks, Economics, and optional Incidents blocks; tests cover no-command and actionable-command cases."
+        },
+        {
+          "criterion": "Attention lines remain full and untruncated; renderer polish must not invent workflow wording beyond daemon-owned status/feed fields.",
+          "status": "satisfied",
+          "evidence": "Attention/terminal/replan/question lines are emitted without projection truncation and rendered unbounded for StatusFeedRole::Attention; render_monitor_dashboard_v2_uses_feed_only_and_keeps_attention_unbounded asserts feed-only rendering and full attention output."
+        },
+        {
+          "criterion": "Document the dashboard v2 before/after and the invariant that monitor/dashboard output is attach-only observability over daemon state.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/herdr-dashboard-v2-2026-07-08.md records before/after sections and the attach-only observability invariant."
+        }
+      ],
+      "assumptions": [
+        "Kept StatusFeed feed_version at 1 because the JSON feed shape is unchanged; dashboard v2 is a projection/layout revision over the existing daemon status/feed schema."
+      ]
+    },
+    {
+      "slice_id": "LAYOUT-04",
+      "status": "complete",
+      "summary": "Placed native Pi TUI workers through the cockpit layout v2 planner: TUI agents are staged, moved into stable left worker slots, renamed with slot labels, and recorded with slot metadata while result parsing remains artifact-only.",
+      "commit_sha": "3dd81b577cb87e3b709e3648d70dbea2f05d9b8c",
+      "commit_message": "khazad(layout): place TUI workers in grid",
+      "changed_files": [
+        "src/workflow/cockpit.rs",
+        "src/workflow/manager.rs",
+        "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+      ],
+      "tests_run": [
+        "cargo test -q tui_worker_grid",
+        "cargo test -q tui_worker",
+        "bash -n scripts/proof-herdr-layout-v2",
+        "cargo check -q",
+        "git diff --check",
+        "cargo fmt --check"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Native Pi TUI worker launches use layout v2 placement: no unused root shell left visible, no default Operator column, and worker panes occupy the left worker region.",
+          "status": "satisfied",
+          "evidence": "src/workflow/cockpit.rs now routes open_tui_worker_agent through CockpitLayoutPlanner, ensures the right Dashboard, selects worker-1..worker-4 slots, starts TUI agents in a staging tab, moves the agent pane into the planned left slot, renames it, and closes replaced root/staging panes. Tests include cockpit_tui_worker_uses_layout_v2_worker_slot and cockpit_tui_worker_grid_advances_stable_left_worker_slots_for_four_workers."
+        },
+        {
+          "criterion": "For up to 4 concurrent TUI workers, KD records stable worker slot metadata with the cockpit_worker_ready event while keeping source_of_truth as kd_tui_result_artifact.",
+          "status": "satisfied",
+          "evidence": "CockpitTuiWorkerOpened carries slot name/index/region, and src/workflow/manager.rs records layout_planner, worker_slot_name, worker_slot_index, worker_region, agent_name/terminal_id, and source_of_truth=kd_tui_result_artifact on cockpit_worker_ready. cargo test -q tui_worker_grid validates worker-1 through worker-4 assignment."
+        },
+        {
+          "criterion": "Worker timeout and cancellation paths still close the associated Herdr pane on a best-effort basis and never read pane text as result evidence.",
+          "status": "satisfied",
+          "evidence": "wait_for_pi_tui_worker_result still watches only artifacts.result_path, parses via parse_pi_tui_worker_result_artifact, and calls close_default_pane(opened.pane_id) on result or cancellation. No pane text/scrollback read path was added."
+        },
+        {
+          "criterion": "Existing wrapper/direct fallback behavior remains available when experimental native TUI is disabled or Herdr TUI launch is unavailable.",
+          "status": "satisfied",
+          "evidence": "run_herdr_worker_or_direct still selects the wrapper path when experimental_pi_tui_worker is false, direct cockpit mode still returns SkippedDirect, and TUI launch/layout errors still map to CockpitWorkerJobError::Fallback before direct_runner.run. cargo test -q tui_worker and cargo check -q passed."
+        }
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "LAYOUT-01",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "bash -n scripts/proof-herdr-layout-v2",
+        "scripts/proof-herdr-layout-v2 --dry-run",
+        "test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "fbd5ba4f0ea90ed45187302fa1a8b330a8c06fe0",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "LAYOUT-02",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "cargo test -q cockpit_layout",
+        "cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "cargo check -q",
+        "git diff --check"
+      ],
+      "attempt": 1,
+      "worker_head": "4ea37579d1f34047d4d0c95d932cbdbd66aa0c24",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "LAYOUT-03",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "cargo test -q dashboard_v2",
+        "cargo test -q render_monitor",
+        "cargo check -q",
+        "test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "git diff --check"
+      ],
+      "attempt": 1,
+      "worker_head": "ce6ca249bda51a3fc21d205b28cae7bdfc03155b",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "LAYOUT-04",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "cargo test -q tui_worker_grid",
+        "cargo test -q tui_worker",
+        "bash -n scripts/proof-herdr-layout-v2",
+        "cargo check -q",
+        "git diff --check"
+      ],
+      "attempt": 1,
+      "worker_head": "3dd81b577cb87e3b709e3648d70dbea2f05d9b8c",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "bash -n scripts/proof-herdr-layout-v2",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "duration_ms": 100
+      },
+      {
+        "command": "scripts/proof-herdr-layout-v2 --dry-run",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "Khazad-Doom Herdr layout v2 proof\nrepo: /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\nmode: dry-run\nworkers: 1 2 3 4\ntarget: no unused root shell; left worker region; right full-height dashboard\n\n== dry-run workers=1 ==\ngeometry: worker-1 fills the left worker region; dashboard is right full-height.\n+ herdr workspace create --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=1 --no-focus\n+ herdr tab create --workspace \\<workspace-id\\> --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=1\\ move-probe --no-focus\n+ herdr pane move \\<move-probe-pane\\> --tab \\<target-tab-id\\> --split down --target-pane \\<root-pane\\> --ratio 0.80 --no-focus\n+ herdr pane close \\<move-probe-pane\\>\n+ herdr pane split \\<root-pane\\> --direction right --ratio 0.68 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # right full-height dashboard; root remains left worker region\n+ herdr pane rename \\<worker-1-pane\\> KD\\ layout\\ v2\\ worker\\ 1/1\n+ herdr pane run \\<worker-1-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-1\\nworkers=1\\n\\'; exec sleep 600'\n+ herdr pane rename \\<dashboard-pane\\> KD\\ layout\\ v2\\ dashboard\\ 1\\ workers\n+ herdr pane run \\<dashboard-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=dashboard\\nworkers=1\\n\\'; exec sleep 600'\n+ herdr pane layout --pane \\<root-pane\\>\n+ herdr workspace close \\<workspace-id\\> # cleanup scratch workspace only\n\n== dry-run workers=2 ==\ngeometry: worker-1 and worker-2 are side-by-side inside the left worker region; dashboard is right full-height.\n+ herdr workspace create --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=2 --no-focus\n+ herdr tab create --workspace \\<workspace-id\\> --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=2\\ move-probe --no-focus\n+ herdr pane move \\<move-probe-pane\\> --tab \\<target-tab-id\\> --split down --target-pane \\<root-pane\\> --ratio 0.80 --no-focus\n+ herdr pane close \\<move-probe-pane\\>\n+ herdr pane split \\<root-pane\\> --direction right --ratio 0.68 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # right full-height dashboard; root remains left worker region\n+ herdr pane split \\<worker-1-pane\\> --direction right --ratio 0.50 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # worker-2 side-by-side in worker region\n+ herdr pane rename \\<worker-1-pane\\> KD\\ layout\\ v2\\ worker\\ 1/2\n+ herdr pane run \\<worker-1-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-1\\nworkers=2\\n\\'; exec sleep 600'\n+ herdr pane rename \\<worker-2-pane\\> KD\\ layout\\ v2\\ worker\\ 2/2\n+ herdr pane run \\<worker-2-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-2\\nworkers=2\\n\\'; exec sleep 600'\n+ herdr pane rename \\<dashboard-pane\\> KD\\ layout\\ v2\\ dashboard\\ 2\\ workers\n+ herdr pane run \\<dashboard-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=dashboard\\nworkers=2\\n\\'; exec sleep 600'\n+ herdr pane layout --pane \\<root-pane\\>\n+ herdr workspace close \\<workspace-id\\> # cleanup scratch workspace only\n\n== dry-run workers=3 ==\ngeometry: Herdr-backed 3-worker fallback: worker-1/worker-3 stacked in the left half of the worker region, worker-2 full-height in the right half; dashboard is right full-height.\n+ herdr workspace create --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=3 --no-focus\n+ herdr tab create --workspace \\<workspace-id\\> --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=3\\ move-probe --no-focus\n+ herdr pane move \\<move-probe-pane\\> --tab \\<target-tab-id\\> --split down --target-pane \\<root-pane\\> --ratio 0.80 --no-focus\n+ herdr pane close \\<move-probe-pane\\>\n+ herdr pane split \\<root-pane\\> --direction right --ratio 0.68 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # right full-height dashboard; root remains left worker region\n+ herdr pane split \\<worker-1-pane\\> --direction right --ratio 0.50 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # worker-2 side-by-side in worker region\n+ herdr pane split \\<worker-1-pane\\> --direction down --ratio 0.50 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # worker-3 lower-left fallback/grid cell\n+ herdr pane rename \\<worker-1-pane\\> KD\\ layout\\ v2\\ worker\\ 1/3\n+ herdr pane run \\<worker-1-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-1\\nworkers=3\\n\\'; exec sleep 600'\n+ herdr pane rename \\<worker-2-pane\\> KD\\ layout\\ v2\\ worker\\ 2/3\n+ herdr pane run \\<worker-2-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-2\\nworkers=3\\n\\'; exec sleep 600'\n+ herdr pane rename \\<worker-3-pane\\> KD\\ layout\\ v2\\ worker\\ 3/3\n+ herdr pane run \\<worker-3-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-3\\nworkers=3\\n\\'; exec sleep 600'\n+ herdr pane rename \\<dashboard-pane\\> KD\\ layout\\ v2\\ dashboard\\ 3\\ workers\n+ herdr pane run \\<dashboard-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=dashboard\\nworkers=3\\n\\'; exec sleep 600'\n+ herdr pane layout --pane \\<root-pane\\>\n+ herdr workspace close \\<workspace-id\\> # cleanup scratch workspace only\n\n== dry-run workers=4 ==\ngeometry: worker-1/worker-2 above worker-3/worker-4 in a 2x2 grid inside the left worker region; dashboard is right full-height.\n+ herdr workspace create --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=4 --no-focus\n+ herdr tab create --workspace \\<workspace-id\\> --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --label Khazad-Doom\\ layout\\ v2\\ proof\\ workers=4\\ move-probe --no-focus\n+ herdr pane move \\<move-probe-pane\\> --tab \\<target-tab-id\\> --split down --target-pane \\<root-pane\\> --ratio 0.80 --no-focus\n+ herdr pane close \\<move-probe-pane\\>\n+ herdr pane split \\<root-pane\\> --direction right --ratio 0.68 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # right full-height dashboard; root remains left worker region\n+ herdr pane split \\<worker-1-pane\\> --direction right --ratio 0.50 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # worker-2 side-by-side in worker region\n+ herdr pane split \\<worker-1-pane\\> --direction down --ratio 0.50 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # worker-3 lower-left fallback/grid cell\n+ herdr pane split \\<worker-2-pane\\> --direction down --ratio 0.50 --cwd /home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration --no-focus # worker-4 lower-right grid cell\n+ herdr pane rename \\<worker-1-pane\\> KD\\ layout\\ v2\\ worker\\ 1/4\n+ herdr pane run \\<worker-1-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-1\\nworkers=4\\n\\'; exec sleep 600'\n+ herdr pane rename \\<worker-2-pane\\> KD\\ layout\\ v2\\ worker\\ 2/4\n+ herdr pane run \\<worker-2-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-2\\nworkers=4\\n\\'; exec sleep 600'\n+ herdr pane rename \\<worker-3-pane\\> KD\\ layout\\ v2\\ worker\\ 3/4\n+ herdr pane run \\<worker-3-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-3\\nworkers=4\\n\\'; exec sleep 600'\n+ herdr pane rename \\<worker-4-pane\\> KD\\ layout\\ v2\\ worker\\ 4/4\n+ herdr pane run \\<worker-4-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=worker-4\\nworkers=4\\n\\'; exec sleep 600'\n+ herdr pane rename \\<dashboard-pane\\> KD\\ layout\\ v2\\ dashboard\\ 4\\ workers\n+ herdr pane run \\<dashboard-pane\\> $'printf \\'Khazad-Doom Herdr layout v2 proof\\nrole=dashboard\\nworkers=4\\n\\'; exec sleep 600'\n+ herdr pane layout --pane \\<root-pane\\>\n+ herdr workspace close \\<workspace-id\\> # cleanup scratch workspace only",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000scripts/proof-herdr-layout-v2 --dry-run",
+        "duration_ms": 257
+      },
+      {
+        "command": "test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "cargo test -q cockpit_layout",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s\n\nwarning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test -q cockpit_layout",
+        "duration_ms": 27018
+      },
+      {
+        "command": "cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 105 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s\n\nwarning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "duration_ms": 100
+      },
+      {
+        "command": "cargo check -q",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "warning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo check -q",
+        "duration_ms": 4803
+      },
+      {
+        "command": "git diff --check",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000git diff --check",
+        "duration_ms": 100
+      },
+      {
+        "command": "cargo test -q dashboard_v2",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 102 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s\n\nwarning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test -q dashboard_v2",
+        "duration_ms": 100
+      },
+      {
+        "command": "cargo test -q render_monitor",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s\n\nwarning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test -q render_monitor",
+        "duration_ms": 100
+      },
+      {
+        "command": "test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "cargo test -q tui_worker_grid",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s\n\nwarning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test -q tui_worker_grid",
+        "duration_ms": 100
+      },
+      {
+        "command": "cargo test -q tui_worker",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "running 6 tests\n......\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.81s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s\n\nwarning: constant `PROGRESS` is never used\n  --> src/workflow/events.rs:20:18\n   |\n20 | pub(crate) const PROGRESS: &str = \"progress\";\n   |                  ^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated items `from_value`, `terminal_relevant`, `kind_or_failure_kind`, `message_or_summary`, `extra_text`, and `legacy` are never used\n   --> src/workflow/events.rs:165:19\n    |\n145 | impl RunIncidentPayload {\n    | ----------------------- associated items in this implementation\n...\n165 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n215 |     pub(crate) fn terminal_relevant(&self) -> bool {\n    |                   ^^^^^^^^^^^^^^^^^\n...\n221 |     pub(crate) fn kind_or_failure_kind(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n...\n226 |     pub(crate) fn message_or_summary(&self) -> String {\n    |                   ^^^^^^^^^^^^^^^^^^\n...\n233 |     pub(crate) fn extra_text(&self, key: &str) -> Option<String> {\n    |                   ^^^^^^^^^^\n...\n237 |     fn legacy(value: &Value) -> Self {\n    |        ^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:363:19\n    |\n362 | impl CockpitReadyPayload {\n    | ------------------------ associated function in this implementation\n363 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:441:19\n    |\n434 | impl SliceStartedPayload {\n    | ------------------------ associated function in this implementation\n...\n441 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:463:19\n    |\n455 | impl SliceMergedPayload {\n    | ----------------------- associated function in this implementation\n...\n463 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:485:19\n    |\n477 | impl IntegrationRepairCompletedPayload {\n    | -------------------------------------- associated function in this implementation\n...\n485 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:512:19\n    |\n505 | impl TerminalSummaryWrittenPayload {\n    | ---------------------------------- associated function in this implementation\n...\n512 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated items `from_value` and `display_status` are never used\n   --> src/workflow/events.rs:572:19\n    |\n537 | impl TerminalNotificationPayload {\n    | -------------------------------- associated items in this implementation\n...\n572 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n...\n584 |     pub(crate) fn display_status(&self) -> String {\n    |                   ^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:640:19\n    |\n639 | impl WorkerAttemptFailurePayload {\n    | -------------------------------- associated function in this implementation\n640 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:696:19\n    |\n679 | impl WorkerQuestionAskedPayload {\n    | ------------------------------- associated function in this implementation\n...\n696 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `ProgressEventPayload` is never constructed\n   --> src/workflow/events.rs:751:19\n    |\n751 | pub(crate) struct ProgressEventPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:765:19\n    |\n764 | impl ProgressEventPayload {\n    | ------------------------- associated function in this implementation\n765 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:819:19\n    |\n790 | impl ParallelLayerPayload {\n    | ------------------------- associated function in this implementation\n...\n819 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: struct `CheckpointWrittenPayload` is never constructed\n   --> src/workflow/events.rs:833:19\n    |\n833 | pub(crate) struct CheckpointWrittenPayload {\n    |                   ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: associated function `from_value` is never used\n   --> src/workflow/events.rs:841:19\n    |\n840 | impl CheckpointWrittenPayload {\n    | ----------------------------- associated function in this implementation\n841 |     pub(crate) fn from_value(value: &Value) -> Self {\n    |                   ^^^^^^^^^^\n\nwarning: function `u64_field` is never used\n    --> src/workflow/events.rs:1014:4\n     |\n1014 | fn u64_field(value: &Value, key: &str) -> u64 {\n     |    ^^^^^^^^^\n\nwarning: function `string_array_field` is never used\n    --> src/workflow/events.rs:1018:4\n     |\n1018 | fn string_array_field(value: &Value, key: &str) -> Vec<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `first_non_empty` is never used\n    --> src/workflow/events.rs:1043:4\n     |\n1043 | fn first_non_empty(values: &[&str]) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: constant `ACTIVITY_LIMIT` is never used\n  --> src/workflow/projection.rs:23:7\n   |\n23 | const ACTIVITY_LIMIT: usize = 7;\n   |       ^^^^^^^^^^^^^^\n\nwarning: constant `OUTPUT_LINES` is never used\n  --> src/workflow/projection.rs:24:7\n   |\n24 | const OUTPUT_LINES: usize = 4;\n   |       ^^^^^^^^^^^^\n\nwarning: constant `TODO_ITEMS` is never used\n  --> src/workflow/projection.rs:25:7\n   |\n25 | const TODO_ITEMS: usize = 8;\n   |       ^^^^^^^^^^\n\nwarning: function `terminal_reason_block` is never used\n   --> src/workflow/projection.rs:828:4\n    |\n828 | fn terminal_reason_block(reason: &TerminalReason) -> StatusFeedBlock {\n    |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `replan_block` is never used\n   --> src/workflow/projection.rs:876:4\n    |\n876 | fn replan_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n    |    ^^^^^^^^^^^^\n\nwarning: function `todos_block` is never used\n    --> src/workflow/projection.rs:1382:4\n     |\n1382 | fn todos_block(details: &RunDetails) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^\n\nwarning: function `progress_block` is never used\n    --> src/workflow/projection.rs:1461:4\n     |\n1461 | fn progress_block(\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `semantic_progress_block` is never used\n    --> src/workflow/projection.rs:1567:4\n     |\n1567 | fn semantic_progress_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `activity_block` is never used\n    --> src/workflow/projection.rs:1739:4\n     |\n1739 | fn activity_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^^^^^\n\nwarning: function `tail_block` is never used\n    --> src/workflow/projection.rs:1765:4\n     |\n1765 | fn tail_block(details: &RunDetails) -> Option<StatusFeedBlock> {\n     |    ^^^^^^^^^^\n\nwarning: function `activity_line` is never used\n    --> src/workflow/projection.rs:1838:4\n     |\n1838 | fn activity_line(event: &Event, details: &RunDetails) -> Option<String> {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_attempt_failure_line` is never used\n    --> src/workflow/projection.rs:1929:4\n     |\n1929 | fn worker_attempt_failure_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `run_incident_line` is never used\n    --> src/workflow/projection.rs:1942:4\n     |\n1942 | fn run_incident_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `implementation_summary_line` is never used\n    --> src/workflow/projection.rs:1956:4\n     |\n1956 | fn implementation_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_ready_line` is never used\n    --> src/workflow/projection.rs:1983:4\n     |\n1983 | fn cockpit_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^\n\nwarning: function `cockpit_worker_ready_line` is never used\n    --> src/workflow/projection.rs:1991:4\n     |\n1991 | fn cockpit_worker_ready_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_summary_line` is never used\n    --> src/workflow/projection.rs:2004:4\n     |\n2004 | fn terminal_summary_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `terminal_notification_line` is never used\n    --> src/workflow/projection.rs:2016:4\n     |\n2016 | fn terminal_notification_line(payload: &serde_json::Value, verb: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `parallel_layer_activity_line` is never used\n    --> src/workflow/projection.rs:2024:4\n     |\n2024 | fn parallel_layer_activity_line(payload: &serde_json::Value, status: &str) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `checkpoint_line` is never used\n    --> src/workflow/projection.rs:2044:4\n     |\n2044 | fn checkpoint_line(payload: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^\n\nwarning: function `progress_activity_line` is never used\n    --> src/workflow/projection.rs:2053:4\n     |\n2053 | fn progress_activity_line(event: &Event) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `primitive_payload_text` is never used\n    --> src/workflow/projection.rs:2100:4\n     |\n2100 | fn primitive_payload_text(value: &serde_json::Value) -> Option<String> {\n     |    ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `event_summary` is never used\n    --> src/workflow/projection.rs:2119:4\n     |\n2119 | fn event_summary(event: &Event) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `worker_process_label` is never used\n    --> src/workflow/projection.rs:2202:4\n     |\n2202 | fn worker_process_label(worker: &WorkerAttemptProgress) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `last_worker_event_label` is never used\n    --> src/workflow/projection.rs:2209:4\n     |\n2209 | fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `timeout_label` is never used\n    --> src/workflow/projection.rs:2223:4\n     |\n2223 | fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {\n     |    ^^^^^^^^^^^^^\n\nwarning: function `phase_label` is never used\n    --> src/workflow/projection.rs:2315:4\n     |\n2315 | fn phase_label(phase: &str) -> &'static str {\n     |    ^^^^^^^^^^^\n\nwarning: function `command_block_label` is never used\n    --> src/workflow/projection.rs:2341:4\n     |\n2341 | fn command_block_label(phase: &str, command: &str) -> &'static str {\n     |    ^^^^^^^^^^^^^^^^^^^\n\nwarning: function `command_meta` is never used\n    --> src/workflow/projection.rs:2355:4\n     |\n2355 | fn command_meta(command: &str) -> String {\n     |    ^^^^^^^^^^^^\n\nwarning: function `is_env_assignment` is never used\n    --> src/workflow/projection.rs:2367:4\n     |\n2367 | fn is_env_assignment(value: &str) -> bool {\n     |    ^^^^^^^^^^^^^^^^^\n\nwarning: function `event_label` is never used\n    --> src/workflow/projection.rs:2381:4\n     |\n2381 | fn event_label(value: &str) -> String {\n     |    ^^^^^^^^^^^",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000cargo test -q tui_worker",
+        "duration_ms": 901
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "LAYOUT-01",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "LAYOUT-02",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "LAYOUT-03",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "LAYOUT-04",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 4,
+    "command_execution_count": 33,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 33,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "LAYOUT-01",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 467871
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "LAYOUT-02",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 915199
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "LAYOUT-03",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 858295
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "LAYOUT-04",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 756403
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 34383
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 23
+      },
+      "worker_layer:LAYOUT-01": {
+        "phase": "worker_layer:LAYOUT-01",
+        "duration_ms": 468780
+      },
+      "worker_layer:LAYOUT-02": {
+        "phase": "worker_layer:LAYOUT-02",
+        "duration_ms": 915845
+      },
+      "worker_layer:LAYOUT-03": {
+        "phase": "worker_layer:LAYOUT-03",
+        "duration_ms": 859067
+      },
+      "worker_layer:LAYOUT-04": {
+        "phase": "worker_layer:LAYOUT-04",
+        "duration_ms": 757978
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-01",
+        "attempt": 1,
+        "command": "bash -n scripts/proof-herdr-layout-v2",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "tree_sha": "1a6af5e787464ae42e5447f735f2ce4f033510e5",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-01\u00001a6af5e787464ae42e5447f735f2ce4f033510e5\u0000\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-01",
+        "attempt": 1,
+        "command": "scripts/proof-herdr-layout-v2 --dry-run",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 226,
+        "dedupe_key": "\u0000\u0000scripts/proof-herdr-layout-v2 --dry-run",
+        "tree_sha": "1a6af5e787464ae42e5447f735f2ce4f033510e5",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-01\u00001a6af5e787464ae42e5447f735f2ce4f033510e5\u0000\u0000\u0000scripts/proof-herdr-layout-v2 --dry-run",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-01",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "tree_sha": "1a6af5e787464ae42e5447f735f2ce4f033510e5",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-01\u00001a6af5e787464ae42e5447f735f2ce4f033510e5\u0000\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-01",
+        "attempt": 1,
+        "command": "grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "tree_sha": "1a6af5e787464ae42e5447f735f2ce4f033510e5",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-01\u00001a6af5e787464ae42e5447f735f2ce4f033510e5\u0000\u0000\u0000grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-01",
+        "attempt": 1,
+        "command": "grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "tree_sha": "1a6af5e787464ae42e5447f735f2ce4f033510e5",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-01\u00001a6af5e787464ae42e5447f735f2ce4f033510e5\u0000\u0000\u0000grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-02",
+        "attempt": 1,
+        "command": "cargo test -q cockpit_layout",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q cockpit_layout",
+        "tree_sha": "2731b131c73664921f2a8c25244373f93bbf2d42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-02\u00002731b131c73664921f2a8c25244373f93bbf2d42\u0000\u0000\u0000cargo test -q cockpit_layout",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-02",
+        "attempt": 1,
+        "command": "cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "tree_sha": "2731b131c73664921f2a8c25244373f93bbf2d42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-02\u00002731b131c73664921f2a8c25244373f93bbf2d42\u0000\u0000\u0000cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-02",
+        "attempt": 1,
+        "command": "cargo check -q",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo check -q",
+        "tree_sha": "2731b131c73664921f2a8c25244373f93bbf2d42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-02\u00002731b131c73664921f2a8c25244373f93bbf2d42\u0000\u0000\u0000cargo check -q",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-02",
+        "attempt": 1,
+        "command": "git diff --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000git diff --check",
+        "tree_sha": "2731b131c73664921f2a8c25244373f93bbf2d42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-02\u00002731b131c73664921f2a8c25244373f93bbf2d42\u0000\u0000\u0000git diff --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-03",
+        "attempt": 1,
+        "command": "cargo test -q dashboard_v2",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q dashboard_v2",
+        "tree_sha": "02cbd53d37330d1c345fd33a7480616ca3474746",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-03\u000002cbd53d37330d1c345fd33a7480616ca3474746\u0000\u0000\u0000cargo test -q dashboard_v2",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-03",
+        "attempt": 1,
+        "command": "cargo test -q render_monitor",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q render_monitor",
+        "tree_sha": "02cbd53d37330d1c345fd33a7480616ca3474746",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-03\u000002cbd53d37330d1c345fd33a7480616ca3474746\u0000\u0000\u0000cargo test -q render_monitor",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-03",
+        "attempt": 1,
+        "command": "cargo check -q",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo check -q",
+        "tree_sha": "02cbd53d37330d1c345fd33a7480616ca3474746",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-03\u000002cbd53d37330d1c345fd33a7480616ca3474746\u0000\u0000\u0000cargo check -q",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-03",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "tree_sha": "02cbd53d37330d1c345fd33a7480616ca3474746",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-03\u000002cbd53d37330d1c345fd33a7480616ca3474746\u0000\u0000\u0000test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-03",
+        "attempt": 1,
+        "command": "git diff --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000git diff --check",
+        "tree_sha": "02cbd53d37330d1c345fd33a7480616ca3474746",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-03\u000002cbd53d37330d1c345fd33a7480616ca3474746\u0000\u0000\u0000git diff --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-04",
+        "attempt": 1,
+        "command": "cargo test -q tui_worker_grid",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q tui_worker_grid",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-04\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q tui_worker_grid",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-04",
+        "attempt": 1,
+        "command": "cargo test -q tui_worker",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 901,
+        "dedupe_key": "\u0000\u0000cargo test -q tui_worker",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-04\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q tui_worker",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-04",
+        "attempt": 1,
+        "command": "bash -n scripts/proof-herdr-layout-v2",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-04\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-04",
+        "attempt": 1,
+        "command": "cargo check -q",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo check -q",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-04\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo check -q",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-04",
+        "attempt": 1,
+        "command": "git diff --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000git diff --check",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/LAYOUT-04\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000git diff --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "bash -n scripts/proof-herdr-layout-v2",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000bash -n scripts/proof-herdr-layout-v2",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "scripts/proof-herdr-layout-v2 --dry-run",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 257,
+        "dedupe_key": "\u0000\u0000scripts/proof-herdr-layout-v2 --dry-run",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000scripts/proof-herdr-layout-v2 --dry-run",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test -q cockpit_layout",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 27018,
+        "dedupe_key": "\u0000\u0000cargo test -q cockpit_layout",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q cockpit_layout",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo check -q",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 4803,
+        "dedupe_key": "\u0000\u0000cargo check -q",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo check -q",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "git diff --check",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000git diff --check",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000git diff --check",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test -q dashboard_v2",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q dashboard_v2",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q dashboard_v2",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test -q render_monitor",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q render_monitor",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q render_monitor",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test -q tui_worker_grid",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000cargo test -q tui_worker_grid",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q tui_worker_grid",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "cargo test -q tui_worker",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 901,
+        "dedupe_key": "\u0000\u0000cargo test -q tui_worker",
+        "tree_sha": "19b2f1fadafb7321153359134a5a0d77a61384fd",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-011930-c21b036d/integration\u000019b2f1fadafb7321153359134a5a0d77a61384fd\u0000\u0000\u0000cargo test -q tui_worker",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: LAYOUT-01,LAYOUT-02,LAYOUT-03,LAYOUT-04",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-08T02:10:07.100616887Z"
+}

@@ -2,6 +2,9 @@
   "id": "LAYOUT-01",
   "title": "Scratch Herdr cockpit layout v2 proof",
   "goal": "Create a deterministic scratch proof for the desired Herdr cockpit layout v2 before changing daemon worker placement: no unused root shell, left worker region, right full-height dashboard, and documented 1-4 worker geometry.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-011930-c21b036d",
+  "closed_at": "2026-07-08T02:10:07.099297255+00:00",
   "areas": [
     ".workflow/slices/LAYOUT-01.json",
     "scripts/proof-herdr-layout-v2",

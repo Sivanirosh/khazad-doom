@@ -2,6 +2,9 @@
   "id": "LAYOUT-03",
   "title": "Compact dashboard v2 projection",
   "goal": "Polish the daemon-fed dashboard for a narrow right panel by removing duplicated sections, shortening noisy profile lines, and highlighting run state, workers, attention, checks, economics, and commands.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-011930-c21b036d",
+  "closed_at": "2026-07-08T02:10:07.099297255+00:00",
   "depends_on": [
     "LAYOUT-02"
   ],

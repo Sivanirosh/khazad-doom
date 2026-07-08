@@ -2,6 +2,9 @@
   "id": "LAYOUT-04",
   "title": "Native Pi TUI worker grid placement",
   "goal": "Use the cockpit layout planner to place native Pi TUI workers into a left-side worker grid and preserve daemon-owned result artifacts as the only worker truth.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-011930-c21b036d",
+  "closed_at": "2026-07-08T02:10:07.099297255+00:00",
   "depends_on": [
     "LAYOUT-03"
   ],
