@@ -1,0 +1,764 @@
+{
+  "run_id": "kd-20260708-030047-bc43bb8c",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260708-030047-bc43bb8c/integration",
+  "base_sha": "bb9b404c283d87866443e80b295f96e2cc149640",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "workflow_config",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "TUI-MULTI-01A",
+      "status": "complete",
+      "summary": "Created the worker A native Pi TUI parallel proof evidence note and committed it.",
+      "commit_sha": "645b2916f2b10e5bed63432d002d06e16722ed6f",
+      "commit_message": "Add TUI worker A proof evidence",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "git status --short"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Create docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md stating that this is worker A for the native Pi TUI parallel proof and that KD-owned submit_worker_result artifacts are authoritative, not terminal text.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md was created with the required worker A statement and the sentence \"KD-owned submit_worker_result artifacts are authoritative, not terminal text.\" The slice verify commands passed and the worktree was clean after commit."
+        }
+      ]
+    },
+    {
+      "slice_id": "TUI-MULTI-01B",
+      "status": "complete",
+      "summary": "Created the worker B native Pi TUI parallel proof evidence note and committed it.",
+      "commit_sha": "1e36e31341616245aa36c979936b833b5832427c",
+      "commit_message": "Add worker B TUI proof note",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md && grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md && grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Create docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md stating that this is worker B for the native Pi TUI parallel proof and that KD-owned submit_worker_result artifacts are authoritative, not terminal text.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md exists and contains both `submit_worker_result` and `terminal text` while identifying worker B for the native Pi TUI parallel proof."
+        }
+      ]
+    },
+    {
+      "slice_id": "TUI-MULTI-01C",
+      "status": "complete",
+      "summary": "Created the worker C native Pi TUI parallel proof evidence note stating KD-owned submit_worker_result artifacts are authoritative, not terminal text.",
+      "commit_sha": "6ff3fd268cfe12aefc0ab6ffc6be0c3fa493bb85",
+      "commit_message": "Add TUI worker multi proof C evidence",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Create docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md stating that this is worker C for the native Pi TUI parallel proof and that KD-owned submit_worker_result artifacts are authoritative, not terminal text.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md exists and includes worker C, native Pi TUI parallel proof, submit_worker_result, and terminal text wording; all slice verify commands passed."
+        }
+      ]
+    },
+    {
+      "slice_id": "TUI-MULTI-01D",
+      "status": "complete",
+      "summary": "Created the worker D native Pi TUI parallel proof evidence note and committed it.",
+      "commit_sha": "3b3d2169c60acc020619c8f4b403efbf150725e9",
+      "commit_message": "Add TUI multi worker D evidence note",
+      "changed_files": [
+        "docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md"
+      ],
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Create docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md stating that this is worker D for the native Pi TUI parallel proof and that KD-owned submit_worker_result artifacts are authoritative, not terminal text.",
+          "status": "satisfied",
+          "evidence": "Created docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md with the required worker D statement and the required submit_worker_result/terminal text authority statement; declared grep/file checks passed."
+        }
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "TUI-MULTI-01A",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "645b2916f2b10e5bed63432d002d06e16722ed6f",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "TUI-MULTI-01B",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "1e36e31341616245aa36c979936b833b5832427c",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "TUI-MULTI-01C",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "6ff3fd268cfe12aefc0ab6ffc6be0c3fa493bb85",
+      "worktree_clean": true,
+      "commit_found": true
+    },
+    {
+      "slice_id": "TUI-MULTI-01D",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "3b3d2169c60acc020619c8f4b403efbf150725e9",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "duration_ms": 101
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "TUI-MULTI-01A",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "TUI-MULTI-01B",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "TUI-MULTI-01C",
+        "worker": "complete",
+        "daemon": "merged"
+      },
+      {
+        "slice_id": "TUI-MULTI-01D",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 4,
+    "command_execution_count": 24,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 24,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-MULTI-01B",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 36790,
+        "input_tokens": 664,
+        "output_tokens": 502
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-MULTI-01C",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 41775,
+        "input_tokens": 697,
+        "output_tokens": 429
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-MULTI-01A",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 50049
+      },
+      {
+        "phase": "slice_worker",
+        "slice_id": "TUI-MULTI-01D",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 52509,
+        "input_tokens": 558,
+        "output_tokens": 782
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 1578
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 22
+      },
+      "worker_layer:TUI-MULTI-01A,TUI-MULTI-01B,TUI-MULTI-01C,TUI-MULTI-01D": {
+        "phase": "worker_layer:TUI-MULTI-01A,TUI-MULTI-01B,TUI-MULTI-01C,TUI-MULTI-01D",
+        "duration_ms": 53277
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01B",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "tree_sha": "ee167fe81418d56ad7d9c98445a32fb5b8664ba1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01B\u0000ee167fe81418d56ad7d9c98445a32fb5b8664ba1\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01B",
+        "attempt": 1,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "tree_sha": "ee167fe81418d56ad7d9c98445a32fb5b8664ba1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01B\u0000ee167fe81418d56ad7d9c98445a32fb5b8664ba1\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01B",
+        "attempt": 1,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "tree_sha": "ee167fe81418d56ad7d9c98445a32fb5b8664ba1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01B\u0000ee167fe81418d56ad7d9c98445a32fb5b8664ba1\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01C",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "tree_sha": "ffc0bdec94c4d7dd3d04a739da6000f0d173dfff",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01C\u0000ffc0bdec94c4d7dd3d04a739da6000f0d173dfff\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01C",
+        "attempt": 1,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "tree_sha": "ffc0bdec94c4d7dd3d04a739da6000f0d173dfff",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01C\u0000ffc0bdec94c4d7dd3d04a739da6000f0d173dfff\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01C",
+        "attempt": 1,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "tree_sha": "ffc0bdec94c4d7dd3d04a739da6000f0d173dfff",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01C\u0000ffc0bdec94c4d7dd3d04a739da6000f0d173dfff\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01A",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "tree_sha": "b044d4932b4140f2808ff054563a0aba1e2702aa",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01A\u0000b044d4932b4140f2808ff054563a0aba1e2702aa\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01A",
+        "attempt": 1,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "tree_sha": "b044d4932b4140f2808ff054563a0aba1e2702aa",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01A\u0000b044d4932b4140f2808ff054563a0aba1e2702aa\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01A",
+        "attempt": 1,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "tree_sha": "b044d4932b4140f2808ff054563a0aba1e2702aa",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01A\u0000b044d4932b4140f2808ff054563a0aba1e2702aa\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01D",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "tree_sha": "881be595774b7d716a051c4075d46441cede357b",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01D\u0000881be595774b7d716a051c4075d46441cede357b\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01D",
+        "attempt": 1,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "tree_sha": "881be595774b7d716a051c4075d46441cede357b",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01D\u0000881be595774b7d716a051c4075d46441cede357b\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "TUI-MULTI-01D",
+        "attempt": 1,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "tree_sha": "881be595774b7d716a051c4075d46441cede357b",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/TUI-MULTI-01D\u0000881be595774b7d716a051c4075d46441cede357b\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-A-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-B-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-C-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "tree_sha": "b6bcb564312ec34e21f0382cfa86c148e81817c1",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-030047-bc43bb8c/integration\u0000b6bcb564312ec34e21f0382cfa86c148e81817c1\u0000\u0000\u0000grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: TUI-MULTI-01A,TUI-MULTI-01B,TUI-MULTI-01C,TUI-MULTI-01D",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-08T03:01:42.795955562Z"
+}

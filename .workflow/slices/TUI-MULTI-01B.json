@@ -2,6 +2,9 @@
   "id": "TUI-MULTI-01B",
   "title": "Native Pi TUI parallel worker proof B",
   "goal": "Create one tiny in-scope evidence note for the native Pi TUI parallel worker layout/lifecycle proof.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-030047-bc43bb8c",
+  "closed_at": "2026-07-08T03:01:42.794656389+00:00",
   "depends_on": [
     "LAYOUT-05"
   ],
