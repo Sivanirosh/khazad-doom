@@ -2,6 +2,9 @@
   "id": "LAYOUT-05",
   "title": "Real KD dogfood proof for cockpit layout v2",
   "goal": "Prove the polished cockpit layout v2 in a real daemon-owned native Pi TUI run, with Herdr used only for observability and submit_worker_result/KD artifacts used as worker truth.",
+  "status": "closed",
+  "closed_by_run": "kd-20260708-021402-0ac6eb09",
+  "closed_at": "2026-07-08T02:18:10.603993086+00:00",
   "depends_on": [
     "LAYOUT-04"
   ],

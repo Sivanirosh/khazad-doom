@@ -1,0 +1,329 @@
+{
+  "run_id": "kd-20260708-021402-0ac6eb09",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260708-021402-0ac6eb09/integration",
+  "base_sha": "08672fb37a410b8f8c8fd0c1e4c64b1712dec181",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "workflow_config",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "LAYOUT-05",
+      "status": "complete",
+      "summary": "Added the layout v2 dogfood proof document for run kd-20260708-021402-0ac6eb09. It records the native Herdr Pi TUI launch, cockpit_worker_ready slot metadata, Herdr layout observation, artifact-only worker result path/source, verification checks, integration/report paths, and explicit proof/non-proof boundaries.",
+      "commit_sha": "8bdb0aeeaa6213b077fbcb3fd6293622b0ccb5b2",
+      "commit_message": "Document layout v2 dogfood proof",
+      "changed_files": [
+        "docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md"
+      ],
+      "tests_run": [
+        "khazad-doom status --run kd-20260708-021402-0ac6eb09",
+        "khazad-doom inspect --run kd-20260708-021402-0ac6eb09",
+        "herdr pane list",
+        "herdr pane layout --pane w42:p4",
+        "herdr pane process-info --pane w42:p4 && herdr pane process-info --pane w42:p2",
+        "test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "git diff --check"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "Run a real KD native Pi TUI dogfood slice after LAYOUT-04 and document the run id, command, terminal state, cockpit_worker_ready event, worker pane ids/slots, layout observation, result artifact, checks, merge, and final report path.",
+          "status": "satisfied",
+          "evidence": "docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md records run kd-20260708-021402-0ac6eb09 after LAYOUT-04 closure, a reproducible KD command and exact worker argv from the command artifact, process-level terminal state, the cockpit_worker_ready payload, pane w42:p4/slot worker-1/left-worker-region, Herdr layout observation, result artifact path, declared checks, integration branch/merge target, and final report/summary paths."
+        },
+        {
+          "criterion": "The evidence shows no unwanted root shell pane and no default Operator column in the v2 cockpit layout, or records any remaining limitation as a blocker before default promotion.",
+          "status": "satisfied",
+          "evidence": "The proof document records Herdr pane metadata for current workspace w42 with exactly worker pane w42:p4 and Dashboard pane w42:p2; it states no unused root shell pane and no Operator pane were observed. It also documents the remaining limitation that this single-worker run does not live-prove 2-4 worker geometry."
+        },
+        {
+          "criterion": "The worker result comes from khazad_worker_submit_worker_result_v1 through a kd_tui_result_artifact path; terminal text and Herdr scrollback are explicitly excluded as correctness evidence.",
+          "status": "satisfied",
+          "evidence": "The document cites command.json result_source khazad_worker_submit_worker_result_v1, source_of_truth kd_tui_result_artifact, and the herdr-tui result artifact path. It explicitly excludes terminal text, Herdr scrollback, screenshots, pane labels, and Pi visual state as worker-result/correctness evidence."
+        },
+        {
+          "criterion": "The proof document states what the dogfood proves and what it does not prove.",
+          "status": "satisfied",
+          "evidence": "The document has dedicated 'What this dogfood proves' and 'What this dogfood does not prove' sections; the required grep for 'does not prove' passed."
+        }
+      ],
+      "assumptions": [
+        "The exact invoking shell line is not persisted in current run artifacts, so the proof records a reproducible KD command equivalent plus the exact daemon-launched Pi worker argv from command.json.",
+        "This worker cannot self-attest post-result merge/publication before calling submit_worker_result; the proof records the daemon-owned integration branch and expected final report paths, with final terminal attestation left to the daemon report."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "LAYOUT-05",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md"
+      ],
+      "attempt": 1,
+      "worker_head": "8bdb0aeeaa6213b077fbcb3fd6293622b0ccb5b2",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "duration_ms": 101
+      },
+      {
+        "command": "grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "duration_ms": 100
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "LAYOUT-05",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 1,
+    "command_execution_count": 8,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 8,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "LAYOUT-05",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 246696
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 534
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 22
+      },
+      "worker_layer:LAYOUT-05": {
+        "phase": "worker_layer:LAYOUT-05",
+        "duration_ms": 247347
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-05",
+        "attempt": 1,
+        "command": "test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/LAYOUT-05\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-05",
+        "attempt": 1,
+        "command": "grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/LAYOUT-05\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-05",
+        "attempt": 1,
+        "command": "grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/LAYOUT-05\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "LAYOUT-05",
+        "attempt": 1,
+        "command": "grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/LAYOUT-05\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 101,
+        "dedupe_key": "\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/integration\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/integration\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/integration\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "tree_sha": "cb6985ce253a71937d081d648d812751f7629167",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260708-021402-0ac6eb09/integration\u0000cb6985ce253a71937d081d648d812751f7629167\u0000\u0000\u0000grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: LAYOUT-05",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-08T02:18:10.604717251Z"
+}
