@@ -66,3 +66,9 @@ Herdr's exposed pane primitive is a split tree, not a declarative grid with empt
 All move and close operations are limited to scratch workspaces created by the proof command and identified by returned Herdr ids. The proof does not require closing or moving panes outside a scratch Khazad-Doom layout proof workspace.
 
 Pane layout/scrollback is observability only and not KD correctness evidence. Pane labels and live shell text are also visibility aids only; daemon-owned artifacts, worker result JSON, verification gates, and slice metadata remain the correctness path.
+
+## LAYOUT-02 runtime adapter notes
+
+`src/workflow/cockpit.rs` now carries the same v2 geometry as a small internal layout planner: the dashboard is the right split from `worker-1`, worker slots are stably named `worker-1` through `worker-4`, and no default Operator pane is planned. The Herdr adapter remains the only implementation seam for cockpit layout mechanics: it inspects panes with `pane list` / `pane layout`, creates or reuses the Dashboard pane, reuses the workspace root as the first worker slot instead of leaving a root shell behind, and splits from the planned worker-slot anchors for additional worker panes.
+
+Layout errors are still visibility failures only. Manager events annotate cockpit layout incidents as `cockpit_layout_v2_observability_only`, while worker result artifacts, verification gates, merge state, handoff readiness, and terminal run status remain independent of Herdr pane text, scrollback, labels, or Pi display state.
