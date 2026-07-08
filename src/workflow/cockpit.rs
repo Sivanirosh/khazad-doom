@@ -203,6 +203,7 @@ impl CockpitLayoutPlanner {
 pub(crate) struct CockpitLayoutPane {
     pub id: String,
     pub label: String,
+    pub tab_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -241,12 +242,22 @@ impl CockpitLayoutInspection {
             .find(|pane| pane.id == pane_id)
             .map(|pane| pane.label.as_str())
     }
+
+    fn tab_id_for_pane(&self, pane_id: &str) -> Option<&str> {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .map(|pane| pane.tab_id.as_str())
+            .filter(|tab_id| !tab_id.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CockpitWorkerPlacement {
     pub pane: CockpitPaneRef,
     pub slot_name: String,
+    pub slot_index: usize,
+    pub slot_region: String,
     pub pane_label: String,
 }
 
@@ -301,6 +312,8 @@ pub(crate) struct CockpitWorkerOpened {
     pub pane_label: String,
     pub pane_id: String,
     pub slot_name: String,
+    pub slot_index: usize,
+    pub slot_region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,8 +328,12 @@ pub(crate) struct CockpitTuiWorkerOpened {
     pub mode: CockpitMode,
     pub workspace_label: String,
     pub agent_name: String,
+    pub pane_label: String,
     pub pane_id: String,
     pub terminal_id: String,
+    pub slot_name: String,
+    pub slot_index: usize,
+    pub slot_region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,8 +474,29 @@ pub(crate) trait CockpitAdapter {
         Ok(CockpitWorkerPlacement {
             pane,
             slot_name: slot.name.clone(),
+            slot_index: slot.index,
+            slot_region: slot.region.clone(),
             pane_label: request.label.clone(),
         })
+    }
+
+    fn start_tui_worker_agent_in_slot(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        _plan: &CockpitLayoutPlan,
+        slot: &CockpitWorkerSlot,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        let mut opened = self.start_tui_worker_agent(workspace, request)?;
+        opened.pane_label = slot.pane_label(&worker_pane_label(
+            &request.run_id,
+            &request.slice_id,
+            request.attempt,
+        ));
+        opened.slot_name = slot.name.clone();
+        opened.slot_index = slot.index;
+        opened.slot_region = slot.region.clone();
+        Ok(opened)
     }
 
     fn start_tui_worker_agent(
@@ -611,6 +649,8 @@ impl<A: CockpitAdapter> Cockpit<A> {
             pane_label: placement.pane_label,
             pane_id: placement.pane.id,
             slot_name: placement.slot_name,
+            slot_index: placement.slot_index,
+            slot_region: placement.slot_region,
         }))
     }
 
@@ -623,9 +663,18 @@ impl<A: CockpitAdapter> Cockpit<A> {
             return Ok(CockpitTuiWorkerLaunch::SkippedDirect);
         }
         let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
-        let mut opened = self
-            .adapter
-            .start_tui_worker_agent(&workspace, worker_request)?;
+        let inspection = self.adapter.inspect_layout(&workspace)?;
+        let plan = CockpitLayoutPlanner::default().plan(inspection.worker_slot_count() + 1)?;
+        let dashboard = self.dashboard_pane_request(run_request);
+        self.adapter
+            .ensure_dashboard_pane(&workspace, &plan.dashboard, &dashboard)?;
+        let slot = plan
+            .worker_slots
+            .last()
+            .ok_or_else(|| anyhow!("cockpit layout plan omitted TUI worker slot"))?;
+        let mut opened =
+            self.adapter
+                .start_tui_worker_agent_in_slot(&workspace, &plan, slot, worker_request)?;
         opened.mode = self.mode;
         opened.workspace_label = run_request.workspace_label.clone();
         Ok(CockpitTuiWorkerLaunch::Opened(opened))
@@ -863,6 +912,12 @@ struct HerdrCockpitAdapter {
     bin: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct HerdrTempTab {
+    tab_id: String,
+    root_pane_id: String,
+}
+
 impl HerdrCockpitAdapter {
     fn discover(mode: CockpitMode) -> std::result::Result<Self, CockpitUnavailable> {
         let Some(bin) = find_executable_in_path("herdr") else {
@@ -919,9 +974,14 @@ impl HerdrCockpitAdapter {
                             .get("label")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        let tab_id = pane
+                            .get("tab_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         Some(CockpitLayoutPane {
                             id: id.to_string(),
                             label: label.to_string(),
+                            tab_id: tab_id.to_string(),
                         })
                     })
                     .collect()
@@ -1012,6 +1072,133 @@ impl HerdrCockpitAdapter {
     ) -> Result<()> {
         self.rename_pane(pane_id, label)?;
         self.run_pane(pane_id, &pane_command_with_env(request))
+    }
+
+    fn create_temp_tui_worker_tab(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<HerdrTempTab> {
+        let created = self.run_json(&[
+            "tab".to_string(),
+            "create".to_string(),
+            "--workspace".to_string(),
+            workspace.id.clone(),
+            "--cwd".to_string(),
+            request.cwd.to_string_lossy().to_string(),
+            "--label".to_string(),
+            format!("{} staging", request.name),
+            "--no-focus".to_string(),
+        ])?;
+        let tab_id = created
+            .pointer("/result/tab/tab_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("herdr tab create omitted tab_id"))?
+            .to_string();
+        let root_pane_id = created
+            .pointer("/result/root_pane/pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("herdr tab create omitted root_pane.pane_id"))?
+            .to_string();
+        Ok(HerdrTempTab {
+            tab_id,
+            root_pane_id,
+        })
+    }
+
+    fn start_tui_worker_agent_in_tab(
+        &self,
+        tab_id: &str,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        let mut args = vec![
+            "agent".to_string(),
+            "start".to_string(),
+            request.name.clone(),
+            "--cwd".to_string(),
+            request.cwd.to_string_lossy().to_string(),
+            "--tab".to_string(),
+            tab_id.to_string(),
+            "--split".to_string(),
+            "down".to_string(),
+        ];
+        self.push_tui_worker_agent_env(&mut args, request);
+        args.push("--no-focus".to_string());
+        args.push("--".to_string());
+        args.extend(request.argv.iter().cloned());
+        let started = self.run_json(&args)?;
+        self.tui_worker_opened_from_agent(started, request)
+    }
+
+    fn push_tui_worker_agent_env(&self, args: &mut Vec<String>, request: &CockpitTuiWorkerRequest) {
+        for (key, value) in &request.env {
+            args.push("--env".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--env".to_string());
+        args.push(format!(
+            "KHAZAD_TUI_WORKER_ID={}:{}:{}",
+            request.run_id, request.slice_id, request.attempt
+        ));
+    }
+
+    fn tui_worker_opened_from_agent(
+        &self,
+        started: Value,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        let agent = started
+            .pointer("/result/agent")
+            .ok_or_else(|| anyhow!("herdr agent start omitted result.agent"))?;
+        let pane_id = agent
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("herdr agent start omitted agent.pane_id"))?;
+        let terminal_id = agent
+            .get("terminal_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(CockpitTuiWorkerOpened {
+            adapter: self.name().to_string(),
+            mode: CockpitMode::Herdr,
+            workspace_label: String::new(),
+            agent_name: request.name.clone(),
+            pane_label: String::new(),
+            pane_id: pane_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            slot_name: String::new(),
+            slot_index: 0,
+            slot_region: String::new(),
+        })
+    }
+
+    fn move_pane_to_slot(
+        &self,
+        pane_id: &str,
+        target_tab_id: &str,
+        target_pane_id: &str,
+        direction: CockpitLayoutDirection,
+        ratio: &str,
+    ) -> Result<()> {
+        self.run_json(&[
+            "pane".to_string(),
+            "move".to_string(),
+            pane_id.to_string(),
+            "--tab".to_string(),
+            target_tab_id.to_string(),
+            "--split".to_string(),
+            direction.as_herdr_arg().to_string(),
+            "--target-pane".to_string(),
+            target_pane_id.to_string(),
+            "--ratio".to_string(),
+            ratio.to_string(),
+            "--no-focus".to_string(),
+        ])?;
+        Ok(())
+    }
+
+    fn close_pane_best_effort(&self, pane_id: &str) {
+        let _ = self.run_command(&["pane".to_string(), "close".to_string(), pane_id.to_string()]);
     }
 }
 
@@ -1171,6 +1358,8 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             return Ok(CockpitWorkerPlacement {
                 pane: CockpitPaneRef { id: root_pane_id },
                 slot_name: slot.name.clone(),
+                slot_index: slot.index,
+                slot_region: slot.region.clone(),
                 pane_label,
             });
         }
@@ -1194,8 +1383,103 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         Ok(CockpitWorkerPlacement {
             pane,
             slot_name: slot.name.clone(),
+            slot_index: slot.index,
+            slot_region: slot.region.clone(),
             pane_label,
         })
+    }
+
+    fn start_tui_worker_agent_in_slot(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        _plan: &CockpitLayoutPlan,
+        slot: &CockpitWorkerSlot,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        let pane_label = slot.pane_label(&worker_pane_label(
+            &request.run_id,
+            &request.slice_id,
+            request.attempt,
+        ));
+        let inspection = self.inspect_layout(workspace)?;
+        let (target_pane_id, target_tab_id, direction, ratio, replaced_root) = if slot.index == 1 {
+            let root_pane_id = inspection
+                .root_pane_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("cockpit layout inspection omitted root pane"))?;
+            let root_label = inspection.label_for_pane(root_pane_id).unwrap_or_default();
+            if !(root_label.trim().is_empty() || root_label == WORKER_REGION_PLACEHOLDER_PANE) {
+                bail!("cockpit layout root pane is not available for TUI worker slot 1");
+            }
+            let target_tab_id = inspection
+                .tab_id_for_pane(root_pane_id)
+                .ok_or_else(|| anyhow!("cockpit layout root pane omitted tab id"))?;
+            (
+                root_pane_id.to_string(),
+                target_tab_id.to_string(),
+                CockpitLayoutDirection::Down,
+                COCKPIT_LAYOUT_WORKER_SPLIT_RATIO.to_string(),
+                Some(root_pane_id.to_string()),
+            )
+        } else {
+            let split = slot
+                .split
+                .as_ref()
+                .ok_or_else(|| anyhow!("cockpit layout slot {} omitted split", slot.name))?;
+            let anchor_pane_id = inspection
+                .worker_slot_pane_id(&split.anchor_slot)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cockpit layout slot {} could not find anchor {}",
+                        slot.name,
+                        split.anchor_slot
+                    )
+                })?;
+            let target_tab_id = inspection
+                .tab_id_for_pane(anchor_pane_id)
+                .ok_or_else(|| anyhow!("cockpit layout anchor pane omitted tab id"))?;
+            (
+                anchor_pane_id.to_string(),
+                target_tab_id.to_string(),
+                split.direction,
+                split.ratio.clone(),
+                None,
+            )
+        };
+
+        let temp_tab = self.create_temp_tui_worker_tab(workspace, request)?;
+        let mut opened = match self.start_tui_worker_agent_in_tab(&temp_tab.tab_id, request) {
+            Ok(opened) => opened,
+            Err(err) => {
+                self.close_pane_best_effort(&temp_tab.root_pane_id);
+                return Err(err);
+            }
+        };
+        let post_start_result = (|| -> Result<()> {
+            self.move_pane_to_slot(
+                &opened.pane_id,
+                &target_tab_id,
+                &target_pane_id,
+                direction,
+                &ratio,
+            )?;
+            self.rename_pane(&opened.pane_id, &pane_label)?;
+            if let Some(root_pane_id) = &replaced_root {
+                self.close_pane(root_pane_id)?;
+            }
+            self.close_pane(&temp_tab.root_pane_id)?;
+            Ok(())
+        })();
+        if let Err(err) = post_start_result {
+            self.close_pane_best_effort(&opened.pane_id);
+            self.close_pane_best_effort(&temp_tab.root_pane_id);
+            return Err(err);
+        }
+        opened.pane_label = pane_label;
+        opened.slot_name = slot.name.clone();
+        opened.slot_index = slot.index;
+        opened.slot_region = slot.region.clone();
+        Ok(opened)
     }
 
     fn start_tui_worker_agent(
@@ -1214,38 +1498,12 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             "--split".to_string(),
             "down".to_string(),
         ];
-        for (key, value) in &request.env {
-            args.push("--env".to_string());
-            args.push(format!("{key}={value}"));
-        }
-        args.push("--env".to_string());
-        args.push(format!(
-            "KHAZAD_TUI_WORKER_ID={}:{}:{}",
-            request.run_id, request.slice_id, request.attempt
-        ));
+        self.push_tui_worker_agent_env(&mut args, request);
         args.push("--no-focus".to_string());
         args.push("--".to_string());
         args.extend(request.argv.iter().cloned());
         let started = self.run_json(&args)?;
-        let agent = started
-            .pointer("/result/agent")
-            .ok_or_else(|| anyhow!("herdr agent start omitted result.agent"))?;
-        let pane_id = agent
-            .get("pane_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("herdr agent start omitted agent.pane_id"))?;
-        let terminal_id = agent
-            .get("terminal_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        Ok(CockpitTuiWorkerOpened {
-            adapter: self.name().to_string(),
-            mode: CockpitMode::Herdr,
-            workspace_label: String::new(),
-            agent_name: request.name.clone(),
-            pane_id: pane_id.to_string(),
-            terminal_id: terminal_id.to_string(),
-        })
+        self.tui_worker_opened_from_agent(started, request)
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<()> {
@@ -1473,17 +1731,20 @@ mod tests {
             let mut panes = vec![CockpitLayoutPane {
                 id: "pane-1".to_string(),
                 label: WORKER_REGION_PLACEHOLDER_PANE.to_string(),
+                tab_id: "tab-1".to_string(),
             }];
             if layout.dashboard {
                 panes.push(CockpitLayoutPane {
                     id: "pane-dashboard".to_string(),
                     label: RUN_STATUS_FEED_PANE.to_string(),
+                    tab_id: "tab-1".to_string(),
                 });
             }
             for slot in &layout.worker_slots {
                 panes.push(CockpitLayoutPane {
                     id: format!("pane-{slot}"),
                     label: format!("{slot}: fake worker"),
+                    tab_id: "tab-1".to_string(),
                 });
             }
             Ok(CockpitLayoutInspection {
@@ -1545,6 +1806,8 @@ mod tests {
                     id: format!("pane-{}", slot.name),
                 },
                 slot_name: slot.name.clone(),
+                slot_index: slot.index,
+                slot_region: slot.region.clone(),
                 pane_label,
             })
         }
@@ -1568,8 +1831,52 @@ mod tests {
                 mode: CockpitMode::Herdr,
                 workspace_label: String::new(),
                 agent_name: request.name.clone(),
+                pane_label: String::new(),
                 pane_id: "pane-tui".to_string(),
                 terminal_id: "terminal-tui".to_string(),
+                slot_name: String::new(),
+                slot_index: 0,
+                slot_region: String::new(),
+            })
+        }
+
+        fn start_tui_worker_agent_in_slot(
+            &self,
+            workspace: &CockpitWorkspaceRef,
+            _plan: &CockpitLayoutPlan,
+            slot: &CockpitWorkerSlot,
+            request: &CockpitTuiWorkerRequest,
+        ) -> Result<CockpitTuiWorkerOpened> {
+            let pane_label = slot.pane_label(&worker_pane_label(
+                &request.run_id,
+                &request.slice_id,
+                request.attempt,
+            ));
+            self.calls.lock().unwrap().push(format!(
+                "layout:tui-worker-slot:{}:{}:{}:{}:{}:{}",
+                slot.name,
+                pane_label,
+                workspace.id,
+                request.run_id,
+                request.slice_id,
+                request.argv.join(" ")
+            ));
+            self.layout
+                .lock()
+                .unwrap()
+                .worker_slots
+                .push(slot.name.clone());
+            Ok(CockpitTuiWorkerOpened {
+                adapter: self.name().to_string(),
+                mode: CockpitMode::Herdr,
+                workspace_label: String::new(),
+                agent_name: request.name.clone(),
+                pane_label,
+                pane_id: format!("pane-{}", slot.name),
+                terminal_id: format!("terminal-{}", slot.name),
+                slot_name: slot.name.clone(),
+                slot_index: slot.index,
+                slot_region: slot.region.clone(),
             })
         }
 
@@ -1772,6 +2079,8 @@ mod tests {
                 pane_label: "worker-1: Worker kd-run/SLICE-1 attempt 2".to_string(),
                 pane_id: "pane-worker-1".to_string(),
                 slot_name: "worker-1".to_string(),
+                slot_index: 1,
+                slot_region: "left-worker-region".to_string(),
             })
         );
         let calls = adapter.calls();
@@ -1821,12 +2130,14 @@ mod tests {
                 pane_label: "worker-2: Worker kd-run/SLICE-2 attempt 1".to_string(),
                 pane_id: "pane-worker-2".to_string(),
                 slot_name: "worker-2".to_string(),
+                slot_index: 2,
+                slot_region: "left-worker-region".to_string(),
             })
         );
     }
 
     #[test]
-    fn cockpit_tui_worker_uses_herdr_agent_start_semantics() {
+    fn cockpit_tui_worker_uses_layout_v2_worker_slot() {
         let adapter = FakeCockpitAdapter::default();
         let request = CockpitRunRequest {
             repo_path: PathBuf::from("/repo"),
@@ -1858,12 +2169,64 @@ mod tests {
                 mode: CockpitMode::Herdr,
                 workspace_label: "Khazad-Doom kd-run".to_string(),
                 agent_name: "kd-run-SLICE-1-2".to_string(),
-                pane_id: "pane-tui".to_string(),
-                terminal_id: "terminal-tui".to_string(),
+                pane_label: "worker-1: Worker kd-run/SLICE-1 attempt 2".to_string(),
+                pane_id: "pane-worker-1".to_string(),
+                terminal_id: "terminal-worker-1".to_string(),
+                slot_name: "worker-1".to_string(),
+                slot_index: 1,
+                slot_region: "left-worker-region".to_string(),
             })
         );
-        assert_eq!(adapter.calls()[0], "workspace:Khazad-Doom kd-run");
-        assert!(adapter.calls()[1].contains("agent_start:workspace-1:kd-run:SLICE-1:2"));
+        let calls = adapter.calls();
+        assert_eq!(calls[0], "workspace:Khazad-Doom kd-run");
+        assert!(calls.contains(&"layout:dashboard:Dashboard:right:0.68".to_string()));
+        assert!(calls.iter().any(|call| call.starts_with(
+            "layout:tui-worker-slot:worker-1:worker-1: Worker kd-run/SLICE-1 attempt 2"
+        )));
+        assert!(calls.iter().all(|call| !call.contains("Operator")));
+    }
+
+    #[test]
+    fn cockpit_tui_worker_grid_advances_stable_left_worker_slots_for_four_workers() {
+        let adapter = FakeCockpitAdapter::default();
+        let request = CockpitRunRequest {
+            repo_path: PathBuf::from("/repo"),
+            khazad_home: PathBuf::from("/khazad-home"),
+            workspace_label: workspace_label_for_run("kd-run"),
+            feed_command: "feed".to_string(),
+        };
+        let cockpit = Cockpit::new(CockpitMode::Herdr, adapter.clone());
+        let mut opened_slots = Vec::new();
+
+        for index in 1..=4 {
+            let worker = CockpitTuiWorkerRequest {
+                run_id: "kd-run".to_string(),
+                slice_id: format!("SLICE-{index}"),
+                attempt: 1,
+                name: format!("kd-run-SLICE-{index}-1"),
+                argv: vec!["pi".to_string(), format!("@prompt-{index}.md")],
+                cwd: PathBuf::from(format!("/repo/worker-{index}")),
+                env: Vec::new(),
+            };
+            match cockpit.open_tui_worker_agent(&request, &worker).unwrap() {
+                CockpitTuiWorkerLaunch::Opened(opened) => {
+                    assert_eq!(opened.slot_region, "left-worker-region");
+                    assert_eq!(opened.slot_index, index);
+                    opened_slots.push(opened.slot_name);
+                }
+                CockpitTuiWorkerLaunch::SkippedDirect => panic!("unexpected direct skip"),
+            }
+        }
+
+        assert_eq!(
+            opened_slots,
+            vec!["worker-1", "worker-2", "worker-3", "worker-4"]
+        );
+        let calls = adapter.calls();
+        assert!(calls.iter().any(|call| call.starts_with(
+            "layout:tui-worker-slot:worker-4:worker-4: Worker kd-run/SLICE-4 attempt 1"
+        )));
+        assert!(calls.iter().all(|call| !call.contains("Operator")));
     }
 
     #[test]

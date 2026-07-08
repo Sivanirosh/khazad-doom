@@ -67,8 +67,10 @@ All move and close operations are limited to scratch workspaces created by the p
 
 Pane layout/scrollback is observability only and not KD correctness evidence. Pane labels and live shell text are also visibility aids only; daemon-owned artifacts, worker result JSON, verification gates, and slice metadata remain the correctness path.
 
-## LAYOUT-02 runtime adapter notes
+## LAYOUT-02/LAYOUT-04 runtime adapter notes
 
 `src/workflow/cockpit.rs` now carries the same v2 geometry as a small internal layout planner: the dashboard is the right split from `worker-1`, worker slots are stably named `worker-1` through `worker-4`, and no default Operator pane is planned. The Herdr adapter remains the only implementation seam for cockpit layout mechanics: it inspects panes with `pane list` / `pane layout`, creates or reuses the Dashboard pane, reuses the workspace root as the first worker slot instead of leaving a root shell behind, and splits from the planned worker-slot anchors for additional worker panes.
+
+Native Pi TUI workers use the same planner before launch. KD starts the Herdr agent in a short-lived staging tab, moves the resulting agent pane into the planned left worker slot (`worker-1` through `worker-4`), renames the pane with the stable slot label, and closes the replaced root/staging panes during successful placement so the visible cockpit has the left worker region plus right Dashboard instead of an idle root shell or Operator column. The `cockpit_worker_ready` event carries `layout_planner=cockpit_layout_v2`, `worker_slot_name`, `worker_slot_index`, and `worker_region` metadata while keeping `source_of_truth=kd_tui_result_artifact` for native TUI workers.
 
 Layout errors are still visibility failures only. Manager events annotate cockpit layout incidents as `cockpit_layout_v2_observability_only`, while worker result artifacts, verification gates, merge state, handoff readiness, and terminal run status remain independent of Herdr pane text, scrollback, labels, or Pi display state.
