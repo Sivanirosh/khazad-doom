@@ -1,0 +1,38 @@
+{
+  "id": "COCKPIT-ANCHOR-01",
+  "title": "Live role-based cockpit anchor resolution and placeholder lifecycle",
+  "goal": "Eliminate the stale-pane-identity failure class in the Herdr cockpit: anchor/root resolution must reflect the live workspace by role at every layout operation, and the worker region must always be placeable (live worker panes or a recreatable placeholder), so native TUI slot placement survives slot-1 root replacement, worker timeouts, retries, and re-focused workspaces. Behavior is the contract; whether the anchor cache is deleted or verified-at-use is the implementer's choice.",
+  "depends_on": [],
+  "areas": [
+    "src/workflow/cockpit.rs",
+    "tests/daemon_integration.rs",
+    "docs/design/evidence/cockpit-anchor-stale-pane-2026-07-08.md",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Every cockpit layout operation resolves its anchor/root from live workspace state by role label (worker-region placeholder, dashboard, worker slots); a pane identity that was closed since the last inspection is never targeted, and no unverified cached pane id is treated as authoritative.",
+    "A closed or unknown pane id resolves to an explicit not-found outcome; it must not surface as an empty label that passes the slot-1 placeholder-availability check.",
+    "Placeholder/placeability lifecycle invariant holds: whenever closing a TUI/worker pane empties the worker region, the next slot-1 placement resolves a live placeholder, empty pane, or safe split base and places successfully instead of failing with 'root pane is not available'.",
+    "A focused existing workspace resolves anchors by role label, never by first-pane order; the dashboard pane is never mistaken for the worker-region root.",
+    "A pane_not_found failure from a documented herdr operation triggers exactly one re-inspect and re-resolve retry; persistent failure degrades through the existing CockpitUnavailable fallback with a non-fatal incident, and worker correctness, result capture, and retry policy remain unchanged.",
+    "A stateful fake Herdr CLI fixture models pane lifecycle (create/close/rename/move; operations on unknown pane ids fail like herdr pane_not_found/target_pane_not_found), and the three named regression tests reproduce the pre-fix failures against the production HerdrCockpitAdapter logic.",
+    "The workflow-invariants cockpit bullet records the behavior contract: pane identities are resolved live by role at use time and the worker region is always placeable; the amendment cites this slice's evidence.",
+    "Real-Herdr gated evidence proves multi-slot native TUI placement after slot-1 root replacement and slot-1 retry-after-close; the normal cargo test suite remains portable when Herdr is absent."
+  ],
+  "must_ask_if": [
+    "The implementation would treat any cached pane identity as authoritative without live verification at the point of use.",
+    "The implementation would remove or weaken the direct/wrapper fallback, or make native TUI placement required for worker execution.",
+    "The implementation would depend on undocumented Herdr surfaces or parse pane text/scrollback as evidence.",
+    "The implementation would change worker result capture, retry policy, cancellation truth, or any correctness path.",
+    "The implementation would remove the slot-1 root-availability safety check without a role-based replacement."
+  ],
+  "verify": [
+    "khazad-doom slices validate --repo .",
+    "cargo test cockpit --quiet",
+    "cargo test tui_slot1_replacement_then_second_slot_placement_succeeds --quiet",
+    "cargo test tui_slot1_retry_after_close_recreates_placeholder --quiet",
+    "cargo test focused_existing_workspace_resolves_anchor_by_label_not_first_pane --quiet",
+    "HERDR_E2E=1 cargo test herdr_tui --quiet"
+  ],
+  "verify_profile": "quick"
+}

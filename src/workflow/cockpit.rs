@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ const COCKPIT_LAYOUT_WORKER_REGION_RATIO: &str = "0.68";
 const COCKPIT_LAYOUT_WORKER_SPLIT_RATIO: &str = "0.50";
 const COCKPIT_MODE_TRANSPORT_PREFIX: &str = "__khazad_cockpit_mode=";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+static HERDR_LAYOUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(crate) struct CockpitRunRequest {
@@ -220,6 +222,20 @@ impl CockpitLayoutInspection {
             .map(|pane| pane.id.as_str())
     }
 
+    fn worker_region_placeholder_pane_id(&self) -> Option<&str> {
+        self.panes
+            .iter()
+            .find(|pane| pane.label == WORKER_REGION_PLACEHOLDER_PANE)
+            .map(|pane| pane.id.as_str())
+    }
+
+    fn unlabeled_pane_id(&self) -> Option<&str> {
+        self.panes
+            .iter()
+            .find(|pane| pane.label.trim().is_empty())
+            .map(|pane| pane.id.as_str())
+    }
+
     fn worker_slot_count(&self) -> usize {
         self.panes
             .iter()
@@ -250,6 +266,51 @@ impl CockpitLayoutInspection {
             .map(|pane| pane.tab_id.as_str())
             .filter(|tab_id| !tab_id.is_empty())
     }
+
+    fn live_layout_anchor_pane_id(&self, preferred_anchor_id: Option<&str>) -> Option<&str> {
+        self.worker_region_placeholder_pane_id()
+            .or_else(|| self.worker_slot_pane_id("worker-1"))
+            .or_else(|| {
+                preferred_anchor_id.and_then(|pane_id| {
+                    self.panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id && pane.label.trim().is_empty())
+                        .map(|pane| pane.id.as_str())
+                })
+            })
+            .or_else(|| self.unlabeled_pane_id())
+            .or_else(|| self.dashboard_pane_id())
+            .or_else(|| {
+                preferred_anchor_id.and_then(|pane_id| {
+                    self.panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id)
+                        .map(|pane| pane.id.as_str())
+                })
+            })
+            .or_else(|| self.panes.first().map(|pane| pane.id.as_str()))
+    }
+
+    fn slot_one_reusable_pane_id(&self, preferred_anchor_id: Option<&str>) -> Option<&str> {
+        self.worker_region_placeholder_pane_id()
+            .or_else(|| self.worker_slot_pane_id("worker-1"))
+            .or_else(|| {
+                preferred_anchor_id.and_then(|pane_id| {
+                    self.panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id && pane.label.trim().is_empty())
+                        .map(|pane| pane.id.as_str())
+                })
+            })
+            .or_else(|| self.unlabeled_pane_id())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CockpitSlotOneTarget {
+    pane_id: String,
+    tab_id: String,
+    close_after_move: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,6 +677,9 @@ impl<A: CockpitAdapter> Cockpit<A> {
         if self.mode == CockpitMode::Direct {
             return Ok(CockpitWorkerLaunch::SkippedDirect);
         }
+        let _layout_guard = herdr_layout_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
         let inspection = self.adapter.inspect_layout(&workspace)?;
         let plan = CockpitLayoutPlanner::default().plan(inspection.worker_slot_count() + 1)?;
@@ -662,6 +726,9 @@ impl<A: CockpitAdapter> Cockpit<A> {
         if self.mode == CockpitMode::Direct {
             return Ok(CockpitTuiWorkerLaunch::SkippedDirect);
         }
+        let _layout_guard = herdr_layout_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
         let inspection = self.adapter.inspect_layout(&workspace)?;
         let plan = CockpitLayoutPlanner::default().plan(inspection.worker_slot_count() + 1)?;
@@ -989,23 +1056,61 @@ impl HerdrCockpitAdapter {
             .unwrap_or_default())
     }
 
-    fn first_pane_in_workspace(&self, workspace_id: &str) -> Result<CockpitPaneRef> {
-        let pane_id = self
-            .pane_list(workspace_id)?
-            .into_iter()
-            .next()
-            .map(|pane| pane.id)
-            .ok_or_else(|| {
-                anyhow!("herdr workspace {workspace_id} has no pane to anchor cockpit panes")
-            })?;
-        Ok(CockpitPaneRef { id: pane_id })
+    fn preferred_anchor_id<'a>(&self, workspace: &'a CockpitWorkspaceRef) -> Option<&'a str> {
+        workspace.anchor_pane.as_ref().map(|pane| pane.id.as_str())
     }
 
-    fn root_pane_id(&self, workspace: &CockpitWorkspaceRef) -> Result<String> {
-        if let Some(pane) = &workspace.anchor_pane {
-            return Ok(pane.id.clone());
-        }
-        Ok(self.first_pane_in_workspace(&workspace.id)?.id)
+    fn select_live_layout_anchor(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        panes: Vec<CockpitLayoutPane>,
+    ) -> Result<(String, Vec<CockpitLayoutPane>)> {
+        let inspection = CockpitLayoutInspection {
+            root_pane_id: None,
+            panes,
+        };
+        let anchor_id = inspection
+            .live_layout_anchor_pane_id(self.preferred_anchor_id(workspace))
+            .ok_or_else(|| {
+                anyhow!(
+                    "herdr workspace {} has no live pane to anchor cockpit panes",
+                    workspace.id
+                )
+            })?
+            .to_string();
+        Ok((anchor_id, inspection.panes))
+    }
+
+    fn live_layout_anchor_pane_id(&self, workspace: &CockpitWorkspaceRef) -> Result<String> {
+        let panes = self.pane_list(&workspace.id)?;
+        self.select_live_layout_anchor(workspace, panes)
+            .map(|(anchor_id, _)| anchor_id)
+    }
+
+    fn slot_one_target(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        inspection: &CockpitLayoutInspection,
+    ) -> Result<CockpitSlotOneTarget> {
+        let pane_id = if let Some(pane_id) =
+            inspection.slot_one_reusable_pane_id(self.preferred_anchor_id(workspace))
+        {
+            pane_id
+        } else {
+            inspection.dashboard_pane_id().ok_or_else(|| {
+                anyhow!("cockpit layout has no live pane available for TUI worker slot 1")
+            })?
+        };
+        let tab_id = inspection
+            .tab_id_for_pane(pane_id)
+            .ok_or_else(|| anyhow!("cockpit layout slot 1 target pane omitted tab id"))?;
+        Ok(CockpitSlotOneTarget {
+            pane_id: pane_id.to_string(),
+            tab_id: tab_id.to_string(),
+            close_after_move: inspection
+                .slot_one_reusable_pane_id(self.preferred_anchor_id(workspace))
+                == Some(pane_id),
+        })
     }
 
     fn split_pane(
@@ -1197,6 +1302,88 @@ impl HerdrCockpitAdapter {
         Ok(())
     }
 
+    fn start_tui_worker_agent_in_slot_once(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        slot: &CockpitWorkerSlot,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        let pane_label = slot.pane_label(&worker_pane_label(
+            &request.run_id,
+            &request.slice_id,
+            request.attempt,
+        ));
+        let inspection = self.inspect_layout(workspace)?;
+        let (target_pane_id, target_tab_id, direction, ratio, replaced_root) = if slot.index == 1 {
+            let target = self.slot_one_target(workspace, &inspection)?;
+            (
+                target.pane_id.clone(),
+                target.tab_id,
+                CockpitLayoutDirection::Down,
+                COCKPIT_LAYOUT_WORKER_SPLIT_RATIO.to_string(),
+                target.close_after_move.then_some(target.pane_id),
+            )
+        } else {
+            let split = slot
+                .split
+                .as_ref()
+                .ok_or_else(|| anyhow!("cockpit layout slot {} omitted split", slot.name))?;
+            let anchor_pane_id = inspection
+                .worker_slot_pane_id(&split.anchor_slot)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cockpit layout slot {} could not find anchor {}",
+                        slot.name,
+                        split.anchor_slot
+                    )
+                })?;
+            let target_tab_id = inspection
+                .tab_id_for_pane(anchor_pane_id)
+                .ok_or_else(|| anyhow!("cockpit layout anchor pane omitted tab id"))?;
+            (
+                anchor_pane_id.to_string(),
+                target_tab_id.to_string(),
+                split.direction,
+                split.ratio.clone(),
+                None,
+            )
+        };
+
+        let temp_tab = self.create_temp_tui_worker_tab(workspace, request)?;
+        let mut opened = match self.start_tui_worker_agent_in_tab(&temp_tab.tab_id, request) {
+            Ok(opened) => opened,
+            Err(err) => {
+                self.close_pane_best_effort(&temp_tab.root_pane_id);
+                return Err(err);
+            }
+        };
+        let post_start_result = (|| -> Result<()> {
+            self.move_pane_to_slot(
+                &opened.pane_id,
+                &target_tab_id,
+                &target_pane_id,
+                direction,
+                &ratio,
+            )?;
+            self.rename_pane(&opened.pane_id, &pane_label)?;
+            if let Some(root_pane_id) = &replaced_root {
+                self.close_pane(root_pane_id)?;
+            }
+            self.close_pane(&temp_tab.root_pane_id)?;
+            Ok(())
+        })();
+        if let Err(err) = post_start_result {
+            self.close_pane_best_effort(&opened.pane_id);
+            self.close_pane_best_effort(&temp_tab.root_pane_id);
+            return Err(err);
+        }
+        opened.pane_label = pane_label;
+        opened.slot_name = slot.name.clone();
+        opened.slot_index = slot.index;
+        opened.slot_region = slot.region.clone();
+        Ok(opened)
+    }
+
     fn close_pane_best_effort(&self, pane_id: &str) {
         let _ = self.run_command(&["pane".to_string(), "close".to_string(), pane_id.to_string()]);
     }
@@ -1277,25 +1464,38 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         } else {
             CockpitLayoutDirection::Right
         };
-        let anchor_pane_id = self.root_pane_id(workspace)?;
+        let anchor_pane_id = self.live_layout_anchor_pane_id(workspace)?;
         let pane = self.split_pane(&anchor_pane_id, direction, "0.5", request)?;
         self.run_pane_request(&pane.id, request)?;
         Ok(pane)
     }
 
     fn inspect_layout(&self, workspace: &CockpitWorkspaceRef) -> Result<CockpitLayoutInspection> {
-        let root_pane_id = self.root_pane_id(workspace)?;
-        let panes = self.pane_list(&workspace.id)?;
-        self.run_json(&[
-            "pane".to_string(),
-            "layout".to_string(),
-            "--pane".to_string(),
-            root_pane_id.clone(),
-        ])?;
-        Ok(CockpitLayoutInspection {
-            root_pane_id: Some(root_pane_id),
-            panes,
-        })
+        let mut last_pane_not_found = None;
+        for _ in 0..2 {
+            let panes = self.pane_list(&workspace.id)?;
+            let (root_pane_id, panes) = self.select_live_layout_anchor(workspace, panes)?;
+            match self.run_json(&[
+                "pane".to_string(),
+                "layout".to_string(),
+                "--pane".to_string(),
+                root_pane_id.clone(),
+            ]) {
+                Ok(_) => {
+                    return Ok(CockpitLayoutInspection {
+                        root_pane_id: Some(root_pane_id),
+                        panes,
+                    });
+                }
+                Err(err) if is_herdr_pane_not_found_error(&err) => {
+                    last_pane_not_found = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_pane_not_found
+            .unwrap_or_else(|| anyhow!("cockpit layout inspection could not resolve a live pane")))
     }
 
     fn ensure_dashboard_pane(
@@ -1332,15 +1532,7 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         if slot.index != 1 {
             return Ok(());
         }
-        let inspection = self.inspect_layout(workspace)?;
-        let root_pane_id = inspection
-            .root_pane_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("cockpit layout inspection omitted root pane"))?;
-        let root_label = inspection.label_for_pane(root_pane_id).unwrap_or_default();
-        if root_label.trim().is_empty() || root_label == WORKER_REGION_PLACEHOLDER_PANE {
-            self.rename_pane(root_pane_id, replacement_label)?;
-        }
+        let _ = (workspace, replacement_label);
         Ok(())
     }
 
@@ -1353,10 +1545,32 @@ impl CockpitAdapter for HerdrCockpitAdapter {
     ) -> Result<CockpitWorkerPlacement> {
         let pane_label = slot.pane_label(&request.label);
         if slot.index == 1 {
-            let root_pane_id = self.root_pane_id(workspace)?;
-            self.run_pane_request_with_label(&root_pane_id, &pane_label, request)?;
+            let inspection = self.inspect_layout(workspace)?;
+            if let Some(root_pane_id) =
+                inspection.slot_one_reusable_pane_id(self.preferred_anchor_id(workspace))
+            {
+                let root_pane_id = root_pane_id.to_string();
+                self.run_pane_request_with_label(&root_pane_id, &pane_label, request)?;
+                return Ok(CockpitWorkerPlacement {
+                    pane: CockpitPaneRef { id: root_pane_id },
+                    slot_name: slot.name.clone(),
+                    slot_index: slot.index,
+                    slot_region: slot.region.clone(),
+                    pane_label,
+                });
+            }
+            let dashboard_pane_id = inspection.dashboard_pane_id().ok_or_else(|| {
+                anyhow!("cockpit layout has no live pane available for worker slot 1")
+            })?;
+            let pane = self.split_pane(
+                dashboard_pane_id,
+                CockpitLayoutDirection::Down,
+                COCKPIT_LAYOUT_WORKER_SPLIT_RATIO,
+                request,
+            )?;
+            self.run_pane_request_with_label(&pane.id, &pane_label, request)?;
             return Ok(CockpitWorkerPlacement {
-                pane: CockpitPaneRef { id: root_pane_id },
+                pane,
                 slot_name: slot.name.clone(),
                 slot_index: slot.index,
                 slot_region: slot.region.clone(),
@@ -1396,90 +1610,20 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         slot: &CockpitWorkerSlot,
         request: &CockpitTuiWorkerRequest,
     ) -> Result<CockpitTuiWorkerOpened> {
-        let pane_label = slot.pane_label(&worker_pane_label(
-            &request.run_id,
-            &request.slice_id,
-            request.attempt,
-        ));
-        let inspection = self.inspect_layout(workspace)?;
-        let (target_pane_id, target_tab_id, direction, ratio, replaced_root) = if slot.index == 1 {
-            let root_pane_id = inspection
-                .root_pane_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("cockpit layout inspection omitted root pane"))?;
-            let root_label = inspection.label_for_pane(root_pane_id).unwrap_or_default();
-            if !(root_label.trim().is_empty() || root_label == WORKER_REGION_PLACEHOLDER_PANE) {
-                bail!("cockpit layout root pane is not available for TUI worker slot 1");
+        let mut last_pane_not_found = None;
+        for _ in 0..2 {
+            match self.start_tui_worker_agent_in_slot_once(workspace, slot, request) {
+                Ok(opened) => return Ok(opened),
+                Err(err) if is_herdr_pane_not_found_error(&err) => {
+                    last_pane_not_found = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
             }
-            let target_tab_id = inspection
-                .tab_id_for_pane(root_pane_id)
-                .ok_or_else(|| anyhow!("cockpit layout root pane omitted tab id"))?;
-            (
-                root_pane_id.to_string(),
-                target_tab_id.to_string(),
-                CockpitLayoutDirection::Down,
-                COCKPIT_LAYOUT_WORKER_SPLIT_RATIO.to_string(),
-                Some(root_pane_id.to_string()),
-            )
-        } else {
-            let split = slot
-                .split
-                .as_ref()
-                .ok_or_else(|| anyhow!("cockpit layout slot {} omitted split", slot.name))?;
-            let anchor_pane_id = inspection
-                .worker_slot_pane_id(&split.anchor_slot)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "cockpit layout slot {} could not find anchor {}",
-                        slot.name,
-                        split.anchor_slot
-                    )
-                })?;
-            let target_tab_id = inspection
-                .tab_id_for_pane(anchor_pane_id)
-                .ok_or_else(|| anyhow!("cockpit layout anchor pane omitted tab id"))?;
-            (
-                anchor_pane_id.to_string(),
-                target_tab_id.to_string(),
-                split.direction,
-                split.ratio.clone(),
-                None,
-            )
-        };
-
-        let temp_tab = self.create_temp_tui_worker_tab(workspace, request)?;
-        let mut opened = match self.start_tui_worker_agent_in_tab(&temp_tab.tab_id, request) {
-            Ok(opened) => opened,
-            Err(err) => {
-                self.close_pane_best_effort(&temp_tab.root_pane_id);
-                return Err(err);
-            }
-        };
-        let post_start_result = (|| -> Result<()> {
-            self.move_pane_to_slot(
-                &opened.pane_id,
-                &target_tab_id,
-                &target_pane_id,
-                direction,
-                &ratio,
-            )?;
-            self.rename_pane(&opened.pane_id, &pane_label)?;
-            if let Some(root_pane_id) = &replaced_root {
-                self.close_pane(root_pane_id)?;
-            }
-            self.close_pane(&temp_tab.root_pane_id)?;
-            Ok(())
-        })();
-        if let Err(err) = post_start_result {
-            self.close_pane_best_effort(&opened.pane_id);
-            self.close_pane_best_effort(&temp_tab.root_pane_id);
-            return Err(err);
         }
-        opened.pane_label = pane_label;
-        opened.slot_name = slot.name.clone();
-        opened.slot_index = slot.index;
-        opened.slot_region = slot.region.clone();
-        Ok(opened)
+        Err(last_pane_not_found.unwrap_or_else(|| {
+            anyhow!("cockpit TUI worker placement could not resolve a live pane")
+        }))
     }
 
     fn start_tui_worker_agent(
@@ -1640,11 +1784,25 @@ fn bounded(value: &str) -> String {
     }
 }
 
+fn is_herdr_pane_not_found_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("pane_not_found")
+        || message.contains("target_pane_not_found")
+        || message.contains("pane not found")
+}
+
+fn herdr_layout_lock() -> &'static Mutex<()> {
+    HERDR_LAYOUT_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{Run, RunStatus, WorkflowConfig};
     use chrono::Utc;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -1974,6 +2132,284 @@ mod tests {
             plan.worker_slots[3].split.as_ref().unwrap().direction,
             CockpitLayoutDirection::Down
         );
+    }
+
+    fn fake_herdr_fixture(
+        panes: serde_json::Value,
+        next_pane: usize,
+    ) -> (tempfile::TempDir, HerdrCockpitAdapter) {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("fake-herdr-state.json");
+        let script_path = dir.path().join("herdr");
+        fs::write(
+            &state_path,
+            serde_json::json!({
+                "panes": panes,
+                "next_pane": next_pane,
+                "next_tab": 2
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state_path_json = serde_json::to_string(&state_path.to_string_lossy()).unwrap();
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+STATE = pathlib.Path({state_path_json})
+
+def load():
+    return json.loads(STATE.read_text())
+
+def save(state):
+    STATE.write_text(json.dumps(state))
+
+def ok(result):
+    print(json.dumps({{"result": result}}))
+    sys.exit(0)
+
+def fail(code, message):
+    print(json.dumps({{"error": {{"code": code, "message": message}}, "id": "fake-herdr"}}))
+    sys.exit(1)
+
+def pane(state, pane_id):
+    for item in state["panes"]:
+        if item["pane_id"] == pane_id:
+            return item
+    return None
+
+def next_pane(state, workspace_id):
+    pane_id = f"{{workspace_id}}:p{{state['next_pane']}}"
+    state["next_pane"] += 1
+    return pane_id
+
+def next_tab(state, workspace_id):
+    tab_id = f"{{workspace_id}}:t{{state['next_tab']}}"
+    state["next_tab"] += 1
+    return tab_id
+
+args = sys.argv[1:]
+state = load()
+
+if args[:2] == ["pane", "list"]:
+    workspace_id = args[args.index("--workspace") + 1]
+    ok({{"panes": [p for p in state["panes"] if p["workspace_id"] == workspace_id]}})
+
+if args[:2] == ["pane", "layout"]:
+    pane_id = args[args.index("--pane") + 1]
+    if pane(state, pane_id) is None:
+        fail("pane_not_found", "pane not found")
+    ok({{"pane": {{"pane_id": pane_id}}}})
+
+if args[:2] == ["tab", "create"]:
+    workspace_id = args[args.index("--workspace") + 1]
+    tab_id = next_tab(state, workspace_id)
+    root_pane_id = next_pane(state, workspace_id)
+    state["panes"].append({{"pane_id": root_pane_id, "workspace_id": workspace_id, "tab_id": tab_id, "label": ""}})
+    save(state)
+    ok({{"tab": {{"tab_id": tab_id}}, "root_pane": {{"pane_id": root_pane_id}}}})
+
+if args[:2] == ["agent", "start"]:
+    tab_id = args[args.index("--tab") + 1]
+    workspace_id = tab_id.split(":t", 1)[0]
+    pane_id = next_pane(state, workspace_id)
+    state["panes"].append({{"pane_id": pane_id, "workspace_id": workspace_id, "tab_id": tab_id, "label": ""}})
+    save(state)
+    ok({{"agent": {{"pane_id": pane_id, "terminal_id": f"term-{{pane_id}}"}}}})
+
+if args[:2] == ["pane", "move"]:
+    pane_id = args[2]
+    moved = pane(state, pane_id)
+    target = pane(state, args[args.index("--target-pane") + 1])
+    if moved is None:
+        fail("pane_not_found", "pane not found")
+    if target is None:
+        fail("target_pane_not_found", "target pane not found")
+    moved["tab_id"] = args[args.index("--tab") + 1]
+    save(state)
+    ok({{"pane": {{"pane_id": pane_id}}}})
+
+if args[:2] == ["pane", "rename"]:
+    item = pane(state, args[2])
+    if item is None:
+        fail("pane_not_found", "pane not found")
+    item["label"] = " ".join(args[3:])
+    save(state)
+    ok({{"pane": {{"pane_id": args[2]}}}})
+
+if args[:2] == ["pane", "close"]:
+    pane_id = args[2]
+    if pane(state, pane_id) is None:
+        fail("pane_not_found", "pane not found")
+    state["panes"] = [p for p in state["panes"] if p["pane_id"] != pane_id]
+    save(state)
+    ok({{"closed": pane_id}})
+
+fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
+"#
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        (dir, HerdrCockpitAdapter { bin: script_path })
+    }
+
+    fn test_workspace(anchor_pane: Option<&str>) -> CockpitWorkspaceRef {
+        CockpitWorkspaceRef {
+            id: "w1".to_string(),
+            anchor_pane: anchor_pane.map(|id| CockpitPaneRef { id: id.to_string() }),
+            existed: anchor_pane.is_none(),
+        }
+    }
+
+    fn test_tui_worker(slice_id: &str) -> CockpitTuiWorkerRequest {
+        CockpitTuiWorkerRequest {
+            run_id: "kd-run".to_string(),
+            slice_id: slice_id.to_string(),
+            attempt: 1,
+            name: format!("kd-run-{slice_id}-1"),
+            argv: vec!["pi".to_string(), format!("@{slice_id}.md")],
+            cwd: PathBuf::from("/repo/worker"),
+            env: Vec::new(),
+        }
+    }
+
+    fn fake_herdr_state(dir: &tempfile::TempDir) -> serde_json::Value {
+        let state_path = dir.path().join("fake-herdr-state.json");
+        serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn tui_slot1_replacement_then_second_slot_placement_succeeds() {
+        let (_dir, adapter) = fake_herdr_fixture(
+            serde_json::json!([
+                {"pane_id":"w1:p1","workspace_id":"w1","tab_id":"w1:t1","label":WORKER_REGION_PLACEHOLDER_PANE},
+                {"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t1","label":RUN_STATUS_FEED_PANE}
+            ]),
+            3,
+        );
+        let workspace = test_workspace(Some("w1:p1"));
+        let plan = CockpitLayoutPlanner::default().plan(2).unwrap();
+
+        adapter
+            .start_tui_worker_agent_in_slot_once(
+                &workspace,
+                &plan.worker_slots[0],
+                &test_tui_worker("SLICE-1"),
+            )
+            .unwrap();
+        let second = adapter
+            .start_tui_worker_agent_in_slot_once(
+                &workspace,
+                &plan.worker_slots[1],
+                &test_tui_worker("SLICE-2"),
+            )
+            .unwrap();
+
+        assert_eq!(second.slot_name, "worker-2");
+        assert_eq!(second.slot_index, 2);
+        assert_eq!(
+            second.pane_label,
+            "worker-2: Worker kd-run/SLICE-2 attempt 1"
+        );
+    }
+
+    #[test]
+    fn tui_slot1_retry_after_close_recreates_placeholder() {
+        let (dir, adapter) = fake_herdr_fixture(
+            serde_json::json!([
+                {"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t1","label":RUN_STATUS_FEED_PANE}
+            ]),
+            3,
+        );
+        let workspace = test_workspace(None);
+        let plan = CockpitLayoutPlanner::default().plan(1).unwrap();
+
+        let opened = adapter
+            .start_tui_worker_agent_in_slot_once(
+                &workspace,
+                &plan.worker_slots[0],
+                &test_tui_worker("SLICE-RETRY"),
+            )
+            .unwrap();
+
+        assert_eq!(opened.slot_name, "worker-1");
+        assert_eq!(
+            opened.pane_label,
+            "worker-1: Worker kd-run/SLICE-RETRY attempt 1"
+        );
+        let state = fake_herdr_state(&dir);
+        let panes = state["panes"].as_array().unwrap();
+        assert!(
+            panes
+                .iter()
+                .any(|pane| pane["label"].as_str() == Some(RUN_STATUS_FEED_PANE))
+        );
+        assert!(
+            panes.iter().any(|pane| pane["label"].as_str()
+                == Some("worker-1: Worker kd-run/SLICE-RETRY attempt 1"))
+        );
+    }
+
+    #[test]
+    fn tui_slot1_retry_replaces_existing_worker_before_dashboard() {
+        let (dir, adapter) = fake_herdr_fixture(
+            serde_json::json!([
+                {"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t1","label":RUN_STATUS_FEED_PANE},
+                {"pane_id":"w1:p4","workspace_id":"w1","tab_id":"w1:t1","label":"worker-1: Worker kd-run/OLD attempt 1"}
+            ]),
+            5,
+        );
+        let workspace = test_workspace(None);
+        let plan = CockpitLayoutPlanner::default().plan(1).unwrap();
+
+        adapter
+            .start_tui_worker_agent_in_slot_once(
+                &workspace,
+                &plan.worker_slots[0],
+                &test_tui_worker("SLICE-RETRY"),
+            )
+            .unwrap();
+
+        let state = fake_herdr_state(&dir);
+        let panes = state["panes"].as_array().unwrap();
+        assert!(
+            panes
+                .iter()
+                .any(|pane| pane["label"].as_str() == Some(RUN_STATUS_FEED_PANE))
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .filter(|pane| pane["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("worker-1: ")))
+                .count(),
+            1
+        );
+        assert!(
+            panes.iter().any(|pane| pane["label"].as_str()
+                == Some("worker-1: Worker kd-run/SLICE-RETRY attempt 1"))
+        );
+    }
+
+    #[test]
+    fn focused_existing_workspace_resolves_anchor_by_label_not_first_pane() {
+        let (_dir, adapter) = fake_herdr_fixture(
+            serde_json::json!([
+                {"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t1","label":RUN_STATUS_FEED_PANE},
+                {"pane_id":"w1:p4","workspace_id":"w1","tab_id":"w1:t1","label":"worker-1: Worker kd-run/SLICE-1 attempt 1"}
+            ]),
+            5,
+        );
+        let workspace = test_workspace(None);
+
+        let inspection = adapter.inspect_layout(&workspace).unwrap();
+
+        assert_eq!(inspection.root_pane_id.as_deref(), Some("w1:p4"));
     }
 
     #[test]
