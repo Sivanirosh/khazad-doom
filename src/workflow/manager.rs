@@ -869,16 +869,20 @@ impl Manager {
             .record_event(
                 &run.id,
                 workflow_events::COCKPIT_WORKER_READY,
-                &workflow_events::CockpitWorkerReadyPayload {
-                    adapter: opened.adapter,
-                    mode: opened.mode.as_str().to_string(),
-                    workspace: opened.workspace_label,
-                    pane: opened.pane_label,
-                    pane_id: opened.pane_id,
-                    slice_id: context.slice_id.clone(),
-                    attempt: context.attempt,
-                    source_of_truth: "kd_artifact_files".to_string(),
-                },
+                &json!({
+                    "adapter": opened.adapter,
+                    "mode": opened.mode.as_str(),
+                    "workspace": opened.workspace_label,
+                    "pane": opened.pane_label,
+                    "pane_id": opened.pane_id,
+                    "slice_id": context.slice_id.clone(),
+                    "attempt": context.attempt,
+                    "source_of_truth": "kd_artifact_files",
+                    "layout_planner": "cockpit_layout_v2",
+                    "worker_slot_name": opened.slot_name,
+                    "worker_slot_index": opened.slot_index,
+                    "worker_region": opened.slot_region,
+                }),
             )
             .map_err(CockpitWorkerJobError::Worker)?;
         let pid = match wait_for_pi_wrapper_launch(&artifacts, Duration::from_secs(5), &events) {
@@ -952,16 +956,22 @@ impl Manager {
             .record_event(
                 &run.id,
                 workflow_events::COCKPIT_WORKER_READY,
-                &workflow_events::CockpitWorkerReadyPayload {
-                    adapter: opened.adapter,
-                    mode: opened.mode.as_str().to_string(),
-                    workspace: opened.workspace_label,
-                    pane: opened.agent_name,
-                    pane_id: opened.pane_id.clone(),
-                    slice_id: context.slice_id.clone(),
-                    attempt: context.attempt,
-                    source_of_truth: "kd_tui_result_artifact".to_string(),
-                },
+                &json!({
+                    "adapter": opened.adapter.clone(),
+                    "mode": opened.mode.as_str(),
+                    "workspace": opened.workspace_label.clone(),
+                    "pane": opened.pane_label.clone(),
+                    "pane_id": opened.pane_id.clone(),
+                    "terminal_id": opened.terminal_id.clone(),
+                    "agent_name": opened.agent_name.clone(),
+                    "slice_id": context.slice_id.clone(),
+                    "attempt": context.attempt,
+                    "source_of_truth": "kd_tui_result_artifact",
+                    "layout_planner": "cockpit_layout_v2",
+                    "worker_slot_name": opened.slot_name.clone(),
+                    "worker_slot_index": opened.slot_index,
+                    "worker_region": opened.slot_region.clone(),
+                }),
             )
             .map_err(CockpitWorkerJobError::Worker)?;
         if let Some(sink) = &events {
