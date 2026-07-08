@@ -23,7 +23,8 @@ const FEED_VERSION: u64 = 1;
 const ACTIVITY_LIMIT: usize = 7;
 const OUTPUT_LINES: usize = 4;
 const TODO_ITEMS: usize = 8;
-const LINE_WIDTH: usize = 180;
+const WORKER_ITEMS: usize = 6;
+const LINE_WIDTH: usize = 96;
 
 const GATE_PANE_LINE_WIDTH: usize = 180;
 const GATE_PANE_TAIL_LINES: usize = 6;
@@ -792,57 +793,26 @@ pub fn project_waiting(repo: &str) -> StatusFeed {
 }
 
 pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
-    let mut blocks = Vec::new();
-    blocks.push(run_block(details, now));
-    blocks.push(todos_block(details));
-    if let Some(reason) = &details.primary_terminal_reason {
-        blocks.push(terminal_reason_block(reason));
-    }
-    if let Some(replan) = replan_block(details) {
-        blocks.push(replan);
-    }
-    if let Some(progress) = &details.progress
-        && !should_hide_current_progress(details, progress)
-    {
-        blocks.push(progress_block(details, progress, now));
-        if let Some(worker) = &progress.worker
-            && let Some(warning) = worker_quiet_warning(worker, now)
-        {
-            blocks.push(block(
-                "Warn",
-                "",
-                vec![
-                    line(warning, StatusFeedRole::Warning),
-                    line("wait, inspect, or cancel explicitly", StatusFeedRole::Dim),
-                ],
-            ));
-        }
-    }
-    blocks.push(semantic_progress_block(details, now));
-    if let Some(activity) = activity_block(details) {
-        blocks.push(activity);
-    }
-    if let Some(tail) = tail_block(details) {
-        blocks.push(tail);
-    }
-    if let Some(economics) = &details.economics {
-        blocks.push(economics_block(details, economics));
-    }
-    if !details.incidents.is_empty() {
-        blocks.push(incidents_block(&details.incidents));
-    }
-
     let question_commands = pending_question_commands(details);
     let replan_commands = pending_replan_commands(details);
-    let mut attention = pending_question_attention(details, now);
-    attention.extend(replan_attention(details));
+    let attention = dashboard_attention(details, now);
     let operator_commands = operator_commands(details, &question_commands, &replan_commands);
-    if !attention.is_empty() {
-        blocks.insert(0, block("Attention", "", attention.clone()));
-    }
+
+    let mut blocks = vec![
+        run_block(details, now),
+        workers_block(details, now),
+        attention_block(&attention),
+    ];
     if !operator_commands.is_empty() {
-        let index = if attention.is_empty() { 0 } else { 1 };
-        blocks.insert(index, commands_block(&operator_commands));
+        blocks.push(commands_block(&operator_commands));
+    }
+    blocks.push(checks_block(details, now));
+    blocks.push(match &details.economics {
+        Some(economics) => economics_block(details, economics),
+        None => economics_missing_block(),
+    });
+    if !details.incidents.is_empty() {
+        blocks.push(incidents_block(&details.incidents));
     }
 
     StatusFeed {
@@ -1126,6 +1096,283 @@ fn commands_block(commands: &[String]) -> StatusFeedBlock {
     )
 }
 
+fn dashboard_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<StatusFeedLine> {
+    let mut lines = Vec::new();
+    if let Some(reason) = &details.primary_terminal_reason {
+        lines.extend(terminal_reason_attention_lines(reason));
+    }
+    lines.extend(pending_question_attention(details, now));
+    lines.extend(replan_attention(details));
+    lines
+}
+
+fn terminal_reason_attention_lines(reason: &TerminalReason) -> Vec<StatusFeedLine> {
+    let mut lines = vec![line(
+        format!(
+            "Terminal reason: kind={} • owner={} • retryable={} • operator_action_required={}",
+            display_or_dash(&reason.kind),
+            display_or_dash(&reason.resolution_owner),
+            reason.retryable,
+            reason.operator_action_required
+        ),
+        StatusFeedRole::Attention,
+    )];
+    if !reason.summary.trim().is_empty() {
+        lines.push(line(
+            format!("Summary: {}", reason.summary),
+            StatusFeedRole::Attention,
+        ));
+    }
+    if !reason.remediation.trim().is_empty() {
+        lines.push(line(
+            format!("Remediation: {}", reason.remediation),
+            StatusFeedRole::Attention,
+        ));
+    }
+    if !reason.disposition.trim().is_empty() {
+        lines.push(line(
+            format!("Disposition: {}", reason.disposition),
+            StatusFeedRole::Attention,
+        ));
+    }
+    if !reason.evidence_links.is_empty() {
+        lines.push(line(
+            format!("Evidence: {}", reason.evidence_links.join(", ")),
+            StatusFeedRole::Attention,
+        ));
+    }
+    lines
+}
+
+fn attention_block(attention: &[StatusFeedLine]) -> StatusFeedBlock {
+    let lines = if attention.is_empty() {
+        vec![line("no operator attention", StatusFeedRole::Dim)]
+    } else {
+        attention.to_vec()
+    };
+    block("Attention", "", lines)
+}
+
+fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
+    let items = selected_slice_items(details);
+    let active = active_worker_count(details, &items);
+    let mut lines = Vec::new();
+
+    if let Some(progress) = &details.progress
+        && !should_hide_current_progress(details, progress)
+    {
+        if let Some(active_line) = active_worker_line(details, progress, now) {
+            lines.push(active_line);
+        }
+        if let Some(worker) = &progress.worker
+            && let Some(warning) = worker_quiet_warning(worker, now)
+        {
+            lines.push(line(warning, StatusFeedRole::Warning));
+            lines.push(line(
+                "wait, inspect, or cancel explicitly",
+                StatusFeedRole::Dim,
+            ));
+        }
+    }
+
+    if items.is_empty() {
+        if lines.is_empty() {
+            lines.push(line("no selected workers recorded", StatusFeedRole::Dim));
+        }
+    } else {
+        for slice in items.iter().take(WORKER_ITEMS) {
+            lines.push(line(todo_line(slice), role_for_slice_status(slice.status)));
+        }
+        if items.len() > WORKER_ITEMS {
+            lines.push(line(
+                format!("… {} more", items.len() - WORKER_ITEMS),
+                StatusFeedRole::Dim,
+            ));
+        }
+    }
+
+    block(
+        "Workers",
+        format!("({active} active / {} total)", items.len()),
+        lines,
+    )
+}
+
+fn active_worker_count(details: &RunDetails, items: &[SliceRun]) -> usize {
+    if let Some(progress) = &details.progress
+        && !should_hide_current_progress(details, progress)
+        && is_worker_agent_phase(&progress.phase)
+    {
+        if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+            return progress.parallel_slices.len();
+        }
+        return 1;
+    }
+    items
+        .iter()
+        .filter(|slice| slice.status == SliceStatus::Running)
+        .count()
+}
+
+fn active_worker_line(
+    details: &RunDetails,
+    progress: &RunProgress,
+    now: DateTime<Utc>,
+) -> Option<StatusFeedLine> {
+    if !is_worker_agent_phase(&progress.phase) {
+        return None;
+    }
+    let target = if progress.parallel_layer && !progress.parallel_slices.is_empty() {
+        format!("parallel {}", progress.parallel_slices.join(","))
+    } else if !progress.slice_id.trim().is_empty() {
+        progress.slice_id.clone()
+    } else {
+        monitor_slice_label(details)
+    };
+    let attempt = if progress.attempt > 0 {
+        format!(" • attempt {}", progress.attempt)
+    } else {
+        String::new()
+    };
+    let mut text = format!(
+        "active {target}{attempt} • elapsed {}",
+        since_time(progress.phase_started_at, now)
+    );
+    if let Some(worker) = &progress.worker {
+        text.push_str(&format!(" • {}", supervisor_label(worker, now)));
+    }
+    if !progress.message.trim().is_empty() {
+        text.push_str(&format!(
+            " • {}",
+            truncate_display(&progress.message, LINE_WIDTH / 2)
+        ));
+    }
+    Some(line(
+        truncate_display(&text, LINE_WIDTH),
+        StatusFeedRole::Info,
+    ))
+}
+
+fn checks_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
+    let summary = gate_pane_latest_implementation_summary(details);
+    let latest_gate = summary
+        .as_ref()
+        .and_then(|summary| summary.integration_gate.clone())
+        .or_else(|| gate_pane_gate_result_from_economics(details));
+    let pre_repair_gate = summary
+        .as_ref()
+        .and_then(|summary| summary.pre_repair_integration_gate.clone());
+    let repair = summary
+        .as_ref()
+        .and_then(|summary| summary.integration_repair.clone());
+
+    let mut lines = vec![line(
+        format!(
+            "verify profile {}",
+            gate_pane_verification_profile(details, summary.as_ref())
+        ),
+        StatusFeedRole::Dim,
+    )];
+    match &details.progress {
+        Some(progress) if !should_hide_current_progress(details, progress) => {
+            lines.push(line(
+                format!(
+                    "phase {} • updated {} ago",
+                    progress_phase_label(progress),
+                    since_time(progress.updated_at, now)
+                ),
+                StatusFeedRole::Info,
+            ));
+            if !progress.command.trim().is_empty() && !is_worker_agent_phase(&progress.phase) {
+                lines.push(line(
+                    format!(
+                        "command {}",
+                        truncate_display(&progress.command, LINE_WIDTH)
+                    ),
+                    StatusFeedRole::Dim,
+                ));
+            }
+            if !progress.message.trim().is_empty() {
+                lines.push(line(
+                    format!(
+                        "message {}",
+                        truncate_display(&progress.message, LINE_WIDTH)
+                    ),
+                    StatusFeedRole::Info,
+                ));
+            }
+        }
+        _ => lines.push(line(
+            format!("phase {}", details.run.status),
+            StatusFeedRole::Dim,
+        )),
+    }
+
+    match &latest_gate {
+        Some(gate) => lines.push(line(
+            format!(
+                "gate {}{}",
+                display_or_dash(&gate.status),
+                dashboard_summary_suffix(&gate.summary)
+            ),
+            gate_pane_role_for_gate_status(&gate.status),
+        )),
+        None => lines.push(line("gate not run yet", StatusFeedRole::Dim)),
+    }
+    if let Some(last_failure) =
+        gate_pane_last_failure(pre_repair_gate.as_ref(), latest_gate.as_ref())
+    {
+        lines.push(line(
+            format!("last failure {last_failure}"),
+            StatusFeedRole::Warning,
+        ));
+    }
+    let repair_policy = gate_pane_repair_policy(details);
+    let (repair_state, repair_role) =
+        gate_pane_repair_state(&repair_policy, latest_gate.as_ref(), repair.as_ref());
+    lines.push(line(
+        format!(
+            "repair {repair_policy} • {}",
+            repair_state
+                .strip_prefix("State: ")
+                .unwrap_or(&repair_state)
+        ),
+        repair_role,
+    ));
+
+    let worker = details
+        .progress
+        .as_ref()
+        .and_then(|progress| progress.worker.as_ref());
+    let semantic = last_semantic_progress_label(worker, now);
+    lines.push(line(
+        format!("semantic {semantic}"),
+        if semantic == "unknown" {
+            StatusFeedRole::Dim
+        } else {
+            StatusFeedRole::Info
+        },
+    ));
+
+    block("Checks", "", lines)
+}
+
+fn dashboard_summary_suffix(summary: &str) -> String {
+    if summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", truncate_display(summary, LINE_WIDTH))
+    }
+}
+
+fn economics_missing_block() -> StatusFeedBlock {
+    block(
+        "Economics",
+        "",
+        vec![line("not recorded yet", StatusFeedRole::Dim)],
+    )
+}
+
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
         values.push(value);
@@ -1177,17 +1424,14 @@ fn run_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
             StatusFeedRole::Dim,
         ),
     ];
-    if !details.worker_profile.profile_summary.trim().is_empty() {
-        lines.push(line(
-            format!("worker profile {}", details.worker_profile.profile_summary),
-            StatusFeedRole::Dim,
-        ));
+    if let Some(profile) = compact_worker_profile(&details.worker_profile) {
+        lines.push(line(format!("profile {profile}"), StatusFeedRole::Dim));
     }
     if details.worker_profile.worker_evidence_kind
         == "deterministic_test_double_not_real_pi_worker_evidence"
     {
         lines.push(line(
-            details.worker_profile.worker_evidence_label.clone(),
+            "worker evidence deterministic test-double; not real Pi",
             StatusFeedRole::Warning,
         ));
     }
@@ -1377,7 +1621,7 @@ fn economics_block(details: &RunDetails, economics: &RunEconomics) -> StatusFeed
     let mut lines = vec![
         line(
             format!(
-                "Agent calls: {} | Commands: {} | Duplicates: {} | Cache: {}/{} hit/miss",
+                "agents {} • cmds {} • dup {} • cache {}/{}",
                 agent_call_count_label(economics.agent_call_count, active_agents, active_work),
                 command_count_label(economics.command_execution_count, active_commands),
                 economics.duplicate_command_count,
@@ -1388,8 +1632,8 @@ fn economics_block(details: &RunDetails, economics: &RunEconomics) -> StatusFeed
         ),
         line(
             format!(
-                "Repair: policy={} attempts={}/{} | Fail-fast: {}",
-                economics.repair_policy,
+                "repair {} {}/{} • fail-fast {}",
+                display_or_dash(&economics.repair_policy),
                 economics.repair_attempts,
                 economics.repair_max_attempts,
                 economics.gate_fail_fast
@@ -1397,21 +1641,17 @@ fn economics_block(details: &RunDetails, economics: &RunEconomics) -> StatusFeed
             StatusFeedRole::Info,
         ),
     ];
-    if let Some(fake_call) = economics.agent_calls.iter().find(|call| {
+    if economics.agent_calls.iter().any(|call| {
         call.worker_evidence_kind() == "deterministic_test_double_not_real_pi_worker_evidence"
     }) {
         lines.push(line(
-            format!(
-                "Worker evidence: {} ({})",
-                fake_call.worker_evidence_kind(),
-                fake_call.worker_evidence_label()
-            ),
+            "worker evidence deterministic test-double; not real Pi",
             StatusFeedRole::Warning,
         ));
     }
     if !economics.sla_violations.is_empty() {
         lines.push(line(
-            format!("SLA violations: {}", economics.sla_violations.join("; ")),
+            format!("SLA {}", economics.sla_violations.join("; ")),
             StatusFeedRole::Warning,
         ));
     }
@@ -2225,6 +2465,38 @@ fn short_path(value: &str) -> String {
     format!("…/{}", parts[parts.len().saturating_sub(2)..].join("/"))
 }
 
+fn compact_worker_profile(profile: &crate::domain::WorkerProfileEvidence) -> Option<String> {
+    let mut parts = Vec::new();
+    let agent = [profile.agent.trim(), profile.agent_profile.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if !agent.is_empty() {
+        parts.push(agent);
+    }
+    let model = [profile.agent_provider.trim(), profile.agent_model.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if !model.is_empty() {
+        parts.push(model);
+    }
+    let mode = [profile.agent_reasoning.trim(), profile.agent_mode.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if !mode.is_empty() {
+        parts.push(mode);
+    }
+    if parts.is_empty() && !profile.profile_summary.trim().is_empty() {
+        parts.push(profile.profile_summary.trim().to_string());
+    }
+    (!parts.is_empty()).then(|| truncate_display(&parts.join(" • "), LINE_WIDTH))
+}
+
 fn display_or_dash(value: &str) -> &str {
     if value.trim().is_empty() { "-" } else { value }
 }
@@ -2267,7 +2539,7 @@ mod tests {
     };
 
     #[test]
-    fn projection_has_versioned_blocks_and_raw_safe_roles() {
+    fn dashboard_v2_projection_has_versioned_compact_blocks_and_raw_safe_roles() {
         let now = Utc::now();
         let details = RunDetails {
             run: Run {
@@ -2305,14 +2577,22 @@ mod tests {
         let feed = project_run_at(&details, now);
         assert_eq!(feed.feed_version, 1);
         assert_eq!(feed.blocks[0].label, "Run");
-        assert_eq!(feed.blocks[1].label, "Todos");
-        assert_eq!(feed.blocks[2].label, "Progress");
+        assert_eq!(feed.blocks[1].label, "Workers");
+        assert_eq!(feed.blocks[2].label, "Attention");
+        assert_eq!(feed.blocks[3].label, "Checks");
+        assert_eq!(feed.blocks[4].label, "Economics");
+        assert!(feed.blocks.iter().all(|block| block.label != "Commands"));
+        assert!(feed.blocks.iter().all(|block| block.label != "Incidents"));
     }
 
     #[test]
-    fn projection_information_orders_tiers_and_humanizes_activity() {
+    fn dashboard_v2_projection_orders_compact_sections_and_keeps_attention_full() {
         let now = Utc::now();
         let progress_at = now - chrono::Duration::seconds(5);
+        let long_question = "choose a path with the full terminal reason and operator context intact so the renderer must not truncate this attention line".to_string();
+        let noisy_profile =
+            "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast"
+                .to_string();
         let details = RunDetails {
             run: Run {
                 id: "kd-test".to_string(),
@@ -2327,7 +2607,16 @@ mod tests {
                 started_at: now - chrono::Duration::minutes(2),
                 updated_at: now,
             },
-            worker_profile: Default::default(),
+            worker_profile: crate::domain::WorkerProfileEvidence {
+                agent: "pi".to_string(),
+                agent_profile: "implementer".to_string(),
+                agent_provider: "openai-codex".to_string(),
+                agent_model: "gpt-5.5".to_string(),
+                agent_reasoning: "xhigh".to_string(),
+                agent_mode: "fast".to_string(),
+                profile_summary: noisy_profile.clone(),
+                ..Default::default()
+            },
             slice_runs: vec![SliceRun {
                 run_id: "kd-test".to_string(),
                 slice_id: "slice-1".to_string(),
@@ -2367,7 +2656,7 @@ mod tests {
                 run_id: "kd-test".to_string(),
                 slice_id: "slice-1".to_string(),
                 attempt: 1,
-                question: "choose a path".to_string(),
+                question: long_question.clone(),
                 options: Vec::new(),
                 timeout_seconds: 1800,
                 state: "pending".to_string(),
@@ -2376,57 +2665,21 @@ mod tests {
                 answer: String::new(),
             }],
             replan: Default::default(),
-            events: vec![
-                Event {
-                    id: 1,
-                    run_id: "kd-test".to_string(),
-                    typ: "cockpit_ready".to_string(),
-                    payload: serde_json::json!({
-                        "adapter": "herdr",
-                        "workspace": "Khazad-Doom kd-test",
-                        "panes": ["Run Status / Event Feed"]
-                    }),
-                    created_at: now,
-                },
-                Event {
-                    id: 2,
-                    run_id: "kd-test".to_string(),
-                    typ: "terminal_summary_written".to_string(),
-                    payload: serde_json::json!({"path": "/tmp/run-summary.json"}),
-                    created_at: now,
-                },
-                Event {
-                    id: 3,
-                    run_id: "kd-test".to_string(),
-                    typ: "opaque_event".to_string(),
-                    payload: serde_json::json!({"nested": {"raw": true}}),
-                    created_at: now,
-                },
-                Event {
-                    id: 4,
-                    run_id: "kd-test".to_string(),
-                    typ: "progress".to_string(),
-                    payload: serde_json::json!({
-                        "phase": "worker_running",
-                        "slice_id": "slice-1",
-                        "attempt": 1,
-                        "message": "slice worker is running"
-                    }),
-                    created_at: now,
-                },
-                Event {
-                    id: 5,
-                    run_id: "kd-test".to_string(),
-                    typ: "progress".to_string(),
-                    payload: serde_json::json!({
-                        "phase": "worker_running",
-                        "slice_id": "slice-1",
-                        "attempt": 1,
-                        "message": "slice worker is running"
-                    }),
-                    created_at: now,
-                },
-            ],
+            events: vec![Event {
+                id: 1,
+                run_id: "kd-test".to_string(),
+                typ: "implementation_summary".to_string(),
+                payload: serde_json::json!({
+                    "verify_profile": "full",
+                    "integration_gate": {
+                        "status": "passed",
+                        "summary": "integration gate passed",
+                        "commands": [],
+                        "findings": []
+                    }
+                }),
+                created_at: now,
+            }],
             economics: Some(RunEconomics::default()),
             primary_terminal_reason: None,
             feed: None,
@@ -2450,49 +2703,61 @@ mod tests {
         {
             assert_eq!(labels[index], expected.as_str().expect("block label"));
         }
-        assert!(position(&labels, "Run") < position(&labels, "Todos"));
-        assert!(position(&labels, "Progress") < position(&labels, "Activity"));
-        assert!(position(&labels, "Activity") < position(&labels, "Economics"));
+        for forbidden in golden["forbidden_block_labels"]
+            .as_array()
+            .expect("forbidden block labels")
+        {
+            let forbidden = forbidden.as_str().expect("forbidden block label");
+            assert!(labels.iter().all(|label| *label != forbidden), "{labels:?}");
+        }
 
-        let progress = block_by_label(&feed, "Progress");
-        assert!(progress.lines.iter().any(|line| {
+        let run = block_by_label(&feed, "Run");
+        let run_text = run
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(run_text.contains("profile pi/implementer • openai-codex/gpt-5.5 • xhigh/fast"));
+        assert!(!run_text.contains(&noisy_profile));
+
+        let workers = block_by_label(&feed, "Workers");
+        assert!(
+            workers
+                .lines
+                .iter()
+                .any(|line| line.text.contains("active slice-1"))
+        );
+        assert!(
+            workers
+                .lines
+                .iter()
+                .any(|line| line.text.contains("slice-1"))
+        );
+
+        let attention = block_by_label(&feed, "Attention");
+        let question_line = format!("Question: {long_question}");
+        assert!(
+            attention
+                .lines
+                .iter()
+                .any(|line| line.text == question_line)
+        );
+        assert!(feed.attention.iter().any(|line| line.text == question_line));
+
+        let checks = block_by_label(&feed, "Checks");
+        assert!(checks.lines.iter().any(|line| {
             line.text.contains(
                 golden["semantic_progress_substring"]
                     .as_str()
                     .expect("semantic progress substring"),
             )
         }));
-
-        let activity = block_by_label(&feed, "Activity");
-        let activity_text = activity
-            .lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        for forbidden in golden["forbidden_activity_substrings"]
-            .as_array()
-            .expect("forbidden activity substrings")
-        {
-            let forbidden = forbidden.as_str().expect("forbidden substring");
-            assert!(activity_text.iter().all(|text| !text.contains(forbidden)));
-        }
-        for expected in golden["required_activity_substrings"]
-            .as_array()
-            .expect("required activity substrings")
-        {
-            let expected = expected.as_str().expect("activity substring");
-            assert!(activity_text.iter().any(|text| text.contains(expected)));
-        }
-        assert!(!activity_text.windows(2).any(|pair| pair[0] == pair[1]));
-        let dedup = golden["dedup_activity_substring"]
-            .as_str()
-            .expect("dedup substring");
-        assert_eq!(
-            activity_text
+        assert!(
+            checks
+                .lines
                 .iter()
-                .filter(|text| text.contains(dedup))
-                .count(),
-            1
+                .any(|line| line.text.contains("gate passed"))
         );
 
         let economics = block_by_label(&feed, "Economics");
@@ -2504,14 +2769,7 @@ mod tests {
                     .expect("economics substring")
             )
         );
-        assert!(!economics.lines[0].text.contains("Agent calls: 0 |"));
-    }
-
-    fn position(labels: &[&str], label: &str) -> usize {
-        labels
-            .iter()
-            .position(|value| *value == label)
-            .unwrap_or_else(|| panic!("missing block {label}"))
+        assert!(!economics.lines[0].text.contains("Agent calls:"));
     }
 
     fn block_by_label<'a>(feed: &'a StatusFeed, label: &str) -> &'a StatusFeedBlock {
@@ -2575,23 +2833,35 @@ mod tests {
                 .iter()
                 .any(|command| command == "pi /login")
         );
-        let terminal = feed
+        assert!(feed.blocks.iter().all(|block| block.label != "Terminal"));
+        let attention = feed
             .blocks
             .iter()
-            .find(|block| block.label == "Terminal")
-            .expect("terminal block");
-        assert_eq!(terminal.meta, "agent_auth_required");
+            .find(|block| block.label == "Attention")
+            .expect("attention block");
         assert!(
-            terminal
+            attention
                 .lines
                 .iter()
                 .any(|line| line.text.contains("owner=operator"))
+        );
+        assert!(
+            attention
+                .lines
+                .iter()
+                .any(|line| line.text == "Summary: Pi login required")
+        );
+        assert!(
+            attention
+                .lines
+                .iter()
+                .any(|line| line.text.contains("event:7:run_incident"))
         );
         assert!(feed.blocks.iter().any(|block| block.label == "Commands"));
     }
 
     #[test]
-    fn replan_projection_renders_pending_and_decided_proposals() {
+    fn replan_projection_renders_pending_attention_and_commands() {
         let now = Utc::now();
         let pending = ReplanProposal {
             id: "rp-test-001".to_string(),
@@ -2675,20 +2945,20 @@ mod tests {
         assert!(feed.operator_commands.iter().any(|command| {
             command == "khazad-doom replan accept kd-test rp-test-001 --reason <reason>"
         }));
-        let replan = feed
+        assert!(feed.blocks.iter().all(|block| block.label != "Replan"));
+        let attention = feed
             .blocks
             .iter()
-            .find(|block| block.label == "Replan")
-            .expect("replan block");
-        assert_eq!(replan.meta, "(1 pending, 1 decided)");
-        assert!(replan.lines.iter().any(|line| {
-            line.text.contains("pending rp-test-001") && line.text.contains("risk=intent_affecting")
+            .find(|block| block.label == "Attention")
+            .expect("attention block");
+        assert!(attention.lines.iter().any(|line| {
+            line.text.contains("Pending replan rp-test-001")
+                && line.text.contains("risk=intent_affecting")
         }));
-        assert!(
-            replan
-                .lines
-                .iter()
-                .any(|line| line.text.contains("rejected rp-test-000"))
-        );
+        assert!(attention.lines.iter().any(|line| {
+            line.text
+                .contains("Proposed change: add_followup_slice:slice-1-followup")
+        }));
+        assert!(feed.blocks.iter().any(|block| block.label == "Commands"));
     }
 }

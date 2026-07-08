@@ -1900,7 +1900,7 @@ fn render_feed_monitor(out: &mut impl Write, feed: &StatusFeed) -> Result<()> {
     Ok(())
 }
 
-const MONITOR_LINE_WIDTH: usize = 180;
+const MONITOR_LINE_WIDTH: usize = 96;
 
 fn render_monitor_snapshot(
     details: Option<&RunDetails>,
@@ -2210,6 +2210,64 @@ mod tests {
         assert!(rendered.contains("assistant: hello world"));
         assert!(rendered.contains("unknown event ignored"));
         assert!(rendered.contains("wrapper terminal artifacts observed"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_monitor_dashboard_v2_uses_feed_only_and_keeps_attention_unbounded() -> Result<()> {
+        let long_attention = "Attention: this operator-facing line must remain complete even when it is wider than the compact right dashboard column";
+        let long_dim = "profile implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast with extra wrapping noise";
+        let mut details = test_run_details(TestRunDetailsOptions {
+            status: RunStatus::Running,
+            feed: Some(StatusFeed {
+                feed_version: 1,
+                summary_line: "daemon feed summary".to_string(),
+                terminal_reason: None,
+                operator_commands: vec!["khazad-doom answer kd-test q-1 <answer>".to_string()],
+                attention: vec![crate::domain::StatusFeedLine {
+                    text: long_attention.to_string(),
+                    role: StatusFeedRole::Attention,
+                }],
+                blocks: vec![
+                    crate::domain::StatusFeedBlock {
+                        label: "Run".to_string(),
+                        meta: "● running • kd-test".to_string(),
+                        lines: vec![crate::domain::StatusFeedLine {
+                            text: long_dim.to_string(),
+                            role: StatusFeedRole::Dim,
+                        }],
+                    },
+                    crate::domain::StatusFeedBlock {
+                        label: "Attention".to_string(),
+                        meta: String::new(),
+                        lines: vec![crate::domain::StatusFeedLine {
+                            text: long_attention.to_string(),
+                            role: StatusFeedRole::Attention,
+                        }],
+                    },
+                    crate::domain::StatusFeedBlock {
+                        label: "Commands".to_string(),
+                        meta: String::new(),
+                        lines: vec![crate::domain::StatusFeedLine {
+                            text: "khazad-doom answer kd-test q-1 <answer>".to_string(),
+                            role: StatusFeedRole::Attention,
+                        }],
+                    },
+                ],
+            }),
+            ..Default::default()
+        });
+        details.run.error = "from run error not feed".to_string();
+
+        let mut out = Vec::new();
+        render_run_monitor(&mut out, &details)?;
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains(long_attention));
+        assert!(rendered.contains("khazad-doom answer kd-test q-1 <answer>"));
+        assert!(!rendered.contains(long_dim));
+        assert!(rendered.contains('…'));
+        assert!(!rendered.contains("from run error not feed"));
         Ok(())
     }
 
