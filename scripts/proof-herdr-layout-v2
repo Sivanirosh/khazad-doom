@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/proof-herdr-layout-v2 [--dry-run] [--workers all|1|2|3|4] [--keep] [--focus] [--label LABEL]
+
+Create a scratch Herdr cockpit-layout proof for the v2 Khazad-Doom shape:
+left worker region, right full-height dashboard, and no unused root shell.
+
+Dry-run mode prints the deterministic command plan without invoking Herdr.
+Real mode creates scratch Herdr workspaces, uses harmless shell commands in the
+proof panes, exercises split/move/close/layout mechanics, prints Herdr layout
+JSON, and closes the scratch workspaces unless --keep is supplied.
+
+Environment overrides:
+  HERDR_BIN                         Herdr binary (default: herdr)
+  KHAZAD_HERDR_LAYOUT_PROOF_SLEEP   Seconds harmless pane commands sleep (default: 600)
+USAGE
+}
+
+quote_command() {
+  local out=()
+  local arg
+  for arg in "$@"; do
+    out+=("$(printf '%q' "$arg")")
+  done
+  printf '%s\n' "${out[*]}"
+}
+
+json_get() {
+  local path="$1"
+  python3 -c '
+import json
+import sys
+value = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    value = value[part]
+if not isinstance(value, str):
+    value = str(value)
+print(value)
+' "$path"
+}
+
+pane_command() {
+  local role="$1"
+  local workers="$2"
+  printf "printf 'Khazad-Doom Herdr layout v2 proof\\nrole=%s\\nworkers=%s\\n'; exec sleep %s" \
+    "$role" "$workers" "$sleep_seconds"
+}
+
+run_herdr() {
+  printf '+ %s\n' "$(quote_command "$herdr_bin" "$@")" >&2
+  "$herdr_bin" "$@"
+}
+
+cleanup_workspaces=()
+cleanup_scratch_workspaces() {
+  if [[ "$dry_run" == "1" || "$keep" == "1" ]]; then
+    return 0
+  fi
+  local workspace_id
+  for workspace_id in "${cleanup_workspaces[@]}"; do
+    if [[ -n "$workspace_id" ]]; then
+      run_herdr workspace close "$workspace_id" >/dev/null || true
+    fi
+  done
+}
+
+geometry_note() {
+  local workers="$1"
+  case "$workers" in
+    1)
+      echo "geometry: worker-1 fills the left worker region; dashboard is right full-height."
+      ;;
+    2)
+      echo "geometry: worker-1 and worker-2 are side-by-side inside the left worker region; dashboard is right full-height."
+      ;;
+    3)
+      echo "geometry: Herdr-backed 3-worker fallback: worker-1/worker-3 stacked in the left half of the worker region, worker-2 full-height in the right half; dashboard is right full-height."
+      ;;
+    4)
+      echo "geometry: worker-1/worker-2 above worker-3/worker-4 in a 2x2 grid inside the left worker region; dashboard is right full-height."
+      ;;
+  esac
+}
+
+dry_plan_case() {
+  local workers="$1"
+  local workspace_label="$base_label workers=$workers"
+  local focus_flag="--no-focus"
+  if [[ "$focus" == "1" ]]; then
+    focus_flag="--focus"
+  fi
+
+  printf '\n== dry-run workers=%s ==\n' "$workers"
+  geometry_note "$workers"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" workspace create --cwd "$repo" --label "$workspace_label" "$focus_flag")"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" tab create --workspace '<workspace-id>' --cwd "$repo" --label "$workspace_label move-probe" --no-focus)"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" pane move '<move-probe-pane>' --tab '<target-tab-id>' --split down --target-pane '<root-pane>' --ratio 0.80 --no-focus)"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" pane close '<move-probe-pane>')"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" pane split '<root-pane>' --direction right --ratio 0.68 --cwd "$repo" --no-focus) # right full-height dashboard; root remains left worker region"
+  if [[ "$workers" -ge 2 ]]; then
+    printf '+ %s\n' "$(quote_command "$herdr_bin" pane split '<worker-1-pane>' --direction right --ratio 0.50 --cwd "$repo" --no-focus) # worker-2 side-by-side in worker region"
+  fi
+  if [[ "$workers" -ge 3 ]]; then
+    printf '+ %s\n' "$(quote_command "$herdr_bin" pane split '<worker-1-pane>' --direction down --ratio 0.50 --cwd "$repo" --no-focus) # worker-3 lower-left fallback/grid cell"
+  fi
+  if [[ "$workers" -ge 4 ]]; then
+    printf '+ %s\n' "$(quote_command "$herdr_bin" pane split '<worker-2-pane>' --direction down --ratio 0.50 --cwd "$repo" --no-focus) # worker-4 lower-right grid cell"
+  fi
+  local i
+  for ((i = 1; i <= workers; i++)); do
+    printf '+ %s\n' "$(quote_command "$herdr_bin" pane rename "<worker-$i-pane>" "KD layout v2 worker $i/$workers")"
+    printf '+ %s\n' "$(quote_command "$herdr_bin" pane run "<worker-$i-pane>" "$(pane_command "worker-$i" "$workers")")"
+  done
+  printf '+ %s\n' "$(quote_command "$herdr_bin" pane rename '<dashboard-pane>' "KD layout v2 dashboard $workers workers")"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" pane run '<dashboard-pane>' "$(pane_command dashboard "$workers")")"
+  printf '+ %s\n' "$(quote_command "$herdr_bin" pane layout --pane '<root-pane>')"
+  if [[ "$keep" == "0" ]]; then
+    printf '+ %s\n' "$(quote_command "$herdr_bin" workspace close '<workspace-id>') # cleanup scratch workspace only"
+  else
+    echo '# --keep supplied: scratch workspace is left open for visual inspection.'
+  fi
+}
+
+split_pane() {
+  local anchor_pane="$1"
+  local direction="$2"
+  local ratio="$3"
+  local split_json
+  split_json="$(run_herdr pane split "$anchor_pane" --direction "$direction" --ratio "$ratio" --cwd "$repo" --no-focus)"
+  json_get result.pane.pane_id <<<"$split_json"
+}
+
+rename_and_run_pane() {
+  local pane_id="$1"
+  local label="$2"
+  local role="$3"
+  local workers="$4"
+  run_herdr pane rename "$pane_id" "$label" >/dev/null
+  run_herdr pane run "$pane_id" "$(pane_command "$role" "$workers")" >/dev/null
+}
+
+exercise_move_and_close_probe() {
+  local workspace_id="$1"
+  local target_tab_id="$2"
+  local root_pane="$3"
+  local workers="$4"
+  local workspace_label="$base_label workers=$workers"
+  local tab_json probe_pane
+
+  tab_json="$(run_herdr tab create --workspace "$workspace_id" --cwd "$repo" --label "$workspace_label move-probe" --no-focus)"
+  probe_pane="$(json_get result.root_pane.pane_id <<<"$tab_json")"
+  run_herdr pane rename "$probe_pane" "KD layout v2 move probe $workers" >/dev/null
+  run_herdr pane move "$probe_pane" --tab "$target_tab_id" --split down --target-pane "$root_pane" --ratio 0.80 --no-focus >/dev/null
+  run_herdr pane close "$probe_pane" >/dev/null
+}
+
+run_real_case() {
+  local workers="$1"
+  local workspace_label="$base_label workers=$workers"
+  local focus_flag="--no-focus"
+  if [[ "$focus" == "1" ]]; then
+    focus_flag="--focus"
+  fi
+
+  printf '\n== real workers=%s ==\n' "$workers"
+  geometry_note "$workers"
+
+  local created workspace_id root_pane target_tab_id dashboard_pane worker_2 worker_3 worker_4 layout_json
+  created="$(run_herdr workspace create --cwd "$repo" --label "$workspace_label" "$focus_flag")"
+  workspace_id="$(json_get result.workspace.workspace_id <<<"$created")"
+  cleanup_workspaces+=("$workspace_id")
+  root_pane="$(json_get result.root_pane.pane_id <<<"$created")"
+  target_tab_id="$(json_get result.tab.tab_id <<<"$created")"
+  printf 'scratch_workspace: %s (%s)\n' "$workspace_id" "$workspace_label"
+  printf 'root_worker_pane: %s\n' "$root_pane"
+
+  exercise_move_and_close_probe "$workspace_id" "$target_tab_id" "$root_pane" "$workers"
+
+  dashboard_pane="$(split_pane "$root_pane" right 0.68)"
+  if [[ "$workers" -ge 2 ]]; then
+    worker_2="$(split_pane "$root_pane" right 0.50)"
+  fi
+  if [[ "$workers" -ge 3 ]]; then
+    worker_3="$(split_pane "$root_pane" down 0.50)"
+  fi
+  if [[ "$workers" -ge 4 ]]; then
+    worker_4="$(split_pane "$worker_2" down 0.50)"
+  fi
+
+  rename_and_run_pane "$root_pane" "KD layout v2 worker 1/$workers" worker-1 "$workers"
+  if [[ "$workers" -ge 2 ]]; then
+    rename_and_run_pane "$worker_2" "KD layout v2 worker 2/$workers" worker-2 "$workers"
+  fi
+  if [[ "$workers" -ge 3 ]]; then
+    rename_and_run_pane "$worker_3" "KD layout v2 worker 3/$workers" worker-3 "$workers"
+  fi
+  if [[ "$workers" -ge 4 ]]; then
+    rename_and_run_pane "$worker_4" "KD layout v2 worker 4/$workers" worker-4 "$workers"
+  fi
+  rename_and_run_pane "$dashboard_pane" "KD layout v2 dashboard $workers workers" dashboard "$workers"
+
+  layout_json="$(run_herdr pane layout --pane "$root_pane")"
+  printf 'target_layout_workers_%s: %s\n' "$workers" "$layout_json"
+}
+
+dry_run=0
+workers_spec="all"
+keep=0
+focus=0
+base_label="Khazad-Doom layout v2 proof"
+herdr_bin="${HERDR_BIN:-herdr}"
+sleep_seconds="${KHAZAD_HERDR_LAYOUT_PROOF_SLEEP:-600}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --workers)
+      if [[ $# -lt 2 ]]; then
+        echo "missing value for --workers" >&2
+        exit 2
+      fi
+      workers_spec="$2"
+      shift 2
+      ;;
+    --keep)
+      keep=1
+      shift
+      ;;
+    --focus)
+      focus=1
+      shift
+      ;;
+    --label)
+      if [[ $# -lt 2 ]]; then
+        echo "missing value for --label" >&2
+        exit 2
+      fi
+      base_label="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ! [[ "$sleep_seconds" =~ ^[0-9]+$ ]]; then
+  echo "KHAZAD_HERDR_LAYOUT_PROOF_SLEEP must be a non-negative integer" >&2
+  exit 2
+fi
+
+repo="$(git rev-parse --show-toplevel)"
+
+worker_cases=()
+case "$workers_spec" in
+  all)
+    worker_cases=(1 2 3 4)
+    ;;
+  1|2|3|4)
+    worker_cases=("$workers_spec")
+    ;;
+  *)
+    echo "--workers must be all, 1, 2, 3, or 4" >&2
+    exit 2
+    ;;
+esac
+
+cat <<EOF
+Khazad-Doom Herdr layout v2 proof
+repo: $repo
+mode: $([[ "$dry_run" == "1" ]] && echo dry-run || echo real)
+workers: ${worker_cases[*]}
+target: no unused root shell; left worker region; right full-height dashboard
+EOF
+
+if [[ "$dry_run" == "1" ]]; then
+  for workers in "${worker_cases[@]}"; do
+    dry_plan_case "$workers"
+  done
+  exit 0
+fi
+
+command -v "$herdr_bin" >/dev/null || {
+  echo "Herdr binary not found: $herdr_bin" >&2
+  exit 1
+}
+command -v python3 >/dev/null || {
+  echo "python3 is required to parse Herdr JSON responses" >&2
+  exit 1
+}
+
+trap cleanup_scratch_workspaces EXIT
+for workers in "${worker_cases[@]}"; do
+  run_real_case "$workers"
+done
+
+if [[ "$keep" == "1" ]]; then
+  echo "kept scratch workspaces: ${cleanup_workspaces[*]}"
+else
+  echo "scratch workspaces will be closed by cleanup trap: ${cleanup_workspaces[*]}"
+fi
