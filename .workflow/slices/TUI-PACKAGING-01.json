@@ -1,0 +1,33 @@
+{
+  "id": "TUI-PACKAGING-01",
+  "title": "Native Pi TUI worker packaging policy proof",
+  "goal": "Prove and document that the native Pi TUI worker extension is loaded per attempt as a KD-prepared artifact and is not globally installed as a user-visible Pi extension.",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-PACKAGING-01.json",
+    "package.json",
+    "extensions/khazad-worker/index.js",
+    "extensions/khazad-worker/index.test.mjs",
+    "docs/design/evidence/tui-worker-packaging-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Document that package.json does not list extensions/khazad-worker in pi.extensions and that worker extension loading is per-attempt/embedded by KD.",
+    "Evidence includes generated run artifact examples for .herdr-tui.extension/index.js and .herdr-tui.command.json from a native TUI run.",
+    "Run and record package/release checks: npm pack --dry-run --json, cargo package --list, npm run check:extension, npm run test:extension, and cargo test -q tui_worker.",
+    "The proof document states what packaging policy proves and does not prove."
+  ],
+  "must_ask_if": [
+    "The proof would require globally registering extensions/khazad-worker in package.json pi.extensions.",
+    "Packaging checks show the embedded worker extension source is absent from releasable artifacts."
+  ],
+  "verify": [
+    "npm run check:extension",
+    "npm run test:extension",
+    "cargo test -q tui_worker",
+    "test -f docs/design/evidence/tui-worker-packaging-proof-2026-07-08.md",
+    "grep -q 'per-attempt' docs/design/evidence/tui-worker-packaging-proof-2026-07-08.md",
+    "grep -q 'does not prove' docs/design/evidence/tui-worker-packaging-proof-2026-07-08.md"
+  ]
+}

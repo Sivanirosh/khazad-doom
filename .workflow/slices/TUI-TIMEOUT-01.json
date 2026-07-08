@@ -1,0 +1,28 @@
+{
+  "id": "TUI-TIMEOUT-01",
+  "title": "Native Pi TUI worker timeout proof",
+  "goal": "Prove that KD can time out and clean up a real Herdr-hosted native Pi TUI worker that does not submit an accepted result artifact in time.",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-TIMEOUT-01.json",
+    "docs/design/evidence/tui-worker-timeout-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Document a real KD run started with --experimental-pi-tui-worker and a deliberately tiny worker_attempt_timeout_seconds value, including the exact temporary config or command setup used and the run id.",
+    "Evidence includes cockpit_worker_ready.source_of_truth = kd_tui_result_artifact, a worker_attempt_timeout event, terminal failed/blocked status, and a final-report/incident timeout reason.",
+    "Evidence shows no accepted worker success result was used after timeout and the Herdr pane id from cockpit_worker_ready is closed or absent from herdr pane list.",
+    "The proof document states what timeout cleanup proves and does not prove."
+  ],
+  "must_ask_if": [
+    "The timeout proof would require leaving worker_attempt_timeout_seconds permanently changed in .workflow/khazad.json.",
+    "The worker submits a valid complete result before timeout, making the proof invalid."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-timeout-proof-2026-07-08.md",
+    "grep -q worker_attempt_timeout docs/design/evidence/tui-worker-timeout-proof-2026-07-08.md",
+    "grep -q kd_tui_result_artifact docs/design/evidence/tui-worker-timeout-proof-2026-07-08.md",
+    "grep -q 'does not prove' docs/design/evidence/tui-worker-timeout-proof-2026-07-08.md"
+  ]
+}

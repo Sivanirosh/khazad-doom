@@ -31,6 +31,15 @@ pub(crate) struct PiWrapperArtifacts {
     pub result_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PiTuiWorkerArtifacts {
+    pub prompt_path: PathBuf,
+    pub command_path: PathBuf,
+    pub result_path: PathBuf,
+    pub extension_dir: PathBuf,
+    pub extension_index_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SliceClosureIncident {
     pub severity: String,
@@ -143,6 +152,29 @@ impl Store {
             exit_path: path("exit.json"),
             status_path: path("status.json"),
             result_path: path("result.json"),
+        })
+    }
+
+    pub(crate) fn pi_tui_worker_artifacts_for_output_path(
+        &self,
+        output_path: &Path,
+    ) -> Result<PiTuiWorkerArtifacts> {
+        let parent = output_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("worker output path has no parent"))?;
+        let file_name = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("worker output path is not UTF-8"))?;
+        let prefix = file_name.strip_suffix(".json").unwrap_or(file_name);
+        let path = |suffix: &str| parent.join(format!("{prefix}.herdr-tui.{suffix}"));
+        let extension_dir = path("extension");
+        Ok(PiTuiWorkerArtifacts {
+            prompt_path: path("prompt.md"),
+            command_path: path("command.json"),
+            result_path: path("result.json"),
+            extension_index_path: extension_dir.join("index.js"),
+            extension_dir,
         })
     }
 

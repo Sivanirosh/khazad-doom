@@ -1,0 +1,30 @@
+{
+  "id": "LAYOUT-02",
+  "title": "Cockpit layout planner and Herdr adapter methods",
+  "goal": "Introduce a small cockpit layout planning interface and Herdr adapter methods that can place dashboard and worker panes intentionally instead of relying on ad hoc split order.",
+  "depends_on": [
+    "LAYOUT-01"
+  ],
+  "areas": [
+    ".workflow/slices/LAYOUT-02.json",
+    "src/workflow/cockpit.rs",
+    "src/workflow/manager.rs",
+    "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Add a tested layout planner for the v2 cockpit contract: dashboard right, worker region left, stable worker slot names for 1-4 workers, and no default Operator column.",
+    "Add Herdr adapter operations needed by the planner, such as dashboard pane creation or reuse, placeholder/root-pane cleanup, worker pane movement or slot placement, and layout inspection, while keeping the adapter as the only Herdr-specific implementation seam.",
+    "Existing cockpit open/fallback semantics remain non-fatal visibility behavior; Herdr layout failures must not change worker authorization, verification, merge, handoff readiness, or run terminal status by themselves.",
+    "Record layout-related incidents/events as observability metadata only; do not make Herdr pane text, scrollback, metadata, or Pi display state correctness evidence."
+  ],
+  "must_ask_if": [
+    "The layout planner needs a public CLI surface or persistent config change beyond an internal experimental/default cockpit behavior.",
+    "The implementation would require treating Herdr state as workflow truth."
+  ],
+  "verify": [
+    "cargo test -q cockpit_layout",
+    "cargo test -q cockpit_tui_worker_uses_herdr_agent_start_semantics",
+    "cargo check -q",
+    "git diff --check"
+  ]
+}

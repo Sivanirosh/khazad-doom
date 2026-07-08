@@ -1,0 +1,27 @@
+{
+  "id": "TUI-REPAIR-01",
+  "title": "Native Pi TUI targeted repair proof",
+  "goal": "Prove that a native Pi TUI worker result can fail slice verification, trigger bounded targeted repair, rerun verification, and merge only after post-repair verification passes.",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-REPAIR-01.json",
+    "docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Document a native Pi TUI proof where the first accepted worker result artifact fails a slice verify command and KD records the check failure.",
+    "Evidence includes targeted slice repair attempt launch, repair output from a KD-owned artifact path, verify rerun, post-repair pass, and merge only after post-repair verification passes.",
+    "The proof document distinguishes slice repair from integration repair and states what repair behavior proves and does not prove."
+  ],
+  "must_ask_if": [
+    "The repair proof would require authorizing paths outside the proof slice areas or weakening path guards.",
+    "The worker tries to change workflow policy, profiles, verification commands, or unrelated slices as part of repair."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+    "grep -q 'targeted' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+    "grep -q 'post-repair' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md",
+    "grep -q 'does not prove' docs/design/evidence/tui-worker-repair-proof-2026-07-08.md"
+  ]
+}

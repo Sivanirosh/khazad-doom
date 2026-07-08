@@ -3,8 +3,10 @@ use super::attention::{
     WorkerPaneTerminalRename,
 };
 use super::cockpit::{
-    CockpitLaunch, CockpitWorkerLaunch, CockpitWorkerPaneRequest, open_default_run_cockpit,
-    open_default_worker_pane, take_cockpit_mode_transport_arg, worker_activity_pane_command,
+    CockpitLaunch, CockpitTuiWorkerLaunch, CockpitTuiWorkerRequest, CockpitWorkerLaunch,
+    CockpitWorkerPaneRequest, close_default_pane, open_default_run_cockpit,
+    open_default_tui_worker_agent, open_default_worker_pane, take_cockpit_mode_transport_arg,
+    worker_activity_pane_command,
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::events as workflow_events;
@@ -21,6 +23,7 @@ use super::{
 use crate::agent::{
     CancellationToken, Job, PiCommandSpec, Runner, RunnerError, RunnerEvent, RunnerEventSink,
     RunnerLaunchFailure, RunnerMetadata, RunnerTranscript, collect_pi_wrapper_result,
+    parse_pi_tui_worker_result_artifact, prepare_pi_tui_worker_artifacts,
     prepare_pi_wrapper_artifacts, runner_from_spec, wait_for_pi_wrapper_launch,
     worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
 };
@@ -127,6 +130,7 @@ pub struct StartOptions {
     pub agent: String,
     pub pi_bin: String,
     pub pi_args: Vec<String>,
+    pub experimental_pi_tui_worker: bool,
     pub parallelism: usize,
     pub allow_dirty: bool,
     pub origin_notification_target: String,
@@ -160,6 +164,7 @@ pub struct ResumeOptions {
     pub agent: String,
     pub pi_bin: String,
     pub pi_args: Vec<String>,
+    pub experimental_pi_tui_worker: bool,
     pub parallelism: usize,
 }
 
@@ -200,6 +205,7 @@ struct WorkerExecutionContext {
     economics: RunEconomicsRecorder,
     verification_cache: VerificationCommandCache,
     worker_token: String,
+    experimental_pi_tui_worker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +217,7 @@ struct WorkerAttemptContext {
     timeout_seconds: u64,
     no_output_warning_seconds: u64,
     termination_grace_seconds: u64,
+    experimental_pi_tui_worker: bool,
 }
 
 struct AgentCallContext<'a> {
@@ -241,6 +248,7 @@ struct WorkerAttemptRunRequest<'a> {
     cancel: &'a CancellationToken,
     worker_token: &'a str,
     cockpit_mode: CockpitMode,
+    experimental_pi_tui_worker: bool,
     primary_failure: &'a mut Option<String>,
     secondary_failures: &'a mut Vec<String>,
     last_failure: &'a mut String,
@@ -279,6 +287,7 @@ struct TargetedSliceRepairRequest<'a> {
     cancel: &'a CancellationToken,
     worker_token: &'a str,
     cockpit_mode: CockpitMode,
+    experimental_pi_tui_worker: bool,
     all_checks: &'a mut Vec<CheckResult>,
 }
 
@@ -303,6 +312,7 @@ impl WorkerAttemptContext {
         slice_id: &str,
         attempt: usize,
         config: &WorkflowConfig,
+        experimental_pi_tui_worker: bool,
     ) -> Self {
         Self {
             run_id: run_id.to_string(),
@@ -312,6 +322,7 @@ impl WorkerAttemptContext {
             timeout_seconds: config.worker_attempt_timeout_seconds,
             no_output_warning_seconds: config.worker_no_output_warning_seconds,
             termination_grace_seconds: config.worker_termination_grace_seconds,
+            experimental_pi_tui_worker,
         }
     }
 }
@@ -768,16 +779,30 @@ impl Manager {
         cockpit_mode: CockpitMode,
         output_path: &Path,
     ) -> Result<crate::agent::ResultData> {
-        match self.try_run_herdr_worker_job(
-            &spec,
-            &job,
-            cancel.clone(),
-            events.clone(),
-            context,
-            run,
-            cockpit_mode,
-            output_path,
-        ) {
+        let result = if context.experimental_pi_tui_worker {
+            self.try_run_herdr_tui_worker_job(
+                &spec,
+                &job,
+                cancel.clone(),
+                events.clone(),
+                context,
+                run,
+                cockpit_mode,
+                output_path,
+            )
+        } else {
+            self.try_run_herdr_worker_job(
+                &spec,
+                &job,
+                cancel.clone(),
+                events.clone(),
+                context,
+                run,
+                cockpit_mode,
+                output_path,
+            )
+        };
+        match result {
             Ok(data) => Ok(data),
             Err(CockpitWorkerJobError::Fallback(message)) => {
                 self.record_cockpit_worker_fallback(run, context, cockpit_mode, &message)?;
@@ -862,6 +887,87 @@ impl Manager {
         };
         collect_pi_wrapper_result(job, &artifacts, cancel, events, pid)
             .map_err(CockpitWorkerJobError::Worker)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_run_herdr_tui_worker_job(
+        &self,
+        spec: &PiCommandSpec,
+        job: &Job,
+        cancel: CancellationToken,
+        events: Option<RunnerEventSink>,
+        context: &WorkerAttemptContext,
+        run: &Run,
+        cockpit_mode: CockpitMode,
+        output_path: &Path,
+    ) -> std::result::Result<crate::agent::ResultData, CockpitWorkerJobError> {
+        if cancel.is_cancelled() {
+            return Err(CockpitWorkerJobError::Worker(anyhow!("job cancelled")));
+        }
+        let artifacts = artifact::Store::new(&run.repo_path)
+            .pi_tui_worker_artifacts_for_output_path(output_path)
+            .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
+        let session_name = tui_worker_session_name(&run.id, &context.slice_id, context.attempt);
+        let argv = prepare_pi_tui_worker_artifacts(spec, job, &artifacts, &session_name)
+            .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
+        let mut env = job
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        env.push((
+            "KHAZAD_WORKER_RESULT_PATH".to_string(),
+            artifacts.result_path.to_string_lossy().to_string(),
+        ));
+        env.push(("KHAZAD_COCKPIT_WORKER".to_string(), "1".to_string()));
+        env.push((
+            "KHAZAD_COCKPIT_SOURCE_OF_TRUTH".to_string(),
+            "kd_tui_result_artifact".to_string(),
+        ));
+        let worker_request = CockpitTuiWorkerRequest {
+            run_id: run.id.clone(),
+            slice_id: context.slice_id.clone(),
+            attempt: context.attempt,
+            name: session_name,
+            argv,
+            cwd: job.cwd.clone(),
+            env,
+        };
+        let opened = match open_default_tui_worker_agent(
+            run,
+            cockpit_mode,
+            &self.paths.root,
+            &worker_request,
+        ) {
+            Ok(CockpitTuiWorkerLaunch::Opened(opened)) => opened,
+            Ok(CockpitTuiWorkerLaunch::SkippedDirect) => {
+                return Err(CockpitWorkerJobError::Fallback(
+                    "cockpit mode resolved to direct before TUI worker launch".to_string(),
+                ));
+            }
+            Err(unavailable) => return Err(CockpitWorkerJobError::Fallback(unavailable.message)),
+        };
+        self.state
+            .record_event(
+                &run.id,
+                workflow_events::COCKPIT_WORKER_READY,
+                &workflow_events::CockpitWorkerReadyPayload {
+                    adapter: opened.adapter,
+                    mode: opened.mode.as_str().to_string(),
+                    workspace: opened.workspace_label,
+                    pane: opened.agent_name,
+                    pane_id: opened.pane_id.clone(),
+                    slice_id: context.slice_id.clone(),
+                    attempt: context.attempt,
+                    source_of_truth: "kd_tui_result_artifact".to_string(),
+                },
+            )
+            .map_err(CockpitWorkerJobError::Worker)?;
+        if let Some(sink) = &events {
+            sink(RunnerEvent::started(None));
+        }
+        let result = wait_for_pi_tui_worker_result(&artifacts, cancel, events, opened.pane_id);
+        result.map_err(CockpitWorkerJobError::Worker)
     }
 
     fn record_cockpit_worker_fallback(
@@ -1159,6 +1265,7 @@ impl Manager {
         }
         let runner = self.runner_for_options(&opts, &config)?;
         let parallelism = effective_parallelism(opts.parallelism, &config);
+        let experimental_pi_tui_worker = opts.experimental_pi_tui_worker;
         let base_branch = if config.base_branch.trim().is_empty() {
             gitutil::current_branch(&repo.path).unwrap_or_default()
         } else {
@@ -1224,6 +1331,8 @@ impl Manager {
                 "allow_dirty": opts.allow_dirty,
                 "status_porcelain": dirty_status,
                 "selected_slices": &selected_ids,
+                "experimental_pi_tui_worker": experimental_pi_tui_worker,
+                "worker_interface": if experimental_pi_tui_worker { "native_pi_tui" } else { "json_wrapper" },
                 "daemon_path": std::env::var("PATH").unwrap_or_default(),
                 "created_at": now,
             }),
@@ -1286,6 +1395,7 @@ impl Manager {
                 IntegrationMode::Fresh,
                 cockpit_mode,
                 worker_token,
+                experimental_pi_tui_worker,
             );
         });
         Ok(run)
@@ -1385,10 +1495,15 @@ impl Manager {
             })?;
         }
         self.state.update_run(&run.id, RunStatus::Running, "")?;
+        let experimental_pi_tui_worker =
+            opts.experimental_pi_tui_worker || run_preflight_experimental_pi_tui_worker(&run);
         self.state.record_event(
             &run.id,
             "run_resumed",
-            &json!({ "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>() }),
+            &json!({
+                "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>(),
+                "experimental_pi_tui_worker": experimental_pi_tui_worker,
+            }),
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let config = store.read_config()?;
@@ -1417,6 +1532,7 @@ impl Manager {
                 IntegrationMode::Existing,
                 cockpit_mode,
                 worker_token,
+                experimental_pi_tui_worker,
             );
         });
         self.state
@@ -1740,6 +1856,7 @@ impl Manager {
         integration_mode: IntegrationMode,
         cockpit_mode: CockpitMode,
         worker_token: String,
+        experimental_pi_tui_worker: bool,
     ) {
         let outcome = self.run_slices(
             &run,
@@ -1751,6 +1868,7 @@ impl Manager {
             integration_mode,
             cockpit_mode,
             worker_token,
+            experimental_pi_tui_worker,
         );
         let (terminal_status, terminal_message) = match &outcome {
             Ok(_) => {
@@ -1836,6 +1954,7 @@ impl Manager {
         integration_mode: IntegrationMode,
         cockpit_mode: CockpitMode,
         worker_token: String,
+        experimental_pi_tui_worker: bool,
     ) -> Result<ImplementationSummary> {
         check_cancelled(cancel)?;
         let store = artifact::Store::new(&run.repo_path);
@@ -1915,6 +2034,7 @@ impl Manager {
                 economics: economics.clone(),
                 verification_cache: verification_cache.clone(),
                 worker_token: worker_token.clone(),
+                experimental_pi_tui_worker,
             };
             let outcomes = self.run_worker_layer(&layer, &worker_context, parallelism)?;
             worker_phase.finish();
@@ -2693,6 +2813,7 @@ impl Manager {
                     cancel,
                     worker_token: &ctx.worker_token,
                     cockpit_mode: ctx.cockpit_mode,
+                    experimental_pi_tui_worker: ctx.experimental_pi_tui_worker,
                     primary_failure: &mut primary_failure,
                     secondary_failures: &mut secondary_failures,
                     last_failure: &mut last_failure,
@@ -2858,6 +2979,7 @@ impl Manager {
                         cancel,
                         worker_token: &ctx.worker_token,
                         cockpit_mode: ctx.cockpit_mode,
+                        experimental_pi_tui_worker: ctx.experimental_pi_tui_worker,
                         all_checks: &mut all_checks,
                     })?
                 {
@@ -3434,6 +3556,7 @@ impl Manager {
                 &slice.id,
                 attempt,
                 request.config,
+                request.experimental_pi_tui_worker,
             ),
             request.economics,
             AgentCallContext {
@@ -3663,6 +3786,7 @@ impl Manager {
                     &request.slice.id,
                     request.attempt,
                     request.config,
+                    request.experimental_pi_tui_worker,
                 ),
                 request.economics,
                 AgentCallContext {
@@ -3851,6 +3975,7 @@ impl Manager {
             request.cancel,
             request.worker_token,
             request.cockpit_mode,
+            request.experimental_pi_tui_worker,
             request.last_failure,
             invalid_artifact,
             request.primary_failure,
@@ -3886,6 +4011,7 @@ impl Manager {
         cancel: &CancellationToken,
         worker_token: &str,
         cockpit_mode: CockpitMode,
+        experimental_pi_tui_worker: bool,
         initial_failure: &str,
         initial_invalid_artifact: &Path,
         primary_failure: &mut Option<String>,
@@ -3934,6 +4060,7 @@ impl Manager {
                     &slice.id,
                     attempt,
                     config,
+                    experimental_pi_tui_worker,
                 ),
                 economics,
                 AgentCallContext {
@@ -4101,7 +4228,14 @@ impl Manager {
                     termination_grace_seconds: 0,
                 },
                 cancel,
-                WorkerAttemptContext::new(&run.id, "integration_repair", "", attempt, config),
+                WorkerAttemptContext::new(
+                    &run.id,
+                    "integration_repair",
+                    "",
+                    attempt,
+                    config,
+                    false,
+                ),
                 &economics,
                 AgentCallContext {
                     phase: "integration_repair",
@@ -5455,6 +5589,55 @@ fn new_worker_token() -> String {
     hex::encode(bytes)
 }
 
+fn run_preflight_experimental_pi_tui_worker(run: &Run) -> bool {
+    let store = artifact::Store::new(&run.repo_path);
+    artifact::read_json::<serde_json::Value>(store.output_path(&run.id, "preflight.json"))
+        .ok()
+        .and_then(|value| {
+            value
+                .get("experimental_pi_tui_worker")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn tui_worker_session_name(run_id: &str, slice_id: &str, attempt: usize) -> String {
+    format!("kd-tui-{run_id}-{slice_id}-attempt-{attempt}")
+}
+
+fn wait_for_pi_tui_worker_result(
+    artifacts: &artifact::PiTuiWorkerArtifacts,
+    cancel: CancellationToken,
+    events: Option<RunnerEventSink>,
+    pane_id: String,
+) -> Result<crate::agent::ResultData> {
+    let mut next_observation = Instant::now();
+    loop {
+        if artifacts.result_path.exists() {
+            let data = parse_pi_tui_worker_result_artifact(artifacts)?;
+            if let Some(sink) = &events {
+                sink(RunnerEvent::finished(None, Some(0)));
+            }
+            let _ = close_default_pane(&pane_id);
+            return Ok(data);
+        }
+        if cancel.is_cancelled() {
+            let _ = close_default_pane(&pane_id);
+            if let Some(sink) = &events {
+                sink(RunnerEvent::finished(None, None));
+            }
+            bail!("job cancelled");
+        }
+        if Instant::now() >= next_observation {
+            if let Some(sink) = &events {
+                sink(RunnerEvent::process_observed(None));
+            }
+            next_observation = Instant::now() + Duration::from_secs(1);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn worker_job_env(
     paths: &Paths,
     run: &Run,
@@ -5761,6 +5944,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 2,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -5775,6 +5959,47 @@ mod tests {
                 .iter()
                 .all(|slice_run| slice_run.status == SliceStatus::Merged)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn experimental_tui_worker_flag_is_recorded_in_run_preflight() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut only = slice("slice-001");
+        only.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &only)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            experimental_pi_tui_worker: true,
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+        })?;
+
+        let preflight: serde_json::Value =
+            artifact::read_json(store.output_path(&run.id, "preflight.json"))?;
+        assert_eq!(preflight["experimental_pi_tui_worker"], true);
+        assert_eq!(preflight["worker_interface"], "native_pi_tui");
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
         Ok(())
     }
 
@@ -5811,6 +6036,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 2,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -5878,6 +6104,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6027,6 +6254,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: "agent-1".to_string(),
@@ -6402,6 +6630,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6489,6 +6718,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6532,6 +6762,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: true,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6565,6 +6796,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
         })?;
 
@@ -6585,6 +6817,12 @@ mod tests {
                 .count(),
             1
         );
+        let events = state.get_events(&run.id, 20)?;
+        let resumed_event = events
+            .iter()
+            .find(|event| event.typ == "run_resumed")
+            .expect("run_resumed event");
+        assert_eq!(resumed_event.payload["experimental_pi_tui_worker"], true);
         let summary: ImplementationSummary =
             artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
         assert_eq!(summary.final_sha, head_after);
@@ -6641,6 +6879,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
         })?;
 
@@ -6709,6 +6948,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
         })?;
 
@@ -6759,6 +6999,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6834,6 +7075,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6892,6 +7134,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -6955,6 +7198,7 @@ mod tests {
                 agent: "fake".to_string(),
                 pi_bin: String::new(),
                 pi_args: Vec::new(),
+                experimental_pi_tui_worker: false,
                 parallelism: 1,
                 allow_dirty: false,
                 origin_notification_target: String::new(),
@@ -7021,6 +7265,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7060,6 +7305,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: true,
             origin_notification_target: String::new(),
@@ -7109,6 +7355,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7164,6 +7411,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7227,6 +7475,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7280,6 +7529,7 @@ mod tests {
                 agent: "fake".to_string(),
                 pi_bin: String::new(),
                 pi_args: Vec::new(),
+                experimental_pi_tui_worker: false,
                 parallelism: 1,
                 allow_dirty: false,
                 origin_notification_target: String::new(),
@@ -7349,6 +7599,7 @@ mod tests {
             agent: String::new(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 0,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7385,6 +7636,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7398,6 +7650,7 @@ mod tests {
                 agent: "fake".to_string(),
                 pi_bin: String::new(),
                 pi_args: Vec::new(),
+                experimental_pi_tui_worker: false,
                 parallelism: 1,
                 allow_dirty: false,
                 origin_notification_target: String::new(),
@@ -7440,6 +7693,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 2,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7493,6 +7747,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
@@ -7577,6 +7832,7 @@ mod tests {
             agent: "fake".to_string(),
             pi_bin: String::new(),
             pi_args: Vec::new(),
+            experimental_pi_tui_worker: false,
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),

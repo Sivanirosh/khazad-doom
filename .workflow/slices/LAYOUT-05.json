@@ -1,0 +1,28 @@
+{
+  "id": "LAYOUT-05",
+  "title": "Real KD dogfood proof for cockpit layout v2",
+  "goal": "Prove the polished cockpit layout v2 in a real daemon-owned native Pi TUI run, with Herdr used only for observability and submit_worker_result/KD artifacts used as worker truth.",
+  "depends_on": [
+    "LAYOUT-04"
+  ],
+  "areas": [
+    ".workflow/slices/LAYOUT-05.json",
+    "docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Run a real KD native Pi TUI dogfood slice after LAYOUT-04 and document the run id, command, terminal state, cockpit_worker_ready event, worker pane ids/slots, layout observation, result artifact, checks, merge, and final report path.",
+    "The evidence shows no unwanted root shell pane and no default Operator column in the v2 cockpit layout, or records any remaining limitation as a blocker before default promotion.",
+    "The worker result comes from khazad_worker_submit_worker_result_v1 through a kd_tui_result_artifact path; terminal text and Herdr scrollback are explicitly excluded as correctness evidence.",
+    "The proof document states what the dogfood proves and what it does not prove."
+  ],
+  "must_ask_if": [
+    "The proof would require treating a screenshot or pane text as correctness evidence.",
+    "The dogfood run fails in a way that suggests a layout v2 invariant is wrong rather than a transient Herdr/Pi launch issue."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+    "grep -q kd_tui_result_artifact docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+    "grep -q khazad_worker_submit_worker_result_v1 docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md",
+    "grep -q 'does not prove' docs/design/evidence/herdr-layout-v2-dogfood-2026-07-08.md"
+  ]
+}

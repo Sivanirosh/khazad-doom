@@ -1,0 +1,40 @@
+{
+  "id": "TUI-PROOF-01",
+  "title": "Native Pi TUI worker result-channel proof",
+  "goal": "Prove, without replacing the current JSON-wrapper worker path, that a real interactive Pi TUI session can run in Herdr with a Khazad worker extension loaded per launch and submit authoritative worker output through a KD-owned artifact channel instead of terminal scraping.",
+  "status": "open",
+  "depends_on": [],
+  "areas": [
+    ".workflow/slices/TUI-PROOF-01.json",
+    "extensions/khazad-worker/index.js",
+    "extensions/khazad-worker/index.test.mjs",
+    "package.json",
+    "scripts/proof-pi-tui-worker",
+    "docs/design/evidence/pi-tui-worker-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "The existing daemon JSON-wrapper Pi worker path remains unchanged and remains the production/fallback path.",
+    "The Khazad worker extension exposes a terminating submit_worker_result tool that accepts the worker-result contract, validates basic required fields, writes an atomic JSON artifact at KHAZAD_WORKER_RESULT_PATH, and does not rely on terminal text, Herdr scrollback, or Herdr metadata.",
+    "submit_worker_result returns non-terminating validation failures for invalid worker output or slice-id mismatches so the Pi TUI worker can correct the tool call instead of silently producing bad evidence.",
+    "A bounded proof launcher can start a real Herdr-hosted Pi TUI with the worker extension loaded explicitly per launch and KD context passed through environment variables.",
+    "ask_operator remains available through daemon IPC when KD worker environment variables are present, and unavailable/timeout behavior remains a blocked-contract signal rather than invented operator intent.",
+    "Evidence documentation clearly separates what is proven by this slice from what remains unproven before any production replacement, especially daemon-owned timeout, cancellation, lifecycle integration, and packaging policy."
+  ],
+  "must_ask_if": [
+    "The implementation would replace, default-enable, or remove the current JSON-wrapper worker path.",
+    "The implementation would treat terminal text, Herdr pane text, Herdr scrollback, Herdr agent state, or Pi TUI display state as authoritative worker result evidence.",
+    "The implementation would bypass daemon validation, scope checks, verification gates, repair budgets, cancellation, merge, or handoff state.",
+    "The implementation would make Herdr or a Pi UI extension required for headless/default worker execution.",
+    "The implementation would answer operator questions by typing into a worker pane instead of using KD daemon commands or ask_operator IPC."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "node --check extensions/khazad-worker/index.js",
+    "node --test extensions/khazad-worker/index.test.mjs",
+    "npm run test:extension",
+    "bash -n scripts/proof-pi-tui-worker",
+    "scripts/proof-pi-tui-worker --dry-run",
+    "khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 600
+}

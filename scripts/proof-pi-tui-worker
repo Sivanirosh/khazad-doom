@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/proof-pi-tui-worker [--dry-run] [--wait-seconds N]
+
+Launch a native Pi TUI proof worker in Herdr with the Khazad worker extension
+loaded explicitly through pi --extension. This is an observability proof only;
+it does not replace the daemon's current JSON-wrapper worker path.
+
+Environment overrides:
+  HERDR_BIN                  Herdr binary (default: herdr)
+  KHAZAD_PI_BIN             Pi binary (default: pi)
+  KHAZAD_PI_TUI_PROOF_DIR   Output dir (default: .workflow/runs/<proof-id>)
+  KHAZAD_DAEMON_SOCKET      Optional daemon socket for ask_operator proof
+USAGE
+}
+
+quote_command() {
+  local out=()
+  local arg
+  for arg in "$@"; do
+    out+=("$(printf '%q' "$arg")")
+  done
+  printf '%s\n' "${out[*]}"
+}
+
+wait_seconds=0
+dry_run=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --wait-seconds)
+      if [[ $# -lt 2 ]]; then
+        echo "missing value for --wait-seconds" >&2
+        exit 2
+      fi
+      wait_seconds="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+repo="$(git rev-parse --show-toplevel)"
+herdr_bin="${HERDR_BIN:-herdr}"
+pi_bin="${KHAZAD_PI_BIN:-pi}"
+proof_id="kd-pi-tui-proof-$(date -u +%Y%m%d-%H%M%S)"
+proof_dir="${KHAZAD_PI_TUI_PROOF_DIR:-$repo/.workflow/runs/$proof_id}"
+prompt_path="$proof_dir/prompt.md"
+result_path="$proof_dir/result.json"
+extension_path="$repo/extensions/khazad-worker"
+mkdir -p "$proof_dir"
+
+cat > "$prompt_path" <<EOF
+You are running a Khazad-Doom native Pi TUI proof, not a real implementation slice.
+
+Constraints:
+- Do not edit files.
+- Do not run shell commands.
+- Do not paste final JSON into the terminal.
+- Use the submit_worker_result tool as your final action.
+- If ask_operator is unavailable, report that only inside the submitted worker result.
+
+Submit exactly this worker result, preserving the fields and criterion text:
+
+{
+  "slice_id": "TUI-PROOF-01",
+  "status": "complete",
+  "summary": "Native Pi TUI proof submitted through the Khazad worker extension artifact channel.",
+  "changed_files": [],
+  "tests_run": [],
+  "acceptance_status": [
+    {
+      "criterion": "A real interactive Pi TUI session can be launched in Herdr with the Khazad worker extension loaded per launch.",
+      "status": "satisfied",
+      "evidence": "submit_worker_result was available in the native Pi TUI session and wrote KHAZAD_WORKER_RESULT_PATH."
+    },
+    {
+      "criterion": "KD can receive the worker result through an artifact channel without scraping terminal text or Herdr scrollback.",
+      "status": "satisfied",
+      "evidence": "The authoritative proof output is the JSON artifact at KHAZAD_WORKER_RESULT_PATH, not terminal text."
+    }
+  ],
+  "assumptions": [
+    "This proof does not replace the current JSON wrapper worker path.",
+    "Timeout and cancellation remain unproven for production until a daemon-owned TUI runner supervises the Herdr process/session."
+  ]
+}
+EOF
+
+cmd=(
+  "$herdr_bin" agent start "$proof_id"
+  --cwd "$repo"
+  --focus
+  --env "KHAZAD_RUN_ID=$proof_id"
+  --env "KHAZAD_SLICE_ID=TUI-PROOF-01"
+  --env "KHAZAD_ATTEMPT=1"
+  --env "KHAZAD_WORKER_TOKEN=proof-token"
+  --env "KHAZAD_WORKER_RESULT_PATH=$result_path"
+)
+if [[ -n "${KHAZAD_DAEMON_SOCKET:-}" ]]; then
+  cmd+=(--env "KHAZAD_DAEMON_SOCKET=$KHAZAD_DAEMON_SOCKET")
+fi
+cmd+=(
+  --
+  "$pi_bin"
+  --no-extensions
+  --extension "$extension_path"
+  --no-builtin-tools
+  --tools submit_worker_result,ask_operator
+  --name "$proof_id"
+  "@$prompt_path"
+)
+
+cat <<EOF
+Khazad-Doom native Pi TUI proof
+proof_id: $proof_id
+proof_dir: $proof_dir
+prompt_path: $prompt_path
+result_path: $result_path
+command: $(quote_command "${cmd[@]}")
+EOF
+
+if [[ "$dry_run" == "1" ]]; then
+  exit 0
+fi
+
+"${cmd[@]}"
+
+if [[ "$wait_seconds" =~ ^[0-9]+$ ]] && [[ "$wait_seconds" -gt 0 ]]; then
+  deadline=$((SECONDS + wait_seconds))
+  while [[ ! -s "$result_path" && "$SECONDS" -lt "$deadline" ]]; do
+    sleep 1
+  done
+  if [[ -s "$result_path" ]]; then
+    echo "submit_worker_result artifact:"
+    cat "$result_path"
+  else
+    echo "timed out waiting for $result_path" >&2
+    exit 1
+  fi
+fi

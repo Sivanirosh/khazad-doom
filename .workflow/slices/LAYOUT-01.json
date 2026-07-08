@@ -1,0 +1,27 @@
+{
+  "id": "LAYOUT-01",
+  "title": "Scratch Herdr cockpit layout v2 proof",
+  "goal": "Create a deterministic scratch proof for the desired Herdr cockpit layout v2 before changing daemon worker placement: no unused root shell, left worker region, right full-height dashboard, and documented 1-4 worker geometry.",
+  "areas": [
+    ".workflow/slices/LAYOUT-01.json",
+    "scripts/proof-herdr-layout-v2",
+    "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Add scripts/proof-herdr-layout-v2 with a dry-run mode and a real mode that uses harmless shell commands, not KD workers, to exercise Herdr pane split/move/close/layout mechanics for the v2 cockpit shape.",
+    "The proof defines the target layout as a left worker region and a right full-height dashboard, with 1 worker filling the worker region, 2 workers side-by-side, and 3-4 workers arranged as a 2x2 grid or a documented Herdr-backed fallback.",
+    "Write docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md with commands, observed Herdr capabilities, limitations, and explicit confirmation that pane layout/scrollback is observability only and not KD correctness evidence.",
+    "Do not change daemon runtime behavior in this slice."
+  ],
+  "must_ask_if": [
+    "The proof would require closing or moving panes outside a scratch Khazad-Doom layout proof workspace.",
+    "Herdr lacks a necessary layout primitive and the proposed fallback changes the user-visible target layout."
+  ],
+  "verify": [
+    "bash -n scripts/proof-herdr-layout-v2",
+    "scripts/proof-herdr-layout-v2 --dry-run",
+    "test -f docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+    "grep -q 'worker region' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md",
+    "grep -q 'observability only' docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+  ]
+}

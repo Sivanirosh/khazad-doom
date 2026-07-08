@@ -48,6 +48,8 @@ pub struct StartRunParams {
     pub pi_bin: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pi_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub experimental_pi_tui_worker: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallelism: usize,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -65,6 +67,8 @@ pub struct ResumeRunParams {
     pub pi_bin: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pi_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub experimental_pi_tui_worker: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallelism: usize,
 }

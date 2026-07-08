@@ -1,4 +1,4 @@
-use crate::artifact::PiWrapperArtifacts;
+use crate::artifact::{PiTuiWorkerArtifacts, PiWrapperArtifacts};
 use crate::domain::Handoff;
 use crate::pi_contract::{self, PiContractObservation, PiContractWarning, PiParser};
 use crate::{artifact, gitutil};
@@ -584,6 +584,8 @@ struct PiWrapperStatus {
     exit_code: Option<i32>,
 }
 
+const KHAZAD_WORKER_EXTENSION_INDEX_JS: &str = include_str!("../extensions/khazad-worker/index.js");
+
 pub(crate) fn prepare_pi_wrapper_artifacts(
     spec: &PiCommandSpec,
     job: &Job,
@@ -632,6 +634,99 @@ pub(crate) fn prepare_pi_wrapper_artifacts(
         "/bin/sh {}",
         shell_quote_path(&artifacts.wrapper_path)
     ))
+}
+
+pub(crate) fn prepare_pi_tui_worker_artifacts(
+    spec: &PiCommandSpec,
+    job: &Job,
+    artifacts: &PiTuiWorkerArtifacts,
+    session_name: &str,
+) -> Result<Vec<String>> {
+    if let Some(parent) = artifacts.prompt_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::create_dir_all(&artifacts.extension_dir)
+        .with_context(|| format!("create {}", artifacts.extension_dir.display()))?;
+    let _ = fs::remove_file(&artifacts.result_path);
+    write_private(
+        &artifacts.prompt_path,
+        build_tui_worker_prompt(&job.prompt, &job.json_schema),
+    )?;
+    write_private(
+        &artifacts.extension_index_path,
+        KHAZAD_WORKER_EXTENSION_INDEX_JS.to_string(),
+    )?;
+
+    let mut argv = Vec::new();
+    argv.push(spec.bin.clone());
+    argv.extend(pi_tui_args_from_json_spec(&spec.args));
+    argv.extend([
+        "--no-extensions".to_string(),
+        "--extension".to_string(),
+        artifacts.extension_dir.to_string_lossy().to_string(),
+        "--name".to_string(),
+        session_name.to_string(),
+        format!("@{}", artifacts.prompt_path.to_string_lossy()),
+    ]);
+    artifact::write_json(
+        &artifacts.command_path,
+        &json!({
+            "argv": argv,
+            "cwd": job.cwd,
+            "prompt_path": artifacts.prompt_path,
+            "result_path": artifacts.result_path,
+            "extension_dir": artifacts.extension_dir,
+            "extension_index_path": artifacts.extension_index_path,
+            "contract": "khazad-owned-herdr-pi-tui-worker-v1",
+            "result_source": "khazad_worker_submit_worker_result_v1",
+        }),
+    )?;
+    Ok(argv)
+}
+
+pub(crate) fn parse_pi_tui_worker_result_artifact(
+    artifacts: &PiTuiWorkerArtifacts,
+) -> Result<ResultData> {
+    let value: Value = artifact::read_json(&artifacts.result_path).with_context(|| {
+        format!(
+            "read Pi TUI worker result {}",
+            artifacts.result_path.display()
+        )
+    })?;
+    let source = value
+        .get("source")
+        .and_then(Value::as_str)
+        .context("Pi TUI worker result artifact omitted source")?;
+    if source != "khazad_worker_submit_worker_result_v1" {
+        bail!("Pi TUI worker result artifact had unexpected source {source:?}");
+    }
+    let output = value
+        .get("result")
+        .cloned()
+        .context("Pi TUI worker result artifact omitted result")?;
+    Ok(ResultData {
+        output: Some(output),
+        usage: Usage::default(),
+        contract_warnings: Vec::new(),
+    })
+}
+
+fn pi_tui_args_from_json_spec(args: &[String]) -> Vec<String> {
+    let mut filtered = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--mode" && args.get(index + 1).is_some_and(|value| value == "json") {
+            index += 2;
+            continue;
+        }
+        if args[index] == "--no-session" {
+            index += 1;
+            continue;
+        }
+        filtered.push(args[index].clone());
+        index += 1;
+    }
+    filtered
 }
 
 pub(crate) fn wait_for_pi_wrapper_launch(
@@ -1130,6 +1225,20 @@ fn build_prompt(prompt: &str, schema: &str) -> String {
     )
 }
 
+fn build_tui_worker_prompt(prompt: &str, schema: &str) -> String {
+    if schema.trim().is_empty() {
+        return prompt.to_string();
+    }
+    format!(
+        "{prompt}\n\n## Khazad-Doom final output contract\n\n\
+         You are running inside a native Pi TUI session hosted by Herdr. \
+         Use the submit_worker_result tool as your final action. Its parameters must match this JSON Schema. \
+         Do not paste final JSON into the terminal, do not wrap it in Markdown fences, and do not emit prose as the final answer. \
+         Khazad-Doom reads only the submit_worker_result artifact as worker output; terminal text and Herdr scrollback are not evidence.\n\n\
+         {schema}\n"
+    )
+}
+
 fn extract_json_object(text: &str) -> Result<Value> {
     let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -1151,10 +1260,13 @@ fn is_zero(value: &usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_AUTH_REQUIRED_FAILURE_KIND, RunnerError, RunnerMetadata, RunnerSpec,
-        RunnerTranscript, extract_json_object,
+        AGENT_AUTH_REQUIRED_FAILURE_KIND, Job, PiCommandSpec, RunnerError, RunnerMetadata,
+        RunnerSpec, RunnerTranscript, extract_json_object, parse_pi_tui_worker_result_artifact,
+        prepare_pi_tui_worker_artifacts,
     };
-    use std::collections::BTreeMap;
+    use crate::artifact;
+    use serde_json::json;
+    use std::collections::{BTreeMap, HashSet};
 
     #[test]
     fn classifies_pi_auth_failure_only_without_assistant_output() {
@@ -1224,5 +1336,90 @@ mod tests {
     fn extracts_embedded_json_object() {
         let value = extract_json_object("prose {\"status\":\"ok\"} trailing").unwrap();
         assert_eq!(value["status"], "ok");
+    }
+
+    #[test]
+    fn prepares_tui_worker_artifacts_with_embedded_extension_and_without_json_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_tui_worker_artifacts_for_output_path(
+                &temp.path().join("slice.worker.attempt-1.json"),
+            )
+            .unwrap();
+        let spec = PiCommandSpec {
+            bin: "pi".to_string(),
+            args: vec![
+                "--provider".to_string(),
+                "openai-codex".to_string(),
+                "--mode".to_string(),
+                "json".to_string(),
+                "--no-session".to_string(),
+            ],
+        };
+        let job = Job {
+            kind: "slice-worker".to_string(),
+            prompt: "Implement the slice.".to_string(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{\"type\":\"object\"}".to_string(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+        };
+
+        let argv =
+            prepare_pi_tui_worker_artifacts(&spec, &job, &artifacts, "session-name").unwrap();
+        let argv_set: HashSet<_> = argv.iter().map(String::as_str).collect();
+        assert_eq!(argv[0], "pi");
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--provider", "openai-codex"])
+        );
+        assert!(!argv.windows(2).any(|pair| pair == ["--mode", "json"]));
+        assert!(!argv_set.contains("--no-session"));
+        assert!(argv.windows(2).any(|pair| {
+            pair[0] == "--extension" && pair[1] == artifacts.extension_dir.to_string_lossy()
+        }));
+        assert!(argv.iter().any(|arg| arg == "--no-extensions"));
+        assert!(
+            std::fs::read_to_string(&artifacts.prompt_path)
+                .unwrap()
+                .contains("Use the submit_worker_result tool as your final action")
+        );
+        assert!(
+            std::fs::read_to_string(&artifacts.extension_index_path)
+                .unwrap()
+                .contains("submit_worker_result")
+        );
+    }
+
+    #[test]
+    fn parses_tui_worker_result_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_tui_worker_artifacts_for_output_path(
+                &temp.path().join("slice.worker.attempt-1.json"),
+            )
+            .unwrap();
+        std::fs::create_dir_all(artifacts.result_path.parent().unwrap()).unwrap();
+        artifact::write_json(
+            &artifacts.result_path,
+            &json!({
+                "schema_version": 1,
+                "source": "khazad_worker_submit_worker_result_v1",
+                "result": {
+                    "slice_id": "slice-001",
+                    "status": "complete",
+                    "summary": "done",
+                    "acceptance_status": []
+                }
+            }),
+        )
+        .unwrap();
+
+        let data = parse_pi_tui_worker_result_artifact(&artifacts).unwrap();
+        let output = data.output.unwrap();
+        assert_eq!(output["slice_id"], "slice-001");
+        assert_eq!(output["status"], "complete");
     }
 }

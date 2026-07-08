@@ -13,9 +13,9 @@
     "daemon-feed"
   ],
   "scripts": {
-    "check:extension": "node --check extensions/khazad-monitor/index.js",
+    "check:extension": "node --check extensions/khazad-monitor/index.js && node --check extensions/khazad-worker/index.js",
     "test": "npm run test:extension",
-    "test:extension": "node --test extensions/khazad-monitor/index.test.mjs"
+    "test:extension": "node --test extensions/khazad-monitor/index.test.mjs extensions/khazad-worker/index.test.mjs"
   },
   "pi": {
     "skills": [

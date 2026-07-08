@@ -56,6 +56,17 @@ pub(crate) struct CockpitWorkerPaneRequest {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct CockpitTuiWorkerRequest {
+    pub run_id: String,
+    pub slice_id: String,
+    pub attempt: usize,
+    pub name: String,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CockpitWorkspaceRef {
     id: String,
     anchor_pane: Option<CockpitPaneRef>,
@@ -103,6 +114,22 @@ pub(crate) struct CockpitWorkerOpened {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CockpitWorkerLaunch {
     Opened(CockpitWorkerOpened),
+    SkippedDirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CockpitTuiWorkerOpened {
+    pub adapter: String,
+    pub mode: CockpitMode,
+    pub workspace_label: String,
+    pub agent_name: String,
+    pub pane_id: String,
+    pub terminal_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CockpitTuiWorkerLaunch {
+    Opened(CockpitTuiWorkerOpened),
     SkippedDirect,
 }
 
@@ -209,6 +236,18 @@ pub(crate) trait CockpitAdapter {
         request: &CockpitPaneRequest,
     ) -> Result<CockpitPaneRef> {
         self.create_read_only_pane(workspace, request)
+    }
+
+    fn start_tui_worker_agent(
+        &self,
+        _workspace: &CockpitWorkspaceRef,
+        _request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        bail!("{} adapter does not support TUI worker agents", self.name())
+    }
+
+    fn close_pane(&self, _pane_id: &str) -> Result<()> {
+        bail!("{} adapter does not support closing panes", self.name())
     }
 
     fn send_agent_message(&self, _target: &str, _text: &str) -> Result<()> {
@@ -341,6 +380,30 @@ impl<A: CockpitAdapter> Cockpit<A> {
         }))
     }
 
+    pub fn open_tui_worker_agent(
+        &self,
+        run_request: &CockpitRunRequest,
+        worker_request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerLaunch> {
+        if self.mode == CockpitMode::Direct {
+            return Ok(CockpitTuiWorkerLaunch::SkippedDirect);
+        }
+        let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
+        let mut opened = self
+            .adapter
+            .start_tui_worker_agent(&workspace, worker_request)?;
+        opened.mode = self.mode;
+        opened.workspace_label = run_request.workspace_label.clone();
+        Ok(CockpitTuiWorkerLaunch::Opened(opened))
+    }
+
+    pub fn close_pane(&self, pane_id: &str) -> Result<()> {
+        if self.mode == CockpitMode::Direct {
+            bail!("cockpit direct mode does not close Herdr panes");
+        }
+        self.adapter.close_pane(pane_id)
+    }
+
     pub fn send_agent_message(&self, target: &str, text: &str) -> Result<CockpitAgentMessageSent> {
         if self.mode == CockpitMode::Direct {
             bail!("cockpit direct mode does not send Herdr agent messages");
@@ -430,6 +493,34 @@ pub(crate) fn open_default_worker_pane(
     let request = CockpitRunRequest::for_run(run, khazad_home);
     Cockpit::new(mode, adapter)
         .open_worker_pane(&request, worker_request)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn open_default_tui_worker_agent(
+    run: &Run,
+    mode: CockpitMode,
+    khazad_home: &Path,
+    worker_request: &CockpitTuiWorkerRequest,
+) -> std::result::Result<CockpitTuiWorkerLaunch, CockpitUnavailable> {
+    #[cfg(test)]
+    if std::env::var("KHAZAD_UNIT_TEST_COCKPIT").ok().as_deref() != Some("1") {
+        return Ok(CockpitTuiWorkerLaunch::SkippedDirect);
+    }
+    if mode == CockpitMode::Direct {
+        return Ok(CockpitTuiWorkerLaunch::SkippedDirect);
+    }
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    let request = CockpitRunRequest::for_run(run, khazad_home);
+    Cockpit::new(mode, adapter)
+        .open_tui_worker_agent(&request, worker_request)
+        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn close_default_pane(pane_id: &str) -> std::result::Result<(), CockpitUnavailable> {
+    let mode = CockpitMode::Herdr;
+    let adapter = HerdrCockpitAdapter::discover(mode)?;
+    Cockpit::new(mode, adapter)
+        .close_pane(pane_id)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
 }
 
@@ -714,6 +805,61 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         Ok(CockpitPaneRef { id: pane_id })
     }
 
+    fn start_tui_worker_agent(
+        &self,
+        workspace: &CockpitWorkspaceRef,
+        request: &CockpitTuiWorkerRequest,
+    ) -> Result<CockpitTuiWorkerOpened> {
+        let mut args = vec![
+            "agent".to_string(),
+            "start".to_string(),
+            request.name.clone(),
+            "--cwd".to_string(),
+            request.cwd.to_string_lossy().to_string(),
+            "--workspace".to_string(),
+            workspace.id.clone(),
+            "--split".to_string(),
+            "down".to_string(),
+        ];
+        for (key, value) in &request.env {
+            args.push("--env".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--env".to_string());
+        args.push(format!(
+            "KHAZAD_TUI_WORKER_ID={}:{}:{}",
+            request.run_id, request.slice_id, request.attempt
+        ));
+        args.push("--no-focus".to_string());
+        args.push("--".to_string());
+        args.extend(request.argv.iter().cloned());
+        let started = self.run_json(&args)?;
+        let agent = started
+            .pointer("/result/agent")
+            .ok_or_else(|| anyhow!("herdr agent start omitted result.agent"))?;
+        let pane_id = agent
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("herdr agent start omitted agent.pane_id"))?;
+        let terminal_id = agent
+            .get("terminal_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(CockpitTuiWorkerOpened {
+            adapter: self.name().to_string(),
+            mode: CockpitMode::Herdr,
+            workspace_label: String::new(),
+            agent_name: request.name.clone(),
+            pane_id: pane_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+        })
+    }
+
+    fn close_pane(&self, pane_id: &str) -> Result<()> {
+        self.run_command(&["pane".to_string(), "close".to_string(), pane_id.to_string()])?;
+        Ok(())
+    }
+
     fn send_agent_message(&self, target: &str, text: &str) -> Result<()> {
         self.run_command(&[
             "agent".to_string(),
@@ -905,6 +1051,38 @@ mod tests {
             })
         }
 
+        fn start_tui_worker_agent(
+            &self,
+            workspace: &CockpitWorkspaceRef,
+            request: &CockpitTuiWorkerRequest,
+        ) -> Result<CockpitTuiWorkerOpened> {
+            self.calls.lock().unwrap().push(format!(
+                "agent_start:{}:{}:{}:{}:{}:{}",
+                workspace.id,
+                request.run_id,
+                request.slice_id,
+                request.attempt,
+                request.name,
+                request.argv.join(" ")
+            ));
+            Ok(CockpitTuiWorkerOpened {
+                adapter: self.name().to_string(),
+                mode: CockpitMode::Herdr,
+                workspace_label: String::new(),
+                agent_name: request.name.clone(),
+                pane_id: "pane-tui".to_string(),
+                terminal_id: "terminal-tui".to_string(),
+            })
+        }
+
+        fn close_pane(&self, pane_id: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pane_close:{pane_id}"));
+            Ok(())
+        }
+
         fn send_agent_message(&self, target: &str, text: &str) -> Result<()> {
             self.calls
                 .lock()
@@ -1045,6 +1223,59 @@ mod tests {
         let calls = adapter.calls();
         assert_eq!(calls[0], "workspace:Khazad-Doom kd-run");
         assert!(calls[1].starts_with("pane:Worker kd-run/SLICE-1 attempt 2:/bin/sh wrapper.sh"));
+    }
+
+    #[test]
+    fn cockpit_tui_worker_uses_herdr_agent_start_semantics() {
+        let adapter = FakeCockpitAdapter::default();
+        let request = CockpitRunRequest {
+            repo_path: PathBuf::from("/repo"),
+            khazad_home: PathBuf::from("/khazad-home"),
+            workspace_label: workspace_label_for_run("kd-run"),
+            feed_command: "feed".to_string(),
+            phase_command: "phase".to_string(),
+        };
+        let worker = CockpitTuiWorkerRequest {
+            run_id: "kd-run".to_string(),
+            slice_id: "SLICE-1".to_string(),
+            attempt: 2,
+            name: "kd-run-SLICE-1-2".to_string(),
+            argv: vec!["pi".to_string(), "@prompt.md".to_string()],
+            cwd: PathBuf::from("/repo/worker"),
+            env: vec![(
+                "KHAZAD_WORKER_RESULT_PATH".to_string(),
+                "/repo/.workflow/runs/kd-run/outputs/result.json".to_string(),
+            )],
+        };
+
+        let opened = Cockpit::new(CockpitMode::Herdr, adapter.clone())
+            .open_tui_worker_agent(&request, &worker)
+            .unwrap();
+
+        assert_eq!(
+            opened,
+            CockpitTuiWorkerLaunch::Opened(CockpitTuiWorkerOpened {
+                adapter: "fake-herdr".to_string(),
+                mode: CockpitMode::Herdr,
+                workspace_label: "Khazad-Doom kd-run".to_string(),
+                agent_name: "kd-run-SLICE-1-2".to_string(),
+                pane_id: "pane-tui".to_string(),
+                terminal_id: "terminal-tui".to_string(),
+            })
+        );
+        assert_eq!(adapter.calls()[0], "workspace:Khazad-Doom kd-run");
+        assert!(adapter.calls()[1].contains("agent_start:workspace-1:kd-run:SLICE-1:2"));
+    }
+
+    #[test]
+    fn cockpit_can_close_tui_worker_pane_through_adapter() {
+        let adapter = FakeCockpitAdapter::default();
+
+        Cockpit::new(CockpitMode::Herdr, adapter.clone())
+            .close_pane("pane-tui")
+            .unwrap();
+
+        assert_eq!(adapter.calls(), vec!["pane_close:pane-tui".to_string()]);
     }
 
     #[test]

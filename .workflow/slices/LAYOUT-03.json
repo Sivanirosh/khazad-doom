@@ -1,0 +1,32 @@
+{
+  "id": "LAYOUT-03",
+  "title": "Compact dashboard v2 projection",
+  "goal": "Polish the daemon-fed dashboard for a narrow right panel by removing duplicated sections, shortening noisy profile lines, and highlighting run state, workers, attention, checks, economics, and commands.",
+  "depends_on": [
+    "LAYOUT-02"
+  ],
+  "areas": [
+    ".workflow/slices/LAYOUT-03.json",
+    "src/workflow/projection.rs",
+    "src/cli.rs",
+    "tests/fixtures",
+    "docs/design/evidence/herdr-dashboard-v2-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Add or update a compact dashboard/feed projection that fits the right panel without long profile-line wrapping and without duplicating worker blocks.",
+    "Dashboard v2 includes concise sections for Run, Workers, Attention, Checks, Economics, Incidents when present, and Commands when actionable.",
+    "Attention lines remain full and untruncated; renderer polish must not invent workflow wording beyond daemon-owned status/feed fields.",
+    "Document the dashboard v2 before/after and the invariant that monitor/dashboard output is attach-only observability over daemon state."
+  ],
+  "must_ask_if": [
+    "Compact rendering would omit terminal reasons, attention, or operator commands from the daemon feed.",
+    "A proposed renderer would use Herdr pane text or Pi extension state instead of daemon status/feed JSON."
+  ],
+  "verify": [
+    "cargo test -q dashboard_v2",
+    "cargo test -q render_monitor",
+    "cargo check -q",
+    "test -f docs/design/evidence/herdr-dashboard-v2-2026-07-08.md",
+    "git diff --check"
+  ]
+}

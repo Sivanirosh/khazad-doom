@@ -1,0 +1,27 @@
+{
+  "id": "TUI-DOGFOOD-01",
+  "title": "Native Pi TUI daemon dogfood proof",
+  "goal": "Prove the opt-in daemon-owned native Pi TUI worker path in a real Khazad-Doom run by having a Herdr-hosted Pi TUI worker make a tiny in-scope evidence commit and submit its final result through submit_worker_result.",
+  "status": "open",
+  "depends_on": [],
+  "areas": [
+    ".workflow/slices/TUI-DOGFOOD-01.json",
+    "docs/design/evidence/tui-worker-daemon-dogfood-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Create docs/design/evidence/tui-worker-daemon-dogfood-2026-07-08.md with a short note that this slice was executed by a daemon-launched native Pi TUI worker and that the authoritative result must be the submit_worker_result artifact, not terminal text.",
+    "Do not modify Rust source, package metadata, extension source, scripts, or existing design docs; this proof slice is intentionally limited to the new evidence note and this slice file.",
+    "Commit the evidence note in the worker worktree and submit a complete worker result using submit_worker_result."
+  ],
+  "must_ask_if": [
+    "The worker would need to modify files outside this slice's areas.",
+    "The worker would treat terminal text, Herdr pane text, Herdr scrollback, Herdr metadata, or Pi display state as authoritative worker result evidence.",
+    "The worker would bypass submit_worker_result or daemon-owned verification."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-daemon-dogfood-2026-07-08.md",
+    "grep -q submit_worker_result docs/design/evidence/tui-worker-daemon-dogfood-2026-07-08.md",
+    "grep -q 'terminal text' docs/design/evidence/tui-worker-daemon-dogfood-2026-07-08.md"
+  ],
+  "verify_timeout_seconds": 120
+}

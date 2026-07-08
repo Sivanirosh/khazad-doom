@@ -1,0 +1,20 @@
+{
+  "id": "TUI-MULTI-01D",
+  "title": "Native Pi TUI parallel worker proof D",
+  "goal": "Create one tiny in-scope evidence note for the native Pi TUI parallel worker layout/lifecycle proof.",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-MULTI-01D.json",
+    "docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Create docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md stating that this is worker D for the native Pi TUI parallel proof and that KD-owned submit_worker_result artifacts are authoritative, not terminal text."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+    "grep -q submit_worker_result docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md",
+    "grep -q 'terminal text' docs/design/evidence/tui-worker-multi-proof-D-2026-07-08.md"
+  ]
+}

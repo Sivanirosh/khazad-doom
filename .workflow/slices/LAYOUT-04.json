@@ -1,0 +1,34 @@
+{
+  "id": "LAYOUT-04",
+  "title": "Native Pi TUI worker grid placement",
+  "goal": "Use the cockpit layout planner to place native Pi TUI workers into a left-side worker grid and preserve daemon-owned result artifacts as the only worker truth.",
+  "depends_on": [
+    "LAYOUT-03"
+  ],
+  "areas": [
+    ".workflow/slices/LAYOUT-04.json",
+    "src/workflow/cockpit.rs",
+    "src/workflow/manager.rs",
+    "src/agent.rs",
+    "src/artifact.rs",
+    "scripts/proof-herdr-layout-v2",
+    "docs/design/evidence/herdr-layout-v2-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Native Pi TUI worker launches use layout v2 placement: no unused root shell left visible, no default Operator column, and worker panes occupy the left worker region.",
+    "For up to 4 concurrent TUI workers, KD records stable worker slot metadata with the cockpit_worker_ready event while keeping source_of_truth as kd_tui_result_artifact.",
+    "Worker timeout and cancellation paths still close the associated Herdr pane on a best-effort basis and never read pane text as result evidence.",
+    "Existing wrapper/direct fallback behavior remains available when experimental native TUI is disabled or Herdr TUI launch is unavailable."
+  ],
+  "must_ask_if": [
+    "The implementation would remove the wrapper/direct fallback path.",
+    "Herdr layout constraints require changing the source-of-truth model for worker results."
+  ],
+  "verify": [
+    "cargo test -q tui_worker_grid",
+    "cargo test -q tui_worker",
+    "bash -n scripts/proof-herdr-layout-v2",
+    "cargo check -q",
+    "git diff --check"
+  ]
+}

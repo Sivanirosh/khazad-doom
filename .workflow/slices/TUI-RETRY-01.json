@@ -1,0 +1,28 @@
+{
+  "id": "TUI-RETRY-01",
+  "title": "Native Pi TUI invalid result retry proof",
+  "goal": "Prove that native Pi TUI worker attempts use the same bounded invalid-output evidence and envelope retry behavior as the wrapper path, without parsing terminal text as a fallback result.",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-RETRY-01.json",
+    "docs/design/evidence/tui-worker-retry-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Document an adversarial native Pi TUI run or deterministic test where a TUI result artifact exists but its result payload is invalid for the worker result model, producing preserved invalid-output evidence.",
+    "Evidence includes the invalid-output artifact path, invalid_worker_output or worker_attempt_failure event, retry disposition, bounded retry count, and final terminal outcome.",
+    "Evidence shows terminal text, Herdr scrollback, Herdr metadata, and Pi display state were not parsed as fallback result evidence.",
+    "The proof document states what retry behavior proves and does not prove."
+  ],
+  "must_ask_if": [
+    "The proof would require weakening submit_worker_result validation in production code.",
+    "The proof can only be obtained by reading terminal text as output."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+    "grep -q invalid_worker_output docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+    "grep -q 'terminal text' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md",
+    "grep -q 'does not prove' docs/design/evidence/tui-worker-retry-proof-2026-07-08.md"
+  ]
+}

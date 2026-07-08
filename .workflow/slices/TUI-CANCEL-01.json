@@ -1,0 +1,27 @@
+{
+  "id": "TUI-CANCEL-01",
+  "title": "Native Pi TUI worker cancellation cleanup proof",
+  "goal": "Prove that operator cancellation through KD daemon IPC closes the real Herdr-hosted native Pi TUI worker pane, prevents merge, and preserves cancellation evidence.",
+  "depends_on": [
+    "LAYOUT-05"
+  ],
+  "areas": [
+    ".workflow/slices/TUI-CANCEL-01.json",
+    "docs/design/evidence/tui-worker-cancellation-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Document a real KD native Pi TUI run cancelled through khazad-doom cancel after cockpit_worker_ready, including run id, pane id, cancel command, reason, and terminal status.",
+    "Evidence includes run_cancelled with the requested reason, absence/closure of the TUI worker pane, no accepted result after cancellation, no slice merge commit, and run status cancelled.",
+    "The proof document states what cancellation cleanup proves and does not prove."
+  ],
+  "must_ask_if": [
+    "The proof would require cancelling any run not created specifically for this cancellation proof.",
+    "A worker result is accepted and merged before the cancellation command is issued."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/tui-worker-cancellation-proof-2026-07-08.md",
+    "grep -q run_cancelled docs/design/evidence/tui-worker-cancellation-proof-2026-07-08.md",
+    "grep -q 'no slice merge' docs/design/evidence/tui-worker-cancellation-proof-2026-07-08.md",
+    "grep -q 'does not prove' docs/design/evidence/tui-worker-cancellation-proof-2026-07-08.md"
+  ]
+}
