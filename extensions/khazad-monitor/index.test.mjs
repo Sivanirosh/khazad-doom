@@ -7,12 +7,12 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import khazadMonitorExtension from './index.js';
 
 function registerExtension() {
-	let tool;
+	const tools = new Map();
 	const commands = new Map();
 	const events = new Map();
 	khazadMonitorExtension({
 		registerTool(registered) {
-			tool = registered;
+			tools.set(registered.name, registered);
 		},
 		registerCommand(name, registered) {
 			commands.set(name, registered);
@@ -21,20 +21,16 @@ function registerExtension() {
 			events.set(name, handler);
 		},
 	});
-	assert.ok(tool, 'expected ask_operator tool registration');
-	return { tool, commands, events };
-}
-
-function registerTool() {
-	return registerExtension().tool;
+	return { tools, commands, events };
 }
 
 function fakeCtx(extra = {}) {
 	const calls = [];
+	const { ui: extraUi = {}, ...ctxExtra } = extra;
 	return {
 		calls,
 		ctx: {
-			...extra,
+			...ctxExtra,
 			ui: {
 				notify(message, level) {
 					calls.push({ type: 'notify', message, level });
@@ -45,6 +41,7 @@ function fakeCtx(extra = {}) {
 				setStatus(key, text) {
 					calls.push({ type: 'status', key, text });
 				},
+				...extraUi,
 			},
 		},
 	};
@@ -68,11 +65,71 @@ function withEnv(overrides, callback) {
 }
 
 async function waitFor(predicate) {
-	for (let attempt = 0; attempt < 50; attempt += 1) {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
 		if (predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error('timed out waiting for condition');
+}
+
+async function withDaemonRequestServer(handler, callback) {
+	const tempDir = await mkdtemp(path.join(os.tmpdir(), 'khazad-monitor-daemon-test-'));
+	const socketPath = path.join(tempDir, 'daemon.sock');
+	const requests = [];
+	const server = net.createServer((socket) => {
+		let buffer = '';
+		socket.setEncoding('utf8');
+		socket.on('data', (chunk) => {
+			buffer += chunk;
+			const idx = buffer.indexOf('\n');
+			if (idx < 0) return;
+			const request = JSON.parse(buffer.slice(0, idx));
+			requests.push(request);
+			Promise.resolve()
+				.then(() => handler(request, requests))
+				.then((result) => socket.end(`${JSON.stringify({ id: request.id, result })}\n`))
+				.catch((error) => socket.end(`${JSON.stringify({ id: request.id, error: error?.message || String(error) })}\n`));
+		});
+	});
+	try {
+		await new Promise((resolve, reject) => {
+			server.once('error', reject);
+			server.listen(socketPath, () => {
+				server.off('error', reject);
+				resolve();
+			});
+		});
+		return await callback(socketPath, requests);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+		await rm(tempDir, { recursive: true, force: true });
+	}
+}
+
+function statusWithPendingQuestion(overrides = {}) {
+	return {
+		run: { id: 'kd-run', status: 'running' },
+		progress: {
+			run_id: 'kd-run',
+			phase: 'awaiting_operator',
+			slice_id: 'slice-001',
+			attempt: 2,
+			message: 'awaiting operator answer',
+		},
+		questions: [
+			{
+				id: 'q-1',
+				run_id: 'kd-run',
+				slice_id: 'slice-001',
+				attempt: 2,
+				question: 'Proceed?',
+				options: ['yes', 'no'],
+				state: 'pending',
+			},
+		],
+		feed: { feed_version: 1, summary_line: 'Run running — awaiting operator', attention: [], blocks: [] },
+		...overrides,
+	};
 }
 
 test('package ships the thin monitor bridge extension', async () => {
@@ -84,11 +141,10 @@ test('package ships the thin monitor bridge extension', async () => {
 	assert.match(pkg.scripts['check:extension'], /extensions\/khazad-monitor\/index\.js/);
 });
 
-test('monitor bridge registers tools and explicit bridge commands', () => {
-	const { tool, commands, events } = registerExtension();
+test('monitor bridge registers explicit bridge commands only', () => {
+	const { tools, commands, events } = registerExtension();
 
-	assert.equal(tool.name, 'ask_operator');
-	assert.equal(tool.parameters.required[0], 'question');
+	assert.equal(tools.has('ask_operator'), false, 'ask_operator belongs to the worker extension, not the monitor extension');
 	for (const command of ['khazad-attach', 'khazad-detach', 'khazad-explain', 'khazad-open', 'khazad-handoff', 'khazad-answer']) {
 		assert.ok(commands.has(command), `missing ${command}`);
 	}
@@ -179,59 +235,34 @@ test('khazad open delegates Herdr focus to the daemon CLI command', async () => 
 	}
 });
 
-test('ask_operator forwards bounded questions to daemon state', async () => {
-	const tool = registerTool();
-	const tempDir = await mkdtemp(path.join(os.tmpdir(), 'khazad-monitor-worker-test-'));
-	const socketPath = path.join(tempDir, 'daemon.sock');
-	let seenRequest;
-	const server = net.createServer((socket) => {
-		let buffer = '';
-		socket.setEncoding('utf8');
-		socket.on('data', (chunk) => {
-			buffer += chunk;
-			const idx = buffer.indexOf('\n');
-			if (idx < 0) return;
-			seenRequest = JSON.parse(buffer.slice(0, idx));
-			socket.end(`${JSON.stringify({ id: seenRequest.id, result: { question_id: 'q-1', answer: 'yes' } })}\n`);
-		});
+test('khazad attach remains read-only when daemon status includes pending questions', async () => {
+	const { commands, events } = registerExtension();
+	const { calls, ctx } = fakeCtx({
+		ui: {
+			async select() {
+				throw new Error('monitor bridge must not prompt for worker questions');
+			},
+			async input() {
+				throw new Error('monitor bridge must not prompt for worker questions');
+			},
+		},
 	});
 
-	try {
-		await new Promise((resolve, reject) => {
-			server.once('error', reject);
-			server.listen(socketPath, () => {
-				server.off('error', reject);
-				resolve();
+	await withDaemonRequestServer(
+		(request) => {
+			if (request.method === 'status') return statusWithPendingQuestion();
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath, requests) => {
+			await withEnv({ KHAZAD_DAEMON_SOCKET: socketPath }, async () => {
+				await commands.get('khazad-attach').handler('kd-run', ctx);
+				await events.get('session_shutdown')({ reason: 'done' }, ctx);
 			});
-		});
 
-		const result = await withEnv(
-			{
-				KHAZAD_DAEMON_SOCKET: socketPath,
-				KHAZAD_RUN_ID: 'kd-run',
-				KHAZAD_SLICE_ID: 'slice-001',
-				KHAZAD_WORKER_TOKEN: 'secret-token',
-				KHAZAD_ATTEMPT: '2',
-			},
-			() => tool.execute('tool-call', { question: 'Proceed?', options: ['yes', 'no'], timeout_seconds: 30 }),
-		);
-
-		assert.equal(result.details.available, true);
-		assert.equal(result.details.answer, 'yes');
-		assert.equal(seenRequest.method, 'workerAsk');
-		assert.deepEqual(seenRequest.params, {
-			run_id: 'kd-run',
-			slice_id: 'slice-001',
-			token: 'secret-token',
-			attempt: 2,
-			question: 'Proceed?',
-			options: ['yes', 'no'],
-			timeout_seconds: 30,
-		});
-	} finally {
-		await new Promise((resolve) => server.close(resolve));
-		await rm(tempDir, { recursive: true, force: true });
-	}
+			assert.equal(requests.some((request) => request.method === 'answerQuestion'), false);
+			assert.ok(calls.some((call) => call.type === 'widget' && call.lines?.some((line) => line.includes('awaiting operator'))));
+		},
+	);
 });
 
 test('khazad attach ignores delayed daemon responses after shutdown', async () => {

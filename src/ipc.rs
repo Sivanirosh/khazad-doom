@@ -108,6 +108,8 @@ pub struct WorkerAskResult {
     pub answer: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -133,6 +135,13 @@ pub struct AnswerQuestionParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerQuestionResult {
     pub question: WorkerQuestion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerQuestionTimeoutParams {
+    pub run_id: String,
+    pub question_id: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

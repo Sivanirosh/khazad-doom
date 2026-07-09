@@ -10,6 +10,7 @@ use crate::ipc::{
     ListQuestionsParams, ListQuestionsResult, ListReplanProposalsParams, ListReplanProposalsResult,
     ListSlicesResult, Request, Response, ResumeRunParams, SliceImportGithubParams, SliceNewParams,
     SlicesParams, StartRunParams, StartRunResult, StatusParams, WorkerAskParams, WorkerAskResult,
+    WorkerQuestionTimeoutParams,
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
@@ -278,7 +279,91 @@ impl Server {
             .details)
     }
 
+    fn handle_worker_ask_open(&self, params: WorkerAskParams) -> Result<WorkerAskResult> {
+        let (question, timeout_seconds) = self.open_worker_question(&params)?;
+        self.schedule_worker_question_timeout(question.clone());
+        Ok(WorkerAskResult {
+            question_id: question.id,
+            state: "pending".to_string(),
+            answer: String::new(),
+            timed_out: false,
+            timeout_seconds,
+        })
+    }
+
     fn handle_worker_ask(&self, params: WorkerAskParams) -> Result<WorkerAskResult> {
+        let (question, timeout_seconds) = self.open_worker_question(&params)?;
+        let question_id = question.id.clone();
+        let deadline = if timeout_seconds == 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs(timeout_seconds))
+        };
+        while deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            let Some(current) = self.store.get_worker_question(&question_id)? else {
+                bail!("question {question_id:?} disappeared");
+            };
+            if current.state == "answered" {
+                return Ok(WorkerAskResult {
+                    question_id,
+                    state: "answered".to_string(),
+                    answer: current.answer,
+                    timed_out: false,
+                    timeout_seconds,
+                });
+            }
+            if current.state == "timed_out" {
+                return Ok(WorkerAskResult {
+                    question_id,
+                    state: "timed_out".to_string(),
+                    answer: String::new(),
+                    timed_out: true,
+                    timeout_seconds,
+                });
+            }
+            let run = self.store.get_run(&params.run_id)?;
+            if run.as_ref().is_some_and(|run| {
+                matches!(
+                    run.status,
+                    RunStatus::Interrupted
+                        | RunStatus::Cancelled
+                        | RunStatus::Failed
+                        | RunStatus::Blocked
+                        | RunStatus::Completed
+                )
+            }) {
+                bail!(
+                    "run {} reached a terminal state before the question was answered",
+                    params.run_id
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        let question = self.timeout_worker_question(
+            &params.run_id,
+            &question_id,
+            "worker_question_timed_out",
+            "operator question timed out",
+        )?;
+        if question.state == "answered" {
+            return Ok(WorkerAskResult {
+                question_id,
+                state: "answered".to_string(),
+                answer: question.answer,
+                timed_out: false,
+                timeout_seconds: question.timeout_seconds,
+            });
+        }
+        Ok(WorkerAskResult {
+            question_id,
+            state: question.state,
+            answer: String::new(),
+            timed_out: true,
+            timeout_seconds: question.timeout_seconds,
+        })
+    }
+
+    fn open_worker_question(&self, params: &WorkerAskParams) -> Result<(WorkerQuestion, u64)> {
         if !self
             .store
             .validate_worker_token(&params.run_id, &params.token)?
@@ -294,7 +379,7 @@ impl Server {
             )?;
             bail!("worker token rejected for run {}", params.run_id);
         }
-        let timeout_seconds = self.worker_question_timeout_seconds(&params);
+        let timeout_seconds = self.worker_question_timeout_seconds(params);
         let question_id = format!("q-{}", request_id());
         let question = self.store.insert_worker_question(
             &question_id,
@@ -322,62 +407,127 @@ impl Server {
         );
 
         self.notify_attention_for_worker_question(&question);
+        Ok((question, timeout_seconds))
+    }
 
-        let deadline = if timeout_seconds == 0 {
-            None
-        } else {
-            Some(Instant::now() + Duration::from_secs(timeout_seconds))
-        };
-        while deadline.is_none_or(|deadline| Instant::now() < deadline) {
-            let Some(current) = self.store.get_worker_question(&question_id)? else {
-                bail!("question {question_id:?} disappeared");
-            };
-            if current.state == "answered" {
-                return Ok(WorkerAskResult {
-                    question_id,
-                    state: "answered".to_string(),
-                    answer: current.answer,
-                    timed_out: false,
-                });
-            }
-            let run = self.store.get_run(&params.run_id)?;
-            if run.as_ref().is_some_and(|run| {
-                matches!(
-                    run.status,
-                    RunStatus::Interrupted
-                        | RunStatus::Cancelled
-                        | RunStatus::Failed
-                        | RunStatus::Blocked
-                        | RunStatus::Completed
-                )
-            }) {
-                bail!(
-                    "run {} reached a terminal state before the question was answered",
-                    params.run_id
-                );
-            }
-            thread::sleep(Duration::from_millis(500));
+    fn handle_worker_question_timeout(
+        &self,
+        params: WorkerQuestionTimeoutParams,
+    ) -> Result<WorkerAskResult> {
+        if !self
+            .store
+            .validate_worker_token(&params.run_id, &params.token)?
+        {
+            self.store.record_event(
+                &params.run_id,
+                workflow_events::RUN_INCIDENT,
+                &workflow_events::RunIncidentPayload::error(
+                    "worker_question_token_rejected",
+                    "workerQuestionTimeout rejected because the worker token did not match the run",
+                ),
+            )?;
+            bail!("worker token rejected for run {}", params.run_id);
         }
+        let pending = self
+            .store
+            .get_worker_question(&params.question_id)?
+            .ok_or_else(|| anyhow!("question {:?} not found", params.question_id))?;
+        if pending.run_id != params.run_id {
+            bail!(
+                "question {:?} belongs to run {}, not {}",
+                params.question_id,
+                pending.run_id,
+                params.run_id
+            );
+        }
+        if pending.state != "pending" {
+            bail!("question {:?} is already {}", pending.id, pending.state);
+        }
+        if !self.worker_question_is_currently_awaited(&pending)? {
+            bail!(
+                "question {} is not attached to the active worker attempt",
+                pending.id
+            );
+        }
+        let question = self.timeout_worker_question(
+            &params.run_id,
+            &params.question_id,
+            "worker_question_cancelled",
+            "operator question closed without an answer",
+        )?;
+        let timed_out = question.state == "timed_out";
+        Ok(WorkerAskResult {
+            question_id: question.id,
+            state: question.state,
+            answer: if timed_out {
+                String::new()
+            } else {
+                question.answer
+            },
+            timed_out,
+            timeout_seconds: question.timeout_seconds,
+        })
+    }
+
+    fn timeout_worker_question(
+        &self,
+        run_id: &str,
+        question_id: &str,
+        incident_code: &str,
+        message_prefix: &str,
+    ) -> Result<WorkerQuestion> {
         let question = self
             .store
-            .timeout_worker_question(&question_id)?
+            .timeout_worker_question(question_id)?
             .ok_or_else(|| anyhow!("question {question_id:?} disappeared"))?;
+        if question.state != "timed_out" {
+            return Ok(question);
+        }
         self.store.record_event(
-            &params.run_id,
+            run_id,
             workflow_events::RUN_INCIDENT,
             &workflow_events::RunIncidentPayload::warning(
-                "worker_question_timed_out",
-                format!("operator question timed out: {}", question.question),
+                incident_code,
+                format!("{message_prefix}: {}", question.question),
             )
             .with_extra("question_id", &question.id)
             .with_extra("slice_id", &question.slice_id),
         )?;
-        Ok(WorkerAskResult {
-            question_id,
-            state: "timed_out".to_string(),
-            answer: String::new(),
-            timed_out: true,
-        })
+        let _ = self.store.update_progress(
+            run_id,
+            "worker_running",
+            &question.slice_id,
+            question.attempt,
+            "ask_operator",
+            &format!(
+                "operator answer unavailable for {}; worker applying blocked contract",
+                question.id
+            ),
+            "",
+        );
+        Ok(question)
+    }
+
+    fn schedule_worker_question_timeout(&self, question: WorkerQuestion) {
+        if question.timeout_seconds == 0 {
+            return;
+        }
+        let server = self.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(question.timeout_seconds));
+            let Ok(Some(current)) = server.store.get_worker_question(&question.id) else {
+                return;
+            };
+            if current.state != "pending" {
+                return;
+            }
+            let _ = server.timeout_worker_question(
+                &question.run_id,
+                &question.id,
+                "worker_question_timed_out",
+                "operator question timed out",
+            );
+        });
     }
 
     fn worker_question_timeout_seconds(&self, params: &WorkerAskParams) -> u64 {
@@ -540,6 +690,11 @@ impl Server {
                 let result = self.handle_worker_ask(params)?;
                 Ok(HandleOutcome::result(result)?)
             }
+            "workerAskOpen" => {
+                let params: WorkerAskParams = decode_params(raw)?;
+                let result = self.handle_worker_ask_open(params)?;
+                Ok(HandleOutcome::result(result)?)
+            }
             "listQuestions" => {
                 let params: ListQuestionsParams = raw
                     .map(serde_json::from_value)
@@ -603,7 +758,21 @@ impl Server {
                         &question.answer,
                     ),
                 )?;
+                let _ = self.store.update_progress(
+                    &params.run_id,
+                    "worker_running",
+                    &question.slice_id,
+                    question.attempt,
+                    "ask_operator",
+                    &format!("operator answered {}; worker resuming", question.id),
+                    "",
+                );
                 Ok(HandleOutcome::result(AnswerQuestionResult { question })?)
+            }
+            "workerQuestionTimeout" => {
+                let params: WorkerQuestionTimeoutParams = decode_params(raw)?;
+                let result = self.handle_worker_question_timeout(params)?;
+                Ok(HandleOutcome::result(result)?)
             }
             "listReplanProposals" => {
                 let params: ListReplanProposalsParams = decode_params(raw)?;
@@ -734,7 +903,12 @@ impl HandleOutcome {
 fn method_allows_concurrent_handling(method: &str) -> bool {
     matches!(
         method,
-        "workerAsk" | "answerQuestion" | "listQuestions" | "listReplanProposals"
+        "workerAsk"
+            | "workerAskOpen"
+            | "workerQuestionTimeout"
+            | "answerQuestion"
+            | "listQuestions"
+            | "listReplanProposals"
     )
 }
 

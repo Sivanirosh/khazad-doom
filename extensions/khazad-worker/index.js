@@ -11,6 +11,7 @@ const TERMINAL_RUN_STATUSES = new Set(['blocked', 'completed', 'failed', 'cancel
 const SUBMIT_WORKER_RESULT_SOURCE = 'khazad_worker_submit_worker_result_v1';
 const WORKER_RESULT_STATUSES = new Set(['complete', 'blocked', 'failed']);
 const ACCEPTANCE_EVIDENCE_STATUSES = new Set(['satisfied', 'blocked', 'failed']);
+const CUSTOM_ANSWER_CHOICE = 'Type a custom answer…';
 
 function khazadWorkerExtension(pi) {
 	const feedback = createFeedbackAdapter();
@@ -34,7 +35,7 @@ function khazadWorkerExtension(pi) {
 			required: ['question'],
 			additionalProperties: false,
 		},
-		async execute(_toolCallId, input) {
+		async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
 			const socket = process.env.KHAZAD_DAEMON_SOCKET;
 			const runId = process.env.KHAZAD_RUN_ID;
 			const sliceId = process.env.KHAZAD_SLICE_ID;
@@ -45,7 +46,7 @@ function khazadWorkerExtension(pi) {
 					answer: '',
 				});
 			}
-			const result = await daemonCall(socket, 'workerAsk', {
+			const params = {
 				run_id: runId,
 				slice_id: sliceId,
 				token,
@@ -53,20 +54,11 @@ function khazadWorkerExtension(pi) {
 				question: String(input.question || ''),
 				options: Array.isArray(input.options) ? input.options.map(String) : [],
 				timeout_seconds: Number(input.timeout_seconds || 0),
-			});
-			if (result.timed_out) {
-				return toolResult('No operator answer before timeout; proceed per the blocked contract.', {
-					available: true,
-					answer: '',
-					timed_out: true,
-					question_id: result.question_id,
-				});
+			};
+			if (canPromptInWorkerPane(ctx?.ui, params.options)) {
+				return askOperatorInWorkerPane(socket, params, ctx.ui);
 			}
-			return toolResult(`Operator answered: ${result.answer || ''}`, {
-				available: true,
-				answer: result.answer || '',
-				question_id: result.question_id,
-			});
+			return askOperatorViaDaemonWait(socket, params);
 		},
 	});
 
@@ -88,6 +80,117 @@ function khazadWorkerExtension(pi) {
 			feedback.shutdown(ctx);
 		});
 	}
+}
+
+async function askOperatorViaDaemonWait(socket, params) {
+	const result = await daemonCall(socket, 'workerAsk', params);
+	if (result.timed_out) {
+		return toolResult('No operator answer before timeout; proceed per the blocked contract.', {
+			available: true,
+			answer: '',
+			timed_out: true,
+			question_id: result.question_id,
+		});
+	}
+	return toolResult(`Operator answered: ${result.answer || ''}`, {
+		available: true,
+		answer: result.answer || '',
+		question_id: result.question_id,
+		answered_via: 'daemon_wait',
+	});
+}
+
+async function askOperatorInWorkerPane(socket, params, ui) {
+	let opened;
+	try {
+		opened = await daemonCall(socket, 'workerAskOpen', params);
+	} catch (error) {
+		return askOperatorUnavailable(`ask_operator channel unavailable: ${error?.message || error}`);
+	}
+	const questionId = String(opened.question_id || '');
+	if (!questionId) return askOperatorUnavailable('ask_operator channel unavailable: daemon did not return a question id');
+	const question = { ...params, id: questionId, timeout_seconds: Number(opened.timeout_seconds || params.timeout_seconds || 0) };
+	const answer = await promptWorkerPaneForAnswer(ui, question);
+	const trimmed = answer === undefined ? '' : String(answer).trim();
+	if (!trimmed) {
+		await daemonCall(socket, 'workerQuestionTimeout', {
+			run_id: params.run_id,
+			question_id: questionId,
+			token: params.token,
+		}).catch(() => undefined);
+		return toolResult('No operator answer was submitted; proceed per the blocked contract.', {
+			available: true,
+			answer: '',
+			timed_out: true,
+			question_id: questionId,
+		});
+	}
+	try {
+		await daemonCall(socket, 'answerQuestion', {
+			run_id: params.run_id,
+			question_id: questionId,
+			answer: trimmed,
+		});
+	} catch (error) {
+		return toolResult(`Operator answer could not be recorded: ${error?.message || error}; proceed per the blocked contract.`, {
+			available: true,
+			answer: '',
+			question_id: questionId,
+			error: String(error?.message || error),
+		});
+	}
+	return toolResult(`Operator answered: ${trimmed}`, {
+		available: true,
+		answer: trimmed,
+		question_id: questionId,
+		answered_via: 'worker_pane',
+	});
+}
+
+function askOperatorUnavailable(message) {
+	return toolResult(`${message}; return blocked JSON if the question is required.`, {
+		available: false,
+		answer: '',
+	});
+}
+
+function canPromptInWorkerPane(ui, options) {
+	if (!ui) return false;
+	if (Array.isArray(options) && options.length > 0 && typeof ui.select === 'function') return true;
+	return typeof ui.input === 'function';
+}
+
+async function promptWorkerPaneForAnswer(ui, question) {
+	const options = Array.isArray(question.options) ? question.options.map(String).filter((option) => option.trim()) : [];
+	const opts = dialogOptions(question.timeout_seconds);
+	const title = questionPromptTitle(question);
+	if (options.length > 0 && typeof ui?.select === 'function') {
+		const choices = [...options];
+		const customChoice = customAnswerChoice(choices);
+		if (typeof ui?.input === 'function') choices.push(customChoice);
+		const selected = await ui.select(title, choices, opts);
+		if (selected === undefined) return undefined;
+		if (selected === customChoice) return ui.input(`Answer ${question.id}`, options[0] || '', opts);
+		return selected;
+	}
+	if (typeof ui?.input === 'function') return ui.input(title, options[0] || '', opts);
+	return undefined;
+}
+
+function dialogOptions(timeoutSeconds) {
+	const seconds = Number(timeoutSeconds || 0);
+	return seconds > 0 ? { timeout: seconds * 1000 } : undefined;
+}
+
+function customAnswerChoice(options) {
+	let label = CUSTOM_ANSWER_CHOICE;
+	while (options.includes(label)) label = `${label}.`;
+	return label;
+}
+
+function questionPromptTitle(question) {
+	const slice = question.slice_id ? ` ${question.slice_id}` : '';
+	return truncateLine(`Khazad-Doom asks${slice}: ${question.question || question.id}`, 180);
 }
 
 function registerSubmitWorkerResultTool(pi) {

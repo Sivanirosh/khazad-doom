@@ -661,7 +661,6 @@ pub(crate) fn prepare_pi_tui_worker_artifacts(
     argv.push(spec.bin.clone());
     argv.extend(pi_contract::remove_json_mode_flags(&spec.args));
     argv.extend([
-        "--no-extensions".to_string(),
         "--extension".to_string(),
         artifacts.extension_dir.to_string_lossy().to_string(),
         "--name".to_string(),
@@ -1361,7 +1360,7 @@ mod tests {
         assert!(argv.windows(2).any(|pair| {
             pair[0] == "--extension" && pair[1] == artifacts.extension_dir.to_string_lossy()
         }));
-        assert!(argv.iter().any(|arg| arg == "--no-extensions"));
+        assert!(!argv.iter().any(|arg| arg == "--no-extensions"));
         assert!(
             std::fs::read_to_string(&artifacts.prompt_path)
                 .unwrap()

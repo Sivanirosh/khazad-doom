@@ -7,10 +7,10 @@ Depends on: PI-01 (blocked semantics, incident vocabulary), PI-02 (contract modu
 
 Convert the most frustrating terminal state — a worker dying `blocked` on a `must_ask_if` condition — into an interactive pause:
 
-- **Worker side:** a Khazad-shipped Pi extension, loaded only into worker sessions (pi-subagents' `subagentOnlyExtensions` pattern), registers an `ask_operator` tool. The worker prompt (`src/workflow/prompts.rs`) instructs: on a `must_ask_if` condition, call `ask_operator` with the question and the options considered; only return `blocked` JSON if the channel is unavailable or the question times out.
-- **Transport:** the daemon's existing Unix socket (`src/ipc.rs`). The daemon passes `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN` into the worker environment. New IPC methods: `workerAsk` (posts question, then long-polls or blocks for the answer), `listQuestions`, `answerQuestion`.
+- **Worker side:** a Khazad-shipped Pi extension, loaded additively into worker sessions, registers an `ask_operator` tool. Worker launches keep the operator's normal Pi extensions and skills; Khazad-Doom adds only the per-attempt worker extension. The worker prompt (`src/workflow/prompts.rs`) instructs: on a `must_ask_if` condition, call `ask_operator` with the question and the options considered; only return `blocked` JSON if the channel is unavailable or the question times out/cancels.
+- **Transport:** the daemon's existing Unix socket (`src/ipc.rs`). The daemon passes `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, and a per-run `KHAZAD_WORKER_TOKEN` into the worker environment. IPC methods: `workerAsk` (posts question, then blocks for a CLI/headless answer), `workerAskOpen` (posts question for same-pane Pi UI), `workerQuestionTimeout` (closes cancelled/expired in-pane prompts), `listQuestions`, `answerQuestion`.
 - **Daemon side:** questions persist in `state::Store` (new table: id, run_id, slice_id, question, options, asked_at, answered_at, answer, state). Progress snapshot gains phase `awaiting_operator` (string phase — **no** `SliceStatus` enum change; slice stays `Running`). `run_incident`-style event on ask and on answer.
-- **Operator side:** `khazad-doom status`/monitor show the pending question and the exact answer command; new CLI `khazad-doom answer <run-id> <question-id> "text"`. Optional notification hook reuses the existing incident surfacing.
+- **Operator side:** in native Pi TUI mode, the worker pane itself is the operator answer surface: `ask_operator` records the pending daemon question, shows the normal Pi select/input dialog in that worker session, and submits the selected answer through `answerQuestion`. `khazad-doom status`/monitor still show the pending question and exact answer command; CLI `khazad-doom answer <run-id> <question-id> "text"` and `/khazad-answer` remain explicit fallback/debug paths. The Pi monitor bridge is read-only for worker questions.
 - **Timeout policy:** configurable `ask_operator` timeout (default generous, e.g. 30–60 min). On timeout the tool returns "no answer; proceed per your blocked contract" and the worker returns `blocked` exactly as today — the feature degrades to current behavior, never hangs a run forever.
 - **Economics:** awaiting-operator wall time is accounted separately from agent time in progress/reports (the pause must not pollute phase-duration economics).
 - **Attempt-timeout interplay:** `worker_attempt_timeout_seconds` must exclude time spent in `awaiting_operator`, or a long think by the operator kills the attempt. The supervision loop (`WorkerAttemptContext`) needs a pause-aware clock.
@@ -18,7 +18,7 @@ Convert the most frustrating terminal state — a worker dying `blocked` on a `m
 ## Out of scope
 
 - Nested fan-out (workers spawning subagents) — deferred at matrix level.
-- Interactive TUI answering (CLI `answer` command first; no Pi monitor UI ships in the current package).
+- Remote/mobile answering beyond a thin authenticated bridge over daemon `status` + `answerQuestion`.
 - Multi-question concurrency per slice beyond a simple queue (one open question per slice at a time is acceptable v1).
 - Changing `must_ask_if` slice-schema semantics (the fence stays; this changes only what happens at the fence).
 
@@ -30,7 +30,7 @@ Convert the most frustrating terminal state — a worker dying `blocked` on a `m
 
 ## API changes
 
-- IPC: `workerAsk { run_id, slice_id, token, question, options[], timeout_seconds }` → `{ answer }` | timeout error; `listQuestions { repo_path | run_id }`; `answerQuestion { run_id, question_id, answer }`. Documented in invariants doc with the token rule.
+- IPC: `workerAsk { run_id, slice_id, token, question, options[], timeout_seconds }` → `{ answer }` | timeout; `workerAskOpen { ... }` → `{ question_id, timeout_seconds }`; `workerQuestionTimeout { run_id, question_id, token }` → timeout; `listQuestions { repo_path | run_id }`; `answerQuestion { run_id, question_id, answer }`. Documented in invariants doc with the token rule.
 - CLI: `khazad-doom answer ...`, `khazad-doom questions [--run ...]`.
 - Worker extension ships in this repo (`extensions/`), versioned with the daemon; handoff already tells workers their contract — prompt text gains the escalation instructions.
 
@@ -64,6 +64,7 @@ Unit:
 
 Integration:
 - Scripted fake worker asks → CLI answers → worker output reflects the answer → run completes.
+- Worker extension same-pane Pi prompt path opens the question with `workerAskOpen`, calls `answerQuestion`, and returns the selected answer; prompt cancellation calls `workerQuestionTimeout` and returns the blocked-contract signal.
 - Timeout → slice `blocked` with question-bearing incident.
 - Daemon restart with pending question → question survives; answer-after-interrupt rejected with guidance; resume path re-exposes the question.
 - Channel-unavailable worker → byte-identical to pre-slice behavior.
@@ -74,7 +75,7 @@ Integration:
 1. Operator starts a run whose slice has a must_ask_if rule the worker will hit.
 2. Worker calls ask_operator; progress phase becomes awaiting_operator; status shows the
    question and the answer command; economics clock for agent time is paused.
-3. Operator answers via `khazad-doom answer`; worker continues and completes the slice;
+3. Operator answers in the same worker Pi pane (or via explicit `khazad-doom answer` fallback); worker continues and completes the slice;
    run reaches ready_to_merge.
 4. Edge condition: a second run's worker attempts workerAsk with the first run's token;
    daemon rejects it and records an incident; the first run is unaffected.
@@ -88,7 +89,7 @@ Integration:
 ## Acceptance criteria
 
 1. Worker can escalate mid-run and continue after an operator answer, without consuming an attempt.
-2. Pending questions are durable, visible in status/monitor, and answerable via CLI.
+2. Pending questions are durable, visible in status/monitor, answerable in the worker pane by default, and answerable via CLI fallback.
 3. Timeout degrades to today's `blocked` with the question preserved in the incident/handoff.
 4. Token scoping enforced at the daemon; cross-run asks rejected.
 5. Attempt timeout and economics exclude awaiting time.
@@ -97,10 +98,7 @@ Integration:
 
 ## Open questions (block `ready`)
 
-1. **Blocking vs polling `workerAsk`:** can the daemon's threaded accept loop hold a long-lived worker connection per pending question (read-timeout interplay with the 2026-06-27 socket hardening), or should the extension poll `questionStatus`? Decide against the accepted-stream timeout design before implementation.
-2. Does Pi's extension API let a tool call block for tens of minutes without tripping Pi-side tool timeouts? (Discovery against installed Pi; determines poll-with-backoff vs block.)
-3. Where does the extension live at runtime — installed via `pi_args`-loaded path per worker launch, or requires `pi install`? (Prefer per-launch path injection: zero operator setup.)
-4. One question per slice at a time acceptable for v1? (Recommended yes; multi-question queue deferred.)
+1. One question per slice at a time acceptable for v1? (Recommended yes; multi-question queue deferred.)
 
 ## Definition of Done
 

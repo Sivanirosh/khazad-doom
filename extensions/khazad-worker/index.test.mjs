@@ -149,7 +149,111 @@ async function withDaemonServer(handler, fn) {
 	}
 }
 
-test('ask_operator uses daemon workerAsk channel when KD worker env is present', async () => {
+test('ask_operator prompts in the worker Pi pane and records the answer through daemon state', async () => {
+	const tool = registeredTools().get('ask_operator');
+	const requests = [];
+	const calls = [];
+	await withDaemonServer(
+		(request) => {
+			requests.push(request);
+			if (request.method === 'workerAskOpen') {
+				assert.equal(request.params.run_id, 'kd-run');
+				assert.equal(request.params.slice_id, 'TUI-PROOF-01');
+				assert.equal(request.params.token, 'secret-token');
+				assert.equal(request.params.attempt, 1);
+				assert.equal(request.params.question, 'Choose?');
+				assert.deepEqual(request.params.options, ['A', 'B']);
+				return { question_id: 'q-1', state: 'pending', timeout_seconds: 3 };
+			}
+			if (request.method === 'answerQuestion') {
+				assert.deepEqual(request.params, { run_id: 'kd-run', question_id: 'q-1', answer: 'B' });
+				return { question: { id: 'q-1', state: 'answered', answer: 'B' } };
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+					KHAZAD_ATTEMPT: '1',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-5',
+						{ question: 'Choose?', options: ['A', 'B'], timeout_seconds: 3 },
+						undefined,
+						undefined,
+						{
+							ui: {
+								async select(title, options, opts) {
+									calls.push({ type: 'select', title, options, opts });
+									return 'B';
+								},
+								async input() {
+									throw new Error('input should not be used when a concrete option is selected');
+								},
+							},
+						},
+					);
+					assert.equal(result.details.available, true);
+					assert.equal(result.details.answer, 'B');
+					assert.equal(result.details.question_id, 'q-1');
+					assert.equal(result.details.answered_via, 'worker_pane');
+				},
+			);
+		},
+	);
+
+	assert.deepEqual(requests.map((request) => request.method), ['workerAskOpen', 'answerQuestion']);
+	assert.deepEqual(calls[0].options, ['A', 'B', 'Type a custom answer…']);
+	assert.deepEqual(calls[0].opts, { timeout: 3000 });
+});
+
+test('ask_operator closes the daemon question when the worker-pane prompt is cancelled', async () => {
+	const tool = registeredTools().get('ask_operator');
+	const requests = [];
+	await withDaemonServer(
+		(request) => {
+			requests.push(request);
+			if (request.method === 'workerAskOpen') return { question_id: 'q-cancel', state: 'pending' };
+			if (request.method === 'workerQuestionTimeout') {
+				assert.deepEqual(request.params, { run_id: 'kd-run', question_id: 'q-cancel', token: 'secret-token' });
+				return { question_id: 'q-cancel', state: 'timed_out', timed_out: true };
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-cancel',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{ ui: { async select() { return undefined; } } },
+					);
+					assert.equal(result.details.available, true);
+					assert.equal(result.details.timed_out, true);
+					assert.equal(result.details.answer, '');
+					assert.equal(result.details.question_id, 'q-cancel');
+				},
+			);
+		},
+	);
+
+	assert.deepEqual(requests.map((request) => request.method), ['workerAskOpen', 'workerQuestionTimeout']);
+});
+
+test('ask_operator uses daemon workerAsk channel when worker-pane UI is unavailable', async () => {
 	const tool = registeredTools().get('ask_operator');
 	await withDaemonServer(
 		(request) => {

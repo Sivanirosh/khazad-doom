@@ -117,10 +117,7 @@ fi
 cmd+=(
   --
   "$pi_bin"
-  --no-extensions
   --extension "$extension_path"
-  --no-builtin-tools
-  --tools submit_worker_result,ask_operator
   --name "$proof_id"
   "@$prompt_path"
 )

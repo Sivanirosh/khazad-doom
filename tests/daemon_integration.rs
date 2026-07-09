@@ -512,6 +512,18 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
         &["answer", &answer_run_id, &question_id, "alpha"],
     )?)?;
     assert_eq!(answered["question"]["state"], "answered");
+    let resumed = json_stdout(&kd_ok(
+        &bin,
+        home_answer.path(),
+        &["status", "--run", &answer_run_id],
+    )?)?;
+    assert_eq!(resumed["progress"]["phase"], "worker_running");
+    assert!(
+        resumed["progress"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("worker resuming")
+    );
     let completed = wait_for_status(&bin, home_answer.path(), &answer_run_id, "completed")?;
     assert_eq!(completed["questions"][0]["answer"], "alpha");
     guard_answer.stop();
