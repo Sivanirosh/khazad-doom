@@ -128,6 +128,10 @@ The classifier returns the highest required tier plus all applicable reason code
 
 ### Classifier rule order
 
+AF-03 implements this as `src/workflow/frontier.rs` / `promotion_policy::classify_followup_proposal`: a pure classifier over an explicit proposal view, `MissionEnvelope`, slice/proposal graph view, and
+`FrontierBudgetState`. It is policy only; it has no runtime callers in AF-03 and creates no proposal, decision, apply, queue, git, IPC, filesystem,
+worker, or clock authority.
+
 1. If there is no candidate follow-up, return no frontier work. Existing queue behavior continues.
 2. If the item is an in-slice discovery with no new runnable work, classify Tier 0.
 3. If `autonomy_level` is `off`, classify Tier 2 with `frontier_disabled`.
