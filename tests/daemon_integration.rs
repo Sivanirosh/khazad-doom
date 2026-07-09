@@ -77,6 +77,92 @@ fn roadmap_truth_lint_accepts_done_status_with_slice_and_run_evidence() -> TestR
 }
 
 #[test]
+fn roadmap_truth_lint_rejects_generated_slice_without_accepted_proposal_decision() -> TestResult {
+    let repo = tempfile::tempdir()?;
+    write_roadmap_fixture(
+        repo.path(),
+        "| Product Decision | Required Feature | Slice ID | Status |\n|---|---|---|---|\n| D1 | Fixture | FIX-01 | `planned` |\n",
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "FIX-02",
+            "title": "Generated fixture",
+            "goal": "Generated without accepted proposal evidence.",
+            "acceptance": ["done"],
+            "provenance": {
+                "parent_slice_id": "FIX-01",
+                "origin_proposal_id": "rp-fixture",
+                "generation": 1,
+                "created_by": "frontier",
+                "created_at": "2026-07-07T00:00:00Z"
+            }
+        }),
+    )?;
+
+    let output = roadmap_truth_check(repo.path())?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rp-fixture"), "{stderr}");
+    assert!(
+        stderr.contains("has no accepted daemon report decision"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn roadmap_truth_lint_accepts_generated_slice_with_accepted_proposal_decision() -> TestResult {
+    let repo = tempfile::tempdir()?;
+    write_roadmap_fixture(
+        repo.path(),
+        "| Product Decision | Required Feature | Slice ID | Status |\n|---|---|---|---|\n| D1 | Fixture | FIX-01 | `planned` |\n",
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "FIX-02",
+            "title": "Generated fixture",
+            "goal": "Generated with accepted proposal evidence.",
+            "acceptance": ["done"],
+            "provenance": {
+                "parent_slice_id": "FIX-01",
+                "origin_proposal_id": "rp-fixture",
+                "generation": 1,
+                "created_by": "frontier",
+                "created_at": "2026-07-07T00:00:00Z"
+            }
+        }),
+    )?;
+    fs::create_dir_all(repo.path().join(".workflow/reports"))?;
+    fs::write(
+        repo.path()
+            .join(".workflow/reports/kd-fixture-final-report.json"),
+        serde_json::to_string_pretty(&json!({
+            "plan_revisions": {
+                "accepted": [{
+                    "proposal_id": "rp-fixture",
+                    "state": "accepted",
+                    "decision": {
+                        "decision": "accepted",
+                        "generated_slice_id": "FIX-02"
+                    }
+                }]
+            }
+        }))?,
+    )?;
+
+    let output = roadmap_truth_check(repo.path())?;
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
