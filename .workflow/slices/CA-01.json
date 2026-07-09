@@ -1,0 +1,41 @@
+{
+  "id": "CA-01",
+  "title": "Verification purity and explicit publication",
+  "goal": "Make daemon-owned verification observationally pure and make completion publication stage only explicit daemon-owned paths, with behavior-first regressions for verification side effects and publication confinement.",
+  "status": "open",
+  "areas": [
+    "src/workflow/gate.rs",
+    "src/workflow/shell.rs",
+    "src/workflow/manager.rs",
+    "src/gitutil.rs",
+    "src/artifact.rs",
+    "src/domain.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Use the confirmed behavioral TDD seams: first add focused gate/module tests plus daemon black-box publication tests, demonstrate that they fail for the intended side-effect/publication reason, then implement without weakening the assertions.",
+    "Before and after every slice and integration verification command, the daemon compares a NUL-safe Git worktree snapshot that distinguishes tracked modifications, staged changes, untracked files, renames, and deletions; paths containing whitespace or newlines are handled correctly.",
+    "A verification command that changes the verified worktree is classified as failed verification, records structured before/after evidence, restores the worktree to its exact pre-command state, and never lets those mutations reach merge, repair, completion publication, or final_sha.",
+    "Successful verification requires the expected clean integration workspace; ignored build outputs may remain ignored but cannot become publication inputs.",
+    "Completion publication replaces unrestricted git add -A with an explicit daemon-owned publication manifest. Only close-record slice JSON and declared report/handoff publication paths are stageable; unrelated tracked or untracked files cannot be committed.",
+    "Verification-cache reuse has an explicit tested identity including repository/worktree identity, verified commit/tree, command, cwd, environment, and relevant policy version; commands with side effects or changed identity are not falsely reused.",
+    "Regressions cover a mutating successful command, a mutating failing command, an unrelated dirty publication file, NUL-sensitive path names, restoration failure, and a normal successful publication.",
+    "Pi remains the sole real worker harness, verification remains daemon-owned, and slice verification remains within slice authority."
+  ],
+  "must_ask_if": [
+    "The fix would make workers, CLI renderers, Herdr, or Pi own verification or publication decisions.",
+    "Exact restoration cannot be guaranteed without deleting pre-existing operator changes or ignored dependency/build caches.",
+    "The implementation would disable verification caching globally instead of making its safety policy explicit and testable.",
+    "An existing test must be deleted, ignored, or relaxed to pass."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test verification --quiet",
+    "cargo test publication --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

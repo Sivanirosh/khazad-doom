@@ -1,0 +1,56 @@
+{
+  "id": "CA-07",
+  "title": "Bounded long-session runtime",
+  "goal": "Measure and bound worker output, telemetry, polling, economics persistence, and child-process supervision so 1/3/10-worker sessions have explicit resource behavior without premature infrastructure expansion.",
+  "status": "open",
+  "depends_on": [
+    "CA-06"
+  ],
+  "areas": [
+    "src/agent.rs",
+    "src/pi_contract.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/domain.rs",
+    "src/gitutil.rs",
+    "src/workflow/shell.rs",
+    "src/workflow/gate.rs",
+    "src/workflow/economics.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/projection.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "scripts/soak-runtime",
+    "docs/design/evidence/complexity-runtime-soak-2026-07-09.md",
+    "docs/workflow-invariants.md",
+    ".workflow/khazad.json"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add deterministic high-volume/quiet-worker/process-tree regressions and record baseline 1/3/10-worker measurements, then introduce bounds and rerun the same measurements.",
+    "Worker and shell monitors keep bounded in-memory tails/counters. Full raw output, when configured/needed, streams to append-only attempt artifacts rather than being retained and repeatedly cloned in memory; truncation/spill metadata is explicit.",
+    "Pi line observations are coalesced by bounded time/byte thresholds into transactional activity updates while preserving liveness, important semantic events, final counters, and debuggability; SQLite is not opened/written once per ordinary output line.",
+    "Polling uses an explicit adaptive/backoff or notification policy with tested maximum attention/cancellation latency, avoiding unconditional 500ms full-state scans for every quiet long-running worker.",
+    "Economics are maintained incrementally from typed counters/events and persisted atomically at bounded checkpoints; growing snapshots are not fully rescanned and rewritten for every observation.",
+    "Pi workers, verification commands, repair workers, and cancellable Git subprocesses share one deep child-process supervisor policy for process groups, timeout, cancellation, grace, escalation, output bounds, and terminal capture, with platform fallback documented.",
+    "Configuration exposes safe defaults and hard maximums for retained bytes/lines, observation flush cadence, polling/backoff, and raw-output spill; zero/unbounded values are deliberate and validated rather than accidental.",
+    "A reproducible local soak script and evidence note compare baseline and final wall time, peak RSS, SQLite row/write growth, artifact bytes, poll count, command count, and agent calls for 1, 3, and 10 deterministic workers; conclusions justify the chosen bounds and do not add pooling/pub-sub without evidence.",
+    "Tests cover multi-megabyte output, no-output workers, split UTF-8/JSON lines, output spill failure, cancellation with grandchildren, timeout races, and final economics/status agreement."
+  ],
+  "must_ask_if": [
+    "Meeting the bound would require dropping authoritative worker results, questions, terminal events, or verification evidence.",
+    "The implementation would add an external telemetry system, database pool, or pub/sub broker before soak evidence shows it is necessary.",
+    "A default hard limit would silently kill valid workers instead of bounding observation/storage behavior.",
+    "Cross-platform process supervision would require removing the existing Unix safety guarantee."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test bounded --quiet",
+    "cargo test economics --quiet",
+    "cargo test supervision --quiet",
+    "scripts/soak-runtime --quick",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1800
+}

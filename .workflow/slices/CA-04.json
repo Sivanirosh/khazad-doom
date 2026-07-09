@@ -1,0 +1,46 @@
+{
+  "id": "CA-04",
+  "title": "Transactional operator decisions",
+  "goal": "Replace race-prone check-then-write question and replan transitions with typed compare-and-set StateStore commands that mutate state and append the matching event atomically.",
+  "status": "open",
+  "depends_on": [
+    "CA-03"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/workflow/events.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/attention.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add deterministic concurrent daemon-RPC and StateStore tests for answer-vs-timeout and accept-vs-reject/defer/auto-accept races, observe the invalid double-transition failure, then implement.",
+    "Worker-question answer and timeout are compare-and-set commands requiring the expected pending state and token/attempt identity; the state mutation and typed event append occur in one SQLite transaction.",
+    "Replan accept, reject, defer, timeout, and budgeted auto-accept share one transactional decision command that enforces exactly one terminal decision and atomically records budget changes plus event evidence.",
+    "Commands return typed applied, already-applied-idempotently, conflict, stale-token, and not-found outcomes so daemon RPC methods do not infer correctness from follow-up reads or error strings.",
+    "Concurrent handling allowed by the daemon cannot produce two successful answers/decisions, duplicate authoritative events, negative/double budget consumption, or a response that contradicts durable state.",
+    "SQLite connections consistently apply foreign keys, WAL policy, a bounded busy timeout, and transaction mode through one connection-configuration seam rather than repeated ad-hoc PRAGMAs.",
+    "Attention delivery happens only after the authoritative transaction and remains non-fatal; failed delivery cannot roll back or alter the operator decision.",
+    "Tests use real concurrent connections/RPCs and cover duplicate identical commands, conflicting commands, timeout races, stale attempt tokens, restart reads, and event/state agreement."
+  ],
+  "must_ask_if": [
+    "The implementation would serialize correctness only with the in-process daemon mutex rather than enforce it in durable state.",
+    "An operator decision would become dependent on Herdr/Pi delivery.",
+    "Backward-compatible reading of existing question/proposal rows cannot be retained.",
+    "Tests would need sleeps as the only concurrency control instead of barriers or deterministic hooks."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test worker_question --quiet",
+    "cargo test replan --quiet",
+    "cargo test concurrent --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

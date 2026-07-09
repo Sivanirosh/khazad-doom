@@ -1,0 +1,53 @@
+{
+  "id": "CA-06",
+  "title": "Transactional status snapshot and semantic projection",
+  "goal": "Build one coherent daemon-owned run snapshot and move lifecycle, gate, attention, and operator-action interpretation fully behind the server projection boundary.",
+  "status": "open",
+  "depends_on": [
+    "CA-05"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/gitutil.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/manager.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "extensions/khazad-monitor",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add snapshot consistency/error-visibility tests and Rust/renderer parity tests that fail under mixed revisions or client-side semantic interpretation, then implement.",
+    "RunReadModelBuilder obtains run, slices, attempts, questions, replans, incidents, events, economics, terminalization, and merge/admission state from one SQLite read transaction/revision. Required read failures are surfaced explicitly and never converted into empty attention lists.",
+    "Artifact and Git-derived fields used by status are either durably indexed into that transaction, read against a recorded revision/commit with explicit freshness metadata, or reported unavailable; a response cannot silently combine unrelated revisions.",
+    "Daemon-owned StatusFeed and typed projection blocks own terminal/lifecycle interpretation, primary reason, gate/repair summaries, worker activity, attention priority, and exact operator action commands.",
+    "CLI, watch, monitor, cockpit, and Node extension are painters over the versioned projection. They do not parse raw events, infer terminal semantics, synthesize gate state, or independently decide which operator command is valid.",
+    "Terminal run summaries, live/latest status, handoff/report readiness, and terminal notifications consume the same read model with explicit pre-advertisement overrides where required.",
+    "Snapshot schema is backward-compatible or versioned additively, includes freshness/error metadata, and preserves daemon-state authority independent of Herdr/Pi availability.",
+    "Tests force concurrent writes during snapshot construction, question-read failure, missing/corrupt artifacts, Git movement, blocked/failed/completed/cancelled states, and Rust/Node painter parity."
+  ],
+  "must_ask_if": [
+    "Status correctness would depend on locking the entire workflow manager for all reads.",
+    "A renderer must retain semantic logic because the server projection lacks a field; add/version the field instead.",
+    "Required attention data would be hidden on read failure.",
+    "The implementation would make daemon state depend on Pi/Herdr UI state."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test read_model --quiet",
+    "cargo test projection --quiet",
+    "cargo test status --quiet",
+    "npm test",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

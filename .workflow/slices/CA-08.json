@@ -1,0 +1,60 @@
+{
+  "id": "CA-08",
+  "title": "Typed contracts and authority consolidation",
+  "goal": "Consolidate worker-wire conversion, event vocabulary, attention policy, selected-slice planning, and provenance/follow-up domain fields without adding generic registries or moving daemon-owned semantics into workers/renderers.",
+  "status": "open",
+  "depends_on": [
+    "CA-07"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/agent.rs",
+    "src/pi_contract.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "src/workflow/schema.rs",
+    "src/workflow/events.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/manager.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "extensions/khazad-worker",
+    "extensions/khazad-monitor",
+    "docs/workflow-invariants.md",
+    "docs/design/replan-checkpoints.md"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: add worker-wire golden/compatibility tests, legacy-event/migration tests, attention-action parity tests, and queue/provenance round-trip tests before changing implementations.",
+    "WorkerResultWire and RepairResultWire (or equivalent explicit wire structs) exactly describe JSON emitted by Pi workers. Conversion into daemon domain results adds attempts, trigger, immutable attempt identity, and other daemon-owned enrichment; those fields are not falsely required from the agent.",
+    "Persisted workflow events use a typed event-kind vocabulary and typed payload structs/constructors at producers and consumers. Legacy string/ad-hoc JSON events remain readable through explicit compatibility decoding with unknown-event preservation.",
+    "One deep attention policy maps daemon read-model state to typed attention intents/actions for worker questions, replan decisions, terminal transitions, and pane hygiene; delivery/dedupe remains behind the cockpit seam and non-authoritative.",
+    "Run slice selection/queue state is stored as a typed normalized plan or relation rather than a comma-encoded selected_slice_id string, with backward-compatible migration and safe slice IDs still enforced.",
+    "GitHub/provenance metadata and follow-up slice drafts move out of overloaded github_issue and summary strings into explicit typed fields/tables/artifacts, with legacy reads and lossless migration tests.",
+    "State/status IPC remains harness-neutral JSON, Pi remains the sole real worker harness, fake remains only a deterministic test seam, and renderers remain painters over daemon projections.",
+    "No generic repository layer, provider registry, harness registry, phase-based manager split, or shallow pass-through module is introduced. Extract only invariant-bearing wire/event/attention/plan protocols with small deep interfaces.",
+    "Public JSON changes are additive/versioned, old run artifacts and SQLite databases remain inspectable, and schema migration is idempotent across repeated startup."
+  ],
+  "must_ask_if": [
+    "A daemon-owned field such as repair attempts or trigger must be added to the Pi worker response schema.",
+    "Legacy persisted runs/events cannot be read without destructive migration.",
+    "A consolidation would create a speculative multi-harness/provider abstraction.",
+    "Attention delivery would become authoritative for workflow state or cancellation."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test wire --quiet",
+    "cargo test events --quiet",
+    "cargo test attention --quiet",
+    "cargo test migration --quiet",
+    "npm test",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1800
+}

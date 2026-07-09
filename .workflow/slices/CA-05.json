@@ -1,0 +1,46 @@
+{
+  "id": "CA-05",
+  "title": "Launch admission and merge reconciliation",
+  "goal": "Make run admission and serial integration merge recoverable daemon-owned protocols with durable intent, compensation, and restart reconciliation.",
+  "status": "open",
+  "depends_on": [
+    "CA-04"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/gitutil.rs",
+    "src/daemon.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/events.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add fault/concurrency tests that leave partial launch activation or an ambiguous post-cherry-pick state, demonstrate the failures, then implement recoverable protocols.",
+    "Run admission is a transactional StateStore command with a durable uniqueness guarantee for one active run per canonical repository, independent of the daemon process mutex.",
+    "Admission records a launch intent before branch/worktree/cockpit activation. Every subsequent failure either compensates created resources and resolves the intent or leaves a durable reconcilable state with the primary cause.",
+    "Daemon restart reconciles incomplete launch intents idempotently and never creates duplicate active runs, integration branches, worktrees, or worker launches.",
+    "Each serial integration operation persists a merge intent containing run, slice, attempt, source commit, expected integration head, and operation identity before Git mutation.",
+    "After cherry-pick/merge and before marking completion, the daemon durably records the resulting head and state/event transition. Restart reconciliation uses commit ancestry/tree and the journal to distinguish not-started, applied, conflicted, and divergent states without reapplying an already integrated commit.",
+    "Merge conflicts, abort failures, branch deletion failures, and state-write failures retain structured evidence and a deterministic operator/recovery path; they do not silently advance checkpoints.",
+    "Tests inject failures at every admission and merge boundary, include two concurrent daemon clients/processes, and prove restart convergence, no duplicate merges, and no leaked active-run lock."
+  ],
+  "must_ask_if": [
+    "The design would treat Git reflog or renderer text as the sole authoritative merge journal.",
+    "Recovery would auto-discard operator commits or force-reset a divergent integration branch.",
+    "Admission uniqueness requires a new external coordination service instead of SQLite/filesystem/Git state already owned by the daemon.",
+    "The fix would change dependency ordering, slice authority, or serial integration policy."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test admission --quiet",
+    "cargo test merge_reconciliation --quiet",
+    "cargo test active_repo_run --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

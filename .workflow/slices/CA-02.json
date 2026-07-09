@@ -1,0 +1,45 @@
+{
+  "id": "CA-02",
+  "title": "Recoverable terminalization and atomic artifacts",
+  "goal": "Turn terminalization into an invariant-bearing recoverable protocol and make authoritative JSON artifact replacement crash-safe, so mandatory persistence failures can never be discarded before cleanup.",
+  "status": "open",
+  "depends_on": [
+    "CA-01"
+  ],
+  "areas": [
+    "src/artifact.rs",
+    "src/state.rs",
+    "src/domain.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/events.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add fault-injection tests at ArtifactStore/StateStore seams and daemon lifecycle tests that fail because terminal summary/update errors are currently discarded, then implement without loosening them.",
+    "Authoritative JSON writes use same-directory temporary files, flush/sync as appropriate, atomic rename, and parent-directory durability; a crash or injected failure leaves either the old complete artifact or the new complete artifact, never truncated JSON.",
+    "Terminalization is an explicit protocol with durable intent, atomic terminal summary replacement, transactional terminal status plus event commit, notification bookkeeping, and cleanup in that order.",
+    "A mandatory summary/state/event persistence failure cannot be ignored and cannot yield a falsely terminal run. It leaves durable retry/recovery evidence and preserves the primary requested terminal outcome and failure cause.",
+    "Daemon startup and explicit resume reconcile incomplete terminalization idempotently without duplicate terminal events, notifications, close records, publication commits, or cleanup side effects.",
+    "Cleanup and visibility-notification failures remain non-authoritative incidents after mandatory state is durable; they never overwrite the primary terminal reason.",
+    "Tests inject failures before temp write, before rename, after rename, during status/event commit, during notification, and during cleanup, then prove restart reconciliation and valid artifacts.",
+    "The protocol is extracted only as a deep terminalization/artifact seam; manager.rs is not split by phase or file size."
+  ],
+  "must_ask_if": [
+    "The design would advertise a terminal status before the matching durable summary and event exist.",
+    "Recovery would require guessing from renderer output or Herdr state rather than daemon-owned records.",
+    "Atomic replacement cannot be implemented portably without changing the documented runtime support policy.",
+    "An existing lifecycle or notification regression would need to be weakened."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test atomic --quiet",
+    "cargo test terminalization --quiet",
+    "cargo test terminal_notification --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

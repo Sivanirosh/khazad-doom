@@ -1,69 +1,69 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://khazad-doom.local/mission-envelope.schema.json",
-  "title": "Khazad-Doom Mission Envelope",
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": true,
-  "required": [
-    "goal",
-    "allowed_areas"
-  ],
   "properties": {
-    "goal": {
-      "type": "string",
-      "minLength": 1
-    },
     "allowed_areas": {
-      "type": "array",
-      "minItems": 1,
       "items": {
-        "type": "string",
+        "description": "Repo-relative literal path prefix using the same area contract as slice areas.",
         "minLength": 1,
         "pattern": "^(?!\\s)(?!/)(?!\\.\\/)(?!.*\\.\\.)(?!.*[\\*\\?\\[\\]])(?!.*\\s$).+$",
-        "description": "Repo-relative literal path prefix using the same area contract as slice areas."
+        "type": "string"
       },
+      "minItems": 1,
+      "type": "array",
       "uniqueItems": true
     },
-    "non_goals": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      }
-    },
-    "verify_profile": {
-      "type": "string",
-      "minLength": 1,
-      "default": "default"
-    },
-    "max_auto_promotions": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "max_depth": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "max_generated_slices": {
-      "type": "integer",
-      "minimum": 0
-    },
     "autonomy_level": {
-      "type": "string",
+      "default": "off",
       "enum": [
         "off",
         "shadow",
         "promote",
         "run"
       ],
-      "default": "off"
+      "type": "string"
+    },
+    "goal": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "max_auto_promotions": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_depth": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_generated_slices": {
+      "minimum": 0,
+      "type": "integer"
     },
     "must_ask_if": {
-      "type": "array",
       "items": {
-        "type": "string",
-        "minLength": 1
-      }
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "non_goals": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "verify_profile": {
+      "default": "default",
+      "minLength": 1,
+      "type": "string"
     }
-  }
+  },
+  "required": [
+    "goal",
+    "allowed_areas"
+  ],
+  "title": "Khazad-Doom Mission Envelope",
+  "type": "object"
 }

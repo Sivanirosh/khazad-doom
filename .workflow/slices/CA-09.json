@@ -1,0 +1,60 @@
+{
+  "id": "CA-09",
+  "title": "Cross-language contract CI and closure",
+  "goal": "Close the complexity-remediation program with shared Rust/Node IPC fixtures, shipped extension tests in CI, corrected AF-06/operator documentation, and full regression/soak evidence.",
+  "status": "open",
+  "depends_on": [
+    "CA-08"
+  ],
+  "areas": [
+    ".github/workflows/ci.yml",
+    "package.json",
+    "src/domain.rs",
+    "src/ipc.rs",
+    "src/daemon.rs",
+    "src/cli.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/projection.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/common",
+    "tests/fixtures",
+    "tests/khazad-worker-extension.test.mjs",
+    "extensions/khazad-worker",
+    "extensions/khazad-monitor",
+    "README.md",
+    "skills/khazad-doom/SKILL.md",
+    "docs/workflow-invariants.md",
+    "docs/design/complexity-remediation-2026-07-09.md",
+    "docs/design/evidence/complexity-runtime-soak-2026-07-09.md",
+    "scripts/roadmap-truth-check",
+    "scripts/soak-runtime"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add/activate a Node consumer test against shared fixtures and show CI/package scripts did not previously run the complete shipped extension suite, then wire it into the standard test path.",
+    "Canonical versioned JSON fixtures cover daemon status/read-model projections, operator actions, worker and repair wire results, typed/legacy events, terminal summaries, and representative blocked/failed/completed/cancelled runs.",
+    "Rust producer/decoder tests and Node extension consumer/painter tests read the same fixture files and fail on semantic/schema drift; fixtures are generated or reviewed through an explicit deterministic process rather than copied independently.",
+    "npm test executes all shipped khazad-worker and khazad-monitor tests, including external tests under tests/, and the GitHub Actions workflow installs the supported Node version and runs npm test alongside Rust fmt/test/clippy/check and workflow validation.",
+    "README.md and skills/khazad-doom/SKILL.md accurately describe AF-06 promote/run autonomy as active, with daemon-owned authority boundaries, truthful stop conditions, and no stale inactive wording.",
+    "A closure note maps CA-01 through CA-09 to the original nine remediation steps, records the confirmed behavioral test seams, lists invariant-bearing protocols extracted, and explicitly records deferred speculative abstractions.",
+    "The final evidence includes passing cargo test --all-targets, cargo clippy --all-targets --all-features -- -D warnings, cargo check --all-targets, npm test, slice validation, roadmap truth check, and the reproducible 1/3/10-worker soak.",
+    "No existing test is deleted, ignored, snapshot-updated without semantic review, or narrowed merely to make the closure gate pass."
+  ],
+  "must_ask_if": [
+    "Cross-language parity would require duplicating daemon semantic logic in JavaScript.",
+    "CI cannot run Node tests without adding privileged services or private credentials.",
+    "Documentation truth conflicts with current daemon behavior after CA-01 through CA-08.",
+    "Full validation exposes a pre-existing unrelated failure that cannot be fixed within declared areas."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test --all-targets",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "cargo check --all-targets",
+    "npm test",
+    "cargo run --quiet -- slices validate --repo .",
+    "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+    "scripts/soak-runtime --quick"
+  ],
+  "verify_timeout_seconds": 2400
+}

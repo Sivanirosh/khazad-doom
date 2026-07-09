@@ -1,0 +1,47 @@
+{
+  "id": "CA-03",
+  "title": "Append-only worker attempt ledger",
+  "goal": "Separate immutable worker-attempt identity from retry budget and execution epoch so resume and retry can never overwrite evidence, branches, artifacts, or activity records.",
+  "status": "open",
+  "depends_on": [
+    "CA-02"
+  ],
+  "areas": [
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/agent.rs",
+    "src/pi_contract.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/projection.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Use behavioral TDD: first add resume/retry tests that expose deterministic attempt-N reuse and evidence overwrite, then implement a monotonic append-only model without weakening those tests.",
+    "A persisted WorkerAttemptLedger allocates a unique monotonic attempt identity per run/slice launch. Retry-budget ordinal, repair ordinal, and execution/resume epoch are separate typed fields rather than being overloaded into one attempt number.",
+    "Attempt allocation and initial running evidence are transactional and happen before launch; an allocated-but-not-launched attempt remains explicit evidence and is reconciled rather than silently reused.",
+    "Attempt artifact directories/files, worker branches, output spill paths, question tokens, and status records use the immutable attempt identity and can never overwrite prior attempts after resume.",
+    "Resume increments/records an execution epoch and schedules only unfinished work while preserving every prior worker result, raw output, activity observation, branch reference, and failure cause.",
+    "Read models and reports expose stable attempt history while preserving compatibility for existing runs that only contain legacy attempt ordinals.",
+    "Direct Pi worker cancellation terminates the supervised process group/tree with configured grace and escalation, matching shell supervision rather than killing only the immediate child PID.",
+    "Tests cover retry, repair, interrupted launch, daemon restart/resume, cancellation with a grandchild process, and two resumes without duplicate identities or evidence loss."
+  ],
+  "must_ask_if": [
+    "A migration would discard or rewrite existing attempt evidence rather than reading it compatibly.",
+    "Worker-wire JSON would be expanded with daemon-owned attempt enrichment instead of using an explicit conversion boundary.",
+    "Process-group supervision would break supported non-Unix behavior without a documented fallback.",
+    "The implementation would reset retry budgets or silently relaunch completed slices."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test worker_attempt --quiet",
+    "cargo test resume --quiet",
+    "cargo test cancellation --quiet",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}
