@@ -1,0 +1,28 @@
+{
+  "id": "COCKPIT-RENAME-01",
+  "title": "Avoid terminal rename noise for cleaned native worker panes",
+  "goal": "Remove expected cockpit_worker_rename_failed noise caused by native Pi TUI worker pane cleanup, without hiding real Herdr placement or rename failures.",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260709-cleanup",
+  "closed_at": "2026-07-09T09:34:16Z",
+  "depends_on": [
+    "TUI-DEFAULT-01"
+  ],
+  "areas": [
+    ".workflow/slices/COCKPIT-RENAME-01.json",
+    "src/workflow/manager.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/cockpit.rs",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Native Pi TUI worker panes are no longer closed before terminal-summary outcome rename can run, or expected closed-pane renames are narrowly suppressed.",
+    "The fix must not turn all cockpit_worker_rename_failed cases into success; unexpected rename failures remain visible incidents.",
+    "Existing worker pane terminal rename dedupe behavior remains covered by tests."
+  ],
+  "verify": [
+    "cargo test --quiet worker_pane_terminal_rename",
+    "cargo test --quiet cockpit_can_close_tui_worker_pane_through_adapter",
+    "cargo check --quiet"
+  ]
+}

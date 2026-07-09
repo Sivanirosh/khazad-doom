@@ -17,7 +17,6 @@ pub(crate) const INTEGRATION_REPAIR_COMPLETED: &str = "integration_repair_comple
 pub(crate) const PARALLEL_LAYER_COMPLETED: &str = "parallel_layer_completed";
 pub(crate) const PARALLEL_LAYER_FAILED: &str = "parallel_layer_failed";
 pub(crate) const PARALLEL_LAYER_STARTED: &str = "parallel_layer_started";
-pub(crate) const PROGRESS: &str = "progress";
 pub(crate) const RUN_CANCEL_REQUESTED: &str = "run_cancel_requested";
 pub(crate) const RUN_CANCELLED: &str = "run_cancelled";
 pub(crate) const RUN_COMPLETED: &str = "run_completed";
@@ -162,23 +161,6 @@ impl RunIncidentPayload {
         }
     }
 
-    pub(crate) fn from_value(value: &Value) -> Self {
-        let mut payload: Self = decode_or_else(value, || Self::legacy(value));
-        if payload.severity.trim().is_empty() {
-            payload.severity = "warning".to_string();
-        }
-        if payload.kind.trim().is_empty() {
-            payload.kind = "run_incident".to_string();
-        }
-        if payload.message.trim().is_empty() {
-            payload.message = payload
-                .extra_text("summary")
-                .or_else(|| payload.extra_text("error"))
-                .unwrap_or_else(|| "incident recorded".to_string());
-        }
-        payload
-    }
-
     pub(crate) fn with_extra<T: Serialize>(mut self, key: impl Into<String>, value: T) -> Self {
         self.extra.insert(
             key.into(),
@@ -210,44 +192,6 @@ impl RunIncidentPayload {
     pub(crate) fn with_fix_commands(mut self, value: Vec<String>) -> Self {
         self.fix_commands = value;
         self
-    }
-
-    pub(crate) fn terminal_relevant(&self) -> bool {
-        !self.failure_kind.trim().is_empty()
-            || self.operator_action_required.is_some()
-            || self.severity == "error"
-    }
-
-    pub(crate) fn kind_or_failure_kind(&self) -> String {
-        first_non_empty(&[&self.failure_kind, &self.kind])
-            .unwrap_or_else(|| "run_incident".to_string())
-    }
-
-    pub(crate) fn message_or_summary(&self) -> String {
-        first_non_empty(&[&self.message])
-            .or_else(|| self.extra_text("error"))
-            .or_else(|| self.extra_text("summary"))
-            .unwrap_or_else(|| "incident recorded".to_string())
-    }
-
-    pub(crate) fn extra_text(&self, key: &str) -> Option<String> {
-        self.extra.get(key).and_then(value_to_text)
-    }
-
-    fn legacy(value: &Value) -> Self {
-        let mut extra = object_extra(value);
-        Self {
-            severity: text_field(value, &["severity"]).unwrap_or_else(default_warning),
-            kind: text_field(value, &["kind"]).unwrap_or_else(|| "run_incident".to_string()),
-            message: text_field(value, &["message", "error", "summary"])
-                .unwrap_or_else(|| "incident recorded".to_string()),
-            failure_kind: text_field(value, &["failure_kind"]).unwrap_or_default(),
-            resolution_owner: text_field(value, &["resolution_owner"]).unwrap_or_default(),
-            operator_action_required: bool_field(value, "operator_action_required"),
-            retryable: bool_field(value, "retryable"),
-            fix_commands: string_array_field(value, "fix_commands"),
-            extra: std::mem::take(&mut extra),
-        }
     }
 }
 
@@ -359,27 +303,6 @@ pub(crate) struct CockpitReadyPayload {
     pub planner: String,
 }
 
-impl CockpitReadyPayload {
-    pub(crate) fn from_value(value: &Value) -> Self {
-        let mut payload: Self = decode_or_else(value, || Self {
-            adapter: text_field(value, &["adapter"]).unwrap_or_else(|| "cockpit".to_string()),
-            mode: text_field(value, &["mode"]).unwrap_or_default(),
-            workspace: text_field(value, &["workspace", "workspace_label"])
-                .unwrap_or_else(|| "workspace".to_string()),
-            panes: string_array_field(value, "panes"),
-            source_of_truth: text_field(value, &["source_of_truth"]).unwrap_or_default(),
-            planner: text_field(value, &["planner"]).unwrap_or_default(),
-        });
-        if payload.adapter.trim().is_empty() {
-            payload.adapter = "cockpit".to_string();
-        }
-        if payload.workspace.trim().is_empty() {
-            payload.workspace = "workspace".to_string();
-        }
-        payload
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct CockpitWorkerReadyPayload {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -437,12 +360,6 @@ impl SliceStartedPayload {
             slice_id: slice_id.into(),
         }
     }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            slice_id: text_field(value, &["slice_id"]).unwrap_or_default(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -459,13 +376,6 @@ impl SliceMergedPayload {
             commit_sha: commit_sha.into(),
         }
     }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            slice_id: text_field(value, &["slice_id"]).unwrap_or_default(),
-            commit_sha: text_field(value, &["commit_sha"]).unwrap_or_default(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -481,20 +391,6 @@ impl IntegrationRepairCompletedPayload {
             summary: summary.into(),
         }
     }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        let mut payload: Self = decode_or_else(value, || Self {
-            status: text_field(value, &["status"]).unwrap_or_default(),
-            summary: text_field(value, &["summary", "message"]).unwrap_or_default(),
-        });
-        if payload.status.trim().is_empty() {
-            payload.status = "-".to_string();
-        }
-        if payload.summary.trim().is_empty() {
-            payload.summary = "integration repair completed".to_string();
-        }
-        payload
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -507,12 +403,6 @@ impl TerminalSummaryWrittenPayload {
         Self {
             path: path_to_string(path),
         }
-    }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            path: text_field(value, &["path"]).unwrap_or_default(),
-        })
     }
 }
 
@@ -568,23 +458,6 @@ impl TerminalNotificationPayload {
             target_kind: String::new(),
         }
     }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            status: text_field(value, &["status"]).unwrap_or_default(),
-            terminal_status: text_field(value, &["terminal_status"]).unwrap_or_default(),
-            transition_key: text_field(value, &["transition_key"]).unwrap_or_default(),
-            reason: text_field(value, &["reason"]).unwrap_or_default(),
-            adapter: text_field(value, &["adapter"]).unwrap_or_default(),
-            surface: text_field(value, &["surface"]).unwrap_or_default(),
-            target_kind: text_field(value, &["target_kind"]).unwrap_or_default(),
-        })
-    }
-
-    pub(crate) fn display_status(&self) -> String {
-        first_non_empty(&[&self.terminal_status, &self.status])
-            .unwrap_or_else(|| "terminal status".to_string())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -634,12 +507,6 @@ pub(crate) struct WorkerAttemptFailurePayload {
     pub primary_failure: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secondary_failures: Vec<String>,
-}
-
-impl WorkerAttemptFailurePayload {
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_default(value)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -692,20 +559,6 @@ impl WorkerQuestionAskedPayload {
             ),
         }
     }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            question_id: text_field(value, &["question_id"]).unwrap_or_default(),
-            slice_id: text_field(value, &["slice_id"]).unwrap_or_default(),
-            attempt: usize_field(value, "attempt"),
-            question: text_field(value, &["question"])
-                .unwrap_or_else(|| "worker question pending".to_string()),
-            options: string_array_field(value, "options"),
-            timeout_seconds: u64_field(value, "timeout_seconds"),
-            deadline_at: text_field(value, &["deadline_at"]),
-            answer_command: text_field(value, &["answer_command"]).unwrap_or_default(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -746,37 +599,6 @@ pub(crate) struct AttentionDeliveryPayload {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_kind: String,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct ProgressEventPayload {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub phase: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub slice_id: String,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    pub attempt: usize,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub command: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub message: String,
-}
-
-impl ProgressEventPayload {
-    pub(crate) fn from_value(value: &Value) -> Self {
-        let mut payload: Self = decode_or_else(value, || Self {
-            phase: text_field(value, &["phase"]).unwrap_or_else(|| "activity".to_string()),
-            slice_id: text_field(value, &["slice_id"]).unwrap_or_default(),
-            attempt: usize_field(value, "attempt"),
-            command: text_field(value, &["command"]).unwrap_or_default(),
-            message: text_field(value, &["message"]).unwrap_or_default(),
-        });
-        if payload.phase.trim().is_empty() {
-            payload.phase = "activity".to_string();
-        }
-        payload
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct ParallelLayerPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -815,37 +637,7 @@ impl ParallelLayerPayload {
             summary: summary.into(),
         }
     }
-
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            slices: string_array_field(value, "slices"),
-            outcomes: value
-                .get("outcomes")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            summary: text_field(value, &["summary"]).unwrap_or_default(),
-        })
-    }
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct CheckpointWrittenPayload {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub completed_slices: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remaining_slices: Vec<String>,
-}
-
-impl CheckpointWrittenPayload {
-    pub(crate) fn from_value(value: &Value) -> Self {
-        decode_or_else(value, || Self {
-            completed_slices: string_array_field(value, "completed_slices"),
-            remaining_slices: string_array_field(value, "remaining_slices"),
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct ImplementationSummaryPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1010,25 +802,6 @@ fn usize_field(value: &Value, key: &str) -> usize {
         .map(|value| value as usize)
         .unwrap_or_default()
 }
-
-fn u64_field(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or_default()
-}
-
-fn string_array_field(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(value_to_text)
-                .filter(|value| !value.trim().is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn object_extra(value: &Value) -> BTreeMap<String, Value> {
     value
         .as_object()
@@ -1039,15 +812,6 @@ fn object_extra(value: &Value) -> BTreeMap<String, Value> {
         })
         .unwrap_or_default()
 }
-
-fn first_non_empty(values: &[&str]) -> Option<String> {
-    values
-        .iter()
-        .map(|value| value.trim())
-        .find(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
 fn default_warning() -> String {
     "warning".to_string()
 }

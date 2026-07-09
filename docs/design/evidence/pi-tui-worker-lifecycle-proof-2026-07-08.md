@@ -78,7 +78,7 @@ Run `kd-20260708-004220-7eb38dc2` was started with only `KHAZAD_EXPERIMENTAL_PI_
 
 This was the old behavior. The run was cancelled as failed proof evidence. Root cause: the first implementation read the opt-in from ambient daemon process environment. That is not a reliable run contract; an already-running daemon may not have the client environment, and the operator's intent must travel through daemon IPC/run state.
 
-Fix: add an explicit `--experimental-pi-tui-worker` CLI flag and `experimental_pi_tui_worker` IPC/run option. The CLI still maps `KHAZAD_EXPERIMENTAL_PI_TUI_WORKER=1` to that request field for convenience, but the daemon no longer has to infer operator intent from its process environment.
+Fix: add an explicit `--experimental-pi-tui-worker` CLI flag and an explicit IPC/run worker-interface option. After default promotion, the internal option is named `native_pi_tui_worker`; the daemon still accepts the historical `experimental_pi_tui_worker` JSON field as an alias and still records it in preflight artifacts for compatibility. The CLI still maps `KHAZAD_EXPERIMENTAL_PI_TUI_WORKER=1` to native TUI selection for convenience, but the daemon no longer has to infer operator intent from its process environment.
 
 ## Live daemon dogfood — native TUI path succeeded
 

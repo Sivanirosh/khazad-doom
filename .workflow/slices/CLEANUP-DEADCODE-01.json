@@ -1,0 +1,28 @@
+{
+  "id": "CLEANUP-DEADCODE-01",
+  "title": "Remove stale projection and event dead code",
+  "goal": "Remove obsolete compact-feed helper code and event decoding helpers that only existed for retired status blocks, while preserving the canonical compact feed sections and semantics.",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260709-cleanup",
+  "closed_at": "2026-07-09T09:34:16Z",
+  "depends_on": [
+    "TUI-DEFAULT-01"
+  ],
+  "areas": [
+    ".workflow/slices/CLEANUP-DEADCODE-01.json",
+    "src/workflow/projection.rs",
+    "src/workflow/events.rs",
+    "tests/fixtures/projection_information_feed_golden.json",
+    "tests/daemon_integration.rs"
+  ],
+  "acceptance": [
+    "Remove or otherwise resolve current dead-code warnings from stale projection/feed helpers without restoring old dashboard block labels.",
+    "The compact feed still exposes Run, Workers, Attention, optional Commands, Checks, and Economics, and does not resurrect Todos, Activity, Tail, Terminal, Replan, or Shell blocks.",
+    "cargo check --quiet completes without dead-code warnings from src/workflow/projection.rs or src/workflow/events.rs."
+  ],
+  "verify": [
+    "cargo check --quiet",
+    "cargo test --quiet projection",
+    "cargo test --quiet dashboard_v2_projection_orders_compact_sections"
+  ]
+}

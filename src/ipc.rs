@@ -48,8 +48,12 @@ pub struct StartRunParams {
     pub pi_bin: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pi_args: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub experimental_pi_tui_worker: bool,
+    #[serde(
+        default,
+        alias = "experimental_pi_tui_worker",
+        skip_serializing_if = "is_false"
+    )]
+    pub native_pi_tui_worker: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallelism: usize,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -67,8 +71,12 @@ pub struct ResumeRunParams {
     pub pi_bin: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pi_args: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub experimental_pi_tui_worker: bool,
+    #[serde(
+        default,
+        alias = "experimental_pi_tui_worker",
+        skip_serializing_if = "is_false"
+    )]
+    pub native_pi_tui_worker: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallelism: usize,
 }
@@ -278,4 +286,27 @@ fn is_zero_u64(value: &u64) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_pi_tui_worker_accepts_legacy_ipc_field() {
+        let start: StartRunParams = serde_json::from_value(json!({
+            "repo_path": "/tmp/repo",
+            "experimental_pi_tui_worker": true
+        }))
+        .expect("start params decode");
+        assert!(start.native_pi_tui_worker);
+
+        let resume: ResumeRunParams = serde_json::from_value(json!({
+            "run_id": "kd-test",
+            "experimental_pi_tui_worker": true
+        }))
+        .expect("resume params decode");
+        assert!(resume.native_pi_tui_worker);
+    }
 }

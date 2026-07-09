@@ -1,0 +1,30 @@
+{
+  "id": "NATIVE-TUI-NAMING-01",
+  "title": "Rename native Pi TUI worker internals",
+  "goal": "Rename internal experimental_pi_tui_worker code paths to native_pi_tui_worker now that the interface is default, while preserving deprecated flag, environment, IPC alias, and preflight compatibility.",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260709-cleanup",
+  "closed_at": "2026-07-09T09:34:16Z",
+  "depends_on": [
+    "TUI-DEFAULT-01"
+  ],
+  "areas": [
+    ".workflow/slices/NATIVE-TUI-NAMING-01.json",
+    "src/cli.rs",
+    "src/ipc.rs",
+    "src/daemon.rs",
+    "src/workflow/manager.rs",
+    "README.md",
+    "docs/design/evidence/pi-tui-worker-lifecycle-proof-2026-07-08.md"
+  ],
+  "acceptance": [
+    "Internal Rust option and helper names use native_pi_tui_worker instead of experimental_pi_tui_worker where the value means the selected worker interface.",
+    "The deprecated --experimental-pi-tui-worker flag and KHAZAD_EXPERIMENTAL_PI_TUI_WORKER environment variable continue to select native TUI rather than failing.",
+    "Preflight and resume remain backward-compatible with historical experimental_pi_tui_worker artifacts while treating native_pi_tui_worker as canonical."
+  ],
+  "verify": [
+    "cargo test --quiet native_pi_tui_worker",
+    "cargo test --quiet --test confinement",
+    "cargo check --quiet"
+  ]
+}

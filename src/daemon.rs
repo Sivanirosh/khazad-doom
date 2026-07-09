@@ -433,7 +433,7 @@ impl Server {
                     agent: params.agent,
                     pi_bin: params.pi_bin,
                     pi_args: params.pi_args,
-                    experimental_pi_tui_worker: params.experimental_pi_tui_worker,
+                    native_pi_tui_worker: params.native_pi_tui_worker,
                     parallelism: params.parallelism,
                     allow_dirty: params.allow_dirty,
                     origin_notification_target: params.origin_notification_target,
@@ -483,7 +483,7 @@ impl Server {
                     agent: params.agent,
                     pi_bin: params.pi_bin,
                     pi_args: params.pi_args,
-                    experimental_pi_tui_worker: params.experimental_pi_tui_worker,
+                    native_pi_tui_worker: params.native_pi_tui_worker,
                     parallelism: params.parallelism,
                 })?;
                 Ok(HandleOutcome::result(StartRunResult { run_id: run.id })?)
