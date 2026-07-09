@@ -1,0 +1,26 @@
+{
+  "id": "ASK-OPERATOR-PI-UI-01",
+  "title": "Dogfood worker-pane Pi prompt for ask_operator",
+  "goal": "Prove a native Khazad-Doom Pi worker opens ask_operator as a real Pi prompt in the same worker pane, records the answer through daemon state, and resumes. Before making any file changes, the worker must call ask_operator with the exact question: \"For ASK-OPERATOR-PI-UI-01, which marker should I record in the proof document?\" and options [\"worker-pane-blue\", \"worker-pane-green\"]. After receiving the answer, create the proof document that records the answer and what was changed.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-150739-40dcf4dc",
+  "closed_at": "2026-07-09T15:09:55.504611911Z",
+  "areas": [
+    ".workflow/slices/ASK-OPERATOR-PI-UI-01.json",
+    "docs/design/evidence/ask-operator-worker-pane-dogfood-2026-07-09.md"
+  ],
+  "acceptance": [
+    "A real native Pi worker calls ask_operator for the marker choice before writing the proof document.",
+    "The operator answers through the Pi prompt displayed in the worker pane; the Dashboard/monitor bridge is not the answer surface.",
+    "Daemon worker question state records the answer through answerQuestion, the worker resumes, and the proof document records the operator answer."
+  ],
+  "must_ask_if": [
+    "Before choosing the marker value, ask the operator via ask_operator with the exact question and options stated in the goal; do not infer or choose a default marker.",
+    "If ask_operator is unavailable, cancelled, or times out, return blocked JSON with an ask-user finding instead of writing the proof document."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/ask-operator-worker-pane-dogfood-2026-07-09.md",
+    "grep -q 'ask_operator' docs/design/evidence/ask-operator-worker-pane-dogfood-2026-07-09.md",
+    "grep -q 'operator answer:' docs/design/evidence/ask-operator-worker-pane-dogfood-2026-07-09.md"
+  ]
+}
