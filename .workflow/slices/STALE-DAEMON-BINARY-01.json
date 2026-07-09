@@ -1,0 +1,22 @@
+{
+  "id": "STALE-DAEMON-BINARY-01",
+  "title": "Avoid deleted daemon executable in cockpit commands",
+  "goal": "Prevent Herdr cockpit monitor and painter panes from launching a literal khazad-doom (deleted) path after the installed binary is replaced while the daemon is still running.",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260709-stale-daemon-binary",
+  "closed_at": "2026-07-09T11:18:12Z",
+  "areas": [
+    ".workflow/slices/STALE-DAEMON-BINARY-01.json",
+    "src/workflow/cockpit.rs"
+  ],
+  "acceptance": [
+    "Cockpit feed, gate painter, and worker painter commands do not quote a current_exe path ending in the Linux ' (deleted)' suffix when a live installed khazad-doom path exists.",
+    "A regression test covers stripping the Linux deleted-executable suffix before shell command construction.",
+    "If no reusable current executable can be found, cockpit commands continue to fall back to khazad-doom on PATH."
+  ],
+  "verify": [
+    "cargo test --quiet reusable_binary_strips_linux_deleted_current_exe_suffix",
+    "cargo test --quiet cockpit -- --test-threads=1",
+    "cargo check --quiet"
+  ]
+}
