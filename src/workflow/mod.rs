@@ -2,6 +2,7 @@ pub(crate) mod attention;
 mod cockpit;
 mod economics;
 pub(crate) mod events;
+pub(crate) mod frontier;
 mod gate;
 mod manager;
 mod projection;
