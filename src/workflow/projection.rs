@@ -934,6 +934,38 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
             ));
         }
     }
+    for proposal in &details.replan.history {
+        let Some(decision) = proposal.operator_decision.as_ref() else {
+            continue;
+        };
+        match decision.apply_status.as_str() {
+            "refused" => lines.push(line(
+                format!(
+                    "Replan {} apply refused • remediation: supersede with a valid follow-up proposal or start a new run • reason: {}",
+                    proposal.id,
+                    display_or_dash(&decision.apply_reason)
+                ),
+                StatusFeedRole::Attention,
+            )),
+            "incomplete" => lines.push(line(
+                format!(
+                    "Replan {} apply incomplete • remediation: khazad-doom resume {} • reason: {}",
+                    proposal.id,
+                    details.run.id,
+                    display_or_dash(&decision.apply_reason)
+                ),
+                StatusFeedRole::Attention,
+            )),
+            "pending" if decision.decision == "accepted" => lines.push(line(
+                format!(
+                    "Replan {} accepted, applying at next checkpoint • remediation: khazad-doom resume {}",
+                    proposal.id, details.run.id
+                ),
+                StatusFeedRole::Attention,
+            )),
+            _ => {}
+        }
+    }
     lines
 }
 
@@ -1989,6 +2021,7 @@ mod tests {
                 attempts: 0,
                 last_error: String::new(),
             }],
+            generated_slices: Vec::new(),
             progress: None,
             incidents: Vec::new(),
             questions: Vec::new(),
@@ -2053,6 +2086,7 @@ mod tests {
                 attempts: 1,
                 last_error: String::new(),
             }],
+            generated_slices: Vec::new(),
             progress: Some(RunProgress {
                 run_id: "kd-test".to_string(),
                 phase: "worker_running".to_string(),
@@ -2227,6 +2261,7 @@ mod tests {
             },
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
+            generated_slices: Vec::new(),
             progress: None,
             incidents: Vec::new(),
             questions: Vec::new(),
@@ -2330,6 +2365,16 @@ mod tests {
                 decided_at: now,
                 applied: false,
                 applied_at: None,
+                apply_status: "not_applicable".to_string(),
+                apply_reason: "rejected proposal is not applied".to_string(),
+                generated_slice_id: String::new(),
+                generated_slice_commit: String::new(),
+                apply_before_checkpoint_id: String::new(),
+                apply_after_checkpoint_id: String::new(),
+                queue_before: Vec::new(),
+                queue_after: Vec::new(),
+                queue_before_hash: String::new(),
+                queue_after_hash: String::new(),
                 replacement_id: String::new(),
                 revisit_condition: String::new(),
             }),
@@ -2352,6 +2397,7 @@ mod tests {
             },
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
+            generated_slices: Vec::new(),
             progress: None,
             incidents: Vec::new(),
             questions: Vec::new(),

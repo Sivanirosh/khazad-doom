@@ -33,11 +33,11 @@ use crate::domain::{
     AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
     FindingDisposition, FollowupSliceDraft, FrontierBudgetState, GateResult, Handoff,
     HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
-    MissionEnvelope, OriginNotificationTarget, PlanRevisions, RepairResult, ReplanEvidenceLink,
-    ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection,
-    RunStatus, Slice, SliceExitState, SliceRun, SliceStatus, SliceValidationReport,
-    SliceWriteResult, WorkerProfileEvidence, WorkerResult, WorkflowConfig, WorkflowExitStates,
-    replan_decision_commands,
+    MissionEnvelope, OriginNotificationTarget, PlanRevisions, RepairResult, ReplanDecision,
+    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run,
+    RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceProvenance, SliceRun,
+    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerProfileEvidence, WorkerResult,
+    WorkflowConfig, WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -47,6 +47,7 @@ use chrono::Utc;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -1501,7 +1502,18 @@ impl Manager {
             .map(str::to_string)
             .collect();
         let requested_set: BTreeSet<_> = requested.iter().cloned().collect();
-        let planned_slices = artifact::topological_order(&all_slices, &requested)?;
+        let known_slice_ids: BTreeSet<_> =
+            all_slices.iter().map(|slice| slice.id.clone()).collect();
+        let known_requested: Vec<_> = requested
+            .iter()
+            .filter(|id| known_slice_ids.contains(*id))
+            .cloned()
+            .collect();
+        let planned_slices = if requested.is_empty() || !known_requested.is_empty() {
+            artifact::topological_order(&all_slices, &known_requested)?
+        } else {
+            Vec::new()
+        };
         let mut selected_slices = Vec::new();
         for slice in planned_slices {
             if slice.status == crate::domain::SLICE_STATUS_CLOSED {
@@ -2051,8 +2063,9 @@ impl Manager {
         }
         setup_phase.finish();
 
+        let mut run = run.clone();
         let slice_runs = self.state.get_slice_runs(&run.id)?;
-        let mut completed_slices = self.prior_completed_worker_results(run, &store, &slice_runs);
+        let mut completed_slices = self.prior_completed_worker_results(&run, &store, &slice_runs);
         let mut checks = Vec::new();
         let mut dependency_summary: BTreeMap<_, _> = completed_slices
             .iter()
@@ -2063,9 +2076,27 @@ impl Manager {
             .filter(|slice_run| slice_run.status == SliceStatus::Merged)
             .map(|slice_run| slice_run.slice_id)
             .collect();
-        for layer in artifact::dependency_layers(worker_slices)? {
+        let mut gate_slices = gate_slices.to_vec();
+        let mut worker_layers = self.initial_worker_layers(
+            &run,
+            worker_slices,
+            &mut gate_slices,
+            &completed_ids,
+            &integration_worktree,
+        )?;
+        loop {
             check_cancelled(cancel)?;
-            self.block_if_pending_replan(run, "worker dispatch")?;
+            self.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "worker_dispatch",
+                &integration_worktree,
+                &mut worker_layers,
+                &mut gate_slices,
+            )?;
+            self.block_if_pending_replan(&run, "worker dispatch")?;
+            let Some(layer) = worker_layers.pop_front() else {
+                break;
+            };
             let slice_base_sha = gitutil::head_sha(&integration_worktree)?;
             let layer_ids = layer
                 .iter()
@@ -2105,7 +2136,7 @@ impl Manager {
                     &format!("khazad(slice:{}): merge {}", slice.id, slice.title),
                 ) {
                     let report = self.write_merge_conflict_report(
-                        run,
+                        &run,
                         &slice,
                         &worker.branch,
                         &integration_worktree,
@@ -2138,14 +2169,28 @@ impl Manager {
                 completed_ids.insert(slice.id.clone());
                 checks.extend(worker.checks);
                 completed_slices.push(worker.result);
-                self.write_checkpoint(run, gate_slices, &completed_ids, &integration_worktree)?;
+                self.write_checkpoint(&run, &gate_slices, &completed_ids, &integration_worktree)?;
             }
         }
 
         check_cancelled(cancel)?;
-        self.block_if_pending_replan(run, "integration gate")?;
+        self.apply_accepted_replan_proposals_at_checkpoint(
+            &mut run,
+            "integration_gate",
+            &integration_worktree,
+            &mut worker_layers,
+            &mut gate_slices,
+        )?;
+        if !worker_layers.is_empty() {
+            return Err(BlockedError::new(
+                "generated follow-up slices were appended at integration gate; resume to dispatch the extended queue from the explicit checkpoint"
+                    .to_string(),
+            )
+            .into());
+        }
+        self.block_if_pending_replan(&run, "integration gate")?;
         self.run_worktree_setup(
-            run,
+            &run,
             "",
             0,
             &integration_worktree,
@@ -2170,7 +2215,7 @@ impl Manager {
         )
         .run_integration_gate(
             IntegrationGateRequest {
-                slices: gate_slices,
+                slices: &gate_slices,
                 integration_worktree: &integration_worktree,
                 config: &config,
             },
@@ -2182,7 +2227,7 @@ impl Manager {
         let repair = if should_run_integration_repair(repair_policy, &gate) {
             pre_repair_gate = Some(gate.clone());
             check_cancelled(cancel)?;
-            self.block_if_pending_replan(run, "integration repair")?;
+            self.block_if_pending_replan(&run, "integration repair")?;
             self.mark_progress(
                 &run.id,
                 "integration_repair",
@@ -2193,8 +2238,8 @@ impl Manager {
             );
             let repair_phase = economics.start_phase("integration_repair");
             let repair = self.integration_repair(IntegrationRepairContext {
-                run,
-                slices: gate_slices,
+                run: &run,
+                slices: &gate_slices,
                 integration_worktree: &integration_worktree,
                 checks: &checks,
                 gate_failure: &gate,
@@ -2208,7 +2253,7 @@ impl Manager {
 
             check_cancelled(cancel)?;
             self.run_worktree_setup(
-                run,
+                &run,
                 "",
                 0,
                 &integration_worktree,
@@ -2233,7 +2278,7 @@ impl Manager {
             )
             .run_integration_gate(
                 IntegrationGateRequest {
-                    slices: gate_slices,
+                    slices: &gate_slices,
                     integration_worktree: &integration_worktree,
                     config: &config,
                 },
@@ -2282,7 +2327,7 @@ impl Manager {
         let worker_profile = worker_profile_evidence(runner.name(), &runner.metadata());
         let mut evidence_attestation = final_evidence_attestation(&gate);
         append_worker_evidence_attestation_basis(&mut evidence_attestation, &worker_profile);
-        let plan_revisions = self.plan_revisions_for_run(run)?;
+        let plan_revisions = self.plan_revisions_for_run(&run)?;
         let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
         let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -2706,6 +2751,348 @@ impl Manager {
                     })
             })
             .collect()
+    }
+
+    fn initial_worker_layers(
+        &self,
+        run: &Run,
+        worker_slices: &[Slice],
+        gate_slices: &mut Vec<Slice>,
+        completed_ids: &BTreeSet<String>,
+        integration_worktree: &Path,
+    ) -> Result<VecDeque<Vec<Slice>>> {
+        let selected_ids = selected_slice_ids(&run.selected_slice_id);
+        let missing_from_gate = selected_ids
+            .iter()
+            .any(|id| !gate_slices.iter().any(|slice| slice.id == *id));
+        if !missing_from_gate {
+            return Ok(artifact::dependency_layers(worker_slices)?.into());
+        }
+        let integration_slices = artifact::Store::new(integration_worktree).load_slices()?;
+        let by_id: BTreeMap<_, _> = integration_slices
+            .iter()
+            .map(|slice| (slice.id.as_str(), slice))
+            .collect();
+        for id in &selected_ids {
+            if gate_slices.iter().any(|slice| slice.id == *id) {
+                continue;
+            }
+            let Some(slice) = by_id.get(id.as_str()) else {
+                return Err(BlockedError::new(format!(
+                    "replan_apply_incomplete: selected slice {id:?} is missing from integration worktree {}; resume cannot verify or launch workers against an ambiguous generated-slice contract",
+                    integration_worktree.display()
+                ))
+                .into());
+            };
+            gate_slices.push((*slice).clone());
+        }
+        let mut layers = VecDeque::new();
+        for id in selected_ids {
+            if completed_ids.contains(&id) {
+                continue;
+            }
+            let Some(slice) = by_id.get(id.as_str()) else {
+                return Err(BlockedError::new(format!(
+                    "replan_apply_incomplete: selected slice {id:?} is missing from integration worktree {}; resume cannot launch workers against an ambiguous generated-slice contract",
+                    integration_worktree.display()
+                ))
+                .into());
+            };
+            layers.push_back(vec![(*slice).clone()]);
+        }
+        Ok(layers)
+    }
+
+    fn apply_accepted_replan_proposals_at_checkpoint(
+        &self,
+        run: &mut Run,
+        checkpoint: &str,
+        integration_worktree: &Path,
+        worker_layers: &mut VecDeque<Vec<Slice>>,
+        gate_slices: &mut Vec<Slice>,
+    ) -> Result<usize> {
+        let proposals = self.state.list_replan_proposals(&run.id)?;
+        let mut applied = 0;
+        for proposal in proposals {
+            if !proposal_needs_followup_apply(&proposal) {
+                continue;
+            }
+            if self.apply_followup_proposal_at_checkpoint(
+                run,
+                checkpoint,
+                integration_worktree,
+                worker_layers,
+                gate_slices,
+                &proposal,
+            )? {
+                applied += 1;
+            }
+        }
+        Ok(applied)
+    }
+
+    fn apply_followup_proposal_at_checkpoint(
+        &self,
+        run: &mut Run,
+        checkpoint: &str,
+        integration_worktree: &Path,
+        worker_layers: &mut VecDeque<Vec<Slice>>,
+        gate_slices: &mut Vec<Slice>,
+        proposal: &ReplanProposal,
+    ) -> Result<bool> {
+        let Some(mut decision) = proposal.operator_decision.clone() else {
+            return Ok(false);
+        };
+        let Some(draft) = applyable_followup_draft(proposal) else {
+            decision.apply_status = "refused".to_string();
+            decision.apply_reason =
+                "accepted proposal no longer carries one typed add_followup_slice draft"
+                    .to_string();
+            self.state
+                .replace_replan_decision(&run.id, &proposal.id, &decision)?;
+            return Ok(false);
+        };
+        let generated_id = draft.id.trim().to_string();
+        if generated_id.is_empty() {
+            decision.apply_status = "refused".to_string();
+            decision.apply_reason = "follow-up slice draft id is empty".to_string();
+            self.state
+                .replace_replan_decision(&run.id, &proposal.id, &decision)?;
+            return Ok(false);
+        }
+        let before_queue = selected_slice_ids(&run.selected_slice_id);
+        let before_sha = gitutil::head_sha(integration_worktree).unwrap_or_default();
+        if decision.queue_before.is_empty() {
+            decision.queue_before = before_queue.clone();
+            decision.queue_before_hash = queue_snapshot_hash(&before_queue);
+        }
+        if decision.apply_before_checkpoint_id.trim().is_empty() {
+            decision.apply_before_checkpoint_id = checkpoint_id(checkpoint, "before", &before_sha);
+        }
+        decision.apply_status = "incomplete".to_string();
+        decision.apply_reason = format!(
+            "daemon started applying proposal {} at checkpoint {checkpoint}",
+            proposal.id
+        );
+        decision.generated_slice_id = generated_id.clone();
+        self.state
+            .replace_replan_decision(&run.id, &proposal.id, &decision)?;
+        self.state.record_event(
+            &run.id,
+            "replan_apply_started",
+            &json!({
+                "proposal_id": proposal.id,
+                "slice_id": generated_id,
+                "checkpoint": checkpoint,
+                "queue_before": before_queue,
+                "queue_before_hash": decision.queue_before_hash,
+                "integration_head": before_sha,
+            }),
+        )?;
+
+        let apply_result = self.ensure_generated_slice_committed(
+            run,
+            proposal,
+            &decision,
+            &draft,
+            integration_worktree,
+        );
+        let generated_slice = match apply_result {
+            Ok(slice) => slice,
+            Err(err) if is_apply_refusal(&err) => {
+                decision.applied = false;
+                decision.applied_at = None;
+                decision.apply_status = "refused".to_string();
+                decision.apply_reason = err.to_string();
+                self.state
+                    .replace_replan_decision(&run.id, &proposal.id, &decision)?;
+                self.state.record_event(
+                    &run.id,
+                    "replan_apply_refused",
+                    &json!({
+                        "proposal_id": proposal.id,
+                        "slice_id": generated_id,
+                        "checkpoint": checkpoint,
+                        "reason": decision.apply_reason,
+                        "remediation": "supersede with a valid follow-up proposal or start a new run",
+                    }),
+                )?;
+                return Ok(false);
+            }
+            Err(err) => {
+                decision.applied = false;
+                decision.applied_at = None;
+                decision.apply_status = "incomplete".to_string();
+                decision.apply_reason = err.to_string();
+                self.state
+                    .replace_replan_decision(&run.id, &proposal.id, &decision)?;
+                self.state.record_event(
+                    &run.id,
+                    "replan_apply_incomplete",
+                    &json!({
+                        "proposal_id": proposal.id,
+                        "slice_id": generated_id,
+                        "checkpoint": checkpoint,
+                        "reason": decision.apply_reason,
+                        "remediation": format!("khazad-doom resume {}", run.id),
+                    }),
+                )?;
+                return Err(BlockedError::new(format!(
+                    "replan_apply_incomplete for proposal {}: {}; resume will retry idempotent apply before any generated slice worker launches",
+                    proposal.id, decision.apply_reason
+                ))
+                .into());
+            }
+        };
+
+        let mut queue_after = selected_slice_ids(&run.selected_slice_id);
+        let already_selected = queue_after.iter().any(|id| id == &generated_id);
+        if !already_selected {
+            queue_after.push(generated_id.clone());
+            let updated = self
+                .state
+                .update_run_selected_slices(&run.id, &queue_after.join(","))?;
+            run.selected_slice_id = updated.selected_slice_id;
+        }
+        let already_layered = worker_layers
+            .iter()
+            .flatten()
+            .any(|slice| slice.id == generated_id);
+        let already_merged = slice_run_is_merged(&self.state, &run.id, &generated_id)?;
+        if !already_layered && !already_merged {
+            worker_layers.push_back(vec![generated_slice.clone()]);
+        }
+        if !gate_slices.iter().any(|slice| slice.id == generated_id) {
+            gate_slices.push(generated_slice.clone());
+        }
+        if !already_merged {
+            self.state.upsert_slice_run(&SliceRun {
+                run_id: run.id.clone(),
+                slice_id: generated_id.clone(),
+                status: SliceStatus::Pending,
+                branch: String::new(),
+                commit_sha: String::new(),
+                attempts: 0,
+                last_error: String::new(),
+            })?;
+        }
+        let after_sha = gitutil::head_sha(integration_worktree).unwrap_or_default();
+        let final_queue = selected_slice_ids(&run.selected_slice_id);
+        decision.applied = true;
+        decision.applied_at = Some(Utc::now());
+        decision.apply_status = "applied".to_string();
+        decision.apply_reason =
+            "generated follow-up slice committed and appended serially".to_string();
+        decision.generated_slice_id = generated_id.clone();
+        decision.generated_slice_commit = after_sha.clone();
+        decision.apply_after_checkpoint_id = checkpoint_id(checkpoint, "after", &after_sha);
+        decision.queue_after = final_queue.clone();
+        decision.queue_after_hash = queue_snapshot_hash(&final_queue);
+        self.state
+            .replace_replan_decision(&run.id, &proposal.id, &decision)?;
+        self.state.record_event(
+            &run.id,
+            "frontier_slice_promoted",
+            &json!({
+                "proposal_id": proposal.id,
+                "slice_id": generated_id,
+                "parent_slice_id": proposal.source.slice_id,
+                "checkpoint": checkpoint,
+                "commit_sha": after_sha,
+                "queue_before": decision.queue_before,
+                "queue_before_hash": decision.queue_before_hash,
+                "queue_after": final_queue,
+                "queue_after_hash": decision.queue_after_hash,
+                "appended": !already_selected,
+                "serial_append": true,
+            }),
+        )?;
+        Ok(true)
+    }
+
+    fn ensure_generated_slice_committed(
+        &self,
+        _run: &Run,
+        proposal: &ReplanProposal,
+        decision: &ReplanDecision,
+        draft: &FollowupSliceDraft,
+        integration_worktree: &Path,
+    ) -> Result<Slice> {
+        let integration_store = artifact::Store::new(integration_worktree);
+        let rel_path = format!(".workflow/slices/{}.json", draft.id);
+        let slice_path = integration_store.slice_path(&draft.id);
+        let mut slice = if slice_path.exists() {
+            let existing: Slice = artifact::read_json(&slice_path)
+                .with_context(|| format!("read generated slice {}", slice_path.display()))?;
+            if existing
+                .provenance()
+                .as_ref()
+                .is_some_and(|provenance| provenance.origin_proposal_id == proposal.id)
+            {
+                if !slice_matches_draft(&existing, draft) {
+                    bail!(
+                        "replan_apply_incomplete: generated slice {:?} exists for proposal {} but no longer matches the accepted draft",
+                        draft.id,
+                        proposal.id
+                    );
+                }
+                existing
+            } else {
+                bail!(
+                    "apply_refused: slice id {:?} already exists and was not generated from proposal {}",
+                    draft.id,
+                    proposal.id
+                );
+            }
+        } else {
+            let existing_slices = integration_store
+                .load_slices()
+                .context("load current slice graph before applying follow-up")?;
+            if let Err(err) = validate_followup_slice_draft(draft, &existing_slices) {
+                bail!("apply_refused: {err:#}");
+            }
+            let mut slice = draft.to_slice();
+            slice.set_provenance(SliceProvenance {
+                parent_slice_id: proposal.source.slice_id.clone(),
+                origin_proposal_id: proposal.id.clone(),
+                generation: followup_generation(&existing_slices, &proposal.source.slice_id),
+                created_by: provenance_created_by(decision),
+                created_at: Utc::now().to_rfc3339(),
+            });
+            artifact::write_json(&slice_path, &slice)
+                .with_context(|| format!("write generated slice {}", slice_path.display()))?;
+            slice
+        };
+        artifact::validate_slice(&slice)
+            .with_context(|| format!("validate generated slice {:?}", slice.id))?;
+        integration_store
+            .load_slices()
+            .context("revalidate current slice graph after generated follow-up apply")?;
+        let message = format!(
+            "khazad(slice:{}): promote follow-up from {} via {}",
+            draft.id,
+            display_or_dash(&proposal.source.slice_id),
+            proposal.id
+        );
+        gitutil::commit_paths(integration_worktree, &[rel_path.as_str()], &message)
+            .with_context(|| format!("commit generated slice {:?}", draft.id))?;
+        let status = gitutil::run(
+            integration_worktree,
+            &["status", "--porcelain", "--", rel_path.as_str()],
+        )?;
+        if !status.trim().is_empty() {
+            bail!(
+                "replan_apply_incomplete: generated slice {:?} is not committed cleanly: {}",
+                draft.id,
+                status.trim()
+            );
+        }
+        if slice.provenance().is_none() {
+            let existing: Slice = artifact::read_json(&slice_path)
+                .with_context(|| format!("reread generated slice {}", slice_path.display()))?;
+            slice = existing;
+        }
+        Ok(slice)
     }
 
     fn write_checkpoint(
@@ -5702,6 +6089,103 @@ impl Drop for ActiveRunGuard {
     }
 }
 
+fn proposal_needs_followup_apply(proposal: &ReplanProposal) -> bool {
+    if proposal.state != crate::domain::ReplanProposalState::Accepted {
+        return false;
+    }
+    let Some(decision) = proposal.operator_decision.as_ref() else {
+        return false;
+    };
+    if decision.applied || decision.decision != "accepted" {
+        return false;
+    }
+    if decision.apply_status.is_empty() {
+        return applyable_followup_draft(proposal).is_some();
+    }
+    matches!(decision.apply_status.as_str(), "pending" | "incomplete")
+}
+
+fn applyable_followup_draft(proposal: &ReplanProposal) -> Option<FollowupSliceDraft> {
+    let [change] = proposal.proposed_changes.as_slice() else {
+        return None;
+    };
+    if change.kind != "add_followup_slice" {
+        return None;
+    }
+    change.followup_slice_draft()
+}
+
+fn is_apply_refusal(err: &anyhow::Error) -> bool {
+    err.to_string().contains("apply_refused:")
+}
+
+fn selected_slice_ids(selected_slice_id: &str) -> Vec<String> {
+    selected_slice_id
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn queue_snapshot_hash(ids: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for id in ids {
+        hasher.update(id.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn checkpoint_id(checkpoint: &str, stage: &str, sha: &str) -> String {
+    let short_sha = sha.chars().take(12).collect::<String>();
+    format!("{checkpoint}:{stage}:{short_sha}")
+}
+
+fn slice_run_is_merged(state: &StateStore, run_id: &str, slice_id: &str) -> Result<bool> {
+    Ok(state
+        .get_slice_runs(run_id)?
+        .into_iter()
+        .any(|slice_run| slice_run.slice_id == slice_id && slice_run.status == SliceStatus::Merged))
+}
+
+fn slice_matches_draft(slice: &Slice, draft: &FollowupSliceDraft) -> bool {
+    slice.id == draft.id
+        && slice.title == draft.title
+        && slice.goal == draft.goal
+        && slice.depends_on == draft.depends_on
+        && slice.areas == draft.areas
+        && slice.acceptance == draft.acceptance
+        && slice.must_ask_if == draft.must_ask_if
+        && slice.verify_profile == draft.verify_profile
+        && slice.verify == draft.verify
+}
+
+fn followup_generation(existing_slices: &[Slice], parent_slice_id: &str) -> u64 {
+    existing_slices
+        .iter()
+        .find(|slice| slice.id == parent_slice_id)
+        .and_then(Slice::provenance)
+        .map(|provenance| provenance.generation.saturating_add(1))
+        .unwrap_or(1)
+}
+
+fn provenance_created_by(decision: &ReplanDecision) -> String {
+    let authorizer = decision.authorizer.trim();
+    if authorizer.is_empty() {
+        "operator".to_string()
+    } else if authorizer.starts_with("operator") {
+        authorizer.to_string()
+    } else {
+        format!("operator:{authorizer}")
+    }
+}
+
+fn display_or_dash(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() { "-" } else { trimmed }
+}
+
 fn validate_followup_slice_draft(
     draft: &FollowupSliceDraft,
     existing_slices: &[Slice],
@@ -6143,19 +6627,20 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKER_ATTEMPTS, Manager, RunReadModelBuilder, RunReadModelOptions, StartOptions,
-        repair_authority_violations, validate_followup_slice_draft, validate_mission_envelope,
-        validate_repair_result, validate_worker_result,
+        MAX_WORKER_ATTEMPTS, Manager, ResumeOptions, RunReadModelBuilder, RunReadModelOptions,
+        StartOptions, queue_snapshot_hash, repair_authority_violations, selected_slice_ids,
+        validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
+        validate_worker_result,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         AcceptanceEvidence, AutonomyLevel, CheckResult, CockpitMode, Finding, FindingDisposition,
         FollowupSliceDraft, FrontierBudgetState, Handoff, ImplementationSummary, MissionEnvelope,
-        OriginNotificationTarget, RepairResult, ReplanEvidenceLink, ReplanProposalSource,
-        ReplanProposalState, ReplanProposedChange, Run, RunEconomics, RunStatus, Slice, SliceRun,
-        SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile, WorkerResult,
-        WorkflowConfig,
+        OriginNotificationTarget, RepairResult, ReplanEvidenceLink, ReplanProposal,
+        ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run, RunEconomics,
+        RunStatus, Slice, SliceProvenance, SliceRun, SliceStatus, TerminalNotificationRecord,
+        VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -6163,7 +6648,7 @@ mod tests {
     use anyhow::Result;
     use chrono::Utc;
     use serde_json::{Value, json};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::path::Path;
     use std::sync::{
@@ -6219,6 +6704,34 @@ mod tests {
             must_ask_if: vec!["intent changes".to_string()],
             rationale: "Worker found a bounded follow-up.".to_string(),
         }
+    }
+
+    fn create_followup_replan_proposal(
+        state: &StateStore,
+        run_id: &str,
+        parent_slice_id: &str,
+        draft: FollowupSliceDraft,
+    ) -> Result<ReplanProposal> {
+        state.create_replan_proposal(
+            run_id,
+            "",
+            ReplanProposalSource {
+                kind: "worker_finding".to_string(),
+                slice_id: parent_slice_id.to_string(),
+                phase: "test".to_string(),
+                attempt: 1,
+                summary: "follow-up needed".to_string(),
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange::with_followup_slice_draft(
+                "add_followup_slice".to_string(),
+                draft.id.clone(),
+                "Add generated follow-up slice".to_string(),
+                draft,
+            )],
+            "operator_review",
+        )
     }
 
     #[test]
@@ -6538,6 +7051,519 @@ mod tests {
             .join("\n");
         assert!(feed_text.contains("Proposed follow-up slice: slice-001-followup"));
         assert!(feed_text.contains("khazad-doom replan accept"));
+        Ok(())
+    }
+
+    #[test]
+    fn replan_apply_accepted_followup_slice_is_idempotent_and_records_snapshots() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = Run {
+            id: "kd-apply-idempotent".to_string(),
+            repo_id: crate::paths::repo_id(repo.path()),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-apply-idempotent/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Merged,
+            branch: "khazad/kd-apply-idempotent/slice-001".to_string(),
+            commit_sha: String::new(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        let draft = followup_draft("slice-001-followup");
+        let proposal = create_followup_replan_proposal(&state, &run.id, "slice-001", draft)?;
+        let proposal = state.decide_replan_proposal(
+            &run.id,
+            &proposal.id,
+            ReplanProposalState::Accepted,
+            "operator accepted follow-up",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+        assert_eq!(
+            proposal.operator_decision.as_ref().unwrap().apply_status,
+            "pending"
+        );
+
+        let mut layers = VecDeque::new();
+        let mut gate_slices = vec![parent.clone()];
+        assert_eq!(
+            manager.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "resume",
+                repo.path(),
+                &mut layers,
+                &mut gate_slices,
+            )?,
+            1
+        );
+        assert_eq!(run.selected_slice_id, "slice-001,slice-001-followup");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0][0].id, "slice-001-followup");
+        assert_eq!(gate_slices.len(), 2);
+        let generated: Slice = artifact::read_json(store.slice_path("slice-001-followup"))?;
+        let provenance = generated.provenance().expect("generated provenance");
+        assert_eq!(provenance.parent_slice_id, "slice-001");
+        assert_eq!(provenance.origin_proposal_id, proposal.id);
+        assert_eq!(provenance.generation, 1);
+        assert!(
+            gitutil::run(
+                repo.path(),
+                &[
+                    "status",
+                    "--porcelain",
+                    "--",
+                    ".workflow/slices/slice-001-followup.json"
+                ],
+            )?
+            .trim()
+            .is_empty()
+        );
+        let head_after_apply = gitutil::head_sha(repo.path())?;
+        let applied = state
+            .get_replan_proposal(&run.id, &proposal.id)?
+            .unwrap()
+            .operator_decision
+            .unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.apply_status, "applied");
+        assert_eq!(applied.generated_slice_id, "slice-001-followup");
+        assert_eq!(applied.generated_slice_commit, head_after_apply);
+        assert_eq!(applied.queue_before, vec!["slice-001".to_string()]);
+        assert_eq!(
+            applied.queue_after,
+            vec!["slice-001".to_string(), "slice-001-followup".to_string()]
+        );
+        assert!(!applied.queue_before_hash.is_empty());
+        assert!(!applied.queue_after_hash.is_empty());
+
+        assert_eq!(
+            manager.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "resume",
+                repo.path(),
+                &mut layers,
+                &mut gate_slices,
+            )?,
+            0
+        );
+        assert_eq!(run.selected_slice_id, "slice-001,slice-001-followup");
+        assert_eq!(gitutil::head_sha(repo.path())?, head_after_apply);
+        Ok(())
+    }
+
+    #[test]
+    fn replan_apply_resume_commit_before_queue_extension_does_not_duplicate() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = Run {
+            id: "kd-apply-resume".to_string(),
+            repo_id: crate::paths::repo_id(repo.path()),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Interrupted,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-apply-resume/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        let draft = followup_draft("slice-001-followup");
+        let proposal =
+            create_followup_replan_proposal(&state, &run.id, "slice-001", draft.clone())?;
+        let proposal = state.decide_replan_proposal(
+            &run.id,
+            &proposal.id,
+            ReplanProposalState::Accepted,
+            "operator accepted before crash",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+        let mut generated = draft.to_slice();
+        generated.set_provenance(SliceProvenance {
+            parent_slice_id: "slice-001".to_string(),
+            origin_proposal_id: proposal.id.clone(),
+            generation: 1,
+            created_by: "operator".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        });
+        artifact::write_json(store.slice_path("slice-001-followup"), &generated)?;
+        gitutil::commit_paths(
+            repo.path(),
+            &[".workflow/slices/slice-001-followup.json"],
+            "khazad(slice:slice-001-followup): promote follow-up from slice-001 via crash",
+        )?;
+        let commit_count_before = gitutil::run(repo.path(), &["rev-list", "--count", "HEAD"])?;
+
+        let mut layers = VecDeque::new();
+        let mut gate_slices = vec![parent];
+        assert_eq!(
+            manager.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "resume",
+                repo.path(),
+                &mut layers,
+                &mut gate_slices,
+            )?,
+            1
+        );
+        assert_eq!(
+            commit_count_before,
+            gitutil::run(repo.path(), &["rev-list", "--count", "HEAD"])?
+        );
+        assert_eq!(run.selected_slice_id, "slice-001,slice-001-followup");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            selected_slice_ids(&run.selected_slice_id)
+                .into_iter()
+                .filter(|id| id == "slice-001-followup")
+                .count(),
+            1
+        );
+        let applied = state
+            .get_replan_proposal(&run.id, &proposal.id)?
+            .unwrap()
+            .operator_decision
+            .unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.apply_status, "applied");
+        assert_eq!(
+            applied.queue_after_hash,
+            queue_snapshot_hash(&applied.queue_after)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replan_apply_resume_keeps_completed_generated_slices_in_gate_set() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        let mut generated = followup_draft("slice-001-followup").to_slice();
+        generated.set_provenance(SliceProvenance {
+            parent_slice_id: "slice-001".to_string(),
+            origin_proposal_id: "proposal-1".to_string(),
+            generation: 1,
+            created_by: "operator".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        });
+        store.write_slice(&generated, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state, Arc::new(FakeRunner));
+        let run = Run {
+            id: "kd-apply-gate-resume".to_string(),
+            repo_id: crate::paths::repo_id(repo.path()),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-apply-gate-resume/integration".to_string(),
+            selected_slice_id: "slice-001,slice-001-followup".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut gate_slices = vec![parent];
+        let completed_ids =
+            BTreeSet::from(["slice-001".to_string(), "slice-001-followup".to_string()]);
+        let layers = manager.initial_worker_layers(
+            &run,
+            &[],
+            &mut gate_slices,
+            &completed_ids,
+            repo.path(),
+        )?;
+        assert!(layers.is_empty());
+        assert!(
+            gate_slices
+                .iter()
+                .any(|slice| slice.id == "slice-001-followup")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replan_apply_rejected_deferred_nonfollowup_and_refused_proposals_stay_unapplied()
+    -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        store.write_slice(&slice("slice-001-followup"), true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = Run {
+            id: "kd-apply-unapplied".to_string(),
+            repo_id: crate::paths::repo_id(repo.path()),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-apply-unapplied/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        let rejected = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-rejected"),
+        )?;
+        state.decide_replan_proposal(
+            &run.id,
+            &rejected.id,
+            ReplanProposalState::Rejected,
+            "duplicate",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+        let deferred = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-deferred"),
+        )?;
+        state.decide_replan_proposal(
+            &run.id,
+            &deferred.id,
+            ReplanProposalState::Deferred,
+            "not now",
+            "operator",
+            "daemon_ipc",
+            "",
+            "after release",
+        )?;
+        let nonfollowup = state.create_replan_proposal(
+            &run.id,
+            "",
+            ReplanProposalSource {
+                kind: "worker_finding".to_string(),
+                slice_id: "slice-001".to_string(),
+                phase: "test".to_string(),
+                attempt: 1,
+                summary: "change queue".to_string(),
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange {
+                kind: "queue_revision".to_string(),
+                target: "slice-001".to_string(),
+                summary: "not a follow-up draft".to_string(),
+            }],
+            "operator_review",
+        )?;
+        state.decide_replan_proposal(
+            &run.id,
+            &nonfollowup.id,
+            ReplanProposalState::Accepted,
+            "accepted prose-only change",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+        let refused = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        state.decide_replan_proposal(
+            &run.id,
+            &refused.id,
+            ReplanProposalState::Accepted,
+            "accepted colliding follow-up",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+
+        let mut layers = VecDeque::new();
+        let mut gate_slices = vec![parent];
+        assert_eq!(
+            manager.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "resume",
+                repo.path(),
+                &mut layers,
+                &mut gate_slices,
+            )?,
+            0
+        );
+        assert_eq!(run.selected_slice_id, "slice-001");
+        assert!(!store.slice_path("slice-rejected").exists());
+        assert!(!store.slice_path("slice-deferred").exists());
+        let refused_decision = state
+            .get_replan_proposal(&run.id, &refused.id)?
+            .unwrap()
+            .operator_decision
+            .unwrap();
+        assert_eq!(refused_decision.apply_status, "refused");
+        assert!(refused_decision.apply_reason.contains("already exists"));
+        let nonfollowup_decision = state
+            .get_replan_proposal(&run.id, &nonfollowup.id)?
+            .unwrap()
+            .operator_decision
+            .unwrap();
+        assert_eq!(nonfollowup_decision.apply_status, "not_applicable");
+        Ok(())
+    }
+
+    #[test]
+    fn replan_apply_e2e_operator_accepted_followup_runs_after_resume() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut parent = slice("slice-001");
+        parent.areas = vec!["src/".to_string()];
+        parent.verify = vec!["test -f src/slice-001.txt".to_string()];
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths.clone(),
+            state.clone(),
+            Arc::new(FollowupEmittingRunner),
+        );
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: true,
+            origin_notification_target: String::new(),
+            mission_envelope: None,
+        })?;
+        let blocked = wait_for_run(&state, &run.id)?;
+        assert_eq!(blocked.status, RunStatus::Blocked);
+        let pending = state.pending_replan_proposals(&run.id)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].proposed_changes[0].kind, "add_followup_slice");
+        state.decide_replan_proposal(
+            &run.id,
+            &pending[0].id,
+            ReplanProposalState::Accepted,
+            "operator accepted generated follow-up",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+
+        manager.resume_run(ResumeOptions {
+            run_id: run.id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+        })?;
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert!(slice_runs.iter().any(|slice_run| {
+            slice_run.slice_id == "slice-001-followup" && slice_run.status == SliceStatus::Merged
+        }));
+        let proposal = state.get_replan_proposal(&run.id, &pending[0].id)?.unwrap();
+        let decision = proposal.operator_decision.unwrap();
+        assert!(decision.applied);
+        assert_eq!(decision.apply_status, "applied");
+        assert_eq!(
+            decision.queue_after,
+            vec!["slice-001".to_string(), "slice-001-followup".to_string()]
+        );
+        let generated_path = store.slice_path("slice-001-followup");
+        assert!(
+            !generated_path.exists(),
+            "source worktree remains unchanged until handoff"
+        );
+        let final_summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
+        assert!(
+            final_summary
+                .completed_slices
+                .iter()
+                .any(|result| result.slice_id == "slice-001-followup")
+        );
         Ok(())
     }
 
@@ -7497,7 +8523,7 @@ mod tests {
                 accepted["after_queue_or_slice_summary"]
                     .as_str()
                     .unwrap()
-                    .contains("applied=false")
+                    .contains("apply_status=not_applicable")
             );
             assert_eq!(
                 revisions["deferred"][0]["decision"]["revisit_condition"],
@@ -8986,6 +10012,61 @@ mod tests {
                     "changed_files": [format!("{}.txt", handoff.slice.id)],
                     "acceptance_status": acceptance_status
                 })),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    struct FollowupEmittingRunner;
+
+    impl Runner for FollowupEmittingRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if job.kind == "integration-repair" {
+                return Ok(ResultData {
+                    output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            fs::create_dir_all(job.cwd.join("src"))?;
+            let rel_path = format!("src/{}.txt", handoff.slice.id);
+            fs::write(job.cwd.join(&rel_path), format!("{}\n", handoff.slice.id))?;
+            gitutil::run(&job.cwd, &["add", "."])?;
+            gitutil::run(
+                &job.cwd,
+                &["commit", "-m", &format!("implement {}", handoff.slice.id)],
+            )?;
+            let sha = gitutil::head_sha(&job.cwd)?;
+            let mut output = json!({
+                "slice_id": handoff.slice.id,
+                "status": "complete",
+                "summary": "implemented with bounded follow-up" ,
+                "commit_sha": sha,
+                "changed_files": [rel_path],
+                "acceptance_status": acceptance_status_json(&handoff.slice)
+            });
+            if handoff.slice.id == "slice-001" {
+                let mut draft = followup_draft("slice-001-followup");
+                draft.verify = vec!["test -f src/slice-001-followup.txt".to_string()];
+                output["candidate_followup_slices"] = serde_json::to_value(vec![draft])?;
+            }
+            Ok(ResultData {
+                output: Some(output),
                 usage: Usage::default(),
                 contract_warnings: Vec::new(),
             })

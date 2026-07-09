@@ -1537,6 +1537,26 @@ pub struct ReplanDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generated_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generated_slice_commit: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_before_checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_after_checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_before: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_after: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue_before_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue_after_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub replacement_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub revisit_condition: String,
@@ -1622,6 +1642,26 @@ pub struct PlanRevisionDecisionSummary {
     pub applied_at: Option<DateTime<Utc>>,
     pub applied_at_checkpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generated_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generated_slice_commit: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_before_checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_after_checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_before: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_after: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue_before_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue_after_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub replacement_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub revisit_condition: String,
@@ -1640,12 +1680,32 @@ pub fn replan_decision_commands(run_id: &str, proposal_id: &str) -> Vec<String> 
     ]
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GeneratedSliceRecord {
+    pub slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_proposal_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub commit_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
     #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
     pub worker_profile: WorkerProfileEvidence,
     pub slice_runs: Vec<SliceRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_slices: Vec<GeneratedSliceRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<RunProgress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

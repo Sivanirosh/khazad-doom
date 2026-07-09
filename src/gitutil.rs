@@ -116,3 +116,25 @@ pub fn commit_all(dir: impl AsRef<Path>, message: &str) -> Result<()> {
     run(dir, &["commit", "-m", message])?;
     Ok(())
 }
+
+pub fn commit_paths(dir: impl AsRef<Path>, paths: &[&str], message: &str) -> Result<bool> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let dir = dir.as_ref();
+    let mut add_args = vec!["add", "--"];
+    add_args.extend(paths.iter().copied());
+    run(dir, &add_args)?;
+    let diff_args = ["diff", "--cached", "--quiet", "--"];
+    let status = Command::new("git")
+        .args(diff_args)
+        .args(paths)
+        .current_dir(dir)
+        .status()
+        .with_context(|| format!("run git diff --cached --quiet -- {}", paths.join(" ")))?;
+    if status.success() {
+        return Ok(false);
+    }
+    run(dir, &["commit", "-m", message])?;
+    Ok(true)
+}
