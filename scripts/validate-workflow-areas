@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Validate Khazad-Doom slice areas against the repo-local area contract."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+GLOB_CHARS = "*?[]"
+
+
+def main(argv: list[str]) -> int:
+    repo = Path(argv[1]) if len(argv) > 1 else Path.cwd()
+    issues = validate_repo(repo)
+    if issues:
+        for issue in issues:
+            print(issue, file=sys.stderr)
+        return 1
+    print(f"workflow area validation passed: {repo / '.workflow' / 'slices'}")
+    return 0
+
+
+def validate_repo(repo: Path) -> list[str]:
+    slices_dir = repo / ".workflow" / "slices"
+    if not slices_dir.exists():
+        return [f"missing slices directory: {slices_dir}"]
+    issues: list[str] = []
+    for path in sorted(slices_dir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            issues.append(f"{path}: invalid JSON: {exc}")
+            continue
+        areas = data.get("areas", [])
+        if not isinstance(areas, list):
+            issues.append(f"{path}: areas must be an array")
+            continue
+        slice_id = str(data.get("id") or path.stem)
+        for index, area in enumerate(areas):
+            if not isinstance(area, str):
+                issues.append(f"{path}: slice {slice_id}: areas[{index}] must be a string")
+                continue
+            reason = invalid_area_reason(area)
+            if reason:
+                issues.append(f"{path}: slice {slice_id}: invalid area {area!r}: {reason}")
+    return issues
+
+
+def invalid_area_reason(area: str) -> str:
+    if area.strip() == "":
+        return "areas must be non-empty repo-relative literal path prefixes"
+    if area.strip() != area:
+        return "leading/trailing whitespace is not allowed"
+    if area.startswith("/"):
+        return "absolute paths are not allowed"
+    if area.startswith("./"):
+        return "omit leading ./"
+    if ".." in area:
+        return "parent traversal '..' is not allowed"
+    for char in GLOB_CHARS:
+        if char in area:
+            return f"glob character {char!r} is not allowed"
+    return ""
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

@@ -12,6 +12,41 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const DIR_NAME: &str = ".workflow";
+pub const AREA_CONTRACT_FILE: &str = "AREA_CONTRACT.md";
+
+const AREA_CONTRACT: &str = r#"# Khazad-Doom Area Contract
+
+`areas` in `.workflow/slices/*.json` are repo-relative literal path prefixes, not globs.
+
+Use directory prefixes with a trailing slash and exact file paths:
+
+```text
+src/normia/       ✅ directory prefix
+tests/            ✅ directory prefix
+roadmap/          ✅ directory prefix
+legacy/           ✅ directory prefix
+README.md         ✅ file path
+pyproject.toml    ✅ file path
+
+src/normia/**     ❌ glob
+tests/*           ❌ glob
+./src/normia/     ❌ leading ./
+../foo            ❌ parent traversal
+```
+
+A valid area must be non-empty and must not:
+
+- contain leading or trailing whitespace
+- contain `*`, `?`, `[`, or `]`
+- contain `..`
+- start with `/`
+- start with `./`
+
+Khazad-Doom core is authoritative: `khazad-doom slices validate` rejects invalid areas before a worker can hit the path guard. Slice generators, PRDs, issues, and skills must generate areas that follow this contract.
+"#;
+
+const SLICE_AREA_SCHEMA_PATTERN: &str =
+    r"^(?!\s)(?!/)(?!\.\/)(?!.*\.\.)(?!.*[\*\?\[\]])(?!.*\s$).+$";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -82,6 +117,7 @@ impl Store {
         }
         self.ensure_default_config()?;
         self.write_slice_schema()?;
+        self.ensure_area_contract()?;
         ensure_gitignore(&self.repo_path)
     }
 
@@ -115,6 +151,10 @@ impl Store {
 
     pub fn slice_schema_path(&self) -> PathBuf {
         self.schema_dir().join("slice.schema.json")
+    }
+
+    pub fn area_contract_path(&self) -> PathBuf {
+        self.workflow_dir().join(AREA_CONTRACT_FILE)
     }
 
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
@@ -394,6 +434,14 @@ impl Store {
         Ok(path)
     }
 
+    fn ensure_area_contract(&self) -> Result<()> {
+        let path = self.area_contract_path();
+        if path.exists() {
+            return Ok(());
+        }
+        fs::write(&path, AREA_CONTRACT).with_context(|| format!("write {}", path.display()))
+    }
+
     pub fn write_slice(&self, slice: &Slice, overwrite: bool) -> Result<SliceWriteResult> {
         validate_slice(slice)?;
         self.ensure_layout()?;
@@ -550,7 +598,16 @@ pub fn slice_schema() -> Value {
             "closed_by_run": { "type": "string" },
             "closed_at": { "type": "string" },
             "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-            "areas": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "areas": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": SLICE_AREA_SCHEMA_PATTERN,
+                    "description": "Repo-relative literal path prefix; globs, parent traversal, absolute paths, leading/trailing whitespace, and leading ./ are rejected."
+                },
+                "uniqueItems": true
+            },
             "acceptance": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
             "must_ask_if": { "type": "array", "items": { "type": "string" } },
             "verify_profile": { "type": "string" },
@@ -594,6 +651,35 @@ pub fn validate_slice(slice: &Slice) -> Result<()> {
         if dep == &slice.id {
             bail!("slice cannot depend on itself");
         }
+    }
+    for area in &slice.areas {
+        validate_slice_area(area)?;
+    }
+    Ok(())
+}
+
+pub fn validate_slice_area(area: &str) -> Result<()> {
+    if area.trim().is_empty() {
+        bail!("area is invalid: areas must be non-empty repo-relative literal path prefixes");
+    }
+    if area.trim() != area {
+        bail!("area {area:?} is invalid: remove leading/trailing whitespace");
+    }
+    if area.starts_with('/') {
+        bail!("area {area:?} is invalid: areas must be repo-relative, not absolute paths");
+    }
+    if area.starts_with("./") {
+        bail!(
+            "area {area:?} is invalid: omit leading ./ and use a repo-relative literal path prefix"
+        );
+    }
+    if area.contains("..") {
+        bail!("area {area:?} is invalid: parent traversal '..' is not allowed");
+    }
+    if let Some(ch) = area.chars().find(|ch| matches!(ch, '*' | '?' | '[' | ']')) {
+        bail!(
+            "area {area:?} is invalid: glob character {ch:?} is not allowed; use a repo-relative literal path prefix such as 'src/normia/' or 'README.md'"
+        );
     }
     Ok(())
 }
@@ -1153,6 +1239,39 @@ mod tests {
     }
 
     #[test]
+    fn validates_slice_areas_as_repo_relative_literal_prefixes() {
+        let mut slice = valid_slice("slice-001");
+        slice.areas = vec![
+            "src/normia/".to_string(),
+            "tests/".to_string(),
+            "README.md".to_string(),
+            ".workflow/slices".to_string(),
+        ];
+        validate_slice(&slice).unwrap();
+
+        for area in [
+            "src/normia/**",
+            "tests/*",
+            "docs/[draft]",
+            "docs/?",
+            "./src",
+            "../foo",
+            "/tmp",
+            "",
+            " docs/",
+            "docs/ ",
+        ] {
+            let mut invalid = valid_slice("slice-001");
+            invalid.areas = vec![area.to_string()];
+            let err = validate_slice(&invalid).unwrap_err().to_string();
+            assert!(
+                err.contains("area") || err.contains("glob") || err.contains("parent"),
+                "area {area:?} should be rejected with area-specific message, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ensure_default_config_uses_parallelism_three() {
         let repo = tempfile::tempdir().unwrap();
         let store = Store::new(repo.path());
@@ -1160,6 +1279,7 @@ mod tests {
 
         let config = store.read_config().unwrap();
         assert_eq!(config.parallelism, 3);
+        assert!(store.area_contract_path().exists());
         assert!(!store.workflow_dir().join("agents.toml").exists());
     }
 

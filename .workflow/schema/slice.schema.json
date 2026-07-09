@@ -12,6 +12,9 @@
     },
     "areas": {
       "items": {
+        "description": "Repo-relative literal path prefix; globs, parent traversal, absolute paths, leading/trailing whitespace, and leading ./ are rejected.",
+        "minLength": 1,
+        "pattern": "^(?!\\s)(?!/)(?!\\.\\/)(?!.*\\.\\.)(?!.*[\\*\\?\\[\\]])(?!.*\\s$).+$",
         "type": "string"
       },
       "type": "array",
