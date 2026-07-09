@@ -209,7 +209,7 @@ Tier 2 is not a stop by itself. It leaves a normal pending replan proposal for t
 All follow-up candidates use the existing replan proposal/decision/apply channel:
 
 1. Candidate emitted by worker, repair worker, or operator.
-2. Daemon validates the draft shape and records a pending `add_followup_slice` replan proposal with evidence.
+2. Daemon validates the draft shape and records a pending `add_followup_slice` replan proposal with evidence. Worker and repair-worker proposals carry the full typed `FollowupSliceDraft` payload on the proposed change; invalid drafts are warning findings, not a second workflow channel.
 3. Classifier records a tier and reason codes on that proposal.
 4. Operator or envelope-authorized policy records a decision.
 5. The single idempotent replan apply engine writes generated slice JSON, commits it, updates queue snapshots, and records checkpoints.
@@ -241,7 +241,7 @@ Required provenance fields:
 | `parent_slice_id` | Slice whose worker/repair output produced the candidate. |
 | `origin_proposal_id` | Replan proposal id that authorized the generated slice. |
 | `generation` | Depth from original queued work; original slices are depth `0`, first follow-ups are depth `1`. |
-| `created_by` | Decision authorizer, for example `operator:<id>` or `envelope:<run_id>`. |
+| `created_by` | Slice-file creator class: `operator` or `worker+daemon`. Decision authorizer remains on the replan decision record. |
 | `created_at` | Daemon timestamp when the slice file was created. |
 
 Promotion decisions must also record:

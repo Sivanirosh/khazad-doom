@@ -921,10 +921,7 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
         ));
         for change in &proposal.proposed_changes {
             lines.push(line(
-                format!(
-                    "Proposed change: {}:{} — {}",
-                    change.kind, change.target, change.summary
-                ),
+                proposed_change_feed_text(change),
                 StatusFeedRole::Attention,
             ));
         }
@@ -936,6 +933,31 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
         }
     }
     lines
+}
+
+fn proposed_change_feed_text(change: &crate::domain::ReplanProposedChange) -> String {
+    if let Some(draft) = change.followup_slice_draft() {
+        let areas = if draft.areas.is_empty() {
+            "<none>".to_string()
+        } else {
+            draft.areas.join(",")
+        };
+        return format!(
+            "Proposed follow-up slice: {} — {}; goal={}; areas=[{}]; acceptance={}; verify={}",
+            display_or_dash(&draft.id),
+            display_or_dash(&draft.title),
+            display_or_dash(&draft.goal),
+            areas,
+            draft.acceptance.len(),
+            draft.verify.len()
+        );
+    }
+    format!(
+        "Proposed change: {}:{} — {}",
+        change.kind,
+        change.target,
+        change.summary_text()
+    )
 }
 
 fn operator_commands(

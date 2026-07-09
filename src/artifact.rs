@@ -597,6 +597,18 @@ pub fn slice_schema() -> Value {
             "status": { "type": "string", "enum": ["open", "closed"] },
             "closed_by_run": { "type": "string" },
             "closed_at": { "type": "string" },
+            "provenance": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["parent_slice_id", "origin_proposal_id", "generation", "created_by", "created_at"],
+                "properties": {
+                    "parent_slice_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+                    "origin_proposal_id": { "type": "string", "minLength": 1 },
+                    "generation": { "type": "integer", "minimum": 0 },
+                    "created_by": { "type": "string", "enum": ["operator", "worker+daemon"] },
+                    "created_at": { "type": "string", "format": "date-time" }
+                }
+            },
             "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
             "areas": {
                 "type": "array",
@@ -641,6 +653,9 @@ pub fn validate_slice(slice: &Slice) -> Result<()> {
     if slice.status == "open" && (!slice.closed_by_run.is_empty() || !slice.closed_at.is_empty()) {
         bail!("open slices must not set closed_by_run or closed_at");
     }
+    if let Some(provenance) = slice.provenance() {
+        validate_slice_provenance(&provenance)?;
+    }
     if slice.verify_timeout_seconds > 86_400 {
         bail!("verify_timeout_seconds must be <= 86400");
     }
@@ -656,6 +671,30 @@ pub fn validate_slice(slice: &Slice) -> Result<()> {
         validate_slice_area(area)?;
     }
     Ok(())
+}
+
+fn validate_slice_provenance(provenance: &crate::domain::SliceProvenance) -> Result<()> {
+    if provenance.parent_slice_id.trim().is_empty() {
+        bail!("provenance.parent_slice_id is required");
+    }
+    if !is_safe_slice_id(&provenance.parent_slice_id) {
+        bail!("provenance.parent_slice_id is not path/ref safe");
+    }
+    if provenance.origin_proposal_id.trim().is_empty() {
+        bail!("provenance.origin_proposal_id is required");
+    }
+    if provenance.origin_proposal_id.contains('/') || provenance.origin_proposal_id.contains("..") {
+        bail!("provenance.origin_proposal_id must be a safe proposal id");
+    }
+    if !matches!(provenance.created_by.as_str(), "operator" | "worker+daemon") {
+        bail!("provenance.created_by must be either 'operator' or 'worker+daemon'");
+    }
+    if provenance.created_at.trim().is_empty() {
+        bail!("provenance.created_at is required");
+    }
+    chrono::DateTime::parse_from_rfc3339(&provenance.created_at)
+        .map(|_| ())
+        .context("provenance.created_at must be RFC3339 date-time")
 }
 
 pub fn validate_slice_area(area: &str) -> Result<()> {
@@ -1269,6 +1308,42 @@ mod tests {
                 "area {area:?} should be rejected with area-specific message, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn validates_optional_slice_provenance_and_schema_property() {
+        let mut slice = valid_slice("slice-generated");
+        let provenance = crate::domain::SliceProvenance {
+            parent_slice_id: "slice-parent".to_string(),
+            origin_proposal_id: "rp-test-001".to_string(),
+            generation: 1,
+            created_by: "worker+daemon".to_string(),
+            created_at: "2026-07-09T15:00:00Z".to_string(),
+        };
+        slice.set_provenance(provenance.clone());
+        validate_slice(&slice).unwrap();
+        assert_eq!(slice.provenance(), Some(provenance));
+
+        let serialized = serde_json::to_value(&slice).unwrap();
+        assert_eq!(serialized["provenance"]["created_by"], "worker+daemon");
+
+        let schema = super::slice_schema();
+        assert_eq!(
+            schema["properties"]["provenance"]["properties"]["created_by"]["enum"][1],
+            "worker+daemon"
+        );
+
+        let mut invalid_provenance = crate::domain::SliceProvenance {
+            parent_slice_id: "slice-parent".to_string(),
+            origin_proposal_id: "rp-test-001".to_string(),
+            generation: 1,
+            created_by: "envelope".to_string(),
+            created_at: "2026-07-09T15:00:00Z".to_string(),
+        };
+        invalid_provenance.created_by = "envelope".to_string();
+        slice.set_provenance(invalid_provenance);
+        let err = validate_slice(&slice).unwrap_err().to_string();
+        assert!(err.contains("provenance.created_by"));
     }
 
     #[test]

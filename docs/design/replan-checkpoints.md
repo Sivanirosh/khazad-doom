@@ -130,8 +130,20 @@ A replan proposal should be recorded as a daemon-owned artifact/event with a sta
   "proposed_changes": [
     {
       "kind": "add_followup_slice",
-      "slice_id": "S-1-followup",
-      "rationale": "Repair requires files outside S-1 areas"
+      "target": "S-1-followup",
+      "summary": "Repair requires files outside S-1 areas",
+      "followup_slice_draft": {
+        "id": "S-1-followup",
+        "title": "Repair out-of-area normalization",
+        "goal": "Capture the repair work in a bounded follow-up slice",
+        "areas": ["src/path_normalizer.rs"],
+        "acceptance": ["Normalization repair is implemented and verified"],
+        "verify": ["cargo test path_normalizer"],
+        "verify_profile": "",
+        "depends_on": ["S-1"],
+        "must_ask_if": ["The repair changes workflow policy"],
+        "rationale": "Repair requires files outside S-1 areas"
+      }
     }
   ],
   "operator_decision": null,
@@ -139,6 +151,8 @@ A replan proposal should be recorded as a daemon-owned artifact/event with a sta
   "updated_at": "2026-07-06T00:00:00Z"
 }
 ```
+
+For `kind: "add_followup_slice"`, `followup_slice_draft` is optional for legacy prose-only proposals but required for daemon-created worker/repair candidate drafts. The typed payload is durable proposal evidence only; it is not applied to `.workflow/slices/` or queued until an explicit operator-authorized apply path validates and promotes it.
 
 Accepted revision records add:
 
