@@ -182,6 +182,21 @@ enum IntegrationMode {
     Existing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowupApplyMode {
+    PromoteOnly,
+    AppendAndRun,
+}
+
+impl FollowupApplyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PromoteOnly => "promote_only",
+            Self::AppendAndRun => "append_and_run",
+        }
+    }
+}
+
 struct IntegrationRepairContext<'a> {
     run: &'a Run,
     slices: &'a [Slice],
@@ -392,7 +407,6 @@ impl Manager {
     }
 
     fn block_if_pending_replan(&self, run: &Run, checkpoint: &str) -> Result<()> {
-        self.classify_pending_frontier_proposals_at_replan_checkpoint(run, checkpoint)?;
         let pending = self.state.pending_replan_proposals(&run.id)?;
         if pending.is_empty() {
             return Ok(());
@@ -406,7 +420,15 @@ impl Manager {
         for proposal in &pending {
             commands.extend(replan_decision_commands(&run.id, &proposal.id));
         }
-        let message = format!("awaiting replan decision for {ids} before {checkpoint}");
+        let frontier_attention = frontier_replan_attention_reasons(&pending);
+        let message = if frontier_attention.is_empty() {
+            format!("awaiting replan decision for {ids} before {checkpoint}")
+        } else {
+            format!(
+                "awaiting replan decision for {ids} before {checkpoint}; {}",
+                frontier_attention.join("; ")
+            )
+        };
         self.mark_progress(&run.id, "awaiting_replan", "", 0, "replan", &message);
         self.state.record_event(
             &run.id,
@@ -442,74 +464,298 @@ impl Manager {
             return Ok(0);
         }
         let all_proposals = self.state.list_replan_proposals(&run.id)?;
-        let graph = self.frontier_slice_graph_for_run(run, &all_proposals)?;
+        let graph =
+            self.frontier_slice_graph_for_path(Path::new(&run.repo_path), &all_proposals)?;
         let envelope_hash = mission_envelope_hash(&envelope)?;
         let mut recorded = 0;
         for proposal in pending {
-            let Some(draft) = add_followup_slice_draft_from_proposal(&proposal) else {
+            let Some(classification) = self.classify_frontier_proposal_at_checkpoint(
+                &envelope,
+                &budget_snapshot,
+                &graph,
+                &envelope_hash,
+                &proposal,
+            )?
+            else {
                 continue;
-            };
-            let view = FollowupProposalView {
-                proposal_id: proposal.id.as_str(),
-                source_slice_id: proposal.source.slice_id.as_str(),
-                change: FollowupProposalChange::AddFollowupSlice(&draft),
-                source_must_ask_if_hits: &[],
-                envelope_must_ask_if_hits: &[],
-                external_dependency_claims: &[],
-                changes_existing_dependencies: false,
-                changes_existing_acceptance: false,
-                changes_verify_profile: false,
-                changes_policy_or_schema: false,
-                needs_operator_context: false,
-                ambiguity_markers: &[],
-            };
-            let decision = classify_followup_proposal(&envelope, &graph, &view, &budget_snapshot);
-            let classification = FrontierClassification {
-                tier: decision.tier.as_str().to_string(),
-                reason_codes: decision
-                    .reason_codes
-                    .iter()
-                    .map(|reason| reason.as_str().to_string())
-                    .collect(),
-                classified_at: Utc::now(),
-                envelope_hash: envelope_hash.clone(),
-                budget_snapshot: budget_snapshot.clone(),
-                autonomy_level: envelope.autonomy_level,
             };
             let proposal = self.state.replace_replan_frontier_classification(
                 &run.id,
                 &proposal.id,
                 &classification,
             )?;
-            self.state.record_event(
-                &run.id,
-                "frontier_classified",
-                &json!({
-                    "proposal_id": proposal.id,
-                    "checkpoint": checkpoint,
-                    "tier": classification.tier,
-                    "reason_codes": classification.reason_codes,
-                    "classified_at": classification.classified_at,
-                    "envelope_hash": classification.envelope_hash,
-                    "budget_snapshot": classification.budget_snapshot,
-                    "autonomy_level": classification.autonomy_level,
-                    "record_only": true,
-                    "queue_mutated": false,
-                    "slice_mutated": false,
-                    "decision_recorded": false,
-                }),
+            self.record_frontier_classification_event(
+                run,
+                checkpoint,
+                &proposal,
+                &classification,
+                true,
             )?;
             recorded += 1;
         }
         Ok(recorded)
     }
 
-    fn frontier_slice_graph_for_run(
+    fn settle_replan_checkpoint(
+        &self,
+        run: &mut Run,
+        checkpoint: &str,
+        integration_worktree: &Path,
+        worker_layers: &mut VecDeque<Vec<Slice>>,
+        gate_slices: &mut Vec<Slice>,
+    ) -> Result<()> {
+        self.apply_accepted_replan_proposals_at_checkpoint(
+            run,
+            checkpoint,
+            integration_worktree,
+            worker_layers,
+            gate_slices,
+        )?;
+        let (envelope, _) = self.state.get_frontier_state(&run.id)?;
+        match envelope.as_ref().map(|envelope| envelope.autonomy_level) {
+            Some(AutonomyLevel::Promote | AutonomyLevel::Run) => {
+                self.auto_accept_frontier_proposals_at_replan_checkpoint(
+                    run,
+                    checkpoint,
+                    integration_worktree,
+                    worker_layers,
+                    gate_slices,
+                )?;
+            }
+            Some(AutonomyLevel::Shadow) => {
+                self.classify_pending_frontier_proposals_at_replan_checkpoint(run, checkpoint)?;
+            }
+            Some(AutonomyLevel::Off) | None => {}
+        }
+        self.block_if_pending_replan(run, checkpoint)
+    }
+
+    fn auto_accept_frontier_proposals_at_replan_checkpoint(
+        &self,
+        run: &mut Run,
+        checkpoint: &str,
+        integration_worktree: &Path,
+        worker_layers: &mut VecDeque<Vec<Slice>>,
+        gate_slices: &mut Vec<Slice>,
+    ) -> Result<usize> {
+        let (envelope, _) = self.state.get_frontier_state(&run.id)?;
+        let Some(envelope) = envelope else {
+            return Ok(0);
+        };
+        if !matches!(
+            envelope.autonomy_level,
+            AutonomyLevel::Promote | AutonomyLevel::Run
+        ) {
+            return Ok(0);
+        }
+        let envelope_hash = mission_envelope_hash(&envelope)?;
+        let mut accepted = 0;
+        loop {
+            let pending = self.state.pending_replan_proposals(&run.id)?;
+            if pending.is_empty() {
+                break;
+            }
+            let all_proposals = self.state.list_replan_proposals(&run.id)?;
+            let graph = self.frontier_slice_graph_for_path(integration_worktree, &all_proposals)?;
+            let (_, budget_snapshot) = self.state.get_frontier_state(&run.id)?;
+            let budget_snapshot = budget_snapshot.unwrap_or_default();
+            let mut accepted_one = false;
+            for proposal in pending {
+                let Some(classification) = self.classify_frontier_proposal_at_checkpoint(
+                    &envelope,
+                    &budget_snapshot,
+                    &graph,
+                    &envelope_hash,
+                    &proposal,
+                )?
+                else {
+                    self.record_frontier_auto_accept_skip(
+                        run,
+                        checkpoint,
+                        &proposal,
+                        "unsupported_proposal_kind",
+                        &[],
+                    )?;
+                    continue;
+                };
+                let proposal = self.state.replace_replan_frontier_classification(
+                    &run.id,
+                    &proposal.id,
+                    &classification,
+                )?;
+                self.record_frontier_classification_event(
+                    run,
+                    checkpoint,
+                    &proposal,
+                    &classification,
+                    false,
+                )?;
+                if !frontier_auto_accept_gate_allows(&envelope, &classification) {
+                    self.record_frontier_auto_accept_skip(
+                        run,
+                        checkpoint,
+                        &proposal,
+                        "classification_not_auto_accept_eligible",
+                        &classification.reason_codes,
+                    )?;
+                    continue;
+                }
+                let budget_before = budget_snapshot.clone();
+                let budget_after = frontier_budget_after_auto_accept(&budget_before);
+                let rationale = format!(
+                    "frontier policy auto-accepted Tier-1 add_followup_slice proposal within mission envelope at {checkpoint}"
+                );
+                let proposal = self.state.auto_accept_replan_proposal_with_budget(
+                    &run.id,
+                    &proposal.id,
+                    &rationale,
+                    &classification,
+                    &budget_before,
+                    &budget_after,
+                )?;
+                self.state.record_event(
+                    &run.id,
+                    "frontier_auto_accept_recorded",
+                    &json!({
+                        "proposal_id": proposal.id,
+                        "checkpoint": checkpoint,
+                        "authorizer": proposal.operator_decision.as_ref().map(|decision| decision.authorizer.as_str()).unwrap_or(""),
+                        "source": proposal.operator_decision.as_ref().map(|decision| decision.source.as_str()).unwrap_or(""),
+                        "rationale": rationale,
+                        "tier": classification.tier,
+                        "reason_codes": classification.reason_codes,
+                        "budget_before": budget_before,
+                        "budget_after": budget_after,
+                        "af00_evidence_gate": "satisfied",
+                        "apply_mode": followup_apply_mode_for_autonomy(envelope.autonomy_level).as_str(),
+                    }),
+                )?;
+                self.apply_followup_proposal_at_checkpoint(
+                    run,
+                    checkpoint,
+                    integration_worktree,
+                    worker_layers,
+                    gate_slices,
+                    &proposal,
+                    followup_apply_mode_for_autonomy(envelope.autonomy_level),
+                )?;
+                accepted += 1;
+                accepted_one = true;
+                break;
+            }
+            if !accepted_one {
+                break;
+            }
+        }
+        Ok(accepted)
+    }
+
+    fn classify_frontier_proposal_at_checkpoint(
+        &self,
+        envelope: &MissionEnvelope,
+        budget_snapshot: &FrontierBudgetState,
+        graph: &SliceGraphView,
+        envelope_hash: &str,
+        proposal: &ReplanProposal,
+    ) -> Result<Option<FrontierClassification>> {
+        let Some(draft) = add_followup_slice_draft_from_proposal(proposal) else {
+            return Ok(None);
+        };
+        let view = FollowupProposalView {
+            proposal_id: proposal.id.as_str(),
+            source_slice_id: proposal.source.slice_id.as_str(),
+            change: FollowupProposalChange::AddFollowupSlice(&draft),
+            source_must_ask_if_hits: &[],
+            envelope_must_ask_if_hits: &[],
+            external_dependency_claims: &[],
+            changes_existing_dependencies: false,
+            changes_existing_acceptance: false,
+            changes_verify_profile: false,
+            changes_policy_or_schema: false,
+            needs_operator_context: false,
+            ambiguity_markers: &[],
+        };
+        let decision = classify_followup_proposal(envelope, graph, &view, budget_snapshot);
+        Ok(Some(FrontierClassification {
+            tier: decision.tier.as_str().to_string(),
+            reason_codes: decision
+                .reason_codes
+                .iter()
+                .map(|reason| reason.as_str().to_string())
+                .collect(),
+            classified_at: Utc::now(),
+            envelope_hash: envelope_hash.to_string(),
+            budget_snapshot: budget_snapshot.clone(),
+            autonomy_level: envelope.autonomy_level,
+        }))
+    }
+
+    fn record_frontier_classification_event(
         &self,
         run: &Run,
+        checkpoint: &str,
+        proposal: &ReplanProposal,
+        classification: &FrontierClassification,
+        record_only: bool,
+    ) -> Result<()> {
+        self.state.record_event(
+            &run.id,
+            "frontier_classified",
+            &json!({
+                "proposal_id": proposal.id,
+                "checkpoint": checkpoint,
+                "tier": &classification.tier,
+                "reason_codes": &classification.reason_codes,
+                "classified_at": classification.classified_at,
+                "envelope_hash": &classification.envelope_hash,
+                "budget_snapshot": &classification.budget_snapshot,
+                "autonomy_level": classification.autonomy_level,
+                "record_only": record_only,
+                "queue_mutated": false,
+                "slice_mutated": false,
+                "decision_recorded": false,
+            }),
+        )
+    }
+
+    fn record_frontier_auto_accept_skip(
+        &self,
+        run: &Run,
+        checkpoint: &str,
+        proposal: &ReplanProposal,
+        reason: &str,
+        reason_codes: &[String],
+    ) -> Result<()> {
+        let tier = proposal
+            .frontier_classification
+            .as_ref()
+            .map(|classification| classification.tier.as_str())
+            .unwrap_or("");
+        let event_type = if matches!(tier, "tier_3" | "stop") {
+            "frontier_auto_accept_stopped"
+        } else {
+            "frontier_auto_accept_skipped"
+        };
+        self.state.record_event(
+            &run.id,
+            event_type,
+            &json!({
+                "proposal_id": proposal.id,
+                "checkpoint": checkpoint,
+                "reason": reason,
+                "tier": tier,
+                "reason_codes": reason_codes,
+                "state": proposal.state,
+            }),
+        )
+    }
+
+    fn frontier_slice_graph_for_path(
+        &self,
+        repo_path: &Path,
         proposals: &[ReplanProposal],
     ) -> Result<SliceGraphView> {
-        let slices = artifact::Store::new(&run.repo_path)
+        let slices = artifact::Store::new(repo_path)
             .load_slices()?
             .into_iter()
             .map(|slice| {
@@ -1504,8 +1750,8 @@ impl Manager {
                 "selected_slices": &selected_ids,
                 "mission_envelope": &mission_envelope,
                 "frontier_budget": &frontier_budget,
-                "autonomy_effective": "off",
-                "autonomy_note": "AF-02 records mission envelopes only; autonomy levels above off grant no authority yet",
+                "autonomy_effective": mission_envelope.as_ref().map(|envelope| envelope.autonomy_level.as_str()).unwrap_or("off"),
+                "autonomy_note": autonomy_effective_note(mission_envelope.as_ref()),
                 "native_pi_tui_worker": native_pi_tui_worker,
                 "experimental_pi_tui_worker": native_pi_tui_worker,
                 "worker_interface": if native_pi_tui_worker { "native_pi_tui" } else { "json_wrapper" },
@@ -1554,8 +1800,8 @@ impl Manager {
                 &json!({
                     "mission_envelope": envelope,
                     "frontier_budget": frontier_budget,
-                    "autonomy_effective": "off",
-                    "authority": "record_only_no_auto_authority",
+                    "autonomy_effective": envelope.autonomy_level.as_str(),
+                    "authority": autonomy_authority_label(envelope.autonomy_level),
                 }),
             )?;
         }
@@ -1634,7 +1880,18 @@ impl Manager {
             );
         }
         self.ensure_repo_run_available(&run.repo_id, Some(&run.id))?;
-        self.block_if_pending_replan(&run, "resume")?;
+        let (resume_envelope, _) = self.state.get_frontier_state(&run.id)?;
+        match resume_envelope
+            .as_ref()
+            .map(|envelope| envelope.autonomy_level)
+        {
+            Some(AutonomyLevel::Promote | AutonomyLevel::Run) => {}
+            Some(AutonomyLevel::Shadow) => {
+                self.classify_pending_frontier_proposals_at_replan_checkpoint(&run, "resume")?;
+                self.block_if_pending_replan(&run, "resume")?;
+            }
+            Some(AutonomyLevel::Off) | None => self.block_if_pending_replan(&run, "resume")?,
+        }
         let store = artifact::Store::new(&run.repo_path);
         let _last_checkpoint = store.read_checkpoint(&run.id).ok();
         self.prepare_resume_worktrees(&run)?;
@@ -2230,14 +2487,13 @@ impl Manager {
         )?;
         loop {
             check_cancelled(cancel)?;
-            self.apply_accepted_replan_proposals_at_checkpoint(
+            self.settle_replan_checkpoint(
                 &mut run,
                 "worker_dispatch",
                 &integration_worktree,
                 &mut worker_layers,
                 &mut gate_slices,
             )?;
-            self.block_if_pending_replan(&run, "worker dispatch")?;
             let Some(layer) = worker_layers.pop_front() else {
                 break;
             };
@@ -2318,7 +2574,7 @@ impl Manager {
         }
 
         check_cancelled(cancel)?;
-        self.apply_accepted_replan_proposals_at_checkpoint(
+        self.settle_replan_checkpoint(
             &mut run,
             "integration_gate",
             &integration_worktree,
@@ -2332,7 +2588,6 @@ impl Manager {
             )
             .into());
         }
-        self.block_if_pending_replan(&run, "integration gate")?;
         self.run_worktree_setup(
             &run,
             "",
@@ -2961,6 +3216,7 @@ impl Manager {
             if !proposal_needs_followup_apply(&proposal) {
                 continue;
             }
+            let mode = self.followup_apply_mode_for_proposal(run, &proposal)?;
             if self.apply_followup_proposal_at_checkpoint(
                 run,
                 checkpoint,
@@ -2968,11 +3224,36 @@ impl Manager {
                 worker_layers,
                 gate_slices,
                 &proposal,
+                mode,
             )? {
                 applied += 1;
             }
         }
         Ok(applied)
+    }
+
+    fn followup_apply_mode_for_proposal(
+        &self,
+        run: &Run,
+        proposal: &ReplanProposal,
+    ) -> Result<FollowupApplyMode> {
+        let Some(decision) = proposal.operator_decision.as_ref() else {
+            return Ok(FollowupApplyMode::AppendAndRun);
+        };
+        if decision.source == "frontier_policy"
+            && decision.authorizer == format!("envelope:{}", run.id)
+        {
+            if let Some(classification) = proposal.frontier_classification.as_ref() {
+                return Ok(followup_apply_mode_for_autonomy(
+                    classification.autonomy_level,
+                ));
+            }
+            let (envelope, _) = self.state.get_frontier_state(&run.id)?;
+            if let Some(envelope) = envelope {
+                return Ok(followup_apply_mode_for_autonomy(envelope.autonomy_level));
+            }
+        }
+        Ok(FollowupApplyMode::AppendAndRun)
     }
 
     fn apply_followup_proposal_at_checkpoint(
@@ -2983,6 +3264,7 @@ impl Manager {
         worker_layers: &mut VecDeque<Vec<Slice>>,
         gate_slices: &mut Vec<Slice>,
         proposal: &ReplanProposal,
+        mode: FollowupApplyMode,
     ) -> Result<bool> {
         let Some(mut decision) = proposal.operator_decision.clone() else {
             return Ok(false);
@@ -3031,6 +3313,7 @@ impl Manager {
                 "queue_before": before_queue,
                 "queue_before_hash": decision.queue_before_hash,
                 "integration_head": before_sha,
+                "apply_mode": mode.as_str(),
             }),
         )?;
 
@@ -3091,42 +3374,55 @@ impl Manager {
 
         let mut queue_after = selected_slice_ids(&run.selected_slice_id);
         let already_selected = queue_after.iter().any(|id| id == &generated_id);
-        if !already_selected {
-            queue_after.push(generated_id.clone());
-            let updated = self
-                .state
-                .update_run_selected_slices(&run.id, &queue_after.join(","))?;
-            run.selected_slice_id = updated.selected_slice_id;
-        }
-        let already_layered = worker_layers
-            .iter()
-            .flatten()
-            .any(|slice| slice.id == generated_id);
-        let already_merged = slice_run_is_merged(&self.state, &run.id, &generated_id)?;
-        if !already_layered && !already_merged {
-            worker_layers.push_back(vec![generated_slice.clone()]);
-        }
-        if !gate_slices.iter().any(|slice| slice.id == generated_id) {
-            gate_slices.push(generated_slice.clone());
-        }
-        if !already_merged {
-            self.state.upsert_slice_run(&SliceRun {
-                run_id: run.id.clone(),
-                slice_id: generated_id.clone(),
-                status: SliceStatus::Pending,
-                branch: String::new(),
-                commit_sha: String::new(),
-                attempts: 0,
-                last_error: String::new(),
-            })?;
+        let mut appended = false;
+        let mut worker_enqueued = false;
+        if mode == FollowupApplyMode::AppendAndRun {
+            if !already_selected {
+                queue_after.push(generated_id.clone());
+                let updated = self
+                    .state
+                    .update_run_selected_slices(&run.id, &queue_after.join(","))?;
+                run.selected_slice_id = updated.selected_slice_id;
+                appended = true;
+            }
+            let already_layered = worker_layers
+                .iter()
+                .flatten()
+                .any(|slice| slice.id == generated_id);
+            let already_merged = slice_run_is_merged(&self.state, &run.id, &generated_id)?;
+            if !already_layered && !already_merged {
+                worker_layers.push_back(vec![generated_slice.clone()]);
+                worker_enqueued = true;
+            }
+            if !gate_slices.iter().any(|slice| slice.id == generated_id) {
+                gate_slices.push(generated_slice.clone());
+            }
+            if !already_merged {
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: generated_id.clone(),
+                    status: SliceStatus::Pending,
+                    branch: String::new(),
+                    commit_sha: String::new(),
+                    attempts: 0,
+                    last_error: String::new(),
+                })?;
+            }
         }
         let after_sha = gitutil::head_sha(integration_worktree).unwrap_or_default();
         let final_queue = selected_slice_ids(&run.selected_slice_id);
         decision.applied = true;
         decision.applied_at = Some(Utc::now());
         decision.apply_status = "applied".to_string();
-        decision.apply_reason =
-            "generated follow-up slice committed and appended serially".to_string();
+        decision.apply_reason = match mode {
+            FollowupApplyMode::PromoteOnly => {
+                "generated follow-up slice committed for a future run; promote autonomy does not append or run it in the current run"
+                    .to_string()
+            }
+            FollowupApplyMode::AppendAndRun => {
+                "generated follow-up slice committed and appended serially".to_string()
+            }
+        };
         decision.generated_slice_id = generated_id.clone();
         decision.generated_slice_commit = after_sha.clone();
         decision.apply_after_checkpoint_id = checkpoint_id(checkpoint, "after", &after_sha);
@@ -3147,8 +3443,10 @@ impl Manager {
                 "queue_before_hash": decision.queue_before_hash,
                 "queue_after": final_queue,
                 "queue_after_hash": decision.queue_after_hash,
-                "appended": !already_selected,
-                "serial_append": true,
+                "appended": appended,
+                "serial_append": mode == FollowupApplyMode::AppendAndRun,
+                "worker_enqueued": worker_enqueued,
+                "apply_mode": mode.as_str(),
             }),
         )?;
         Ok(true)
@@ -5438,6 +5736,90 @@ fn primary_failure_for_terminal_summary(
         .unwrap_or_default()
 }
 
+fn frontier_auto_accept_gate_allows(
+    envelope: &MissionEnvelope,
+    classification: &FrontierClassification,
+) -> bool {
+    // AF-00/AF-06 hard gate: the daemon's delegated authority is active only for
+    // promote/run envelopes whose persisted classifier evidence is Tier 1 and still
+    // carries budget/depth positives. All other cases fail upward to replan attention.
+    matches!(
+        envelope.autonomy_level,
+        AutonomyLevel::Promote | AutonomyLevel::Run
+    ) && classification.tier == "tier_1"
+        && classification
+            .reason_codes
+            .iter()
+            .any(|code| code == "within_budget")
+        && classification
+            .reason_codes
+            .iter()
+            .any(|code| code == "within_depth")
+}
+
+fn frontier_budget_after_auto_accept(before: &FrontierBudgetState) -> FrontierBudgetState {
+    let mut after = before.clone();
+    after.auto_promotions_used = after.auto_promotions_used.saturating_add(1);
+    after.generated_slices = after.generated_slices.saturating_add(1);
+    after
+}
+
+fn followup_apply_mode_for_autonomy(level: AutonomyLevel) -> FollowupApplyMode {
+    match level {
+        AutonomyLevel::Promote => FollowupApplyMode::PromoteOnly,
+        AutonomyLevel::Run | AutonomyLevel::Shadow | AutonomyLevel::Off => {
+            FollowupApplyMode::AppendAndRun
+        }
+    }
+}
+
+fn frontier_replan_attention_reasons(pending: &[ReplanProposal]) -> Vec<String> {
+    pending
+        .iter()
+        .filter_map(|proposal| {
+            let classification = proposal.frontier_classification.as_ref()?;
+            if classification.tier != "tier_3" && classification.tier != "stop" {
+                return None;
+            }
+            let codes = if classification.reason_codes.is_empty() {
+                "no_reason_codes".to_string()
+            } else {
+                classification.reason_codes.join(",")
+            };
+            Some(format!(
+                "frontier {} for {} ({codes})",
+                classification.tier, proposal.id
+            ))
+        })
+        .collect()
+}
+
+fn autonomy_effective_note(envelope: Option<&MissionEnvelope>) -> &'static str {
+    match envelope.map(|envelope| envelope.autonomy_level) {
+        Some(AutonomyLevel::Promote) => {
+            "promote may auto-accept Tier-1 follow-up proposals and generate slices; generated slices are not run in the current run"
+        }
+        Some(AutonomyLevel::Run) => {
+            "run may auto-accept Tier-1 follow-up proposals, generate slices, append them serially, and execute them in the current run"
+        }
+        Some(AutonomyLevel::Shadow) => {
+            "shadow records frontier classifications only; queues, slices, and decisions stay operator-owned"
+        }
+        Some(AutonomyLevel::Off) | None => {
+            "frontier authority inactive; legacy run behavior unchanged"
+        }
+    }
+}
+
+fn autonomy_authority_label(level: AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::Promote => "frontier_tier1_promote_authority",
+        AutonomyLevel::Run => "frontier_tier1_run_authority",
+        AutonomyLevel::Shadow => "record_only_no_auto_authority",
+        AutonomyLevel::Off => "frontier_disabled",
+    }
+}
+
 fn validate_mission_envelope(
     envelope: Option<&MissionEnvelope>,
     config: &WorkflowConfig,
@@ -6327,12 +6709,10 @@ fn followup_generation(existing_slices: &[Slice], parent_slice_id: &str) -> u64 
 
 fn provenance_created_by(decision: &ReplanDecision) -> String {
     let authorizer = decision.authorizer.trim();
-    if authorizer.is_empty() {
-        "operator".to_string()
-    } else if authorizer.starts_with("operator") {
-        authorizer.to_string()
+    if decision.source == "frontier_policy" || authorizer.starts_with("envelope:") {
+        "worker+daemon".to_string()
     } else {
-        format!("operator:{authorizer}")
+        "operator".to_string()
     }
 }
 
@@ -6791,11 +7171,12 @@ mod tests {
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         AcceptanceEvidence, AutonomyLevel, CheckResult, CockpitMode, Finding, FindingDisposition,
-        FollowupSliceDraft, FrontierBudgetState, Handoff, ImplementationSummary, MissionEnvelope,
-        OriginNotificationTarget, RepairResult, ReplanEvidenceLink, ReplanProposal,
-        ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run, RunEconomics,
-        RunStatus, Slice, SliceProvenance, SliceRun, SliceStatus, TerminalNotificationRecord,
-        VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
+        FollowupSliceDraft, FrontierBudgetState, FrontierClassification, Handoff,
+        ImplementationSummary, MissionEnvelope, OriginNotificationTarget, RepairResult,
+        ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
+        ReplanProposedChange, Run, RunEconomics, RunStatus, Slice, SliceProvenance, SliceRun,
+        SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile, WorkerResult,
+        WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -7415,13 +7796,533 @@ mod tests {
             );
             if let Some(classification) = proposal.frontier_classification {
                 assert_eq!(classification.autonomy_level, level, "{label}");
-                assert!(
+                assert_eq!(
                     classification
                         .reason_codes
-                        .contains(&"shadow_observation_only".to_string())
+                        .contains(&"shadow_observation_only".to_string()),
+                    level == AutonomyLevel::Shadow,
+                    "{label}"
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_auto_accept_promote_generates_slice_without_running_it() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = test_run("kd-auto-accept-promote", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Promote;
+        state.set_frontier_state(
+            &run.id,
+            Some(&envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        let mut worker_layers = VecDeque::new();
+        let mut gate_slices = vec![parent.clone()];
+
+        assert_eq!(
+            manager.auto_accept_frontier_proposals_at_replan_checkpoint(
+                &mut run,
+                "test",
+                repo.path(),
+                &mut worker_layers,
+                &mut gate_slices,
+            )?,
+            1
+        );
+
+        assert!(store.slice_path("slice-001-followup").exists());
+        let generated: Slice = artifact::read_json(store.slice_path("slice-001-followup"))?;
+        let provenance = generated.provenance().expect("generated provenance");
+        assert_eq!(provenance.created_by, "worker+daemon");
+        assert_eq!(provenance.parent_slice_id, "slice-001");
+        assert!(worker_layers.is_empty());
+        assert_eq!(gate_slices.len(), 1);
+        assert_eq!(gate_slices[0].id, parent.id);
+        assert_eq!(run.selected_slice_id, "slice-001");
+        assert!(
+            !state
+                .get_slice_runs(&run.id)?
+                .iter()
+                .any(|slice_run| slice_run.slice_id == "slice-001-followup")
+        );
+        let (_, budget) = state.get_frontier_state(&run.id)?;
+        let budget = budget.expect("budget recorded");
+        assert_eq!(budget.auto_promotions_used, 1);
+        assert_eq!(budget.generated_slices, 1);
+        let proposals = state.list_replan_proposals(&run.id)?;
+        let proposal = &proposals[0];
+        assert_eq!(proposal.state, ReplanProposalState::Accepted);
+        let decision = proposal
+            .operator_decision
+            .as_ref()
+            .expect("decision recorded");
+        assert_eq!(decision.authorizer, format!("envelope:{}", run.id));
+        assert_eq!(decision.source, "frontier_policy");
+        assert_eq!(decision.frontier_tier, "tier_1");
+        assert!(
+            decision
+                .frontier_reason_codes
+                .contains(&"within_budget".to_string())
+        );
+        assert!(decision.frontier_budget_before.is_some());
+        assert!(decision.frontier_budget_after.is_some());
+        assert!(decision.applied);
+        assert_eq!(decision.queue_after, vec!["slice-001".to_string()]);
+        assert!(decision.apply_reason.contains("future run"));
+        assert!(!decision.generated_slice_commit.trim().is_empty());
+        let events = state.get_events(&run.id, 50)?;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.typ == "frontier_auto_accept_recorded")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_auto_accept_run_appends_generated_slice_serially() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = test_run("kd-auto-accept-run", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Run;
+        state.set_frontier_state(
+            &run.id,
+            Some(&envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        let mut worker_layers = VecDeque::new();
+        let mut gate_slices = vec![parent];
+
+        assert_eq!(
+            manager.auto_accept_frontier_proposals_at_replan_checkpoint(
+                &mut run,
+                "test",
+                repo.path(),
+                &mut worker_layers,
+                &mut gate_slices,
+            )?,
+            1
+        );
+
+        assert_eq!(run.selected_slice_id, "slice-001,slice-001-followup");
+        assert_eq!(worker_layers.len(), 1);
+        assert_eq!(worker_layers[0][0].id, "slice-001-followup");
+        assert!(
+            gate_slices
+                .iter()
+                .any(|slice| slice.id == "slice-001-followup")
+        );
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert!(slice_runs.iter().any(|slice_run| {
+            slice_run.slice_id == "slice-001-followup" && slice_run.status == SliceStatus::Pending
+        }));
+        let proposal = state.list_replan_proposals(&run.id)?.remove(0);
+        let decision = proposal.operator_decision.expect("decision recorded");
+        assert_eq!(
+            decision.queue_after,
+            vec!["slice-001".to_string(), "slice-001-followup".to_string()]
+        );
+        assert!(decision.apply_reason.contains("appended serially"));
+        let events = state.get_events(&run.id, 50)?;
+        let promoted = events
+            .iter()
+            .find(|event| event.typ == "frontier_slice_promoted")
+            .expect("promotion event");
+        assert_eq!(promoted.payload["apply_mode"], "append_and_run");
+        assert_eq!(promoted.payload["serial_append"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_auto_accept_run_level_e2e_executes_generated_slice() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut parent = slice("slice-001");
+        parent.areas = vec!["src/".to_string()];
+        parent.verify = vec!["test -f src/slice-001.txt".to_string()];
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths.clone(),
+            state.clone(),
+            Arc::new(FollowupEmittingRunner),
+        );
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Run;
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: true,
+            origin_notification_target: String::new(),
+            mission_envelope: Some(envelope),
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(state.pending_replan_proposals(&run.id)?.len(), 0);
+        let slice_runs = state.get_slice_runs(&run.id)?;
+        assert!(slice_runs.iter().any(|slice_run| {
+            slice_run.slice_id == "slice-001-followup" && slice_run.status == SliceStatus::Merged
+        }));
+        let proposal = state.list_replan_proposals(&run.id)?.remove(0);
+        assert_eq!(proposal.state, ReplanProposalState::Accepted);
+        let decision = proposal.operator_decision.expect("auto decision recorded");
+        assert_eq!(decision.authorizer, format!("envelope:{}", run.id));
+        assert_eq!(decision.source, "frontier_policy");
+        assert!(decision.applied);
+        assert_eq!(
+            decision.queue_after,
+            vec!["slice-001".to_string(), "slice-001-followup".to_string()]
+        );
+        let (_, budget) = state.get_frontier_state(&run.id)?;
+        let budget = budget.expect("budget recorded");
+        assert_eq!(budget.auto_promotions_used, 1);
+        assert_eq!(budget.generated_slices, 1);
+        let final_summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
+        assert!(
+            final_summary
+                .completed_slices
+                .iter()
+                .any(|result| result.slice_id == "slice-001-followup")
+        );
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&completed, RunReadModelOptions::status(20))?;
+        assert!(
+            model
+                .details
+                .generated_slices
+                .iter()
+                .any(|slice| slice.slice_id == "slice-001-followup")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_auto_accept_respects_envelope_and_stop_boundaries() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        store.write_slice(&slice("slice-001"), true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        let mut no_envelope_run = test_run("kd-auto-accept-no-envelope", repo.path(), "slice-001")?;
+        state.insert_run(&no_envelope_run)?;
+        create_followup_replan_proposal(
+            &state,
+            &no_envelope_run.id,
+            "slice-001",
+            followup_draft("slice-001-followup-no-envelope"),
+        )?;
+        assert_eq!(
+            manager.auto_accept_frontier_proposals_at_replan_checkpoint(
+                &mut no_envelope_run,
+                "test",
+                repo.path(),
+                &mut VecDeque::new(),
+                &mut vec![slice("slice-001")],
+            )?,
+            0
+        );
+        assert_eq!(
+            state.pending_replan_proposals(&no_envelope_run.id)?.len(),
+            1
+        );
+
+        let mut unsupported_run = test_run("kd-auto-accept-unsupported", repo.path(), "slice-001")?;
+        state.insert_run(&unsupported_run)?;
+        let mut unsupported_envelope = mission_envelope();
+        unsupported_envelope.autonomy_level = AutonomyLevel::Run;
+        state.set_frontier_state(
+            &unsupported_run.id,
+            Some(&unsupported_envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        create_test_replan_proposal(&state, &unsupported_run.id, "slice-001", "unsupported")?;
+        assert_eq!(
+            manager.auto_accept_frontier_proposals_at_replan_checkpoint(
+                &mut unsupported_run,
+                "test",
+                repo.path(),
+                &mut VecDeque::new(),
+                &mut vec![slice("slice-001")],
+            )?,
+            0
+        );
+        let unsupported = state
+            .pending_replan_proposals(&unsupported_run.id)?
+            .remove(0);
+        assert!(unsupported.operator_decision.is_none());
+        assert!(unsupported.frontier_classification.is_none());
+
+        let mut budget_stop_run = test_run("kd-auto-accept-budget-stop", repo.path(), "slice-001")?;
+        state.insert_run(&budget_stop_run)?;
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Run;
+        envelope.max_auto_promotions = 0;
+        state.set_frontier_state(
+            &budget_stop_run.id,
+            Some(&envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        create_followup_replan_proposal(
+            &state,
+            &budget_stop_run.id,
+            "slice-001",
+            followup_draft("slice-001-followup-budget"),
+        )?;
+        assert_eq!(
+            manager.auto_accept_frontier_proposals_at_replan_checkpoint(
+                &mut budget_stop_run,
+                "test",
+                repo.path(),
+                &mut VecDeque::new(),
+                &mut vec![slice("slice-001")],
+            )?,
+            0
+        );
+        let proposal = state
+            .pending_replan_proposals(&budget_stop_run.id)?
+            .remove(0);
+        let classification = proposal
+            .frontier_classification
+            .as_ref()
+            .expect("stop classification");
+        assert_eq!(classification.tier, "stop");
+        assert!(
+            classification
+                .reason_codes
+                .contains(&"frontier_budget_exhausted".to_string())
+        );
+        let err = manager
+            .block_if_pending_replan(&budget_stop_run, "test")
+            .expect_err("pending frontier stop blocks for operator");
+        assert!(format!("{err:#}").contains("frontier stop"));
+        let (_, budget) = state.get_frontier_state(&budget_stop_run.id)?;
+        let budget = budget.expect("budget recorded");
+        assert_eq!(budget.auto_promotions_used, 0);
+        assert_eq!(budget.generated_slices, 0);
+        let events = state.get_events(&budget_stop_run.id, 50)?;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.typ == "frontier_auto_accept_stopped")
+        );
+
+        let mut depth_stop_run = test_run("kd-auto-accept-depth-stop", repo.path(), "slice-001")?;
+        state.insert_run(&depth_stop_run)?;
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Run;
+        envelope.max_depth = 0;
+        state.set_frontier_state(
+            &depth_stop_run.id,
+            Some(&envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        create_followup_replan_proposal(
+            &state,
+            &depth_stop_run.id,
+            "slice-001",
+            followup_draft("slice-001-followup-depth"),
+        )?;
+        assert_eq!(
+            manager.auto_accept_frontier_proposals_at_replan_checkpoint(
+                &mut depth_stop_run,
+                "test",
+                repo.path(),
+                &mut VecDeque::new(),
+                &mut vec![slice("slice-001")],
+            )?,
+            0
+        );
+        let depth_proposal = state
+            .pending_replan_proposals(&depth_stop_run.id)?
+            .remove(0);
+        let depth_classification = depth_proposal
+            .frontier_classification
+            .as_ref()
+            .expect("depth stop classification");
+        assert_eq!(depth_classification.tier, "stop");
+        assert!(
+            depth_classification
+                .reason_codes
+                .contains(&"frontier_depth_exhausted".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_auto_accept_resume_apply_is_idempotent_and_does_not_double_spend_budget()
+    -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = test_run("kd-auto-accept-resume", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Run;
+        state.set_frontier_state(
+            &run.id,
+            Some(&envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        let pending = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        let budget_before = FrontierBudgetState::default();
+        let budget_after = FrontierBudgetState {
+            auto_promotions_used: 1,
+            generated_slices: 1,
+            ..FrontierBudgetState::default()
+        };
+        let classification = FrontierClassification {
+            tier: "tier_1".to_string(),
+            reason_codes: vec![
+                "add_followup_slice_only".to_string(),
+                "inside_allowed_areas".to_string(),
+                "acceptance_present".to_string(),
+                "verify_present".to_string(),
+                "within_budget".to_string(),
+                "within_depth".to_string(),
+                "not_duplicate".to_string(),
+            ],
+            classified_at: Utc::now(),
+            envelope_hash: "test-envelope".to_string(),
+            budget_snapshot: budget_before.clone(),
+            autonomy_level: AutonomyLevel::Run,
+        };
+        state.auto_accept_replan_proposal_with_budget(
+            &run.id,
+            &pending.id,
+            "frontier policy accepted before crash",
+            &classification,
+            &budget_before,
+            &budget_after,
+        )?;
+        let mut worker_layers = VecDeque::new();
+        let mut gate_slices = vec![parent];
+
+        assert_eq!(
+            manager.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "resume",
+                repo.path(),
+                &mut worker_layers,
+                &mut gate_slices,
+            )?,
+            1
+        );
+        assert_eq!(
+            manager.apply_accepted_replan_proposals_at_checkpoint(
+                &mut run,
+                "resume-again",
+                repo.path(),
+                &mut worker_layers,
+                &mut gate_slices,
+            )?,
+            0
+        );
+        let (_, budget) = state.get_frontier_state(&run.id)?;
+        let budget = budget.expect("budget recorded");
+        assert_eq!(budget.auto_promotions_used, 1);
+        assert_eq!(budget.generated_slices, 1);
+        assert_eq!(worker_layers.len(), 1);
+        assert_eq!(
+            gate_slices
+                .iter()
+                .filter(|slice| slice.id == "slice-001-followup")
+                .count(),
+            1
+        );
+        let proposal = state.list_replan_proposals(&run.id)?.remove(0);
+        let decision = proposal.operator_decision.expect("decision recorded");
+        assert!(decision.applied);
+        assert_eq!(decision.frontier_budget_before, Some(budget_before));
+        assert_eq!(decision.frontier_budget_after, Some(budget_after));
         Ok(())
     }
 

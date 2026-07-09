@@ -455,9 +455,8 @@ pub(crate) mod promotion_policy {
     ) -> TierDecision {
         match envelope.autonomy_level {
             AutonomyLevel::Off => decision.push(ReasonCode::FrontierDisabled),
-            AutonomyLevel::Shadow | AutonomyLevel::Promote | AutonomyLevel::Run => {
-                decision.push(ReasonCode::ShadowObservationOnly)
-            }
+            AutonomyLevel::Shadow => decision.push(ReasonCode::ShadowObservationOnly),
+            AutonomyLevel::Promote | AutonomyLevel::Run => {}
         }
 
         decision.push(ReasonCode::AddFollowupSliceOnly);

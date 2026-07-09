@@ -774,6 +774,10 @@ impl Store {
                 source.trim().to_string()
             },
             decided_at: now,
+            frontier_tier: String::new(),
+            frontier_reason_codes: Vec::new(),
+            frontier_budget_before: None,
+            frontier_budget_after: None,
             applied: false,
             applied_at: None,
             apply_status: initial_replan_apply_status(&existing, state, run_for_apply.as_ref()),
@@ -804,6 +808,119 @@ impl Store {
         )?;
         self.get_replan_proposal(run_id, proposal_id)?
             .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision"))
+    }
+
+    pub fn auto_accept_replan_proposal_with_budget(
+        &self,
+        run_id: &str,
+        proposal_id: &str,
+        rationale: &str,
+        classification: &FrontierClassification,
+        budget_before: &FrontierBudgetState,
+        budget_after: &FrontierBudgetState,
+    ) -> Result<ReplanProposal> {
+        if rationale.trim().is_empty() {
+            anyhow::bail!("frontier auto-accept rationale is required");
+        }
+        if classification.tier != "tier_1" {
+            anyhow::bail!("frontier auto-accept requires a Tier-1 classification");
+        }
+        if !classification
+            .reason_codes
+            .iter()
+            .any(|code| code == "add_followup_slice_only")
+        {
+            anyhow::bail!("frontier auto-accept requires add_followup_slice_only evidence");
+        }
+        if budget_after.auto_promotions_used != budget_before.auto_promotions_used.saturating_add(1)
+            || budget_after.generated_slices != budget_before.generated_slices.saturating_add(1)
+        {
+            anyhow::bail!(
+                "frontier auto-accept must consume exactly one promotion and one generated-slice budget unit"
+            );
+        }
+        let existing = self
+            .get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("replan proposal {proposal_id:?} for run {run_id:?} not found")
+            })?;
+        if existing.state != ReplanProposalState::Pending {
+            anyhow::bail!(
+                "replan proposal {proposal_id:?} is already {}",
+                existing.state
+            );
+        }
+        let followup_only = matches!(existing.proposed_changes.as_slice(), [change]
+            if change.kind == "add_followup_slice" && change.followup_slice_draft().is_some());
+        if !followup_only {
+            anyhow::bail!(
+                "frontier auto-accept is only valid for one typed add_followup_slice proposal"
+            );
+        }
+        let now = Utc::now();
+        let run_for_apply = self.get_run(run_id)?;
+        let decision = ReplanDecision {
+            decision: ReplanProposalState::Accepted.as_str().to_string(),
+            rationale: rationale.trim().to_string(),
+            authorizer: format!("envelope:{run_id}"),
+            source: "frontier_policy".to_string(),
+            decided_at: now,
+            frontier_tier: classification.tier.clone(),
+            frontier_reason_codes: classification.reason_codes.clone(),
+            frontier_budget_before: Some(budget_before.clone()),
+            frontier_budget_after: Some(budget_after.clone()),
+            applied: false,
+            applied_at: None,
+            apply_status: initial_replan_apply_status(
+                &existing,
+                ReplanProposalState::Accepted,
+                run_for_apply.as_ref(),
+            ),
+            apply_reason: initial_replan_apply_reason(
+                &existing,
+                ReplanProposalState::Accepted,
+                run_for_apply.as_ref(),
+            ),
+            generated_slice_id: initial_replan_generated_slice_id(
+                &existing,
+                ReplanProposalState::Accepted,
+            ),
+            generated_slice_commit: String::new(),
+            apply_before_checkpoint_id: String::new(),
+            apply_after_checkpoint_id: String::new(),
+            queue_before: Vec::new(),
+            queue_after: Vec::new(),
+            queue_before_hash: String::new(),
+            queue_after_hash: String::new(),
+            replacement_id: String::new(),
+            revisit_condition: String::new(),
+        };
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE runs SET frontier_budget_json=?1, updated_at=?2 WHERE id=?3",
+            params![
+                serde_json::to_string(budget_after)?,
+                now.to_rfc3339(),
+                run_id,
+            ],
+        )?;
+        tx.execute(
+            r#"UPDATE replan_proposals
+               SET state=?1, decision_json=?2, frontier_classification_json=?3, updated_at=?4
+               WHERE run_id=?5 AND id=?6"#,
+            params![
+                ReplanProposalState::Accepted.as_str(),
+                serde_json::to_string(&decision)?,
+                serde_json::to_string(classification)?,
+                now.to_rfc3339(),
+                run_id,
+                proposal_id,
+            ],
+        )?;
+        tx.commit()?;
+        self.get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after auto-accept"))
     }
 
     pub fn replace_replan_decision(

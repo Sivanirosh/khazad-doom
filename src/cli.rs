@@ -136,10 +136,10 @@ enum CommandArgs {
         /// Optional opaque Herdr/Pi target for inert terminal-run feedback.
         #[arg(long = "origin-notification-target", default_value = "")]
         origin_notification_target: String,
-        /// Record a per-run mission envelope JSON file. AF-02 records this only; it grants no authority.
+        /// Attach a per-run mission envelope JSON file. AF-06 enables bounded Tier-1 authority for promote/run.
         #[arg(long = "envelope")]
         envelope: Option<PathBuf>,
-        /// Override the envelope autonomy level: off, shadow, promote, or run. Levels above off are recorded only in AF-02.
+        /// Override the envelope autonomy level: off, shadow, promote, or run.
         #[arg(long = "autonomy", value_parser = ["off", "shadow", "promote", "run"])]
         autonomy: Option<String>,
         #[arg(long)]
@@ -2173,7 +2173,7 @@ fn warn_unknown_mission_envelope_fields(path: &Path, value: &serde_json::Value) 
     for key in object.keys() {
         if !KNOWN.contains(&key.as_str()) {
             eprintln!(
-                "warning: mission envelope {} contains unknown field {key:?}; field is ignored in AF-02",
+                "warning: mission envelope {} contains unknown field {key:?}; field is ignored",
                 path.display()
             );
         }

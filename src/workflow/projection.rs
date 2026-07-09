@@ -1218,14 +1218,18 @@ fn mission_envelope_block(
             "autonomy shadow; classifier records observations only; queues, slices, and decisions stay operator-owned".to_string(),
             StatusFeedRole::Info,
         )),
-        crate::domain::AutonomyLevel::Promote | crate::domain::AutonomyLevel::Run => {
-            lines.push(line(
-                format!(
-                    "autonomy {autonomy} recorded, not yet active; AF-04 treats it as shadow observation only"
-                ),
-                StatusFeedRole::Warning,
-            ))
-        }
+        crate::domain::AutonomyLevel::Promote => lines.push(line(
+            format!(
+                "autonomy {autonomy}; Tier-1 add_followup_slice proposals may be accepted and generated for a future run"
+            ),
+            StatusFeedRole::Info,
+        )),
+        crate::domain::AutonomyLevel::Run => lines.push(line(
+            format!(
+                "autonomy {autonomy}; Tier-1 add_followup_slice proposals may be accepted, generated, appended serially, and run"
+            ),
+            StatusFeedRole::Info,
+        )),
     }
     if !envelope.must_ask_if.is_empty() {
         lines.push(line(
@@ -2442,6 +2446,10 @@ mod tests {
                 authorizer: "operator".to_string(),
                 source: "cli".to_string(),
                 decided_at: now,
+                frontier_tier: String::new(),
+                frontier_reason_codes: Vec::new(),
+                frontier_budget_before: None,
+                frontier_budget_after: None,
                 applied: false,
                 applied_at: None,
                 apply_status: "not_applicable".to_string(),
