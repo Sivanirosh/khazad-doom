@@ -3,6 +3,9 @@
   "title": "Verification purity and explicit publication",
   "goal": "Make daemon-owned verification observationally pure and make completion publication stage only explicit daemon-owned paths, with behavior-first regressions for verification side effects and publication confinement.",
   "status": "open",
+  "depends_on": [
+    "ASK-FALLBACK-01"
+  ],
   "areas": [
     "src/workflow/gate.rs",
     "src/workflow/shell.rs",

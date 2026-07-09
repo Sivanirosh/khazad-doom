@@ -1,0 +1,57 @@
+{
+  "id": "ASK-FALLBACK-01",
+  "title": "ask_operator recommended timeout fallback",
+  "goal": "Let the worker-only ask_operator action carry an explicit bounded LLM recommendation that the daemon atomically applies after 60 seconds without an operator answer, while retaining blocked behavior for missing, invalid, or hard-authorization recommendations.",
+  "status": "open",
+  "areas": [
+    ".workflow/khazad.json",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/workflow/events.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/projection.rs",
+    "extensions/khazad-worker/index.js",
+    "extensions/khazad-worker/index.test.mjs",
+    "tests/khazad-worker-extension.test.mjs",
+    "tests/daemon_integration.rs",
+    "tests/daemon",
+    "tests/fixtures",
+    "README.md",
+    "skills/khazad-doom/SKILL.md",
+    "docs/workflow-invariants.md",
+    "docs/roadmap/pi-native/05-operator-escalation.md",
+    "docs/roadmap/pi-native/00-matrix.md"
+  ],
+  "acceptance": [
+    "Use the confirmed behavioral TDD seams: first add failing StateStore/daemon-RPC tests and worker-extension tests for timeout fallback, user-answer races, invalid recommendations, and both same-pane and headless ask_operator paths; demonstrate the intended RED failures before implementation and do not weaken existing ask/answer/restart coverage.",
+    "The ask_operator tool accepts additive typed recommendation data: a recommended_answer, rationale, and explicit bounded/reversible eligibility attestation. A timeout recommendation is eligible only when it exactly matches one non-empty declared option and both bounded-within-current-slice-or-mission-authority and reversible attestations are true.",
+    "The worker prompt/tool guidance requires the asking LLM to provide its original recommendation and rationale, and forbids timeout fallback eligibility for scope expansion, destructive or irreversible actions, credentials/secrets, permissions, release/push/handoff authorization, or any choice outside the existing JSON Slice or mission envelope. Those hard cases still block on timeout.",
+    "Worker-question durable state stores the recommendation, rationale, eligibility inputs, absolute deadline, final answer, and answer source. Existing rows and ask_operator callers without recommendation fields remain readable and retain the legacy timed_out/blocked behavior.",
+    "The built-in worker-question timeout and this repository's .workflow/khazad.json value are 60 seconds. Status/feed/attention and the same-pane Pi dialog expose the exact deadline and eligible recommended fallback before it fires.",
+    "When an eligible question reaches its daemon-owned deadline with no operator answer, one transactional compare-and-set transition records it as answered with answer_source=llm_recommendation_timeout (or an equivalent typed source), appends the authoritative typed event, restores worker_running progress, and returns the exact original recommendation to the waiting ask_operator call so the worker continues.",
+    "An operator answer racing the deadline wins if committed first; the eligible fallback wins if committed first. The loser receives an idempotent typed outcome, and no path can create two answers, duplicate authoritative events, or a response that disagrees with durable state.",
+    "The native worker-pane path and daemon-wait path both return an auto-applied recommendation as a successful available answer with explicit answered_via metadata. Dialog cancellation/expiry consults daemon state instead of converting an already auto-answered question back to timed_out.",
+    "Missing, empty, non-option, ineligible, or malformed recommendations still transition to timed_out and trigger the blocked contract. An unavailable daemon channel, stale worker token/attempt, terminal run, or daemon restart never fabricates or applies a recommendation to a worker that cannot safely resume.",
+    "Events, read model, reports, and operator projections visibly distinguish operator answers from LLM timeout fallbacks and preserve the recommendation/rationale as audit evidence; renderers remain painters over daemon-owned semantics."
+  ],
+  "must_ask_if": [
+    "The implementation would auto-apply free-form text that is not one of the declared bounded options.",
+    "The fallback would authorize scope expansion, destructive/irreversible work, credentials, permissions, release/push/handoff actions, or work outside the current slice/mission envelope.",
+    "The worker extension, Pi pane, or renderer would become authoritative for the timeout decision instead of daemon state.",
+    "Backward compatibility would require rewriting or discarding existing worker-question evidence.",
+    "An existing ask_operator answer, timeout, unavailable-channel, token, cancellation, or restart test would need to be deleted, ignored, or relaxed."
+  ],
+  "verify_profile": "full",
+  "verify": [
+    "cargo test worker_question --quiet",
+    "cargo test ask_operator --quiet",
+    "node --test extensions/khazad-worker/index.test.mjs tests/khazad-worker-extension.test.mjs",
+    "cargo run --quiet -- slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

@@ -36,7 +36,7 @@
     "Rust producer/decoder tests and Node extension consumer/painter tests read the same fixture files and fail on semantic/schema drift; fixtures are generated or reviewed through an explicit deterministic process rather than copied independently.",
     "npm test executes all shipped khazad-worker and khazad-monitor tests, including external tests under tests/, and the GitHub Actions workflow installs the supported Node version and runs npm test alongside Rust fmt/test/clippy/check and workflow validation.",
     "README.md and skills/khazad-doom/SKILL.md accurately describe AF-06 promote/run autonomy as active, with daemon-owned authority boundaries, truthful stop conditions, and no stale inactive wording.",
-    "A closure note maps CA-01 through CA-09 to the original nine remediation steps, records the confirmed behavioral test seams, lists invariant-bearing protocols extracted, and explicitly records deferred speculative abstractions.",
+    "A closure note maps ASK-FALLBACK-01 plus CA-01 through CA-09 to the operator-authorized ask_operator fallback and original nine remediation steps, records the confirmed behavioral test seams, lists invariant-bearing protocols extracted, and explicitly records deferred speculative abstractions.",
     "The final evidence includes passing cargo test --all-targets, cargo clippy --all-targets --all-features -- -D warnings, cargo check --all-targets, npm test, slice validation, roadmap truth check, and the reproducible 1/3/10-worker soak.",
     "No existing test is deleted, ignored, snapshot-updated without semantic review, or narrowed merely to make the closure gate pass."
   ],
