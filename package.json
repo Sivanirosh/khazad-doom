@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Local daemon for JSON Issue Slice workflows; Pi bridges starts/explanations while Herdr shows live cockpits",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Sivanirosh/khazad-doom.git"
+  },
   "type": "commonjs",
   "keywords": [
     "pi-package",

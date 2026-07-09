@@ -1,0 +1,19 @@
+# Build outputs
+/bin/
+/dist/
+/target/
+/khazad-doom
+*.test
+
+# Runtime state for dogfooding this repo
+.workflow/runs/
+.workflow/worktrees/
+
+# Local editor/system
+.DS_Store
+.env
+
+# Cross-repo evidence stays local: the repo is public and these snapshots
+# contain other projects' paths/slice identifiers (see docs/design/evidence/)
+docs/design/evidence/raw/state-*
+docs/design/evidence/local/
