@@ -57,6 +57,7 @@ def lint_roadmap(repo: Path, matrix: Path) -> list[str]:
             continue
         for slice_id in slice_ids:
             issues.extend(done_status_issues(repo, matrix, line_number, slice_id, status))
+    issues.extend(generated_slice_provenance_issues(repo))
     return issues
 
 
@@ -99,13 +100,102 @@ def load_run_report(repo: Path, run_id: str) -> dict[str, Any] | None:
         reports / f"{run_id}-implementation-summary.json",
     ]
     for path in candidates:
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+        data = load_json_object(path)
+        if data is not None:
+            return data
+    return None
+
+
+def generated_slice_provenance_issues(repo: Path) -> list[str]:
+    slices_dir = repo / ".workflow" / "slices"
+    if not slices_dir.exists():
+        return []
+    issues: list[str] = []
+    proposal_index = accepted_proposal_index(repo)
+    for slice_path in sorted(slices_dir.glob("*.json")):
+        slice_data = load_json_object(slice_path)
+        if slice_data is None:
+            continue
+        provenance = slice_data.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        origin = str(provenance.get("origin_proposal_id") or "").strip()
+        if not origin:
+            issues.append(f"{slice_path}: generated slice has provenance but no origin_proposal_id")
+            continue
+        indexed = proposal_index.get(origin)
+        if indexed is None:
+            issues.append(
+                f"{slice_path}: generated slice provenance origin proposal {origin!r} has no accepted daemon report decision"
+            )
+            continue
+        state, decision, report_path = indexed
+        decision_value = str((decision or {}).get("decision") or "").strip()
+        generated_slice_id = str((decision or {}).get("generated_slice_id") or "").strip()
+        if state != "accepted" or decision_value != "accepted":
+            issues.append(
+                f"{slice_path}: generated slice provenance origin proposal {origin!r} is not accepted in {report_path} (state={state!r}, decision={decision_value!r})"
+            )
+            continue
+        slice_id = str(slice_data.get("id") or slice_path.stem).strip()
+        if generated_slice_id != slice_id:
+            issues.append(
+                f"{slice_path}: generated slice provenance origin proposal {origin!r} accepted {generated_slice_id or '<empty>'!r}, not {slice_id!r}"
+            )
+    return issues
+
+
+def accepted_proposal_index(repo: Path) -> dict[str, tuple[str, dict[str, Any], Path]]:
+    reports = repo / ".workflow" / "reports"
+    index: dict[str, tuple[str, dict[str, Any], Path]] = {}
+    if not reports.exists():
+        return index
+    for report_path in sorted(reports.glob("*.json")):
+        report = load_json_object(report_path)
+        if report is None:
+            continue
+        revisions = report.get("plan_revisions") or {}
+        if not isinstance(revisions, dict):
+            continue
+        for state in ["accepted", "rejected", "deferred", "pending", "superseded"]:
+            records = revisions.get(state) or []
+            if not isinstance(records, list):
                 continue
-            if isinstance(data, dict):
-                return data
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                proposal_id = str(record.get("proposal_id") or "").strip()
+                if not proposal_id:
+                    continue
+                decision = record.get("decision") or {}
+                if not isinstance(decision, dict):
+                    decision = {}
+                # Prefer a concrete accepted generated-slice decision if multiple historical reports mention the same proposal.
+                previous = index.get(proposal_id)
+                new_accepted = (
+                    state == "accepted"
+                    and str(decision.get("decision") or "") == "accepted"
+                )
+                if previous is not None:
+                    previous_state, previous_decision, _ = previous
+                    previous_accepted = previous_state == "accepted" and str(
+                        previous_decision.get("decision") or ""
+                    ) == "accepted"
+                    if previous_accepted or (previous_state == "accepted" and not new_accepted):
+                        continue
+                index[proposal_id] = (state, decision, report_path)
+    return index
+
+
+def load_json_object(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        return data
     return None
 
 

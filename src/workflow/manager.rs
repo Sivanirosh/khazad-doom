@@ -2121,8 +2121,42 @@ impl Manager {
                 .flat_map(|proposal| proposal.decision_commands.clone())
                 .collect::<Vec<_>>()
                 .join("; ");
+            let frontier_pending = plan_revisions
+                .frontier
+                .deferred_rejected_pending_fog
+                .iter()
+                .filter(|fog| fog.state == "pending")
+                .map(|fog| {
+                    let reasons = if fog.reason_codes.is_empty() {
+                        "no frontier reason codes".to_string()
+                    } else {
+                        fog.reason_codes.join(",")
+                    };
+                    format!(
+                        "{} -> {} tier={} reasons={}",
+                        fog.proposal_id,
+                        if fog.proposed_slice_id.trim().is_empty() {
+                            "<no generated slice>"
+                        } else {
+                            fog.proposed_slice_id.as_str()
+                        },
+                        if fog.tier.trim().is_empty() {
+                            "unclassified"
+                        } else {
+                            fog.tier.as_str()
+                        },
+                        reasons
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let frontier_clause = if frontier_pending.trim().is_empty() {
+                String::new()
+            } else {
+                format!("; frontier pending: {frontier_pending}")
+            };
             bail!(
-                "handoff is not ready; unresolved replan proposal(s) {ids} require operator disposition; decide with: {commands}"
+                "handoff is not ready; unresolved replan proposal(s) {ids} require operator disposition{frontier_clause}; decide with: {commands}"
             );
         }
         let pr_title = format!("Khazad-Doom {}: {}", run.id, run.selected_slice_id);
@@ -7729,13 +7763,16 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(block_text.contains("frontier shadow observations"));
+        assert!(block_text.contains("frontier activity"));
+        assert!(block_text.contains("would-have-promoted"));
+        assert_eq!(model.plan_revisions.frontier.activity_status, "active");
+        assert_eq!(model.details.frontier.activity_status, "active");
         assert!(
             model
                 .plan_revisions
                 .frontier
                 .summary_line
-                .contains("frontier shadow observations")
+                .contains("frontier activity")
         );
         Ok(())
     }
@@ -9011,6 +9048,29 @@ mod tests {
             model.details.frontier_budget,
             Some(FrontierBudgetState::default())
         );
+        assert_eq!(model.plan_revisions.frontier.activity_status, "empty");
+        assert_eq!(model.details.frontier.activity_status, "empty");
+        assert_eq!(
+            model.plan_revisions.frontier.envelope_snapshot.as_ref(),
+            Some(&envelope)
+        );
+        assert!(
+            model
+                .plan_revisions
+                .frontier
+                .summary_line
+                .contains("none recorded")
+        );
+        let frontier_block = model
+            .details
+            .feed
+            .as_ref()
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.label == "Frontier")
+            .expect("frontier empty-state block");
+        assert_eq!(frontier_block.meta, "empty");
         let mission_block = model
             .details
             .feed
@@ -9039,6 +9099,14 @@ mod tests {
             summary.frontier_budget,
             Some(FrontierBudgetState::default())
         );
+        assert_eq!(summary.plan_revisions.frontier.activity_status, "empty");
+        assert!(
+            summary
+                .plan_revisions
+                .frontier
+                .empty_reason
+                .contains("no frontier proposals")
+        );
 
         let handoff = manager.branch_handoff(&run.id, false, false, false)?;
         assert_eq!(handoff.mission_envelope.as_ref(), Some(&envelope));
@@ -9046,6 +9114,7 @@ mod tests {
             handoff.frontier_budget,
             Some(FrontierBudgetState::default())
         );
+        assert_eq!(handoff.plan_revisions.frontier.activity_status, "empty");
         Ok(())
     }
 
@@ -9971,7 +10040,40 @@ mod tests {
 
         let final_report: ImplementationSummary =
             artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(
+            final_report.plan_revisions.frontier.activity_status,
+            "active"
+        );
         assert_eq!(final_report.plan_revisions.frontier.candidates_seen, 2);
+        assert_eq!(
+            final_report
+                .plan_revisions
+                .frontier
+                .budget_consumption
+                .max_auto_promotions,
+            mission_envelope().max_auto_promotions
+        );
+        assert_eq!(
+            final_report
+                .plan_revisions
+                .frontier
+                .generated_slice_graph
+                .len(),
+            1
+        );
+        let edge = &final_report.plan_revisions.frontier.generated_slice_graph[0];
+        assert_eq!(edge.parent_slice_id, "slice-001");
+        assert_eq!(edge.child_slice_id, "slice-001-followup-a");
+        assert!(edge.origin_proposal_id.starts_with("rp-"));
+        assert_eq!(
+            final_report
+                .plan_revisions
+                .frontier
+                .deferred_rejected_pending_fog
+                .len(),
+            1
+        );
+        assert_eq!(final_report.plan_revisions.frontier.authorizers.len(), 2);
         assert_eq!(
             final_report
                 .plan_revisions
@@ -10014,6 +10116,10 @@ mod tests {
         let handoff = manager.branch_handoff(&run.id, false, false, false)?;
         assert_eq!(handoff.plan_revisions.frontier.candidates_seen, 2);
         assert_eq!(handoff.plan_revisions.frontier.agreement.rejected, 1);
+        assert_eq!(
+            handoff.plan_revisions.frontier.generated_slice_graph.len(),
+            1
+        );
         Ok(())
     }
 
@@ -10052,13 +10158,34 @@ mod tests {
 
         let completed = wait_for_run(&state, &run.id)?;
         assert_eq!(completed.status, RunStatus::Completed);
-        let pending = create_test_replan_proposal(&state, &run.id, "slice-001", "pending")?;
+        let pending = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-frontier"),
+        )?;
+        state.replace_replan_frontier_classification(
+            &run.id,
+            &pending.id,
+            &FrontierClassification {
+                tier: "tier_3".to_string(),
+                reason_codes: vec!["operator_needed".to_string()],
+                classified_at: Utc::now(),
+                envelope_hash: "test-envelope".to_string(),
+                budget_snapshot: FrontierBudgetState::default(),
+                autonomy_level: AutonomyLevel::Shadow,
+            },
+        )?;
         let err = manager
             .branch_handoff(&run.id, false, false, false)
             .unwrap_err();
-        assert!(err.to_string().contains("handoff is not ready"));
-        assert!(err.to_string().contains(&pending.id));
-        assert!(err.to_string().contains("khazad-doom replan accept"));
+        let err_text = err.to_string();
+        assert!(err_text.contains("handoff is not ready"));
+        assert!(err_text.contains(&pending.id));
+        assert!(err_text.contains("frontier pending"));
+        assert!(err_text.contains("slice-001-frontier"));
+        assert!(err_text.contains("tier=tier_3"));
+        assert!(err_text.contains("khazad-doom replan accept"));
         Ok(())
     }
 

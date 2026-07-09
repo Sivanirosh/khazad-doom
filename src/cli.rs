@@ -2581,6 +2581,7 @@ mod tests {
             replan: Default::default(),
             mission_envelope: None,
             frontier_budget: None,
+            frontier: Default::default(),
             events: options.events,
             economics: options.economics,
             primary_terminal_reason: None,

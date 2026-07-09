@@ -1,5 +1,5 @@
 use super::events::{IMPLEMENTATION_SUMMARY, ImplementationSummaryPayload, RUN_STARTED};
-use super::read_model::frontier_summary_from_proposals;
+use super::read_model::frontier_summary_from_records;
 use crate::domain::{
     FrontierBudgetState, FrontierSummary, GateCommandResult, GateResult, MissionEnvelope,
     RepairResult, ReplanProposal, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus,
@@ -982,6 +982,9 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
 }
 
 fn frontier_summary_for_details(details: &RunDetails) -> FrontierSummary {
+    if !details.frontier.is_empty() {
+        return details.frontier.clone();
+    }
     let proposals = details
         .replan
         .pending
@@ -989,11 +992,82 @@ fn frontier_summary_for_details(details: &RunDetails) -> FrontierSummary {
         .chain(details.replan.history.iter())
         .cloned()
         .collect::<Vec<ReplanProposal>>();
-    frontier_summary_from_proposals(&proposals)
+    frontier_summary_from_records(
+        details.mission_envelope.as_ref(),
+        details.frontier_budget.as_ref(),
+        &proposals,
+        &details.generated_slices,
+    )
 }
 
 fn frontier_block(summary: &FrontierSummary) -> StatusFeedBlock {
     let mut lines = vec![line(summary.summary_line.clone(), StatusFeedRole::Info)];
+    if summary.activity_status == "empty" && !summary.empty_reason.trim().is_empty() {
+        lines.push(line(summary.empty_reason.clone(), StatusFeedRole::Dim));
+    }
+    lines.push(line(
+        format!(
+            "budget auto_promotions {}/{} • generated_slices {}/{} • max_depth {} • max_depth_reached {}",
+            summary.budget_consumption.auto_promotions_used,
+            summary.budget_consumption.max_auto_promotions,
+            summary.budget_consumption.generated_slices,
+            summary.budget_consumption.max_generated_slices,
+            summary.budget_consumption.max_depth,
+            summary.budget_consumption.max_depth_reached
+        ),
+        StatusFeedRole::Dim,
+    ));
+    if !summary.generated_slice_graph.is_empty() {
+        lines.push(line(
+            format!(
+                "generated graph {}",
+                summary
+                    .generated_slice_graph
+                    .iter()
+                    .map(|edge| format!(
+                        "{}→{} via {} ({})",
+                        display_or_dash(&edge.parent_slice_id),
+                        edge.child_slice_id,
+                        edge.origin_proposal_id,
+                        display_or_dash(&edge.authorizer)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            StatusFeedRole::Info,
+        ));
+    }
+    if !summary.deferred_rejected_pending_fog.is_empty() {
+        lines.push(line(
+            format!(
+                "fog {}",
+                summary
+                    .deferred_rejected_pending_fog
+                    .iter()
+                    .map(|fog| format!("{}:{}", fog.proposal_id, fog.state))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            StatusFeedRole::Attention,
+        ));
+    }
+    if !summary.operator_needed_stops.is_empty() {
+        lines.push(line(
+            format!(
+                "operator stops {}",
+                summary
+                    .operator_needed_stops
+                    .iter()
+                    .map(|stop| format!(
+                        "{}:{}:{}",
+                        stop.proposal_id, stop.stop_kind, stop.resolution
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            StatusFeedRole::Attention,
+        ));
+    }
     if !summary.tier_distribution.is_empty() {
         let tiers = summary
             .tier_distribution
@@ -1023,21 +1097,21 @@ fn frontier_block(summary: &FrontierSummary) -> StatusFeedBlock {
             StatusFeedRole::Info,
         ));
     }
-    if !summary.agreement.is_empty() {
+    if !summary.shadow_agreement_metrics.is_empty() {
         lines.push(line(
             format!(
-                "agreement accepted_unchanged={} accepted_modified={} rejected={} deferred={} pending={} ratio={}",
-                summary.agreement.accepted_unchanged,
-                summary.agreement.accepted_modified,
-                summary.agreement.rejected,
-                summary.agreement.deferred,
-                summary.agreement.pending,
-                summary.agreement.agreement_ratio
+                "shadow agreement accepted_unchanged={} accepted_modified={} rejected={} deferred={} pending={} ratio={}",
+                summary.shadow_agreement_metrics.accepted_unchanged,
+                summary.shadow_agreement_metrics.accepted_modified,
+                summary.shadow_agreement_metrics.rejected,
+                summary.shadow_agreement_metrics.deferred,
+                summary.shadow_agreement_metrics.pending,
+                summary.shadow_agreement_metrics.agreement_ratio
             ),
             StatusFeedRole::Dim,
         ));
     }
-    block("Frontier", "shadow classifier observations", lines)
+    block("Frontier", &summary.activity_status, lines)
 }
 
 fn proposed_change_feed_text(change: &crate::domain::ReplanProposedChange) -> String {
@@ -2110,6 +2184,7 @@ mod tests {
             replan: Default::default(),
             mission_envelope: None,
             frontier_budget: None,
+            frontier: Default::default(),
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: None,
@@ -2210,6 +2285,7 @@ mod tests {
             replan: Default::default(),
             mission_envelope: None,
             frontier_budget: None,
+            frontier: Default::default(),
             events: vec![Event {
                 id: 1,
                 run_id: "kd-test".to_string(),
@@ -2350,6 +2426,7 @@ mod tests {
             replan: Default::default(),
             mission_envelope: None,
             frontier_budget: None,
+            frontier: Default::default(),
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: Some(TerminalReason {
@@ -2496,6 +2573,7 @@ mod tests {
             },
             mission_envelope: None,
             frontier_budget: None,
+            frontier: Default::default(),
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: None,

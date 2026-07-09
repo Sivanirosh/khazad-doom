@@ -646,7 +646,28 @@ pub struct FrontierClassification {
 #[serde(default)]
 pub struct FrontierSummary {
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub activity_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary_line: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub empty_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_snapshot: Option<MissionEnvelope>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub autonomy_effective: String,
+    pub budget_consumption: FrontierBudgetConsumption,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_slice_graph: Vec<FrontierGeneratedSliceEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorizers: Vec<FrontierAuthorizerRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposal_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tier_reason_codes: Vec<FrontierTierReasonRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_rejected_pending_fog: Vec<FrontierFogRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_needed_stops: Vec<FrontierOperatorStop>,
     pub candidates_seen: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tier_distribution: BTreeMap<String, usize>,
@@ -654,15 +675,29 @@ pub struct FrontierSummary {
     pub would_have_promoted: Vec<FrontierProposalOutcome>,
     #[serde(default, skip_serializing_if = "FrontierAgreementMetric::is_empty")]
     pub agreement: FrontierAgreementMetric,
+    #[serde(default, skip_serializing_if = "FrontierAgreementMetric::is_empty")]
+    pub shadow_agreement_metrics: FrontierAgreementMetric,
 }
 
 impl FrontierSummary {
     pub fn is_empty(&self) -> bool {
-        self.candidates_seen == 0
+        self.activity_status.is_empty()
+            && self.candidates_seen == 0
             && self.summary_line.is_empty()
+            && self.empty_reason.is_empty()
+            && self.envelope_snapshot.is_none()
+            && self.autonomy_effective.is_empty()
+            && self.budget_consumption.is_empty()
+            && self.generated_slice_graph.is_empty()
+            && self.authorizers.is_empty()
+            && self.proposal_ids.is_empty()
+            && self.tier_reason_codes.is_empty()
+            && self.deferred_rejected_pending_fog.is_empty()
+            && self.operator_needed_stops.is_empty()
             && self.tier_distribution.is_empty()
             && self.would_have_promoted.is_empty()
             && self.agreement.is_empty()
+            && self.shadow_agreement_metrics.is_empty()
     }
 }
 
@@ -695,6 +730,133 @@ impl FrontierAgreementMetric {
             && self.agreement_ratio.is_empty()
             && self.agreement_percent == 0.0
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierBudgetConsumption {
+    pub auto_promotions_used: i64,
+    pub max_auto_promotions: i64,
+    pub generated_slices: i64,
+    pub max_generated_slices: i64,
+    pub max_depth: i64,
+    pub max_depth_reached: u64,
+    pub max_generation_reached: bool,
+}
+
+impl FrontierBudgetConsumption {
+    pub fn is_empty(&self) -> bool {
+        self.auto_promotions_used == 0
+            && self.max_auto_promotions == 0
+            && self.generated_slices == 0
+            && self.max_generated_slices == 0
+            && self.max_depth == 0
+            && self.max_depth_reached == 0
+            && !self.max_generation_reached
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierGeneratedSliceEdge {
+    pub parent_slice_id: String,
+    pub child_slice_id: String,
+    pub origin_proposal_id: String,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authorizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decision_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub commit_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue_before_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue_after_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierAuthorizerRecord {
+    pub proposal_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authorizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generated_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tier: String,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierTierReasonRecord {
+    pub proposal_id: String,
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub classified_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub envelope_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierFogRecord {
+    pub proposal_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proposed_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revisit_condition: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authorizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierOperatorStop {
+    pub proposal_id: String,
+    pub stop_kind: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proposed_slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolution: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1926,6 +2088,8 @@ pub struct RunDetails {
     pub mission_envelope: Option<MissionEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier_budget: Option<FrontierBudgetState>,
+    #[serde(default, skip_serializing_if = "FrontierSummary::is_empty")]
+    pub frontier: FrontierSummary,
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economics: Option<RunEconomics>,

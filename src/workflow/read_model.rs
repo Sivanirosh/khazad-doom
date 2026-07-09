@@ -1,13 +1,16 @@
 use super::projection::project_run;
 use crate::artifact;
 use crate::domain::{
-    Event, FrontierProposalOutcome, FrontierSummary, GeneratedSliceRecord, ImplementationSummary,
-    PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions, ReplanProposal,
-    ReplanProposalState, ReplanStatus, Run, RunDetails, RunEconomics, RunIncident, RunProgress,
-    RunStatus, SliceRun, SliceStatus, TerminalReason, WorkerProfileEvidence, WorkerQuestion,
-    frontier_classification_annotation, frontier_classification_would_auto_promote,
-    replan_decision_commands,
+    Event, FrontierAuthorizerRecord, FrontierBudgetConsumption, FrontierBudgetState,
+    FrontierFogRecord, FrontierGeneratedSliceEdge, FrontierOperatorStop, FrontierProposalOutcome,
+    FrontierSummary, FrontierTierReasonRecord, GeneratedSliceRecord, ImplementationSummary,
+    MissionEnvelope, PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions,
+    ReplanProposal, ReplanProposalState, ReplanStatus, Run, RunDetails, RunEconomics, RunIncident,
+    RunProgress, RunStatus, Slice, SliceProvenance, SliceRun, SliceStatus, TerminalReason,
+    WorkerProfileEvidence, WorkerQuestion, frontier_classification_annotation,
+    frontier_classification_would_auto_promote, replan_decision_commands,
 };
+use crate::gitutil;
 use crate::state::Store as StateStore;
 use anyhow::Result;
 use chrono::Utc;
@@ -96,10 +99,16 @@ impl<'a> RunReadModelBuilder<'a> {
             .list_worker_questions(&run_id)
             .unwrap_or_default();
         let proposals = self.state.list_replan_proposals(&run_id)?;
-        let generated_slices = generated_slices_from_proposals(&proposals, &slice_runs);
-        let replan = replan_status_from_proposals(&run_id, proposals.clone());
         let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run_id)?;
-        let plan_revisions = plan_revisions_from_proposals(&run, proposals)?;
+        let generated_slices = generated_slices_from_proposals(&run, &proposals, &slice_runs);
+        let replan = replan_status_from_proposals(&run_id, proposals.clone());
+        let plan_revisions = plan_revisions_from_proposals(
+            &run,
+            mission_envelope.as_ref(),
+            frontier_budget.as_ref(),
+            proposals,
+            &generated_slices,
+        )?;
         let primary_terminal_reason = primary_terminal_reason_impl(
             &run,
             &slice_runs,
@@ -119,6 +128,7 @@ impl<'a> RunReadModelBuilder<'a> {
             replan,
             mission_envelope,
             frontier_budget,
+            frontier: plan_revisions.frontier.clone(),
             events,
             economics,
             primary_terminal_reason,
@@ -133,7 +143,17 @@ impl<'a> RunReadModelBuilder<'a> {
     }
 
     pub(crate) fn plan_revisions_for_run(&self, run: &Run) -> Result<PlanRevisions> {
-        plan_revisions_from_proposals(run, self.state.list_replan_proposals(&run.id)?)
+        let proposals = self.state.list_replan_proposals(&run.id)?;
+        let slice_runs = self.state.get_slice_runs(&run.id)?;
+        let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
+        let generated_slices = generated_slices_from_proposals(run, &proposals, &slice_runs);
+        plan_revisions_from_proposals(
+            run,
+            mission_envelope.as_ref(),
+            frontier_budget.as_ref(),
+            proposals,
+            &generated_slices,
+        )
     }
 }
 
@@ -148,6 +168,7 @@ fn apply_terminal_override(run: &Run, options: &RunReadModelOptions) -> Run {
 }
 
 fn generated_slices_from_proposals(
+    run: &Run,
     proposals: &[ReplanProposal],
     slice_runs: &[SliceRun],
 ) -> Vec<GeneratedSliceRecord> {
@@ -159,19 +180,33 @@ fn generated_slices_from_proposals(
         if decision.generated_slice_id.trim().is_empty() {
             continue;
         }
+        let provenance = slice_provenance_for_generated_slice(run, &decision.generated_slice_id);
         let slice_run = slice_runs
             .iter()
             .find(|slice_run| slice_run.slice_id == decision.generated_slice_id);
         records.push(GeneratedSliceRecord {
             slice_id: decision.generated_slice_id.clone(),
-            parent_slice_id: proposal.source.slice_id.clone(),
-            origin_proposal_id: proposal.id.clone(),
-            generation: proposal
-                .proposed_changes
-                .iter()
-                .find_map(|change| change.followup_slice_draft())
-                .and_then(|draft| (!draft.id.trim().is_empty()).then_some(1))
-                .unwrap_or(0),
+            parent_slice_id: provenance
+                .as_ref()
+                .map(|provenance| provenance.parent_slice_id.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| proposal.source.slice_id.clone()),
+            origin_proposal_id: provenance
+                .as_ref()
+                .map(|provenance| provenance.origin_proposal_id.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| proposal.id.clone()),
+            generation: provenance
+                .as_ref()
+                .map(|provenance| provenance.generation)
+                .unwrap_or_else(|| {
+                    proposal
+                        .proposed_changes
+                        .iter()
+                        .find_map(|change| change.followup_slice_draft())
+                        .and_then(|draft| (!draft.id.trim().is_empty()).then_some(1))
+                        .unwrap_or(0)
+                }),
             status: slice_run
                 .map(|slice_run| slice_run.status.as_str().to_string())
                 .unwrap_or_else(|| decision.apply_status.clone()),
@@ -186,6 +221,24 @@ fn generated_slices_from_proposals(
         });
     }
     records
+}
+
+fn slice_provenance_for_generated_slice(run: &Run, slice_id: &str) -> Option<SliceProvenance> {
+    let store = artifact::Store::new(&run.repo_path);
+    if let Ok(slice) = artifact::read_json::<Slice>(store.slice_path(slice_id))
+        && let Some(provenance) = slice.provenance()
+    {
+        return Some(provenance);
+    }
+    let branch = run.integration_branch.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    let spec = format!("{branch}:.workflow/slices/{slice_id}.json");
+    gitutil::run(&run.repo_path, &["show", &spec])
+        .ok()
+        .and_then(|text| serde_json::from_str::<Slice>(&text).ok())
+        .and_then(|slice| slice.provenance())
 }
 
 pub(crate) fn replan_status_from_proposals(
@@ -754,9 +807,26 @@ fn is_parallel_layer_slice_status(status: SliceStatus) -> bool {
 
 pub(crate) fn plan_revisions_from_proposals(
     run: &Run,
+    mission_envelope: Option<&MissionEnvelope>,
+    frontier_budget: Option<&FrontierBudgetState>,
     proposals: Vec<ReplanProposal>,
+    generated_slices: &[GeneratedSliceRecord],
 ) -> Result<PlanRevisions> {
-    let frontier = frontier_summary_from_proposals(&proposals);
+    let proposals = proposals
+        .into_iter()
+        .map(|mut proposal| {
+            if proposal.state.as_str() == "pending" {
+                proposal.decision_commands = replan_decision_commands(&run.id, &proposal.id);
+            }
+            proposal
+        })
+        .collect::<Vec<_>>();
+    let frontier = frontier_summary_from_records(
+        mission_envelope,
+        frontier_budget,
+        &proposals,
+        generated_slices,
+    );
     let mut plan = PlanRevisions {
         source_of_truth: "daemon_replan_proposals".to_string(),
         queue_summary: if run.selected_slice_id.trim().is_empty() {
@@ -767,10 +837,7 @@ pub(crate) fn plan_revisions_from_proposals(
         frontier,
         ..PlanRevisions::default()
     };
-    for mut proposal in proposals {
-        if proposal.state.as_str() == "pending" {
-            proposal.decision_commands = replan_decision_commands(&run.id, &proposal.id);
-        }
+    for proposal in proposals {
         let record = plan_revision_record(run, proposal)?;
         match record.state.as_str() {
             "pending" => plan.pending.push(record),
@@ -785,38 +852,109 @@ pub(crate) fn plan_revisions_from_proposals(
     Ok(plan)
 }
 
-pub(crate) fn frontier_summary_from_proposals(proposals: &[ReplanProposal]) -> FrontierSummary {
-    let mut summary = FrontierSummary::default();
-    for proposal in proposals {
-        let Some(classification) = &proposal.frontier_classification else {
-            continue;
-        };
-        summary.candidates_seen += 1;
-        *summary
-            .tier_distribution
-            .entry(classification.tier.clone())
-            .or_insert(0) += 1;
-        if frontier_classification_would_auto_promote(classification) {
-            let outcome = frontier_operator_outcome(proposal);
-            match outcome.as_str() {
-                "accepted_unchanged" => summary.agreement.accepted_unchanged += 1,
-                "accepted_modified" => summary.agreement.accepted_modified += 1,
-                "rejected" => summary.agreement.rejected += 1,
-                "deferred" => summary.agreement.deferred += 1,
-                "pending" => summary.agreement.pending += 1,
-                _ => summary.agreement.pending += 1,
-            }
-            summary.would_have_promoted.push(FrontierProposalOutcome {
+pub(crate) fn frontier_summary_from_records(
+    mission_envelope: Option<&MissionEnvelope>,
+    frontier_budget: Option<&FrontierBudgetState>,
+    proposals: &[ReplanProposal],
+    generated_slices: &[GeneratedSliceRecord],
+) -> FrontierSummary {
+    let has_frontier_context = mission_envelope.is_some() || frontier_budget.is_some();
+    let relevant_proposals = proposals
+        .iter()
+        .filter(|proposal| proposal_is_frontier_relevant(proposal, has_frontier_context))
+        .collect::<Vec<_>>();
+    if mission_envelope.is_none() && relevant_proposals.is_empty() && generated_slices.is_empty() {
+        return FrontierSummary::default();
+    }
+
+    let mut summary = FrontierSummary {
+        activity_status: if relevant_proposals.is_empty() && generated_slices.is_empty() {
+            "empty".to_string()
+        } else {
+            "active".to_string()
+        },
+        envelope_snapshot: mission_envelope.cloned(),
+        autonomy_effective: mission_envelope
+            .map(|envelope| envelope.autonomy_level.as_str())
+            .unwrap_or("off")
+            .to_string(),
+        budget_consumption: frontier_budget_consumption(
+            mission_envelope,
+            frontier_budget,
+            proposals,
+            generated_slices,
+        ),
+        ..FrontierSummary::default()
+    };
+
+    for proposal in &relevant_proposals {
+        push_unique_string(&mut summary.proposal_ids, proposal.id.clone());
+        if let Some(classification) = &proposal.frontier_classification {
+            summary.candidates_seen += 1;
+            *summary
+                .tier_distribution
+                .entry(classification.tier.clone())
+                .or_insert(0) += 1;
+            summary.tier_reason_codes.push(FrontierTierReasonRecord {
                 proposal_id: proposal.id.clone(),
                 tier: classification.tier.clone(),
                 reason_codes: classification.reason_codes.clone(),
-                operator_outcome: outcome,
                 classified_at: classification.classified_at.to_rfc3339(),
                 envelope_hash: classification.envelope_hash.clone(),
-                annotation: frontier_classification_annotation(classification),
+            });
+            if frontier_classification_would_auto_promote(classification) {
+                let outcome = frontier_operator_outcome(proposal);
+                match outcome.as_str() {
+                    "accepted_unchanged" => summary.agreement.accepted_unchanged += 1,
+                    "accepted_modified" => summary.agreement.accepted_modified += 1,
+                    "rejected" => summary.agreement.rejected += 1,
+                    "deferred" => summary.agreement.deferred += 1,
+                    "pending" => summary.agreement.pending += 1,
+                    _ => summary.agreement.pending += 1,
+                }
+                summary.would_have_promoted.push(FrontierProposalOutcome {
+                    proposal_id: proposal.id.clone(),
+                    tier: classification.tier.clone(),
+                    reason_codes: classification.reason_codes.clone(),
+                    operator_outcome: outcome,
+                    classified_at: classification.classified_at.to_rfc3339(),
+                    envelope_hash: classification.envelope_hash.clone(),
+                    annotation: frontier_classification_annotation(classification),
+                });
+            }
+        } else if let Some(decision) = proposal.operator_decision.as_ref()
+            && !decision.frontier_tier.trim().is_empty()
+        {
+            summary.tier_reason_codes.push(FrontierTierReasonRecord {
+                proposal_id: proposal.id.clone(),
+                tier: decision.frontier_tier.clone(),
+                reason_codes: decision.frontier_reason_codes.clone(),
+                classified_at: decision.decided_at.to_rfc3339(),
+                envelope_hash: String::new(),
             });
         }
+
+        if let Some(authorizer) = frontier_authorizer_record(proposal) {
+            summary.authorizers.push(authorizer);
+        }
+        if let Some(fog) = frontier_fog_record(proposal) {
+            summary.deferred_rejected_pending_fog.push(fog);
+        }
+        if let Some(stop) = frontier_operator_stop(proposal) {
+            summary.operator_needed_stops.push(stop);
+        }
     }
+
+    for generated in generated_slices {
+        push_unique_string(
+            &mut summary.proposal_ids,
+            generated.origin_proposal_id.clone(),
+        );
+        if let Some(edge) = frontier_generated_slice_edge(generated, proposals) {
+            summary.generated_slice_graph.push(edge);
+        }
+    }
+
     if summary.candidates_seen > 0 {
         summary.agreement.tier1_total = summary.would_have_promoted.len();
         summary.agreement.agreement_numerator = summary.agreement.accepted_unchanged;
@@ -835,19 +973,326 @@ pub(crate) fn frontier_summary_from_proposals(proposals: &[ReplanProposal]) -> F
                 / summary.agreement.agreement_denominator as f64)
                 * 100.0
         };
+        summary.shadow_agreement_metrics = summary.agreement.clone();
+    }
+
+    summary.proposal_ids.sort();
+    summary.proposal_ids.dedup();
+    summary.generated_slice_graph.sort_by(|left, right| {
+        left.parent_slice_id
+            .cmp(&right.parent_slice_id)
+            .then(left.child_slice_id.cmp(&right.child_slice_id))
+            .then(left.origin_proposal_id.cmp(&right.origin_proposal_id))
+    });
+    summary
+        .authorizers
+        .sort_by(|left, right| left.proposal_id.cmp(&right.proposal_id));
+    summary
+        .tier_reason_codes
+        .sort_by(|left, right| left.proposal_id.cmp(&right.proposal_id));
+    summary
+        .deferred_rejected_pending_fog
+        .sort_by(|left, right| left.proposal_id.cmp(&right.proposal_id));
+    summary
+        .operator_needed_stops
+        .sort_by(|left, right| left.proposal_id.cmp(&right.proposal_id));
+
+    if summary.activity_status == "empty" {
+        summary.empty_reason = "mission envelope recorded; no frontier proposals, generated slices, pending candidates, or classifier observations were recorded".to_string();
+        summary.summary_line = "frontier activity: none recorded".to_string();
+    } else if summary.candidates_seen > 0 {
         let agreement = if summary.agreement.agreement_denominator == 0 {
             "n/a".to_string()
         } else {
             format!("{:.0}%", summary.agreement.agreement_percent)
         };
         summary.summary_line = format!(
-            "frontier shadow observations: candidates_seen={}, tier_1_would_promote={}, agreement={} ({agreement})",
+            "frontier activity: candidates_seen={}, generated_slices={}, pending_deferred_rejected={}, operator_stops={}, tier_1_would_promote={}, agreement={} ({agreement})",
             summary.candidates_seen,
+            summary.generated_slice_graph.len(),
+            summary.deferred_rejected_pending_fog.len(),
+            summary.operator_needed_stops.len(),
             summary.agreement.tier1_total,
             summary.agreement.agreement_ratio
         );
+    } else {
+        summary.summary_line = format!(
+            "frontier activity: generated_slices={}, proposals={}, pending_deferred_rejected={}, operator_stops={}",
+            summary.generated_slice_graph.len(),
+            summary.proposal_ids.len(),
+            summary.deferred_rejected_pending_fog.len(),
+            summary.operator_needed_stops.len()
+        );
     }
     summary
+}
+
+fn proposal_is_frontier_relevant(proposal: &ReplanProposal, has_frontier_context: bool) -> bool {
+    proposal.frontier_classification.is_some()
+        || proposal.operator_decision.as_ref().is_some_and(|decision| {
+            !decision.generated_slice_id.trim().is_empty()
+                || !decision.frontier_tier.trim().is_empty()
+                || !decision.frontier_reason_codes.is_empty()
+        })
+        || (has_frontier_context
+            && proposal.proposed_changes.iter().any(|change| {
+                change.kind == "add_followup_slice" || change.followup_slice_draft().is_some()
+            }))
+}
+
+fn frontier_budget_consumption(
+    mission_envelope: Option<&MissionEnvelope>,
+    frontier_budget: Option<&FrontierBudgetState>,
+    proposals: &[ReplanProposal],
+    generated_slices: &[GeneratedSliceRecord],
+) -> FrontierBudgetConsumption {
+    let auto_promotions_used = frontier_budget
+        .map(|budget| budget.auto_promotions_used)
+        .unwrap_or_else(|| {
+            proposals
+                .iter()
+                .filter(|proposal| {
+                    proposal.operator_decision.as_ref().is_some_and(|decision| {
+                        decision.authorizer.starts_with("envelope:")
+                            && decision.decision == "accepted"
+                    })
+                })
+                .count() as i64
+        });
+    let generated_count = frontier_budget
+        .map(|budget| budget.generated_slices)
+        .unwrap_or(generated_slices.len() as i64);
+    FrontierBudgetConsumption {
+        auto_promotions_used,
+        max_auto_promotions: mission_envelope
+            .map(|envelope| envelope.max_auto_promotions)
+            .unwrap_or(0),
+        generated_slices: generated_count,
+        max_generated_slices: mission_envelope
+            .map(|envelope| envelope.max_generated_slices)
+            .unwrap_or(0),
+        max_depth: mission_envelope
+            .map(|envelope| envelope.max_depth)
+            .unwrap_or(0),
+        max_depth_reached: generated_slices
+            .iter()
+            .map(|slice| slice.generation)
+            .max()
+            .unwrap_or(0),
+        max_generation_reached: frontier_budget
+            .map(|budget| budget.max_generation_reached)
+            .unwrap_or(false),
+    }
+}
+
+fn frontier_authorizer_record(proposal: &ReplanProposal) -> Option<FrontierAuthorizerRecord> {
+    if let Some(decision) = proposal.operator_decision.as_ref() {
+        return Some(FrontierAuthorizerRecord {
+            proposal_id: proposal.id.clone(),
+            state: proposal.state.as_str().to_string(),
+            decision: decision.decision.clone(),
+            authorizer: decision.authorizer.clone(),
+            source: decision.source.clone(),
+            generated_slice_id: decision.generated_slice_id.clone(),
+            tier: proposal_tier(proposal),
+            applied: decision.applied,
+        });
+    }
+    (proposal.state == ReplanProposalState::Pending).then(|| FrontierAuthorizerRecord {
+        proposal_id: proposal.id.clone(),
+        state: proposal.state.as_str().to_string(),
+        decision: "pending".to_string(),
+        authorizer: "operator_required".to_string(),
+        source: "replan".to_string(),
+        generated_slice_id: proposal_followup_slice_id(proposal),
+        tier: proposal_tier(proposal),
+        applied: false,
+    })
+}
+
+fn frontier_fog_record(proposal: &ReplanProposal) -> Option<FrontierFogRecord> {
+    if !matches!(
+        proposal.state,
+        ReplanProposalState::Pending
+            | ReplanProposalState::Deferred
+            | ReplanProposalState::Rejected
+    ) {
+        return None;
+    }
+    let decision = proposal.operator_decision.as_ref();
+    Some(FrontierFogRecord {
+        proposal_id: proposal.id.clone(),
+        state: proposal.state.as_str().to_string(),
+        source_slice_id: proposal.source.slice_id.clone(),
+        proposed_slice_id: proposal_followup_slice_id(proposal),
+        tier: proposal_tier(proposal),
+        reason_codes: proposal_reason_codes(proposal),
+        rationale: decision
+            .map(|decision| decision.rationale.clone())
+            .unwrap_or_default(),
+        revisit_condition: decision
+            .map(|decision| decision.revisit_condition.clone())
+            .unwrap_or_default(),
+        authorizer: decision
+            .map(|decision| decision.authorizer.clone())
+            .unwrap_or_else(|| "operator_required".to_string()),
+        source: decision
+            .map(|decision| decision.source.clone())
+            .unwrap_or_else(|| "replan".to_string()),
+        decision_commands: proposal.decision_commands.clone(),
+    })
+}
+
+fn frontier_operator_stop(proposal: &ReplanProposal) -> Option<FrontierOperatorStop> {
+    let tier = proposal_tier(proposal);
+    let reason_codes = proposal_reason_codes(proposal);
+    let is_stop = tier == "tier_3"
+        || tier == "stop"
+        || reason_codes.iter().any(|code| {
+            matches!(
+                code.as_str(),
+                "frontier_budget_exhausted" | "frontier_depth_exhausted"
+            )
+        });
+    if !is_stop {
+        return None;
+    }
+    let decision = proposal.operator_decision.as_ref();
+    Some(FrontierOperatorStop {
+        proposal_id: proposal.id.clone(),
+        stop_kind: if reason_codes
+            .iter()
+            .any(|code| code == "frontier_budget_exhausted")
+        {
+            "budget_exhausted".to_string()
+        } else if reason_codes
+            .iter()
+            .any(|code| code == "frontier_depth_exhausted")
+        {
+            "depth_exhausted".to_string()
+        } else if tier == "stop" {
+            "frontier_stop".to_string()
+        } else {
+            "tier_3_operator_required".to_string()
+        },
+        state: proposal.state.as_str().to_string(),
+        source_slice_id: proposal.source.slice_id.clone(),
+        proposed_slice_id: proposal_followup_slice_id(proposal),
+        resolution: decision
+            .map(|decision| decision.decision.clone())
+            .unwrap_or_else(|| "pending_operator_decision".to_string()),
+        rationale: decision
+            .map(|decision| decision.rationale.clone())
+            .unwrap_or_default(),
+        reason_codes,
+        decision_commands: proposal.decision_commands.clone(),
+    })
+}
+
+fn frontier_generated_slice_edge(
+    generated: &GeneratedSliceRecord,
+    proposals: &[ReplanProposal],
+) -> Option<FrontierGeneratedSliceEdge> {
+    let proposal = proposals
+        .iter()
+        .find(|proposal| proposal.id == generated.origin_proposal_id);
+    let decision = proposal.and_then(|proposal| proposal.operator_decision.as_ref());
+    let parent = if generated.parent_slice_id.trim().is_empty() {
+        proposal
+            .map(|proposal| proposal.source.slice_id.clone())
+            .unwrap_or_default()
+    } else {
+        generated.parent_slice_id.clone()
+    };
+    let child = generated.slice_id.trim();
+    if child.is_empty() {
+        return None;
+    }
+    Some(FrontierGeneratedSliceEdge {
+        parent_slice_id: parent,
+        child_slice_id: generated.slice_id.clone(),
+        origin_proposal_id: generated.origin_proposal_id.clone(),
+        generation: generated.generation,
+        authorizer: decision
+            .map(|decision| decision.authorizer.clone())
+            .unwrap_or_default(),
+        decision_source: decision
+            .map(|decision| decision.source.clone())
+            .unwrap_or_default(),
+        tier: proposal.map(proposal_tier).unwrap_or_default(),
+        reason_codes: proposal.map(proposal_reason_codes).unwrap_or_default(),
+        status: generated.status.clone(),
+        commit_sha: generated.commit_sha.clone(),
+        applied_at: generated.applied_at,
+        queue_before_hash: decision
+            .map(|decision| decision.queue_before_hash.clone())
+            .unwrap_or_default(),
+        queue_after_hash: decision
+            .map(|decision| decision.queue_after_hash.clone())
+            .unwrap_or_default(),
+    })
+}
+
+fn proposal_tier(proposal: &ReplanProposal) -> String {
+    proposal
+        .frontier_classification
+        .as_ref()
+        .map(|classification| classification.tier.clone())
+        .filter(|tier| !tier.trim().is_empty())
+        .or_else(|| {
+            proposal
+                .operator_decision
+                .as_ref()
+                .map(|decision| decision.frontier_tier.clone())
+                .filter(|tier| !tier.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn proposal_reason_codes(proposal: &ReplanProposal) -> Vec<String> {
+    proposal
+        .frontier_classification
+        .as_ref()
+        .map(|classification| classification.reason_codes.clone())
+        .filter(|codes| !codes.is_empty())
+        .or_else(|| {
+            proposal
+                .operator_decision
+                .as_ref()
+                .map(|decision| decision.frontier_reason_codes.clone())
+                .filter(|codes| !codes.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn proposal_followup_slice_id(proposal: &ReplanProposal) -> String {
+    proposal
+        .proposed_changes
+        .iter()
+        .find_map(|change| {
+            change
+                .followup_slice_draft()
+                .map(|draft| draft.id)
+                .filter(|id| !id.trim().is_empty())
+                .or_else(|| {
+                    (change.kind == "add_followup_slice" && !change.target.trim().is_empty())
+                        .then(|| change.target.clone())
+                })
+        })
+        .or_else(|| {
+            proposal
+                .operator_decision
+                .as_ref()
+                .map(|decision| decision.generated_slice_id.clone())
+                .filter(|id| !id.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn frontier_operator_outcome(proposal: &ReplanProposal) -> String {
