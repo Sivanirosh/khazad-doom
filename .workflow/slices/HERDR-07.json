@@ -2,7 +2,9 @@
   "id": "HERDR-07",
   "title": "Mid-run attention feedback callback",
   "goal": "Reuse the HERDR-06 origin notification seam to notify the originating Herdr/Pi agent or pane when a live run needs operator attention, especially pending ask_operator questions and awaiting_replan proposal decisions.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "HERDR-06"
   ],

@@ -2,6 +2,9 @@
   "id": "AF-05",
   "title": "Operator-authorized follow-up apply engine",
   "goal": "Implement AF-05 from docs/roadmap/auto-frontier/06-apply-engine.md. Complete the idempotent apply path for operator-accepted add_followup_slice proposals carrying typed FollowupSliceDraft payloads. The daemon revalidates, writes and commits generated slice JSON with provenance before any worker can run it, appends serially at an explicit checkpoint, and records applied=true with snapshots. No auto-accept yet.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-01"
   ],

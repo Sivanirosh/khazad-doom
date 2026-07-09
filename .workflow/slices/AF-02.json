@@ -2,6 +2,9 @@
   "id": "AF-02",
   "title": "Mission envelope record and budgets",
   "goal": "Implement AF-02 from docs/roadmap/auto-frontier/03-mission-envelope.md. Add a durable per-run MissionEnvelope and FrontierBudgetState that are recorded at run start, survive restart/resume, render through shared status/watch/monitor/report/handoff projections, and grant no authority yet. Autonomy levels above off are recorded only and behave as off until later slices.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-00"
   ],

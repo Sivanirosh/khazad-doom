@@ -2,6 +2,9 @@
   "id": "AF-04",
   "title": "Shadow classification recording",
   "goal": "Implement AF-04 from docs/roadmap/auto-frontier/05-shadow-mode.md. Give autonomy_level=shadow its read-only meaning: classify pending add_followup_slice proposals at existing replan checkpoints, record tier/reason-code annotations and events, and report would-have-promoted/agreement metrics. Never mutate queues, slice files, or decisions.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-03"
   ],

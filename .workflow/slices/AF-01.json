@@ -2,6 +2,9 @@
   "id": "AF-01",
   "title": "Typed follow-up slice drafts through replan",
   "goal": "Implement AF-01 from docs/roadmap/auto-frontier/02-typed-drafts.md. Workers and repair workers may emit candidate_followup_slices; the daemon validates each draft using existing slice and area-contract rules and records valid drafts as pending add_followup_slice replan proposals with typed payload and evidence links. Add optional provenance to slice JSON/type/schema. Do not classify, apply, mutate queues, or add autonomy.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-00"
   ],

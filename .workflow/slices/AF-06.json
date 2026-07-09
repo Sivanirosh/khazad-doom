@@ -2,6 +2,9 @@
   "id": "AF-06",
   "title": "Envelope-delegated auto-accept levels",
   "goal": "Implement AF-06 from docs/roadmap/auto-frontier/07-auto-accept.md after HERDR-07/RW-2 is closed. For Tier-1 add_followup_slice proposals within envelope and budget, runs at autonomy promote/run may record an accepted decision with authorizer envelope:<run_id> and source frontier_policy, then apply through the AF-05 engine. Promote creates and commits generated slices without running them; run appends and executes them serially. Enforce stop rules, budget consumption, notification for Tier-3, and the AF-00 evidence gate.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-04",
     "AF-05",

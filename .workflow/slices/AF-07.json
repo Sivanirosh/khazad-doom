@@ -2,6 +2,9 @@
   "id": "AF-07",
   "title": "Frontier attestation in reports and handoffs",
   "goal": "Implement AF-07 from docs/roadmap/auto-frontier/08-attestation.md. Derive an auditable frontier block in reports/handoff/read models from envelope, proposal, decision, event, queue, and slice provenance records. Extend roadmap-truth-check so generated slices with provenance must reference an accepted proposal decision. Do not add a new truth store.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-06"
   ],

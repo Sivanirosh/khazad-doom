@@ -2,6 +2,9 @@
   "id": "AF-03",
   "title": "Deterministic follow-up promotion policy",
   "goal": "Implement AF-03 from docs/roadmap/auto-frontier/04-promotion-policy.md. Add a pure deterministic policy module for classifying typed add_followup_slice drafts against a MissionEnvelope, slice/proposal graph view, and budget state. Keep naming obvious and explicit: prefer promotion_policy/classify_followup_proposal over names that imply a second workflow owner. No runtime wiring yet.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-01",
     "AF-02"

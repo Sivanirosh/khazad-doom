@@ -2,6 +2,9 @@
   "id": "AF-08",
   "title": "Dogfood autonomous frontier on a real mission",
   "goal": "Implement AF-08 from docs/roadmap/auto-frontier/09-dogfood.md. Run the staged real-Pi dogfood proof for the autonomous frontier: Stage A shadow classification and manual accept agreement, Stage B run-level auto-promotion/execution/publication, Stage C narrowed-envelope Tier-3 stop with RW-2 notification and operator decision, plus a duplicate-closed rerun guard. Write daemon-state evidence under docs/design/evidence/frontier-dogfood-2026-07-09.md.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-154914-9408be43",
+  "closed_at": "2026-07-09T21:24:13.312429836+00:00",
   "depends_on": [
     "AF-07"
   ],
