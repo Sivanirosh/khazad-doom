@@ -1,0 +1,24 @@
+{
+  "id": "INSTALL-SCRIPT-01",
+  "title": "Make release scripts cwd independent",
+  "goal": "Fix install and package scripts so they resolve the repository root from their own location and work when invoked from the scripts directory or another current working directory.",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260709-install-script",
+  "closed_at": "2026-07-09T09:48:21Z",
+  "areas": [
+    ".workflow/slices/INSTALL-SCRIPT-01.json",
+    "scripts/install.sh",
+    "scripts/package.sh"
+  ],
+  "acceptance": [
+    "scripts/install.sh can be run from scripts/ and installs the repo-root release binary instead of looking for scripts/target/release/khazad-doom.",
+    "scripts/package.sh uses the repo-root Cargo.toml, target directory, README, LICENSE, and dist directory regardless of current working directory.",
+    "The installed khazad-doom binary matches the freshly built repo target/release/khazad-doom."
+  ],
+  "verify": [
+    "bash -n scripts/install.sh scripts/package.sh",
+    "cd scripts && ./install.sh",
+    "cmp -s /home/sivanirosh/.local/bin/khazad-doom target/release/khazad-doom",
+    "cd scripts && ./package.sh"
+  ]
+}
