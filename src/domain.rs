@@ -827,6 +827,32 @@ pub struct TerminalNotificationRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttentionNotificationRecord {
+    pub schema_version: u64,
+    pub run_id: String,
+    pub attention_key: String,
+    pub attention_kind: String,
+    pub delivery_status: String,
+    pub send_status: String,
+    pub focus_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub question_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slice_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proposal_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin_target: String,
+    pub delivery_adapter: String,
+    pub delivery_surface: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub payload: serde_json::Value,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct WorkerProfileEvidence {

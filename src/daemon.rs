@@ -14,9 +14,7 @@ use crate::ipc::{
 };
 use crate::paths::Paths;
 use crate::state::Store as StateStore;
-use crate::workflow::attention::{
-    OperatorAttention, WorkerQuestionPending, worker_question_deadline,
-};
+use crate::workflow::attention::worker_question_deadline;
 use crate::workflow::events as workflow_events;
 use crate::workflow::read_model::{enrich_replan_proposal, replan_status_from_proposals};
 use crate::workflow::{
@@ -547,8 +545,7 @@ impl Server {
     }
 
     fn notify_attention_for_worker_question(&self, question: &WorkerQuestion) {
-        OperatorAttention::new(self.store.clone())
-            .worker_question_pending(WorkerQuestionPending { question });
+        self.manager.notify_worker_question_attention(question);
     }
 
     fn worker_question_is_currently_awaited(&self, question: &WorkerQuestion) -> Result<bool> {
@@ -813,6 +810,8 @@ impl Server {
                         "decision_commands": proposal.decision_commands,
                     }),
                 )?;
+                self.manager
+                    .notify_replan_attention(&params.run_id, &proposal);
                 Ok(HandleOutcome::result(CreateReplanProposalResult {
                     proposal,
                 })?)

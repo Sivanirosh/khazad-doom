@@ -1,10 +1,10 @@
 use super::attention::{
-    OperatorAttention, ReplanDecisionPending, TerminalTransitionNotification,
-    WorkerPaneTerminalRename,
+    OperatorAttention, TerminalTransitionNotification, WorkerPaneTerminalRename,
 };
 use super::cockpit::{
     CockpitLaunch, CockpitTuiWorkerLaunch, CockpitTuiWorkerRequest, CockpitWorkerLaunch,
-    CockpitWorkerPaneRequest, close_default_pane, open_default_run_cockpit,
+    CockpitWorkerPaneRequest, close_default_pane, notify_origin_replan_attention,
+    notify_origin_worker_question_attention, open_default_run_cockpit,
     open_default_tui_worker_agent, open_default_worker_pane, take_cockpit_mode_transport_arg,
     worker_activity_pane_command,
 };
@@ -41,8 +41,8 @@ use crate::domain::{
     PlanRevisions, RepairResult, ReplanDecision, ReplanEvidenceLink, ReplanProposal,
     ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus,
     Slice, SliceExitState, SliceProvenance, SliceRun, SliceStatus, SliceValidationReport,
-    SliceWriteResult, WorkerProfileEvidence, WorkerResult, WorkflowConfig, WorkflowExitStates,
-    is_open_status, replan_decision_commands,
+    SliceWriteResult, WorkerProfileEvidence, WorkerQuestion, WorkerResult, WorkflowConfig,
+    WorkflowExitStates, is_open_status, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -359,6 +359,20 @@ impl Manager {
         self.active.count()
     }
 
+    pub(crate) fn notify_worker_question_attention(&self, question: &WorkerQuestion) {
+        notify_origin_worker_question_attention(&self.state, question);
+    }
+
+    pub(crate) fn notify_replan_attention(&self, run_id: &str, proposal: &ReplanProposal) {
+        if proposal.state != crate::domain::ReplanProposalState::Pending {
+            return;
+        }
+        let Ok(Some(run)) = self.state.get_run(run_id) else {
+            return;
+        };
+        notify_origin_replan_attention(&self.state, &run, proposal);
+    }
+
     fn progress_reporter(&self, run_id: &str) -> ProgressReporter {
         ProgressReporter::new(self.state.clone(), run_id)
     }
@@ -533,8 +547,10 @@ impl Manager {
     }
 
     fn notify_attention_for_replan(&self, run: &Run, proposal: &ReplanProposal) {
-        OperatorAttention::new(self.state.clone())
-            .replan_decision_pending(ReplanDecisionPending { run, proposal });
+        if proposal.state != crate::domain::ReplanProposalState::Pending {
+            return;
+        }
+        notify_origin_replan_attention(&self.state, run, proposal);
     }
 
     fn run_read_model(&self, run: &Run, options: RunReadModelOptions) -> Result<RunReadModel> {
