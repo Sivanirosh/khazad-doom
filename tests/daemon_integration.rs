@@ -2509,6 +2509,7 @@ fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> Test
             "id": "slice-001",
             "title": "Failing parallel slice",
             "goal": "Fail while a sibling worker is still active.",
+            "areas": ["slice-001.txt"],
             "acceptance": ["parallel layer failure is recorded"]
         }),
     )?;
@@ -2518,6 +2519,7 @@ fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> Test
             "id": "slice-002",
             "title": "Long parallel sibling",
             "goal": "Stay active until the layer cancellation reaches this worker.",
+            "areas": ["slice-002.txt"],
             "acceptance": ["parallel sibling receives cancellation"],
             "verify": ["test -f slice-002.txt"]
         }),

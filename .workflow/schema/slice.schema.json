@@ -98,12 +98,14 @@
       "type": "string"
     },
     "verify": {
+      "description": "Worker-local verification commands; keep them inside the slice's fix authority.",
       "items": {
         "type": "string"
       },
       "type": "array"
     },
     "verify_profile": {
+      "description": "Integration-gate profile name. Profile commands run after merges, not as worker-local slice checks.",
       "type": "string"
     },
     "verify_timeout_seconds": {

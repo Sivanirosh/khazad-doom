@@ -633,8 +633,15 @@ pub fn slice_schema() -> Value {
             },
             "acceptance": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
             "must_ask_if": { "type": "array", "items": { "type": "string" } },
-            "verify_profile": { "type": "string" },
-            "verify": { "type": "array", "items": { "type": "string" } },
+            "verify_profile": {
+                "type": "string",
+                "description": "Integration-gate profile name. Profile commands run after merges, not as worker-local slice checks."
+            },
+            "verify": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Worker-local verification commands; keep them inside the slice's fix authority."
+            },
             "verify_timeout_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 }
         }
     })

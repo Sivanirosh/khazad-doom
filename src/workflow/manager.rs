@@ -2531,79 +2531,90 @@ impl Manager {
             let Some(layer) = worker_layers.pop_front() else {
                 break;
             };
-            let slice_base_sha = gitutil::head_sha(&integration_worktree)?;
-            let layer_ids = layer
-                .iter()
-                .map(|slice| slice.id.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let worker_phase = economics.start_phase(format!("worker_layer:{layer_ids}"));
-            let worker_context = WorkerExecutionContext {
-                run: run.clone(),
-                root_worktree: root_worktree.clone(),
-                slice_base_sha,
-                dependency_summary: dependency_summary.clone(),
-                cancel: cancel.clone(),
-                runner: runner.clone(),
-                config: config.clone(),
-                cockpit_mode,
-                economics: economics.clone(),
-                verification_cache: verification_cache.clone(),
-                worker_token: worker_token.clone(),
-                native_pi_tui_worker,
-            };
-            let outcomes = self.run_worker_layer(&layer, &worker_context, parallelism)?;
-            worker_phase.finish();
-            for worker in outcomes {
-                let slice = worker.slice.clone();
-                self.mark_progress(
-                    &run.id,
-                    "merging",
-                    &slice.id,
-                    worker.attempts,
-                    "git merge",
-                    "merging slice branch into integration branch",
-                );
-                if let Err(err) = gitutil::merge(
-                    &integration_worktree,
-                    &worker.branch,
-                    &format!("khazad(slice:{}): merge {}", slice.id, slice.title),
-                ) {
-                    let report = self.write_merge_conflict_report(
-                        &run,
-                        &slice,
-                        &worker.branch,
-                        &integration_worktree,
-                        &err,
-                    )?;
-                    let _ = gitutil::merge_abort(&integration_worktree);
-                    self.state.update_slice_status(
+            for batch in worker_batches_for_layer(&layer, parallelism) {
+                check_cancelled(cancel)?;
+                let slice_base_sha = gitutil::head_sha(&integration_worktree)?;
+                let batch_ids = batch
+                    .iter()
+                    .map(|slice| slice.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let worker_phase = economics.start_phase(format!("worker_layer:{batch_ids}"));
+                let worker_context = WorkerExecutionContext {
+                    run: run.clone(),
+                    root_worktree: root_worktree.clone(),
+                    slice_base_sha,
+                    dependency_summary: dependency_summary.clone(),
+                    cancel: cancel.clone(),
+                    runner: runner.clone(),
+                    config: config.clone(),
+                    cockpit_mode,
+                    economics: economics.clone(),
+                    verification_cache: verification_cache.clone(),
+                    worker_token: worker_token.clone(),
+                    native_pi_tui_worker,
+                };
+                let outcomes = self.run_worker_batch(&batch, &worker_context, parallelism)?;
+                worker_phase.finish();
+                for worker in outcomes {
+                    let slice = worker.slice.clone();
+                    self.mark_progress(
                         &run.id,
+                        "merging",
                         &slice.id,
-                        SliceStatus::Blocked,
-                        &report.summary,
+                        worker.attempts,
+                        "git merge",
+                        "merging slice branch into integration branch",
+                    );
+                    if let Err(err) = gitutil::merge(
+                        &integration_worktree,
+                        &worker.branch,
+                        &format!("khazad(slice:{}): merge {}", slice.id, slice.title),
+                    ) {
+                        let report = self.write_merge_conflict_report(
+                            &run,
+                            &slice,
+                            &worker.branch,
+                            &integration_worktree,
+                            &err,
+                        )?;
+                        let _ = gitutil::merge_abort(&integration_worktree);
+                        self.state.update_slice_status(
+                            &run.id,
+                            &slice.id,
+                            SliceStatus::Blocked,
+                            &report.summary,
+                        )?;
+                        return Err(BlockedError::new(report.summary).into());
+                    }
+                    self.state.upsert_slice_run(&SliceRun {
+                        run_id: run.id.clone(),
+                        slice_id: slice.id.clone(),
+                        status: SliceStatus::Merged,
+                        branch: worker.branch,
+                        commit_sha: worker.result.commit_sha.clone(),
+                        attempts: worker.attempts,
+                        last_error: String::new(),
+                    })?;
+                    self.state.record_event(
+                        &run.id,
+                        workflow_events::SLICE_MERGED,
+                        &workflow_events::SliceMergedPayload::new(
+                            &slice.id,
+                            &worker.result.commit_sha,
+                        ),
                     )?;
-                    return Err(BlockedError::new(report.summary).into());
+                    dependency_summary.insert(slice.id.clone(), worker.result.summary.clone());
+                    completed_ids.insert(slice.id.clone());
+                    checks.extend(worker.checks);
+                    completed_slices.push(worker.result);
+                    self.write_checkpoint(
+                        &run,
+                        &gate_slices,
+                        &completed_ids,
+                        &integration_worktree,
+                    )?;
                 }
-                self.state.upsert_slice_run(&SliceRun {
-                    run_id: run.id.clone(),
-                    slice_id: slice.id.clone(),
-                    status: SliceStatus::Merged,
-                    branch: worker.branch,
-                    commit_sha: worker.result.commit_sha.clone(),
-                    attempts: worker.attempts,
-                    last_error: String::new(),
-                })?;
-                self.state.record_event(
-                    &run.id,
-                    workflow_events::SLICE_MERGED,
-                    &workflow_events::SliceMergedPayload::new(&slice.id, &worker.result.commit_sha),
-                )?;
-                dependency_summary.insert(slice.id.clone(), worker.result.summary.clone());
-                completed_ids.insert(slice.id.clone());
-                checks.extend(worker.checks);
-                completed_slices.push(worker.result);
-                self.write_checkpoint(&run, &gate_slices, &completed_ids, &integration_worktree)?;
             }
         }
 
@@ -2897,27 +2908,21 @@ impl Manager {
         Err(BlockedError::new(blocked_summary).into())
     }
 
-    fn run_worker_layer(
+    fn run_worker_batch(
         &self,
-        layer: &[Slice],
+        batch: &[Slice],
         ctx: &WorkerExecutionContext,
         parallelism: usize,
     ) -> Result<Vec<SliceWorkerOutcome>> {
-        if parallelism <= 1 || layer.len() <= 1 {
+        if parallelism <= 1 || batch.len() <= 1 {
             let mut outcomes = Vec::new();
-            for slice in layer {
+            for slice in batch {
                 outcomes.push(self.run_slice_worker(slice, ctx)?);
             }
             return Ok(outcomes);
         }
 
-        let mut queue: VecDeque<_> = layer.iter().cloned().collect();
-        let mut outcomes = Vec::new();
-        while !queue.is_empty() {
-            let batch: Vec<_> = (0..parallelism).filter_map(|_| queue.pop_front()).collect();
-            let mut batch_outcomes = self.run_parallel_worker_batch(&batch, ctx)?;
-            outcomes.append(&mut batch_outcomes);
-        }
+        let mut outcomes = self.run_parallel_worker_batch(batch, ctx)?;
         outcomes.sort_by(|a, b| a.slice.id.cmp(&b.slice.id));
         Ok(outcomes)
     }
@@ -6580,6 +6585,54 @@ fn effective_parallelism(requested: usize, config: &WorkflowConfig) -> usize {
     }
 }
 
+// Parallelism is allowed only when slice authority is disjoint. This keeps the
+// scheduler rule local: overlapping slices start from the latest merged head
+// instead of producing later merge-conflict recovery special cases.
+fn worker_batches_for_layer(layer: &[Slice], parallelism: usize) -> Vec<Vec<Slice>> {
+    let max_batch_size = parallelism.max(1);
+    let mut batches: Vec<Vec<Slice>> = Vec::new();
+    for slice in layer {
+        if max_batch_size == 1 {
+            batches.push(vec![slice.clone()]);
+            continue;
+        }
+        if let Some(batch) = batches.iter_mut().find(|batch| {
+            batch.len() < max_batch_size
+                && batch
+                    .iter()
+                    .all(|candidate| !slice_areas_overlap(candidate, slice))
+        }) {
+            batch.push(slice.clone());
+        } else {
+            batches.push(vec![slice.clone()]);
+        }
+    }
+    batches
+}
+
+fn slice_areas_overlap(left: &Slice, right: &Slice) -> bool {
+    if left.areas.is_empty() || right.areas.is_empty() {
+        return true;
+    }
+    left.areas.iter().any(|left_area| {
+        right
+            .areas
+            .iter()
+            .any(|right_area| area_prefixes_overlap(left_area, right_area))
+    })
+}
+
+fn area_prefixes_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim().trim_matches('/');
+    let right = right.trim().trim_matches('/');
+    if left.is_empty() || right.is_empty() || left == "." || right == "." {
+        return true;
+    }
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
 fn tail_lines(path: &Path, line_count: usize) -> Result<Vec<String>> {
     if line_count == 0 || !path.exists() {
         return Ok(Vec::new());
@@ -9181,8 +9234,10 @@ mod tests {
         let store = ArtifactStore::new(repo.path());
         store.ensure_layout()?;
         let mut first = slice("slice-001");
+        first.areas = vec!["slice-001.txt".to_string()];
         first.verify = vec!["test -f slice-001.txt".to_string()];
         let mut second = slice("slice-002");
+        second.areas = vec!["slice-002.txt".to_string()];
         second.verify = vec!["test -f slice-002.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
         artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
@@ -9214,6 +9269,66 @@ mod tests {
         assert_eq!(completed.status, RunStatus::Completed);
         let slice_runs = state.get_slice_runs(&run.id)?;
         assert_eq!(slice_runs.len(), 2);
+        assert!(
+            slice_runs
+                .iter()
+                .all(|slice_run| slice_run.status == SliceStatus::Merged)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_area_slices_are_merged_between_worker_batches() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        fs::write(repo.path().join("shared.txt"), "base\n")?;
+        gitutil::run(repo.path(), &["add", "shared.txt"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add shared fixture"])?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.areas = vec!["shared.txt".to_string()];
+        first.verify = vec!["grep -q slice-001 shared.txt".to_string()];
+        let mut second = slice("slice-002");
+        second.areas = vec!["shared.txt".to_string()];
+        second.verify = vec!["grep -q slice-002 shared.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add overlapping slices"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(SharedFileAppendRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: Vec::new(),
+            all: true,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 2,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+            mission_envelope: None,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let shared = gitutil::run(
+            repo.path(),
+            &[
+                "show",
+                &format!("{}:shared.txt", completed.integration_branch),
+            ],
+        )?;
+        assert_eq!(shared, "base\nslice-001\nslice-002");
+        let slice_runs = state.get_slice_runs(&run.id)?;
         assert!(
             slice_runs
                 .iter()
@@ -9272,8 +9387,10 @@ mod tests {
         let store = ArtifactStore::new(repo.path());
         store.ensure_layout()?;
         let mut first = slice("slice-001");
+        first.areas = vec!["slice-001.txt".to_string()];
         first.verify = vec!["false".to_string()];
         let mut second = slice("slice-002");
+        second.areas = vec!["slice-002.txt".to_string()];
         second.verify = vec!["test -f slice-002.txt".to_string()];
         artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
         artifact::write_json(store.slices_dir().join("slice-002.json"), &second)?;
@@ -11145,16 +11262,30 @@ mod tests {
         init_git_repo(repo.path())?;
         let store = ArtifactStore::new(repo.path());
         store.ensure_layout()?;
-        artifact::write_json(
-            store.slices_dir().join("slice-001.json"),
-            &slice("slice-001"),
+        fs::write(repo.path().join("shared.txt"), "base\n")?;
+        gitutil::run(
+            repo.path(),
+            &["add", ".gitignore", ".workflow", "shared.txt"],
         )?;
-        artifact::write_json(
-            store.slices_dir().join("slice-002.json"),
-            &slice("slice-002"),
-        )?;
-        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
-        gitutil::run(repo.path(), &["commit", "-m", "add slices"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add shared file"])?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+
+        gitutil::run(repo.path(), &["checkout", "-b", "slice-one"])?;
+        fs::write(repo.path().join("shared.txt"), "one\n")?;
+        gitutil::run(repo.path(), &["add", "shared.txt"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "slice one"])?;
+
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+        gitutil::run(repo.path(), &["checkout", "-b", "slice-two"])?;
+        fs::write(repo.path().join("shared.txt"), "two\n")?;
+        gitutil::run(repo.path(), &["add", "shared.txt"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "slice two"])?;
+
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+        gitutil::merge(repo.path(), "slice-one", "merge slice one")?;
+        let err = gitutil::merge(repo.path(), "slice-two", "merge slice two")
+            .expect_err("second branch should conflict");
 
         let home = tempfile::tempdir()?;
         let paths = Paths {
@@ -11163,29 +11294,30 @@ mod tests {
         paths.ensure()?;
         let state = StateStore::open(paths.db_file())?;
         let manager = Manager::with_runner(paths, state.clone(), Arc::new(ConflictRunner));
-        let run = manager.start_run(StartOptions {
-            repo_path: repo.path().to_path_buf(),
-            slice_ids: Vec::new(),
-            all: true,
-            agent: "fake".to_string(),
-            pi_bin: String::new(),
-            pi_args: Vec::new(),
-            native_pi_tui_worker: false,
-            parallelism: 2,
-            allow_dirty: false,
-            origin_notification_target: String::new(),
-            mission_envelope: None,
-        })?;
+        let now = Utc::now();
+        let run = Run {
+            id: "run-merge-conflict".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: repo.path().to_string_lossy().into_owned(),
+            status: RunStatus::Running,
+            base_branch: base_branch.clone(),
+            base_sha,
+            integration_branch: base_branch,
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        let report = manager.write_merge_conflict_report(
+            &run,
+            &slice("slice-002"),
+            "slice-two",
+            repo.path(),
+            &err,
+        )?;
 
-        let completed = wait_for_run(&state, &run.id)?;
-        assert_eq!(completed.status, RunStatus::Blocked);
-        let slice_runs = state.get_slice_runs(&run.id)?;
-        assert!(
-            slice_runs
-                .iter()
-                .any(|slice_run| slice_run.slice_id == "slice-002"
-                    && slice_run.status == SliceStatus::Blocked)
-        );
+        assert_eq!(report.status, "blocked");
+        assert_eq!(report.conflicted_files, vec!["shared.txt"]);
         assert!(
             store
                 .output_path(&run.id, "slice-002.merge-conflict.json")
@@ -11569,6 +11701,59 @@ mod tests {
             "changed_files": [format!("{}.txt", handoff.slice.id)],
             "acceptance_status": acceptance_status_json(&handoff.slice)
         }))
+    }
+
+    struct SharedFileAppendRunner;
+
+    impl Runner for SharedFileAppendRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if job.kind == "integration-repair" {
+                return Ok(ResultData {
+                    output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            let shared_path = job.cwd.join("shared.txt");
+            let mut content = fs::read_to_string(&shared_path).unwrap_or_default();
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!("{}\n", handoff.slice.id));
+            fs::write(&shared_path, content)?;
+            gitutil::run(&job.cwd, &["add", "shared.txt"])?;
+            gitutil::run(
+                &job.cwd,
+                &["commit", "-m", &format!("append {}", handoff.slice.id)],
+            )?;
+            let sha = gitutil::head_sha(&job.cwd)?;
+            Ok(ResultData {
+                output: Some(json!({
+                    "slice_id": handoff.slice.id,
+                    "status": "complete",
+                    "summary": "appended shared file",
+                    "commit_sha": sha,
+                    "changed_files": ["shared.txt"],
+                    "acceptance_status": acceptance_status_json(&handoff.slice)
+                })),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
     }
 
     struct FakeRunner;

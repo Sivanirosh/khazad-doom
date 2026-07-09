@@ -50,7 +50,11 @@ impl WorkflowGate {
         cancel: &CancellationToken,
     ) -> Result<SliceVerificationResult> {
         let mut result = SliceVerificationResult::default();
-        for command in effective_verify_commands(request.slice, request.config)? {
+        // Slice verification is deliberately authority-local: a worker can only
+        // be failed here for commands the slice author wrote on the slice
+        // itself. `verify_profile` is gate-only so broad repo checks such as
+        // clippy do not become out-of-area worker blockers.
+        for command in slice_verify_commands(request.slice) {
             if command.command.trim().is_empty() {
                 continue;
             }
@@ -558,7 +562,7 @@ fn integration_gate_commands(
     let mut commands: Vec<VerifyCommand> = Vec::new();
     let mut by_key: HashMap<String, usize> = HashMap::new();
     for slice in slices {
-        for command in effective_verify_commands(slice, config)? {
+        for command in gate_verify_commands(slice, config)? {
             if command.command.trim().is_empty() {
                 continue;
             }
@@ -576,7 +580,7 @@ fn integration_gate_commands(
     Ok(commands)
 }
 
-fn effective_verify_commands(slice: &Slice, config: &WorkflowConfig) -> Result<Vec<VerifyCommand>> {
+fn gate_verify_commands(slice: &Slice, config: &WorkflowConfig) -> Result<Vec<VerifyCommand>> {
     let mut commands = Vec::new();
     if !slice.verify_profile.trim().is_empty() {
         let profile = config
@@ -591,13 +595,22 @@ fn effective_verify_commands(slice: &Slice, config: &WorkflowConfig) -> Result<V
             })?;
         commands.extend(profile.commands.clone());
     }
-    commands.extend(slice.verify.iter().cloned().map(|command| VerifyCommand {
-        command,
-        timeout_seconds: slice.verify_timeout_seconds,
-        cwd: String::new(),
-        env: BTreeMap::new(),
-    }));
+    commands.extend(slice_verify_commands(slice));
     Ok(commands)
+}
+
+fn slice_verify_commands(slice: &Slice) -> Vec<VerifyCommand> {
+    slice
+        .verify
+        .iter()
+        .cloned()
+        .map(|command| VerifyCommand {
+            command,
+            timeout_seconds: slice.verify_timeout_seconds,
+            cwd: String::new(),
+            env: BTreeMap::new(),
+        })
+        .collect()
 }
 
 fn verify_command_timeout(
@@ -943,6 +956,60 @@ mod tests {
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
             vec!["printf fmt", "printf test", "printf clippy"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_profile_is_gate_only_not_worker_local() -> Result<()> {
+        let (_home, gate) = test_gate()?;
+        let worktree = tempfile::tempdir()?;
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "full".to_string(),
+            VerifyProfile {
+                commands: vec![VerifyCommand {
+                    command: "printf profile-ran".to_string(),
+                    timeout_seconds: 5,
+                    ..VerifyCommand::default()
+                }],
+            },
+        );
+        let config = WorkflowConfig {
+            verify_profiles: profiles,
+            gate_fail_fast: false,
+            ..WorkflowConfig::default()
+        };
+        let mut slice = slice("slice-001");
+        slice.verify_profile = "full".to_string();
+        slice.verify = vec!["printf inline-ran".to_string()];
+
+        let slice_result = gate.verify_slice_commands(
+            SliceVerificationRequest {
+                slice: &slice,
+                worker_worktree: worktree.path(),
+                attempt: 1,
+                config: &config,
+            },
+            &CancellationToken::new(),
+        )?;
+        assert_eq!(slice_result.tests_run, vec!["printf inline-ran"]);
+
+        let gate_result = gate.run_integration_gate(
+            IntegrationGateRequest {
+                slices: &[slice],
+                integration_worktree: worktree.path(),
+                config: &config,
+            },
+            &CancellationToken::new(),
+        )?;
+        assert_eq!(
+            gate_result
+                .commands
+                .iter()
+                .map(|command| command.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["printf profile-ran", "printf inline-ran"]
         );
         Ok(())
     }

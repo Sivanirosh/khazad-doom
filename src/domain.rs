@@ -40,7 +40,12 @@ pub struct Slice {
     pub areas: Vec<String>,
     pub acceptance: Vec<String>,
     pub must_ask_if: Vec<String>,
+    /// Integration-gate profile. Profile commands run after slice commits are
+    /// merged, where failures have run-level repair authority; they are not
+    /// worker-local checks.
     pub verify_profile: String,
+    /// Worker-local verification commands. These should only check evidence the
+    /// slice worker is authorized to fix within its declared `areas`.
     pub verify: Vec<String>,
     pub verify_timeout_seconds: u64,
 }
