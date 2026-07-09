@@ -2,6 +2,9 @@
   "id": "AF-00",
   "title": "Frontier doctrine RFC and invariant amendments",
   "goal": "Implement the AF-00 roadmap workpackage. Create docs/design/frontier-autonomy.md as an execution-grade RFC for autonomous frontier behavior, using docs/roadmap/auto-frontier/00-matrix.md and docs/roadmap/auto-frontier/01-doctrine.md as the source plan. The RFC must reconcile autonomy with the existing replan authority channel: candidate follow-up slices are replan proposals, the mission envelope delegates only decision-recording authority, and one idempotent apply engine serves both operator and envelope-authorized accepts. Append proposed Phase-style invariant amendment records to docs/workflow-invariants.md. Keep the language obvious and explicit; avoid introducing names that imply a second workflow owner.",
+  "status": "closed",
+  "closed_by_run": "kd-20260709-153937-a824dabd",
+  "closed_at": "2026-07-09T15:43:37.423092832+00:00",
   "areas": [
     ".workflow/slices/AF-00.json",
     "docs/design/frontier-autonomy.md",

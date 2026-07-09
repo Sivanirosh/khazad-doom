@@ -1,0 +1,402 @@
+{
+  "run_id": "kd-20260709-153937-a824dabd",
+  "repo_path": "/home/sivanirosh/git_repos/khazad-doom",
+  "integration_branch": "khazad/kd-20260709-153937-a824dabd/integration",
+  "base_sha": "37e5afa31bcacdc9b0740b16c8a299b06b5636d0",
+  "worker_profile": {
+    "agent": "pi",
+    "agent_profile": "implementer",
+    "agent_provider": "openai-codex",
+    "agent_model": "gpt-5.5",
+    "agent_reasoning": "xhigh",
+    "agent_mode": "fast",
+    "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+    "worker_evidence_kind": "real_pi_worker",
+    "worker_evidence_label": "real Pi worker implementation evidence",
+    "source_attribution": {
+      "agent": "request",
+      "mode": "resolved_agent_profile",
+      "model": "resolved_agent_profile",
+      "pi_args": "none",
+      "pi_bin": "builtin",
+      "profile": "resolved_agent_profile",
+      "provider": "resolved_agent_profile",
+      "reasoning": "resolved_agent_profile"
+    }
+  },
+  "completed_slices": [
+    {
+      "slice_id": "AF-00",
+      "status": "complete",
+      "summary": "Created the frontier autonomy RFC and appended proposed Frontier autonomy invariant amendment records. Committed docs-only changes and left the worktree clean.",
+      "commit_sha": "c625e723caeaf09051e7437cd5139b8f768f1d38",
+      "commit_message": "docs: define frontier autonomy doctrine",
+      "changed_files": [
+        "docs/design/frontier-autonomy.md",
+        "docs/workflow-invariants.md"
+      ],
+      "tests_run": [
+        "git diff --check",
+        "test -f docs/design/frontier-autonomy.md && grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md && grep -q 'reason code' docs/design/frontier-autonomy.md && grep -q 'replan proposal' docs/design/frontier-autonomy.md && grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "git diff-tree --no-commit-id --name-only -r HEAD",
+        "git status --short --branch"
+      ],
+      "acceptance_status": [
+        {
+          "criterion": "docs/design/frontier-autonomy.md exists and defines MissionEnvelope fields and validation, tier semantics with stable reason codes, the autonomy authority ladder and evidence bar, stop rules, provenance requirements, and deferral reopenings.",
+          "status": "satisfied",
+          "evidence": "Created docs/design/frontier-autonomy.md. Verification greps passed for MissionEnvelope and reason code. The RFC includes MissionEnvelope field/validation and area-containment tables, tier/reason-code tables, authority ladder with promote N=10/M=3/X=80 and run N=20/M=5/X=90 bars, stop rules, provenance requirements, and deferral reopening sections quoting the reconsider conditions."
+        },
+        {
+          "criterion": "The RFC states that follow-up candidates use the existing replan proposal/decision/apply channel and that no separate frontier authority channel exists.",
+          "status": "satisfied",
+          "evidence": "docs/design/frontier-autonomy.md contains a dedicated 'Replan proposal, decision, and apply channel' section; grep for 'replan proposal' passed, and the section explicitly states no separate frontier authority channel, proposal store, decision model, or apply engine exists."
+        },
+        {
+          "criterion": "docs/workflow-invariants.md contains proposed amendment records in the existing Phase-style format, including enforcement mechanisms, violation-detecting tests, and status for mission envelopes, envelope-delegated auto-acceptance, and generated follow-up slice provenance.",
+          "status": "satisfied",
+          "evidence": "Appended 'Frontier autonomy proposed invariant amendment records' to docs/workflow-invariants.md. It contains three Phase-style records with Proposed invariant text, Ledger entries, Enforcement mechanism, Violation-detecting tests, and Status for mission envelopes, envelope-delegated auto-acceptance, and generated follow-up slice provenance. Grep for 'Frontier autonomy' passed."
+        },
+        {
+          "criterion": "AF-00 remains docs-only: no Rust, JavaScript, schema, script, or runtime behavior changes are made.",
+          "status": "satisfied",
+          "evidence": "git diff-tree --no-commit-id --name-only -r HEAD listed only docs/design/frontier-autonomy.md and docs/workflow-invariants.md."
+        },
+        {
+          "criterion": "Roadmap truth lint still passes for docs/roadmap/auto-frontier/00-matrix.md.",
+          "status": "satisfied",
+          "evidence": "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md passed with 'roadmap truth check passed: docs/roadmap/auto-frontier/00-matrix.md'."
+        }
+      ],
+      "assumptions": [
+        "Selected explicit evidence bars inside the RFC without operator escalation because the slice authorized picking N/M/X values and the source doctrine proposed the promote baseline."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "slice_id": "AF-00",
+      "status": "passed",
+      "summary": "lightweight checks passed",
+      "tests_run": [
+        "test -f docs/design/frontier-autonomy.md",
+        "grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md"
+      ],
+      "attempt": 1,
+      "worker_head": "c625e723caeaf09051e7437cd5139b8f768f1d38",
+      "worktree_clean": true,
+      "commit_found": true
+    }
+  ],
+  "integration_repair": {
+    "status": "skipped",
+    "summary": "integration gate passed; integration_repair=auto skipped repair",
+    "trigger": "gate_passed"
+  },
+  "integration_gate": {
+    "status": "passed",
+    "summary": "integration gate passed",
+    "commands": [
+      {
+        "command": "test -f docs/design/frontier-autonomy.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000test -f docs/design/frontier-autonomy.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "status": "passed",
+        "exit_code": 0,
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "duration_ms": 100
+      },
+      {
+        "command": "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "status": "passed",
+        "exit_code": 0,
+        "output": "roadmap truth check passed: docs/roadmap/auto-frontier/00-matrix.md",
+        "cwd": ".",
+        "dedupe_key": "\u0000\u0000scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "duration_ms": 100
+      }
+    ]
+  },
+  "exit_states": {
+    "run": "completed",
+    "handoff": "ready_for_handoff",
+    "evidence": "daemon_attested",
+    "slices": [
+      {
+        "slice_id": "AF-00",
+        "worker": "complete",
+        "daemon": "merged"
+      }
+    ]
+  },
+  "evidence_attestation": {
+    "status": "daemon_attested",
+    "attester": "khazad-doom-daemon",
+    "worker_self_approved": false,
+    "basis": [
+      "worker acceptance_status is treated as an evidence claim, not approval",
+      "daemon required a committed clean worktree before merge",
+      "daemon required slice verification/lightweight checks before merge",
+      "daemon integration gate passed before handoff",
+      "worker evidence kind: real_pi_worker (real Pi worker implementation evidence)"
+    ]
+  },
+  "economics": {
+    "repair_policy": "auto",
+    "gate_fail_fast": true,
+    "worker_max_attempts": 3,
+    "repair_max_attempts": 1,
+    "repair_attempts": 0,
+    "agent_call_count": 1,
+    "command_execution_count": 12,
+    "duplicate_command_count": 0,
+    "cache_hits": 0,
+    "cache_misses": 12,
+    "agent_calls": [
+      {
+        "phase": "slice_worker",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "kind": "slice-worker",
+        "runner": "pi",
+        "worker_evidence_kind": "real_pi_worker",
+        "worker_evidence_label": "real Pi worker implementation evidence",
+        "agent_profile": "implementer",
+        "agent_provider": "openai-codex",
+        "agent_model": "gpt-5.5",
+        "agent_reasoning": "xhigh",
+        "agent_mode": "fast",
+        "profile_summary": "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "launch_summary": "pi implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast",
+        "status": "succeeded",
+        "duration_ms": 237935
+      }
+    ],
+    "phase_durations": {
+      "integration_gate:initial": {
+        "phase": "integration_gate:initial",
+        "duration_ms": 784
+      },
+      "integration_setup": {
+        "phase": "integration_setup",
+        "duration_ms": 26
+      },
+      "worker_layer:AF-00": {
+        "phase": "worker_layer:AF-00",
+        "duration_ms": 238840
+      }
+    },
+    "command_executions": [
+      {
+        "phase": "worker_verify",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "command": "test -f docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/AF-00\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000test -f docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "command": "grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/AF-00\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "command": "grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/AF-00\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "command": "grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/AF-00\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "command": "grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/AF-00\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "worker_verify",
+        "slice_id": "AF-00",
+        "attempt": 1,
+        "command": "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/AF-00\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "test -f docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000test -f docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/integration\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000test -f docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/integration\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/integration\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'reason code' docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/integration\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/integration\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+        "cache_hit": false
+      },
+      {
+        "phase": "integration_gate",
+        "attempt": 0,
+        "command": "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "cwd": ".",
+        "status": "passed",
+        "exit_code": 0,
+        "duration_ms": 100,
+        "dedupe_key": "\u0000\u0000scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "tree_sha": "1394deeec2561e280824ebb8b2ada22926879a42",
+        "cache_key": "/home/sivanirosh/.khazad-doom/worktrees/9afe9527241f/kd-20260709-153937-a824dabd/integration\u00001394deeec2561e280824ebb8b2ada22926879a42\u0000\u0000\u0000scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+        "cache_hit": false
+      }
+    ]
+  },
+  "plan_revisions": {
+    "source_of_truth": "daemon_replan_proposals",
+    "queue_summary": "selected slices: AF-00",
+    "unresolved_pending_blocks_handoff": false,
+    "pending": [],
+    "accepted": [],
+    "rejected": [],
+    "deferred": [],
+    "superseded": []
+  },
+  "created_at": "2026-07-09T15:43:37.423806009Z"
+}
