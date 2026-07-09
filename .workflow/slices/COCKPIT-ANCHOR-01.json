@@ -34,5 +34,8 @@
     "cargo test focused_existing_workspace_resolves_anchor_by_label_not_first_pane --quiet",
     "HERDR_E2E=1 cargo test herdr_tui --quiet"
   ],
-  "verify_profile": "quick"
+  "verify_profile": "quick",
+  "status": "closed",
+  "closed_by_run": "manual-4991d74-proof-evidence",
+  "closed_at": "2026-07-08T09:05:00Z"
 }
