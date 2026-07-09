@@ -577,10 +577,6 @@ impl AutonomyLevel {
             ),
         }
     }
-
-    pub fn recorded_not_active(self) -> bool {
-        !matches!(self, Self::Off)
-    }
 }
 
 impl std::fmt::Display for AutonomyLevel {
@@ -633,6 +629,172 @@ pub struct FrontierBudgetState {
     pub generated_slices: i64,
     #[serde(default)]
     pub max_generation_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrontierClassification {
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    pub classified_at: DateTime<Utc>,
+    pub envelope_hash: String,
+    pub budget_snapshot: FrontierBudgetState,
+    pub autonomy_level: AutonomyLevel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct FrontierSummary {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary_line: String,
+    pub candidates_seen: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tier_distribution: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub would_have_promoted: Vec<FrontierProposalOutcome>,
+    #[serde(default, skip_serializing_if = "FrontierAgreementMetric::is_empty")]
+    pub agreement: FrontierAgreementMetric,
+}
+
+impl FrontierSummary {
+    pub fn is_empty(&self) -> bool {
+        self.candidates_seen == 0
+            && self.summary_line.is_empty()
+            && self.tier_distribution.is_empty()
+            && self.would_have_promoted.is_empty()
+            && self.agreement.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct FrontierAgreementMetric {
+    pub tier1_total: usize,
+    pub accepted_unchanged: usize,
+    pub accepted_modified: usize,
+    pub rejected: usize,
+    pub deferred: usize,
+    pub pending: usize,
+    pub agreement_numerator: usize,
+    pub agreement_denominator: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agreement_ratio: String,
+    pub agreement_percent: f64,
+}
+
+impl FrontierAgreementMetric {
+    pub fn is_empty(&self) -> bool {
+        self.tier1_total == 0
+            && self.accepted_unchanged == 0
+            && self.accepted_modified == 0
+            && self.rejected == 0
+            && self.deferred == 0
+            && self.pending == 0
+            && self.agreement_numerator == 0
+            && self.agreement_denominator == 0
+            && self.agreement_ratio.is_empty()
+            && self.agreement_percent == 0.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierProposalOutcome {
+    pub proposal_id: String,
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    pub operator_outcome: String,
+    pub classified_at: String,
+    pub envelope_hash: String,
+    pub annotation: String,
+}
+
+pub fn frontier_classification_annotation(classification: &FrontierClassification) -> String {
+    let tier = frontier_tier_label(&classification.tier);
+    let reasons = if classification.reason_codes.is_empty() {
+        "no_reason_codes".to_string()
+    } else {
+        classification.reason_codes.join(",")
+    };
+    let outcome = if frontier_classification_would_auto_promote(classification) {
+        "would auto-promote"
+    } else {
+        match classification.tier.as_str() {
+            "tier_0" => "would attest inline",
+            "tier_1" => "would auto-promote",
+            "tier_2" => "would queue pending",
+            "tier_3" => "would ask operator",
+            "stop" => "would stop frontier",
+            _ => "would require review",
+        }
+    };
+    let prefix = match classification.autonomy_level {
+        AutonomyLevel::Shadow => "shadow".to_string(),
+        AutonomyLevel::Promote | AutonomyLevel::Run => format!(
+            "{} recorded, not yet active",
+            classification.autonomy_level.as_str()
+        ),
+        AutonomyLevel::Off => "off".to_string(),
+    };
+    format!("{prefix}: {outcome} ({tier}: {reasons})")
+}
+
+pub fn frontier_classification_would_auto_promote(classification: &FrontierClassification) -> bool {
+    if classification.tier == "tier_1" {
+        return true;
+    }
+    let reasons = &classification.reason_codes;
+    let has = |code: &str| reasons.iter().any(|reason| reason == code);
+    let required = [
+        "inside_allowed_areas",
+        "acceptance_present",
+        "verify_present",
+        "within_budget",
+        "within_depth",
+        "not_duplicate",
+        "add_followup_slice_only",
+    ];
+    let disqualifying = [
+        "frontier_disabled",
+        "area_outside_envelope",
+        "area_ambiguous",
+        "non_goal_overlap",
+        "candidate_changes_dependencies",
+        "candidate_changes_acceptance",
+        "candidate_changes_verify_profile",
+        "candidate_changes_policy_or_schema",
+        "candidate_hits_must_ask_if",
+        "envelope_must_ask_hit",
+        "operator_only_change_kind",
+        "duplicate_rejected_or_deferred_proposal",
+        "classification_ambiguous",
+        "frontier_budget_exhausted",
+        "frontier_depth_exhausted",
+        "no_frontier",
+        "cancel_requested",
+        "replan_apply_incomplete",
+        "candidate_missing_acceptance",
+        "candidate_missing_verify",
+        "duplicate_open_slice",
+        "duplicate_closed_slice",
+        "duplicate_pending_proposal",
+        "proposal_needs_operator_context",
+    ];
+    has("shadow_observation_only")
+        && required.iter().all(|code| has(code))
+        && !disqualifying.iter().any(|code| has(code))
+}
+
+fn frontier_tier_label(tier: &str) -> &'static str {
+    match tier {
+        "tier_0" => "Tier 0",
+        "tier_1" => "Tier 1",
+        "tier_2" => "Tier 2",
+        "tier_3" => "Tier 3",
+        "stop" => "Stop",
+        _ => "Unknown tier",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1577,6 +1739,8 @@ pub struct ReplanProposal {
     pub risk: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_decision: Option<ReplanDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_classification: Option<FrontierClassification>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1597,6 +1761,8 @@ pub struct PlanRevisions {
     pub source_of_truth: String,
     pub queue_summary: String,
     pub unresolved_pending_blocks_handoff: bool,
+    #[serde(default, skip_serializing_if = "FrontierSummary::is_empty")]
+    pub frontier: FrontierSummary,
     pub pending: Vec<PlanRevisionRecord>,
     pub accepted: Vec<PlanRevisionRecord>,
     pub rejected: Vec<PlanRevisionRecord>,
@@ -1620,6 +1786,8 @@ pub struct PlanRevisionRecord {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub action_class: String,
     pub risk: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_classification: Option<FrontierClassification>,
     pub before_queue_or_slice_summary: String,
     pub after_queue_or_slice_summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

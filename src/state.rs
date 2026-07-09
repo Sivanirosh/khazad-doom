@@ -1,7 +1,8 @@
 use crate::domain::{
-    Event, FrontierBudgetState, MissionEnvelope, ReplanDecision, ReplanEvidenceLink,
-    ReplanProposal, ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run,
-    RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptProgress, WorkerQuestion,
+    Event, FrontierBudgetState, FrontierClassification, MissionEnvelope, ReplanDecision,
+    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
+    ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus,
+    WorkerAttemptProgress, WorkerQuestion,
 };
 use crate::pi_contract;
 use anyhow::{Context, Result};
@@ -194,6 +195,7 @@ impl Store {
                 proposed_changes_json TEXT NOT NULL,
                 risk TEXT NOT NULL,
                 decision_json TEXT NOT NULL DEFAULT '',
+                frontier_classification_json TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -273,6 +275,12 @@ impl Store {
             "runs",
             "frontier_budget_json",
             "frontier_budget_json TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "replan_proposals",
+            "frontier_classification_json",
+            "frontier_classification_json TEXT NOT NULL DEFAULT ''",
         )?;
         Ok(())
     }
@@ -646,6 +654,7 @@ impl Store {
                 risk.trim().to_string()
             },
             operator_decision: None,
+            frontier_classification: None,
             created_at: now,
             updated_at: now,
             decision_commands: Vec::new(),
@@ -681,7 +690,7 @@ impl Store {
             .query_row(
                 r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
                           evidence_json, proposed_changes_json, risk, decision_json,
-                          created_at, updated_at
+                          frontier_classification_json, created_at, updated_at
                    FROM replan_proposals WHERE run_id=?1 AND id=?2"#,
                 params![run_id, proposal_id],
                 replan_proposal_tuple_from_row,
@@ -695,7 +704,7 @@ impl Store {
         let mut stmt = conn.prepare(
             r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
                       evidence_json, proposed_changes_json, risk, decision_json,
-                      created_at, updated_at
+                      frontier_classification_json, created_at, updated_at
                FROM replan_proposals WHERE run_id=?1 ORDER BY created_at ASC, id ASC"#,
         )?;
         let rows = stmt.query_map(params![run_id], replan_proposal_tuple_from_row)?;
@@ -826,6 +835,35 @@ impl Store {
         )?;
         self.get_replan_proposal(run_id, proposal_id)?
             .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision update"))
+    }
+
+    pub fn replace_replan_frontier_classification(
+        &self,
+        run_id: &str,
+        proposal_id: &str,
+        classification: &FrontierClassification,
+    ) -> Result<ReplanProposal> {
+        self.get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("replan proposal {proposal_id:?} for run {run_id:?} not found")
+            })?;
+        let now = Utc::now();
+        let conn = self.conn()?;
+        conn.execute(
+            r#"UPDATE replan_proposals
+               SET frontier_classification_json=?1, updated_at=?2
+               WHERE run_id=?3 AND id=?4"#,
+            params![
+                serde_json::to_string(classification)?,
+                now.to_rfc3339(),
+                run_id,
+                proposal_id,
+            ],
+        )?;
+        self.get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("replan proposal disappeared after classification update")
+            })
     }
 
     pub fn update_run_selected_slices(&self, run_id: &str, selected_slice_id: &str) -> Result<Run> {
@@ -1250,6 +1288,7 @@ type ReplanProposalTuple = (
     String,
     String,
     String,
+    String,
 );
 type RunProgressTuple = (
     String,
@@ -1325,6 +1364,7 @@ fn replan_proposal_tuple_from_row(
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+        row.get(11)?,
     ))
 }
 
@@ -1416,6 +1456,7 @@ fn replan_proposal_from_tuple(row: ReplanProposalTuple) -> Result<ReplanProposal
         proposed_changes_json,
         risk,
         decision_json,
+        frontier_classification_json,
         created_at,
         updated_at,
     ) = row;
@@ -1440,6 +1481,15 @@ fn replan_proposal_from_tuple(row: ReplanProposalTuple) -> Result<ReplanProposal
                 serde_json::from_str(&decision_json)
                     .with_context(|| format!("parse replan proposal decision {decision_json:?}"))?,
             )
+        },
+        frontier_classification: if frontier_classification_json.trim().is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&frontier_classification_json).with_context(|| {
+                format!(
+                    "parse replan proposal frontier classification {frontier_classification_json:?}"
+                )
+            })?)
         },
         created_at: parse_time("created_at", &created_at)?,
         updated_at: parse_time("updated_at", &updated_at)?,

@@ -2148,7 +2148,7 @@ fn read_mission_envelope(
             Some(envelope) => envelope.autonomy_level = level,
             None if level == AutonomyLevel::Off => {}
             None => bail!(
-                "--autonomy {level} requires --envelope; AF-02 records bounded per-run envelopes only"
+                "--autonomy {level} requires --envelope; frontier classification is bounded by a per-run mission envelope"
             ),
         }
     }

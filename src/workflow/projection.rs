@@ -1,9 +1,10 @@
 use super::events::{IMPLEMENTATION_SUMMARY, ImplementationSummaryPayload, RUN_STARTED};
+use super::read_model::frontier_summary_from_proposals;
 use crate::domain::{
-    FrontierBudgetState, GateCommandResult, GateResult, MissionEnvelope, RepairResult, RunDetails,
-    RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus, StatusFeed,
-    StatusFeedBlock, StatusFeedLine, StatusFeedRole, TerminalReason, WorkerAttemptProgress,
-    WorkflowExitStates,
+    FrontierBudgetState, FrontierSummary, GateCommandResult, GateResult, MissionEnvelope,
+    RepairResult, ReplanProposal, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus,
+    SliceRun, SliceStatus, StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole,
+    TerminalReason, WorkerAttemptProgress, WorkflowExitStates, frontier_classification_annotation,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -784,12 +785,12 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
     let attention = dashboard_attention(details, now);
     let operator_commands = operator_commands(details, &question_commands, &replan_commands);
 
-    let mut blocks = vec![
-        run_block(details, now),
-        mission_block(details),
-        workers_block(details, now),
-        attention_block(&attention),
-    ];
+    let frontier = frontier_summary_for_details(details);
+    let mut blocks = vec![run_block(details, now), mission_block(details)];
+    if !frontier.is_empty() {
+        blocks.push(frontier_block(&frontier));
+    }
+    blocks.extend([workers_block(details, now), attention_block(&attention)]);
     if !operator_commands.is_empty() {
         blocks.push(commands_block(&operator_commands));
     }
@@ -927,6 +928,17 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
                 StatusFeedRole::Attention,
             ));
         }
+        if let Some(classification) = &proposal.frontier_classification {
+            lines.push(line(
+                format!(
+                    "Frontier shadow: {} • envelope_hash={} • classified_at={}",
+                    frontier_classification_annotation(classification),
+                    display_or_dash(&classification.envelope_hash),
+                    classification.classified_at.to_rfc3339()
+                ),
+                StatusFeedRole::Info,
+            ));
+        }
         for command in &proposal.decision_commands {
             lines.push(line(
                 format!("Decision command: {command}"),
@@ -967,6 +979,65 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
         }
     }
     lines
+}
+
+fn frontier_summary_for_details(details: &RunDetails) -> FrontierSummary {
+    let proposals = details
+        .replan
+        .pending
+        .iter()
+        .chain(details.replan.history.iter())
+        .cloned()
+        .collect::<Vec<ReplanProposal>>();
+    frontier_summary_from_proposals(&proposals)
+}
+
+fn frontier_block(summary: &FrontierSummary) -> StatusFeedBlock {
+    let mut lines = vec![line(summary.summary_line.clone(), StatusFeedRole::Info)];
+    if !summary.tier_distribution.is_empty() {
+        let tiers = summary
+            .tier_distribution
+            .iter()
+            .map(|(tier, count)| format!("{tier}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(line(
+            format!("tier distribution {tiers}"),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if !summary.would_have_promoted.is_empty() {
+        lines.push(line(
+            format!(
+                "would-have-promoted proposals {}",
+                summary
+                    .would_have_promoted
+                    .iter()
+                    .map(|outcome| format!(
+                        "{} ({})",
+                        outcome.proposal_id, outcome.operator_outcome
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            StatusFeedRole::Info,
+        ));
+    }
+    if !summary.agreement.is_empty() {
+        lines.push(line(
+            format!(
+                "agreement accepted_unchanged={} accepted_modified={} rejected={} deferred={} pending={} ratio={}",
+                summary.agreement.accepted_unchanged,
+                summary.agreement.accepted_modified,
+                summary.agreement.rejected,
+                summary.agreement.deferred,
+                summary.agreement.pending,
+                summary.agreement.agreement_ratio
+            ),
+            StatusFeedRole::Dim,
+        ));
+    }
+    block("Frontier", "shadow classifier observations", lines)
 }
 
 fn proposed_change_feed_text(change: &crate::domain::ReplanProposedChange) -> String {
@@ -1138,16 +1209,23 @@ fn mission_envelope_block(
         ),
     ];
     let autonomy = envelope.autonomy_level.as_str();
-    if envelope.autonomy_level.recorded_not_active() {
-        lines.push(line(
-            format!("autonomy {autonomy} recorded, not yet active; effective behavior off"),
-            StatusFeedRole::Warning,
-        ));
-    } else {
-        lines.push(line(
+    match envelope.autonomy_level {
+        crate::domain::AutonomyLevel::Off => lines.push(line(
             "autonomy off; frontier authority inactive".to_string(),
             StatusFeedRole::Dim,
-        ));
+        )),
+        crate::domain::AutonomyLevel::Shadow => lines.push(line(
+            "autonomy shadow; classifier records observations only; queues, slices, and decisions stay operator-owned".to_string(),
+            StatusFeedRole::Info,
+        )),
+        crate::domain::AutonomyLevel::Promote | crate::domain::AutonomyLevel::Run => {
+            lines.push(line(
+                format!(
+                    "autonomy {autonomy} recorded, not yet active; AF-04 treats it as shadow observation only"
+                ),
+                StatusFeedRole::Warning,
+            ))
+        }
     }
     if !envelope.must_ask_if.is_empty() {
         lines.push(line(
@@ -2349,6 +2427,7 @@ mod tests {
             }],
             risk: "intent_affecting".to_string(),
             operator_decision: None,
+            frontier_classification: None,
             created_at: now,
             updated_at: now,
             decision_commands: replan_decision_commands("kd-test", "rp-test-001"),

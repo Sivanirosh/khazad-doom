@@ -10,6 +10,10 @@ use super::cockpit::{
 };
 use super::economics::{RunEconomicsRecorder, agent_call};
 use super::events as workflow_events;
+use super::frontier::promotion_policy::{
+    FollowupProposalChange, FollowupProposalView, ProposalGraphNode, SliceGraphSlice,
+    SliceGraphSliceStatus, SliceGraphView, classify_followup_proposal,
+};
 use super::gate::{
     IntegrationGateRequest, SliceVerificationRequest, VerificationCommandCache, WorkflowGate,
     WorktreeSetupRequest, failure_kind_needs_operator,
@@ -30,14 +34,15 @@ use crate::agent::{
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
 use crate::domain::{
-    AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
-    FindingDisposition, FollowupSliceDraft, FrontierBudgetState, GateResult, Handoff,
-    HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
-    MissionEnvelope, OriginNotificationTarget, PlanRevisions, RepairResult, ReplanDecision,
-    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run,
-    RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceProvenance, SliceRun,
-    SliceStatus, SliceValidationReport, SliceWriteResult, WorkerProfileEvidence, WorkerResult,
-    WorkflowConfig, WorkflowExitStates, replan_decision_commands,
+    AgentProfilesConfig, AutonomyLevel, BranchHandoff, CheckResult, CockpitMode,
+    EvidenceAttestation, Finding, FindingDisposition, FollowupSliceDraft, FrontierBudgetState,
+    FrontierClassification, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
+    ImplementationSummary, MergeConflictReport, MissionEnvelope, OriginNotificationTarget,
+    PlanRevisions, RepairResult, ReplanDecision, ReplanEvidenceLink, ReplanProposal,
+    ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus,
+    Slice, SliceExitState, SliceProvenance, SliceRun, SliceStatus, SliceValidationReport,
+    SliceWriteResult, WorkerProfileEvidence, WorkerResult, WorkflowConfig, WorkflowExitStates,
+    is_open_status, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -373,6 +378,7 @@ impl Manager {
     }
 
     fn block_if_pending_replan(&self, run: &Run, checkpoint: &str) -> Result<()> {
+        self.classify_pending_frontier_proposals_at_replan_checkpoint(run, checkpoint)?;
         let pending = self.state.pending_replan_proposals(&run.id)?;
         if pending.is_empty() {
             return Ok(());
@@ -402,6 +408,128 @@ impl Manager {
             self.notify_attention_for_replan(run, proposal);
         }
         Err(BlockedError::new(format!("{message}; decide with: {}", commands.join("; "))).into())
+    }
+
+    fn classify_pending_frontier_proposals_at_replan_checkpoint(
+        &self,
+        run: &Run,
+        checkpoint: &str,
+    ) -> Result<usize> {
+        let (envelope, budget_snapshot) = self.state.get_frontier_state(&run.id)?;
+        let Some(envelope) = envelope else {
+            return Ok(0);
+        };
+        let budget_snapshot = budget_snapshot.unwrap_or_default();
+        if envelope.autonomy_level == AutonomyLevel::Off {
+            return Ok(0);
+        }
+        let pending = self.state.pending_replan_proposals(&run.id)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let all_proposals = self.state.list_replan_proposals(&run.id)?;
+        let graph = self.frontier_slice_graph_for_run(run, &all_proposals)?;
+        let envelope_hash = mission_envelope_hash(&envelope)?;
+        let mut recorded = 0;
+        for proposal in pending {
+            let Some(draft) = add_followup_slice_draft_from_proposal(&proposal) else {
+                continue;
+            };
+            let view = FollowupProposalView {
+                proposal_id: proposal.id.as_str(),
+                source_slice_id: proposal.source.slice_id.as_str(),
+                change: FollowupProposalChange::AddFollowupSlice(&draft),
+                source_must_ask_if_hits: &[],
+                envelope_must_ask_if_hits: &[],
+                external_dependency_claims: &[],
+                changes_existing_dependencies: false,
+                changes_existing_acceptance: false,
+                changes_verify_profile: false,
+                changes_policy_or_schema: false,
+                needs_operator_context: false,
+                ambiguity_markers: &[],
+            };
+            let decision = classify_followup_proposal(&envelope, &graph, &view, &budget_snapshot);
+            let classification = FrontierClassification {
+                tier: decision.tier.as_str().to_string(),
+                reason_codes: decision
+                    .reason_codes
+                    .iter()
+                    .map(|reason| reason.as_str().to_string())
+                    .collect(),
+                classified_at: Utc::now(),
+                envelope_hash: envelope_hash.clone(),
+                budget_snapshot: budget_snapshot.clone(),
+                autonomy_level: envelope.autonomy_level,
+            };
+            let proposal = self.state.replace_replan_frontier_classification(
+                &run.id,
+                &proposal.id,
+                &classification,
+            )?;
+            self.state.record_event(
+                &run.id,
+                "frontier_classified",
+                &json!({
+                    "proposal_id": proposal.id,
+                    "checkpoint": checkpoint,
+                    "tier": classification.tier,
+                    "reason_codes": classification.reason_codes,
+                    "classified_at": classification.classified_at,
+                    "envelope_hash": classification.envelope_hash,
+                    "budget_snapshot": classification.budget_snapshot,
+                    "autonomy_level": classification.autonomy_level,
+                    "record_only": true,
+                    "queue_mutated": false,
+                    "slice_mutated": false,
+                    "decision_recorded": false,
+                }),
+            )?;
+            recorded += 1;
+        }
+        Ok(recorded)
+    }
+
+    fn frontier_slice_graph_for_run(
+        &self,
+        run: &Run,
+        proposals: &[ReplanProposal],
+    ) -> Result<SliceGraphView> {
+        let slices = artifact::Store::new(&run.repo_path)
+            .load_slices()?
+            .into_iter()
+            .map(|slice| {
+                let generation = slice
+                    .provenance()
+                    .map(|provenance| provenance.generation as i64)
+                    .unwrap_or(0);
+                SliceGraphSlice {
+                    id: slice.id,
+                    goal: slice.goal,
+                    status: if is_open_status(&slice.status) {
+                        SliceGraphSliceStatus::Open
+                    } else {
+                        SliceGraphSliceStatus::Closed
+                    },
+                    generation,
+                }
+            })
+            .collect();
+        let proposal_nodes = proposals
+            .iter()
+            .filter_map(|proposal| {
+                add_followup_slice_draft_from_proposal(proposal).map(|draft| {
+                    ProposalGraphNode::from_draft(proposal.id.clone(), proposal.state, &draft)
+                })
+            })
+            .collect();
+        Ok(SliceGraphView {
+            slices,
+            proposals: proposal_nodes,
+            no_frontier: false,
+            cancel_requested: false,
+            replan_apply_incomplete: false,
+        })
     }
 
     fn notify_attention_for_replan(&self, run: &Run, proposal: &ReplanProposal) {
@@ -6115,6 +6243,10 @@ fn applyable_followup_draft(proposal: &ReplanProposal) -> Option<FollowupSliceDr
     change.followup_slice_draft()
 }
 
+fn add_followup_slice_draft_from_proposal(proposal: &ReplanProposal) -> Option<FollowupSliceDraft> {
+    applyable_followup_draft(proposal)
+}
+
 fn is_apply_refusal(err: &anyhow::Error) -> bool {
     err.to_string().contains("apply_refused:")
 }
@@ -6135,6 +6267,13 @@ fn queue_snapshot_hash(ids: &[String]) -> String {
         hasher.update([0]);
     }
     hex::encode(hasher.finalize())
+}
+
+fn mission_envelope_hash(envelope: &MissionEnvelope) -> Result<String> {
+    let bytes = serde_json::to_vec(envelope)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn checkpoint_id(checkpoint: &str, stage: &str, sha: &str) -> String {
@@ -6734,6 +6873,54 @@ mod tests {
         )
     }
 
+    fn test_run(run_id: &str, repo: &Path, selected_slice_id: &str) -> Result<Run> {
+        let now = Utc::now();
+        Ok(Run {
+            id: run_id.to_string(),
+            repo_id: crate::paths::repo_id(repo),
+            repo_path: repo.to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo)?,
+            integration_branch: format!("khazad/{run_id}/integration"),
+            selected_slice_id: selected_slice_id.to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        })
+    }
+
+    fn workflow_slices_snapshot(store: &ArtifactStore) -> Result<BTreeMap<String, Vec<u8>>> {
+        let mut snapshot = BTreeMap::new();
+        let dir = store.slices_dir();
+        snapshot_dir(&dir, &dir, &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn snapshot_dir(
+        base: &Path,
+        path: &Path,
+        snapshot: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry.file_type()?.is_dir() {
+                snapshot_dir(base, &entry_path, snapshot)?;
+            } else {
+                let rel = entry_path
+                    .strip_prefix(base)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                snapshot.insert(rel, fs::read(entry_path)?);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn rejects_worker_result_for_wrong_slice() {
         let result = WorkerResult {
@@ -7051,6 +7238,246 @@ mod tests {
             .join("\n");
         assert!(feed_text.contains("Proposed follow-up slice: slice-001-followup"));
         assert!(feed_text.contains("khazad-doom replan accept"));
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_shadow_classifies_without_mutating_slices_queue_or_decisions() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = test_run("kd-frontier-shadow", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        state.set_frontier_state(
+            &run.id,
+            Some(&mission_envelope()),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        let before_slices = workflow_slices_snapshot(&store)?;
+        let before_queue = run.selected_slice_id.clone();
+
+        assert_eq!(
+            manager.classify_pending_frontier_proposals_at_replan_checkpoint(&run, "test")?,
+            1
+        );
+
+        let after = state.get_run(&run.id)?.expect("run exists");
+        assert_eq!(after.selected_slice_id, before_queue);
+        assert_eq!(workflow_slices_snapshot(&store)?, before_slices);
+        let proposal = state.pending_replan_proposals(&run.id)?.remove(0);
+        assert!(proposal.operator_decision.is_none());
+        let classification = proposal
+            .frontier_classification
+            .as_ref()
+            .expect("classification recorded");
+        assert_eq!(classification.tier, "tier_1");
+        assert_eq!(classification.autonomy_level, AutonomyLevel::Shadow);
+        assert!(!classification.envelope_hash.trim().is_empty());
+        assert_eq!(
+            classification.budget_snapshot,
+            FrontierBudgetState::default()
+        );
+        assert!(
+            classification
+                .reason_codes
+                .contains(&"shadow_observation_only".to_string())
+        );
+        assert!(
+            classification
+                .reason_codes
+                .contains(&"inside_allowed_areas".to_string())
+        );
+
+        let events = state.get_events(&run.id, 20)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.typ == "frontier_classified")
+                .count(),
+            1
+        );
+        let model =
+            RunReadModelBuilder::new(&state).snapshot(&after, RunReadModelOptions::status(20))?;
+        let feed = model.details.feed.as_ref().expect("feed projected");
+        let attention_text = feed
+            .attention
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(attention_text.contains("Frontier shadow"));
+        assert!(attention_text.contains("would auto-promote"));
+        let block_text = feed
+            .blocks
+            .iter()
+            .flat_map(|block| block.lines.iter())
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block_text.contains("frontier shadow observations"));
+        assert!(
+            model
+                .plan_revisions
+                .frontier
+                .summary_line
+                .contains("frontier shadow observations")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_off_shadow_promote_and_run_do_not_mutate_slices_or_queue() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        store.write_slice(&slice("slice-001"), true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let before_slices = workflow_slices_snapshot(&store)?;
+
+        let cases = [
+            ("off", AutonomyLevel::Off, false),
+            ("shadow", AutonomyLevel::Shadow, true),
+            ("promote", AutonomyLevel::Promote, true),
+            ("run", AutonomyLevel::Run, true),
+        ];
+        for (label, level, should_classify) in cases {
+            let run = test_run(&format!("kd-frontier-{label}"), repo.path(), "slice-001")?;
+            state.insert_run(&run)?;
+            let mut envelope = mission_envelope();
+            envelope.autonomy_level = level;
+            state.set_frontier_state(
+                &run.id,
+                Some(&envelope),
+                Some(&FrontierBudgetState::default()),
+            )?;
+            create_followup_replan_proposal(
+                &state,
+                &run.id,
+                "slice-001",
+                followup_draft("slice-001-followup"),
+            )?;
+
+            let classified =
+                manager.classify_pending_frontier_proposals_at_replan_checkpoint(&run, "test")?;
+            assert_eq!(classified == 1, should_classify, "{label}");
+            assert_eq!(workflow_slices_snapshot(&store)?, before_slices, "{label}");
+            let after = state.get_run(&run.id)?.expect("run exists");
+            assert_eq!(after.selected_slice_id, "slice-001", "{label}");
+            let proposal = state.pending_replan_proposals(&run.id)?.remove(0);
+            assert!(proposal.operator_decision.is_none(), "{label}");
+            assert_eq!(
+                proposal.frontier_classification.is_some(),
+                should_classify,
+                "{label}"
+            );
+            if let Some(classification) = proposal.frontier_classification {
+                assert_eq!(classification.autonomy_level, level, "{label}");
+                assert!(
+                    classification
+                        .reason_codes
+                        .contains(&"shadow_observation_only".to_string())
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_shadow_reclassification_survives_restart_and_preserves_event_history() -> Result<()>
+    {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        store.write_slice(&slice("slice-001"), true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
+        let run = test_run("kd-frontier-restart", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        state.set_frontier_state(
+            &run.id,
+            Some(&mission_envelope()),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        let proposal = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        assert_eq!(
+            manager.classify_pending_frontier_proposals_at_replan_checkpoint(
+                &run,
+                "worker dispatch"
+            )?,
+            1
+        );
+        let first = state
+            .get_replan_proposal(&run.id, &proposal.id)?
+            .unwrap()
+            .frontier_classification
+            .expect("first classification");
+
+        thread::sleep(Duration::from_millis(2));
+        let reopened = StateStore::open(paths.db_file())?;
+        let restarted = Manager::with_runner(paths, reopened.clone(), Arc::new(FakeRunner));
+        let run_after_restart = reopened.get_run(&run.id)?.expect("run persisted");
+        assert_eq!(
+            restarted.classify_pending_frontier_proposals_at_replan_checkpoint(
+                &run_after_restart,
+                "resume"
+            )?,
+            1
+        );
+        let latest = reopened
+            .get_replan_proposal(&run.id, &proposal.id)?
+            .unwrap()
+            .frontier_classification
+            .expect("latest classification");
+        assert_eq!(latest.envelope_hash, first.envelope_hash);
+        assert!(latest.classified_at >= first.classified_at);
+        let events = reopened.get_events(&run.id, 20)?;
+        let frontier_events = events
+            .iter()
+            .filter(|event| event.typ == "frontier_classified")
+            .collect::<Vec<_>>();
+        assert_eq!(frontier_events.len(), 2);
+        assert_eq!(frontier_events[0].payload["checkpoint"], "worker dispatch");
+        assert_eq!(frontier_events[1].payload["checkpoint"], "resume");
         Ok(())
     }
 
@@ -7683,10 +8110,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(mission_text.contains("Complete the bounded mission"));
-        assert!(
-            mission_text
-                .contains("autonomy shadow recorded, not yet active; effective behavior off")
-        );
+        assert!(mission_text.contains(
+            "autonomy shadow; classifier records observations only; queues, slices, and decisions stay operator-owned"
+        ));
 
         let summary_path =
             ArtifactStore::new(repo.path()).output_path(&run.id, "implementation-summary.json");
@@ -8542,6 +8968,135 @@ mod tests {
         assert_eq!(handoff.plan_revisions.rejected.len(), 1);
         assert_eq!(handoff.plan_revisions.deferred.len(), 1);
         assert_eq!(handoff.plan_revisions.superseded.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn shadow_frontier_metrics_reach_final_reports_and_handoff() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.areas = vec!["src/".to_string()];
+        first.verify = vec!["test -f src/slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(TwoFollowupsRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+            mission_envelope: Some(mission_envelope()),
+        })?;
+
+        let blocked = wait_for_run(&state, &run.id)?;
+        assert_eq!(blocked.status, RunStatus::Blocked);
+        let pending = state.pending_replan_proposals(&run.id)?;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|proposal| {
+            proposal
+                .frontier_classification
+                .as_ref()
+                .is_some_and(|classification| {
+                    classification
+                        .reason_codes
+                        .contains(&"shadow_observation_only".to_string())
+                })
+        }));
+
+        state.decide_replan_proposal(
+            &run.id,
+            &pending[0].id,
+            ReplanProposalState::Accepted,
+            "operator accepted first shadow candidate",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+        state.decide_replan_proposal(
+            &run.id,
+            &pending[1].id,
+            ReplanProposalState::Rejected,
+            "operator rejected second shadow candidate",
+            "operator",
+            "daemon_ipc",
+            "",
+            "",
+        )?;
+
+        manager.resume_run(ResumeOptions {
+            run_id: run.id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+        })?;
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+
+        let final_report: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(final_report.plan_revisions.frontier.candidates_seen, 2);
+        assert_eq!(
+            final_report
+                .plan_revisions
+                .frontier
+                .tier_distribution
+                .get("tier_1"),
+            Some(&2)
+        );
+        assert_eq!(
+            final_report.plan_revisions.frontier.agreement.tier1_total,
+            2
+        );
+        assert_eq!(
+            final_report
+                .plan_revisions
+                .frontier
+                .agreement
+                .accepted_unchanged,
+            1
+        );
+        assert_eq!(final_report.plan_revisions.frontier.agreement.rejected, 1);
+        assert_eq!(
+            final_report
+                .plan_revisions
+                .frontier
+                .agreement
+                .agreement_ratio,
+            "1/2"
+        );
+        let implementation_summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
+        assert_eq!(
+            implementation_summary
+                .plan_revisions
+                .frontier
+                .agreement
+                .agreement_ratio,
+            "1/2"
+        );
+        let handoff = manager.branch_handoff(&run.id, false, false, false)?;
+        assert_eq!(handoff.plan_revisions.frontier.candidates_seen, 2);
+        assert_eq!(handoff.plan_revisions.frontier.agreement.rejected, 1);
         Ok(())
     }
 
@@ -10074,6 +10629,67 @@ mod tests {
 
         fn name(&self) -> &str {
             "fake"
+        }
+    }
+
+    struct TwoFollowupsRunner;
+
+    impl Runner for TwoFollowupsRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if job.kind == "integration-repair" {
+                return Ok(ResultData {
+                    output: Some(json!({ "status": "no-op", "summary": "no repair needed" })),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            fs::create_dir_all(job.cwd.join("src"))?;
+            let rel_path = format!("src/{}.txt", handoff.slice.id);
+            fs::write(job.cwd.join(&rel_path), format!("{}\n", handoff.slice.id))?;
+            gitutil::run(&job.cwd, &["add", "."])?;
+            gitutil::run(
+                &job.cwd,
+                &["commit", "-m", &format!("implement {}", handoff.slice.id)],
+            )?;
+            let sha = gitutil::head_sha(&job.cwd)?;
+            let mut output = json!({
+                "slice_id": handoff.slice.id,
+                "status": "complete",
+                "summary": "implemented with two bounded follow-ups" ,
+                "commit_sha": sha,
+                "changed_files": [rel_path],
+                "acceptance_status": acceptance_status_json(&handoff.slice)
+            });
+            if handoff.slice.id == "slice-001" {
+                let mut first = followup_draft("slice-001-followup-a");
+                first.title = "Follow-up A".to_string();
+                first.goal = "Complete follow-up A work".to_string();
+                first.verify = vec!["test -f src/slice-001-followup-a.txt".to_string()];
+                let mut second = followup_draft("slice-001-followup-b");
+                second.title = "Follow-up B".to_string();
+                second.goal = "Complete follow-up B work".to_string();
+                second.verify = vec!["test -f src/slice-001-followup-b.txt".to_string()];
+                output["candidate_followup_slices"] = serde_json::to_value(vec![first, second])?;
+            }
+            Ok(ResultData {
+                output: Some(output),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "two-followups"
         }
     }
 
