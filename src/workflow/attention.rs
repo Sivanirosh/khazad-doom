@@ -22,10 +22,12 @@ pub(crate) struct OperatorAttention {
     state: StateStore,
 }
 
+#[allow(dead_code)]
 pub(crate) struct WorkerQuestionPending<'a> {
     pub question: &'a WorkerQuestion,
 }
 
+#[allow(dead_code)]
 pub(crate) struct ReplanDecisionPending<'a> {
     pub run: &'a Run,
     pub proposal: &'a ReplanProposal,
@@ -50,6 +52,7 @@ impl OperatorAttention {
         Self { state }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn worker_question_pending(&self, intent: WorkerQuestionPending<'_>) {
         let question = intent.question;
         let Ok(Some(run)) = self.state.get_run(&question.run_id) else {
@@ -89,6 +92,7 @@ impl OperatorAttention {
         );
     }
 
+    #[allow(dead_code)]
     pub(crate) fn replan_decision_pending(&self, intent: ReplanDecisionPending<'_>) {
         let Some(origin) = self.origin_target(intent.run) else {
             return;
@@ -319,6 +323,7 @@ impl OperatorAttention {
         }
     }
 
+    #[allow(dead_code)]
     fn origin_target(&self, run: &Run) -> Option<crate::domain::OriginNotificationTarget> {
         let store = artifact::Store::new(&run.repo_path);
         match store.read_origin_notification_target(&run.id) {
@@ -327,6 +332,7 @@ impl OperatorAttention {
         }
     }
 
+    #[allow(dead_code)]
     fn send_and_focus_attention(
         &self,
         run: &Run,
@@ -453,6 +459,7 @@ impl OperatorAttention {
     }
 }
 
+#[allow(dead_code)]
 struct AttentionFailureContext {
     source_of_truth: &'static str,
     delivery_message: &'static str,
@@ -460,6 +467,7 @@ struct AttentionFailureContext {
     payload_fields: Value,
 }
 
+#[allow(dead_code)]
 impl AttentionFailureContext {
     fn delivery_payload(
         &self,
@@ -510,6 +518,7 @@ impl AttentionFailureContext {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn worker_question_answer_command(question: &WorkerQuestion) -> String {
     format!(
         "khazad-doom answer {} {} <answer>",

@@ -3290,6 +3290,7 @@ impl Manager {
         Ok(FollowupApplyMode::AppendAndRun)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_followup_proposal_at_checkpoint(
         &self,
         run: &mut Run,
@@ -6846,13 +6847,13 @@ fn matching_proposed_disposition_index(
     draft: &FollowupSliceDraft,
 ) -> Option<usize> {
     let draft_id = draft.id.trim().to_ascii_lowercase();
-    if !draft_id.is_empty() {
-        if let Some((index, _)) = dispositions.iter().enumerate().find(|(_, disposition)| {
+    if !draft_id.is_empty()
+        && let Some((index, _)) = dispositions.iter().enumerate().find(|(_, disposition)| {
             is_unassigned_proposed_disposition(disposition)
                 && disposition_or_finding_mentions_draft(findings, disposition, &draft_id)
-        }) {
-            return Some(index);
-        }
+        })
+    {
+        return Some(index);
     }
     dispositions
         .iter()

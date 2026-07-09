@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ const COCKPIT_LAYOUT_WORKER_REGION_RATIO: &str = "0.68";
 const COCKPIT_LAYOUT_WORKER_SPLIT_RATIO: &str = "0.50";
 const COCKPIT_MODE_TRANSPORT_PREFIX: &str = "__khazad_cockpit_mode=";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const HERDR_SPAWN_RETRY_ATTEMPTS: usize = 5;
+const HERDR_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
 const ATTENTION_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const ATTENTION_DELIVERY_ADAPTER: &str = "herdr";
 const ATTENTION_DELIVERY_SURFACE: &str = "agent_send";
@@ -407,6 +409,7 @@ pub(crate) struct CockpitTuiWorkerOpened {
     pub slot_region: String,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CockpitTuiWorkerLaunch {
     Opened(CockpitTuiWorkerOpened),
@@ -630,7 +633,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
         workspace: &CockpitWorkspaceRef,
         request: &CockpitRunRequest,
     ) -> Result<Vec<String>> {
-        let plan = CockpitLayoutPlanner::default().plan(1)?;
+        let plan = CockpitLayoutPlanner.plan(1)?;
         let dashboard = self.dashboard_pane_request(request);
         self.adapter.inspect_layout(workspace)?;
         self.adapter
@@ -692,7 +695,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
         let inspection = self.adapter.inspect_layout(&workspace)?;
-        let plan = CockpitLayoutPlanner::default().plan(inspection.worker_slot_count() + 1)?;
+        let plan = CockpitLayoutPlanner.plan(inspection.worker_slot_count() + 1)?;
         let dashboard = self.dashboard_pane_request(run_request);
         self.adapter
             .ensure_dashboard_pane(&workspace, &plan.dashboard, &dashboard)?;
@@ -741,7 +744,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
         let inspection = self.adapter.inspect_layout(&workspace)?;
-        let plan = CockpitLayoutPlanner::default().plan(inspection.worker_slot_count() + 1)?;
+        let plan = CockpitLayoutPlanner.plan(inspection.worker_slot_count() + 1)?;
         let dashboard = self.dashboard_pane_request(run_request);
         self.adapter
             .ensure_dashboard_pane(&workspace, &plan.dashboard, &dashboard)?;
@@ -2081,11 +2084,7 @@ fn run_command_with_timeout(
     args: &[String],
     timeout: Duration,
 ) -> Result<CommandOutput> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut child = spawn_command_with_retry(bin, args)
         .with_context(|| format!("spawn herdr {}", display_args(args)))?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -2131,6 +2130,36 @@ fn run_command_with_timeout(
     }
 }
 
+fn spawn_command_with_retry(bin: &Path, args: &[String]) -> std::io::Result<Child> {
+    for attempt in 0..HERDR_SPAWN_RETRY_ATTEMPTS {
+        match Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(err) if is_text_file_busy(&err) && attempt + 1 < HERDR_SPAWN_RETRY_ATTEMPTS => {
+                thread::sleep(HERDR_SPAWN_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("spawn retry loop always returns on its final attempt")
+}
+
+fn is_text_file_busy(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(26)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
 fn khazad_child_binary() -> PathBuf {
     reusable_khazad_binary(std::env::current_exe().ok().as_deref())
         .unwrap_or_else(|| PathBuf::from("khazad-doom"))
@@ -2141,10 +2170,10 @@ fn reusable_khazad_binary(current_exe: Option<&Path>) -> Option<PathBuf> {
         if is_executable(path) {
             return Some(path.to_path_buf());
         }
-        if let Some(stripped) = strip_linux_deleted_exe_suffix(path) {
-            if is_executable(&stripped) {
-                return Some(stripped);
-            }
+        if let Some(stripped) = strip_linux_deleted_exe_suffix(path)
+            && is_executable(&stripped)
+        {
+            return Some(stripped);
         }
     }
     find_executable_in_path("khazad-doom")
@@ -2698,7 +2727,7 @@ mod tests {
 
     #[test]
     fn cockpit_layout_planner_places_dashboard_right_workers_left_for_one_to_four_workers() {
-        let planner = CockpitLayoutPlanner::default();
+        let planner = CockpitLayoutPlanner;
 
         for workers in 1..=4 {
             let plan = planner.plan(workers).unwrap();
@@ -2723,7 +2752,7 @@ mod tests {
 
     #[test]
     fn cockpit_layout_planner_uses_stable_worker_slots_and_v2_three_worker_fallback() {
-        let planner = CockpitLayoutPlanner::default();
+        let planner = CockpitLayoutPlanner;
         let plan = planner.plan(4).unwrap();
         let names = plan
             .worker_slots
@@ -2916,7 +2945,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             3,
         );
         let workspace = test_workspace(Some("w1:p1"));
-        let plan = CockpitLayoutPlanner::default().plan(2).unwrap();
+        let plan = CockpitLayoutPlanner.plan(2).unwrap();
 
         adapter
             .start_tui_worker_agent_in_slot_once(
@@ -2950,7 +2979,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             3,
         );
         let workspace = test_workspace(None);
-        let plan = CockpitLayoutPlanner::default().plan(1).unwrap();
+        let plan = CockpitLayoutPlanner.plan(1).unwrap();
 
         let opened = adapter
             .start_tui_worker_agent_in_slot_once(
@@ -2988,7 +3017,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             5,
         );
         let workspace = test_workspace(None);
-        let plan = CockpitLayoutPlanner::default().plan(1).unwrap();
+        let plan = CockpitLayoutPlanner.plan(1).unwrap();
 
         adapter
             .start_tui_worker_agent_in_slot_once(

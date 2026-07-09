@@ -741,7 +741,7 @@ pub(crate) mod promotion_policy {
         let text = normalized_text(candidate_text(candidate));
         non_goals
             .iter()
-            .map(|non_goal| normalized_text(non_goal))
+            .map(normalized_text)
             .filter(|non_goal| !non_goal.is_empty())
             .any(|non_goal| text.contains(&non_goal))
     }
@@ -750,7 +750,7 @@ pub(crate) mod promotion_policy {
         let text = normalized_text(candidate_text(candidate));
         must_ask_if
             .iter()
-            .map(|rule| normalized_text(rule))
+            .map(normalized_text)
             .filter(|rule| !rule.is_empty())
             .any(|rule| text.contains(&rule))
     }
