@@ -117,6 +117,7 @@ impl Store {
         }
         self.ensure_default_config()?;
         self.write_slice_schema()?;
+        self.write_mission_envelope_schema()?;
         self.ensure_area_contract()?;
         ensure_gitignore(&self.repo_path)
     }
@@ -151,6 +152,10 @@ impl Store {
 
     pub fn slice_schema_path(&self) -> PathBuf {
         self.schema_dir().join("slice.schema.json")
+    }
+
+    pub fn mission_envelope_schema_path(&self) -> PathBuf {
+        self.schema_dir().join("mission-envelope.schema.json")
     }
 
     pub fn area_contract_path(&self) -> PathBuf {
@@ -434,6 +439,12 @@ impl Store {
         Ok(path)
     }
 
+    pub fn write_mission_envelope_schema(&self) -> Result<PathBuf> {
+        let path = self.mission_envelope_schema_path();
+        write_json(&path, &mission_envelope_schema())?;
+        Ok(path)
+    }
+
     fn ensure_area_contract(&self) -> Result<()> {
         let path = self.area_contract_path();
         if path.exists() {
@@ -625,6 +636,38 @@ pub fn slice_schema() -> Value {
             "verify_profile": { "type": "string" },
             "verify": { "type": "array", "items": { "type": "string" } },
             "verify_timeout_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 }
+        }
+    })
+}
+
+pub fn mission_envelope_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://khazad-doom.local/mission-envelope.schema.json",
+        "title": "Khazad-Doom Mission Envelope",
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["goal", "allowed_areas"],
+        "properties": {
+            "goal": { "type": "string", "minLength": 1 },
+            "allowed_areas": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": SLICE_AREA_SCHEMA_PATTERN,
+                    "description": "Repo-relative literal path prefix using the same area contract as slice areas."
+                },
+                "uniqueItems": true
+            },
+            "non_goals": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "verify_profile": { "type": "string", "minLength": 1, "default": "default" },
+            "max_auto_promotions": { "type": "integer", "minimum": 0 },
+            "max_depth": { "type": "integer", "minimum": 0 },
+            "max_generated_slices": { "type": "integer", "minimum": 0 },
+            "autonomy_level": { "type": "string", "enum": ["off", "shadow", "promote", "run"], "default": "off" },
+            "must_ask_if": { "type": "array", "items": { "type": "string", "minLength": 1 } }
         }
     })
 }

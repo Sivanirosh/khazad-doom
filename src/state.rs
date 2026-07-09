@@ -1,7 +1,7 @@
 use crate::domain::{
-    Event, ReplanDecision, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
-    ReplanProposalState, ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus,
-    WorkerAttemptProgress, WorkerQuestion,
+    Event, FrontierBudgetState, MissionEnvelope, ReplanDecision, ReplanEvidenceLink,
+    ReplanProposal, ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run,
+    RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptProgress, WorkerQuestion,
 };
 use crate::pi_contract;
 use anyhow::{Context, Result};
@@ -262,6 +262,18 @@ impl Store {
             "timeout_seconds",
             "timeout_seconds INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(
+            &conn,
+            "runs",
+            "mission_envelope_json",
+            "mission_envelope_json TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "runs",
+            "frontier_budget_json",
+            "frontier_budget_json TEXT NOT NULL DEFAULT ''",
+        )?;
         Ok(())
     }
 
@@ -297,6 +309,64 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn set_frontier_state(
+        &self,
+        run_id: &str,
+        mission_envelope: Option<&MissionEnvelope>,
+        frontier_budget: Option<&FrontierBudgetState>,
+    ) -> Result<()> {
+        let envelope_json = mission_envelope
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_default();
+        let budget_json = frontier_budget
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_default();
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE runs SET mission_envelope_json=?1, frontier_budget_json=?2, updated_at=?3 WHERE id=?4",
+            params![envelope_json, budget_json, Utc::now().to_rfc3339(), run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_frontier_state(
+        &self,
+        run_id: &str,
+    ) -> Result<(Option<MissionEnvelope>, Option<FrontierBudgetState>)> {
+        let conn = self.conn()?;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT mission_envelope_json, frontier_budget_json FROM runs WHERE id=?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((envelope_json, budget_json)) = row else {
+            return Ok((None, None));
+        };
+        let mission_envelope = if envelope_json.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&envelope_json)
+                    .with_context(|| format!("parse mission envelope for run {run_id}"))?,
+            )
+        };
+        let frontier_budget = if budget_json.trim().is_empty() {
+            mission_envelope
+                .as_ref()
+                .map(|_| FrontierBudgetState::default())
+        } else {
+            Some(
+                serde_json::from_str(&budget_json)
+                    .with_context(|| format!("parse frontier budget for run {run_id}"))?,
+            )
+        };
+        Ok((mission_envelope, frontier_budget))
     }
 
     pub fn update_run(&self, run_id: &str, status: RunStatus, error: &str) -> Result<()> {

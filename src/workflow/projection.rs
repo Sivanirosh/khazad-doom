@@ -1,8 +1,9 @@
 use super::events::{IMPLEMENTATION_SUMMARY, ImplementationSummaryPayload, RUN_STARTED};
 use crate::domain::{
-    GateCommandResult, GateResult, RepairResult, RunDetails, RunEconomics, RunIncident,
-    RunProgress, RunStatus, SliceRun, SliceStatus, StatusFeed, StatusFeedBlock, StatusFeedLine,
-    StatusFeedRole, TerminalReason, WorkerAttemptProgress, WorkflowExitStates,
+    FrontierBudgetState, GateCommandResult, GateResult, MissionEnvelope, RepairResult, RunDetails,
+    RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus, StatusFeed,
+    StatusFeedBlock, StatusFeedLine, StatusFeedRole, TerminalReason, WorkerAttemptProgress,
+    WorkflowExitStates,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -785,6 +786,7 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
 
     let mut blocks = vec![
         run_block(details, now),
+        mission_block(details),
         workers_block(details, now),
         attention_block(&attention),
     ];
@@ -1046,6 +1048,90 @@ fn attention_block(attention: &[StatusFeedLine]) -> StatusFeedBlock {
         attention.to_vec()
     };
     block("Attention", "", lines)
+}
+
+fn mission_block(details: &RunDetails) -> StatusFeedBlock {
+    match &details.mission_envelope {
+        Some(envelope) => mission_envelope_block(envelope, details.frontier_budget.as_ref()),
+        None => block(
+            "Mission",
+            "autonomy off",
+            vec![
+                line("no envelope (autonomy off)", StatusFeedRole::Dim),
+                line(
+                    "frontier authority inactive; legacy run behavior unchanged",
+                    StatusFeedRole::Dim,
+                ),
+            ],
+        ),
+    }
+}
+
+fn mission_envelope_block(
+    envelope: &MissionEnvelope,
+    budget: Option<&FrontierBudgetState>,
+) -> StatusFeedBlock {
+    let budget = budget.cloned().unwrap_or_default();
+    let mut lines = vec![
+        line(
+            format!("goal {}", truncate_display(&envelope.goal, LINE_WIDTH)),
+            StatusFeedRole::Info,
+        ),
+        line(
+            format!("allowed areas {}", list_or_none(&envelope.allowed_areas)),
+            StatusFeedRole::Info,
+        ),
+        line(
+            format!("non-goals {}", list_or_none(&envelope.non_goals)),
+            StatusFeedRole::Dim,
+        ),
+        line(
+            format!(
+                "verify profile {}",
+                display_or_dash(&envelope.verify_profile)
+            ),
+            StatusFeedRole::Dim,
+        ),
+        line(
+            format!(
+                "budgets auto_promotions {}/{} • generated_slices {}/{} • max_depth {} • max_generation_reached {}",
+                budget.auto_promotions_used,
+                envelope.max_auto_promotions,
+                budget.generated_slices,
+                envelope.max_generated_slices,
+                envelope.max_depth,
+                budget.max_generation_reached
+            ),
+            StatusFeedRole::Info,
+        ),
+    ];
+    let autonomy = envelope.autonomy_level.as_str();
+    if envelope.autonomy_level.recorded_not_active() {
+        lines.push(line(
+            format!("autonomy {autonomy} recorded, not yet active; effective behavior off"),
+            StatusFeedRole::Warning,
+        ));
+    } else {
+        lines.push(line(
+            "autonomy off; frontier authority inactive".to_string(),
+            StatusFeedRole::Dim,
+        ));
+    }
+    if !envelope.must_ask_if.is_empty() {
+        lines.push(line(
+            format!("must ask if {}", list_or_none(&envelope.must_ask_if)),
+            StatusFeedRole::Dim,
+        ));
+    }
+    block("Mission", "envelope recorded", lines)
+}
+
+fn list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".to_string()
+    } else {
+        truncate_display(&values.join(", "), LINE_WIDTH)
+    }
 }
 
 fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
@@ -1907,6 +1993,8 @@ mod tests {
             incidents: Vec::new(),
             questions: Vec::new(),
             replan: Default::default(),
+            mission_envelope: None,
+            frontier_budget: None,
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: None,
@@ -1915,10 +2003,11 @@ mod tests {
         let feed = project_run_at(&details, now);
         assert_eq!(feed.feed_version, 1);
         assert_eq!(feed.blocks[0].label, "Run");
-        assert_eq!(feed.blocks[1].label, "Workers");
-        assert_eq!(feed.blocks[2].label, "Attention");
-        assert_eq!(feed.blocks[3].label, "Checks");
-        assert_eq!(feed.blocks[4].label, "Economics");
+        assert_eq!(feed.blocks[1].label, "Mission");
+        assert_eq!(feed.blocks[2].label, "Workers");
+        assert_eq!(feed.blocks[3].label, "Attention");
+        assert_eq!(feed.blocks[4].label, "Checks");
+        assert_eq!(feed.blocks[5].label, "Economics");
         assert!(feed.blocks.iter().all(|block| block.label != "Commands"));
         assert!(feed.blocks.iter().all(|block| block.label != "Incidents"));
     }
@@ -2003,6 +2092,8 @@ mod tests {
                 answer: String::new(),
             }],
             replan: Default::default(),
+            mission_envelope: None,
+            frontier_budget: None,
             events: vec![Event {
                 id: 1,
                 run_id: "kd-test".to_string(),
@@ -2140,6 +2231,8 @@ mod tests {
             incidents: Vec::new(),
             questions: Vec::new(),
             replan: Default::default(),
+            mission_envelope: None,
+            frontier_budget: None,
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: Some(TerminalReason {
@@ -2268,6 +2361,8 @@ mod tests {
                 history: vec![decided],
                 auto_approvable: Vec::new(),
             },
+            mission_envelope: None,
+            frontier_budget: None,
             events: Vec::new(),
             economics: None,
             primary_terminal_reason: None,

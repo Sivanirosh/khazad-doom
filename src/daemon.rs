@@ -587,6 +587,7 @@ impl Server {
                     parallelism: params.parallelism,
                     allow_dirty: params.allow_dirty,
                     origin_notification_target: params.origin_notification_target,
+                    mission_envelope: params.mission_envelope,
                 })?;
                 Ok(HandleOutcome::result(StartRunResult { run_id: run.id })?)
             }

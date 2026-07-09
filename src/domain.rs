@@ -546,6 +546,95 @@ pub struct Run {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyLevel {
+    #[default]
+    Off,
+    Shadow,
+    Promote,
+    Run,
+}
+
+impl AutonomyLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Promote => "promote",
+            Self::Run => "run",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "" | "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "promote" => Ok(Self::Promote),
+            "run" => Ok(Self::Run),
+            other => anyhow::bail!(
+                "mission envelope autonomy_level {other:?} is invalid; expected off, shadow, promote, or run"
+            ),
+        }
+    }
+
+    pub fn recorded_not_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for AutonomyLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MissionEnvelope {
+    pub goal: String,
+    pub allowed_areas: Vec<String>,
+    pub non_goals: Vec<String>,
+    #[serde(default = "default_mission_verify_profile")]
+    pub verify_profile: String,
+    #[serde(default)]
+    pub max_auto_promotions: i64,
+    #[serde(default)]
+    pub max_depth: i64,
+    #[serde(default)]
+    pub max_generated_slices: i64,
+    #[serde(default)]
+    pub autonomy_level: AutonomyLevel,
+    pub must_ask_if: Vec<String>,
+}
+
+impl Default for MissionEnvelope {
+    fn default() -> Self {
+        Self {
+            goal: String::new(),
+            allowed_areas: Vec::new(),
+            non_goals: Vec::new(),
+            verify_profile: default_mission_verify_profile(),
+            max_auto_promotions: 0,
+            max_depth: 0,
+            max_generated_slices: 0,
+            autonomy_level: AutonomyLevel::Off,
+            must_ask_if: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct FrontierBudgetState {
+    #[serde(default)]
+    pub auto_promotions_used: i64,
+    #[serde(default)]
+    pub generated_slices: i64,
+    #[serde(default)]
+    pub max_generation_reached: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct OriginNotificationTarget {
@@ -667,6 +756,10 @@ pub struct Handoff {
     pub dependency_summary: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
     pub worker_profile: WorkerProfileEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_envelope: Option<MissionEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget: Option<FrontierBudgetState>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent_profile: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1098,6 +1191,10 @@ pub struct ImplementationSummary {
     pub final_sha: String,
     #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
     pub worker_profile: WorkerProfileEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_envelope: Option<MissionEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget: Option<FrontierBudgetState>,
     pub completed_slices: Vec<WorkerResult>,
     pub checks: Vec<CheckResult>,
     pub integration_repair: RepairResult,
@@ -1557,6 +1654,10 @@ pub struct RunDetails {
     pub questions: Vec<WorkerQuestion>,
     #[serde(default)]
     pub replan: ReplanStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_envelope: Option<MissionEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget: Option<FrontierBudgetState>,
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economics: Option<RunEconomics>,
@@ -1631,6 +1732,10 @@ pub struct BranchHandoff {
     pub evidence_attestation: EvidenceAttestation,
     #[serde(default)]
     pub plan_revisions: PlanRevisions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_envelope: Option<MissionEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget: Option<FrontierBudgetState>,
     pub summary_path: String,
     pub final_report_path: String,
     pub push_command: String,
@@ -1735,6 +1840,10 @@ fn is_default_cockpit_mode(value: &CockpitMode) -> bool {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_mission_verify_profile() -> String {
+    "default".to_string()
 }
 
 pub fn is_open_status(value: &str) -> bool {

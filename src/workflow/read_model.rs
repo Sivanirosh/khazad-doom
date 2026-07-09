@@ -95,6 +95,7 @@ impl<'a> RunReadModelBuilder<'a> {
             .unwrap_or_default();
         let proposals = self.state.list_replan_proposals(&run_id)?;
         let replan = replan_status_from_proposals(&run_id, proposals.clone());
+        let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run_id)?;
         let plan_revisions = plan_revisions_from_proposals(&run, proposals)?;
         let primary_terminal_reason = primary_terminal_reason_impl(
             &run,
@@ -112,6 +113,8 @@ impl<'a> RunReadModelBuilder<'a> {
             incidents,
             questions,
             replan,
+            mission_envelope,
+            frontier_budget,
             events,
             economics,
             primary_terminal_reason,

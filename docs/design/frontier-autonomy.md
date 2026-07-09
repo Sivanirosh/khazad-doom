@@ -3,7 +3,9 @@
 Date: 2026-07-09  
 Status: proposed for AF-00; runtime implementation is deferred to AF-01..AF-08.
 
-This RFC defines the smallest autonomous-frontier behavior allowed by the roadmap. It is an execution-grade design for later slices, not a runtime change. The daemon remains the workflow owner. Slice JSON plus daemon/run state remain workflow truth. Frontier behavior only changes who may record a bounded accept decision for one kind of existing replan proposal.
+This RFC defines the smallest autonomous-frontier behavior allowed by the roadmap. It is an execution-grade design for later slices. The daemon remains the workflow owner. Slice JSON plus daemon/run state remain workflow truth. Frontier behavior only changes who may record a bounded accept decision for one kind of existing replan proposal.
+
+AF-02 implements only the durable record surface: `khazad-doom run --envelope <mission.json> [--autonomy off|shadow|promote|run]` validates the envelope, persists it with a zeroed `FrontierBudgetState`, and projects both into status/watch/monitor/report/handoff. Every autonomy level remains effective `off` in AF-02; there is no classifier, no auto-authority, no proposal generation, and no apply path.
 
 ## Evidence and constraints
 
