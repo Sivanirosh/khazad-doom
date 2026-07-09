@@ -21,7 +21,7 @@ pub(crate) use cockpit::{
     workspace_label_for_run as cockpit_workspace_label_for_run,
 };
 pub use manager::{GithubImportOptions, Manager, ResumeOptions, SliceDraft, StartOptions};
-pub(crate) use projection::project_gate_pane;
+pub(crate) use projection::{project_gate_pane, short_path};
 pub use prompts::{
     integration_repair_prompt, slice_repair_prompt, worker_envelope_retry_prompt, worker_prompt,
 };

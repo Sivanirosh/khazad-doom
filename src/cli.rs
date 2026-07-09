@@ -18,7 +18,7 @@ use crate::pi_contract::PiActivityFormatter;
 use crate::state::Store as StateStore;
 use crate::workflow::{
     CockpitOpenFocus, cockpit_mode_transport_arg, cockpit_workspace_label_for_run,
-    open_default_run_cockpit_for_operator, project_gate_pane,
+    open_default_run_cockpit_for_operator, project_gate_pane, short_path,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -887,22 +887,29 @@ fn monitor_run(
     interval: Duration,
     clear_screen: bool,
 ) -> Result<()> {
+    let live = clear_screen && !once;
+    let mut guard = live.then(LiveScreenGuard::enter);
     let mut first = true;
     loop {
         let details = fetch_run_details(client, &run_id, events_limit)?;
-        render_monitor_snapshot(Some(&details), None, clear_screen, !clear_screen && !first)?;
+        render_monitor_snapshot(Some(&details), None, live, !live && !first)?;
         first = false;
         if once {
             return monitor_once_result(&details);
         }
-        match details.run.status {
-            RunStatus::Completed => return Ok(()),
-            RunStatus::Failed
-            | RunStatus::Blocked
-            | RunStatus::Cancelled
-            | RunStatus::Interrupted => return terminal_run_error(&details),
-            _ => thread::sleep(interval),
+        if is_terminal_status(details.run.status) {
+            // closing the alternate screen discards the last frame, so
+            // repaint the final state onto the normal screen where it
+            // persists in scrollback
+            if guard.take().is_some() {
+                render_monitor_snapshot(Some(&details), None, false, false)?;
+            }
+            return match details.run.status {
+                RunStatus::Completed => Ok(()),
+                _ => terminal_run_error(&details),
+            };
         }
+        thread::sleep(interval);
     }
 }
 
@@ -914,6 +921,8 @@ fn monitor_latest(
     interval: Duration,
     clear_screen: bool,
 ) -> Result<()> {
+    let live = clear_screen && !once;
+    let _guard = live.then(LiveScreenGuard::enter);
     let mut attached_run_id: Option<String> = None;
     let mut first = true;
     loop {
@@ -930,12 +939,7 @@ fn monitor_latest(
                 fetch_latest_run(client, &repo_path, events_limit, false)?
             }
         };
-        render_monitor_snapshot(
-            details.as_ref(),
-            Some(&repo_path),
-            clear_screen,
-            !clear_screen && !first,
-        )?;
+        render_monitor_snapshot(details.as_ref(), Some(&repo_path), live, !live && !first)?;
         first = false;
 
         if once {
@@ -1007,7 +1011,7 @@ fn run_attend(
         print!("\x1b[2J\x1b[H");
         println!("Khazad-Doom Attend — {}", details.run.id);
         println!();
-        render_run_monitor(&mut io::stdout(), &details)?;
+        render_run_monitor(&mut io::stdout(), &details, MonitorStyle::detect())?;
         println!();
         println!(
             "Commands: a <n> <answer> | answer <question-id> <answer> | accept <proposal-id> <reason> | reject <proposal-id> <reason> | defer <proposal-id> <condition> --reason <reason> | resume | q"
@@ -1908,28 +1912,184 @@ fn render_feed_plain(out: &mut impl Write, feed: &StatusFeed) -> Result<()> {
     Ok(())
 }
 
-fn render_feed_monitor(out: &mut impl Write, feed: &StatusFeed) -> Result<()> {
+fn render_feed_monitor(out: &mut impl Write, feed: &StatusFeed, style: MonitorStyle) -> Result<()> {
     for (index, block) in feed.blocks.iter().enumerate() {
         if index > 0 {
             writeln!(out)?;
         }
-        monitor_heading(out, &block.label, &block.meta)?;
+        monitor_heading(out, style, &block.label, &block.meta)?;
         if block.lines.is_empty() {
-            monitor_tree_dim(out, "-")?;
+            monitor_line(out, style, "-", StatusFeedRole::Dim, true)?;
             continue;
         }
-        for line in &block.lines {
-            match line.role {
-                StatusFeedRole::Attention => monitor_tree_unbounded(out, &line.text)?,
-                StatusFeedRole::Dim => monitor_tree_dim(out, &line.text)?,
-                _ => monitor_tree(out, &line.text)?,
-            }
+        for (position, line) in block.lines.iter().enumerate() {
+            let is_last = position + 1 == block.lines.len();
+            monitor_line(out, style, &line.text, line.role, is_last)?;
         }
     }
     Ok(())
 }
 
 const MONITOR_LINE_WIDTH: usize = 96;
+const MONITOR_MIN_WIDTH: usize = 24;
+const MONITOR_MIN_HEIGHT: usize = 8;
+const MONITOR_FOOTER: &str = "read-only • act: khazad-doom attend --latest";
+
+#[derive(Debug, Clone, Copy)]
+struct MonitorStyle {
+    width: usize,
+    rows: Option<usize>,
+    color: bool,
+}
+
+impl MonitorStyle {
+    fn plain() -> Self {
+        Self {
+            width: MONITOR_LINE_WIDTH,
+            rows: None,
+            color: false,
+        }
+    }
+
+    fn detect() -> Self {
+        if !stdout_is_terminal() {
+            return Self::plain();
+        }
+        let (width, rows) = terminal_size();
+        Self {
+            width: width.unwrap_or(MONITOR_LINE_WIDTH).max(MONITOR_MIN_WIDTH),
+            rows: rows.map(|rows| rows.max(MONITOR_MIN_HEIGHT)),
+            color: std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM").map_or(true, |term| term != "dumb"),
+        }
+    }
+
+    fn paint(&self, text: &str, code: &str) -> String {
+        if !self.color || code.is_empty() {
+            text.to_string()
+        } else {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        }
+    }
+}
+
+fn monitor_role_code(role: StatusFeedRole) -> &'static str {
+    match role {
+        StatusFeedRole::Heading => "1",
+        StatusFeedRole::Info => "",
+        StatusFeedRole::Dim => "2",
+        StatusFeedRole::Success => "32",
+        StatusFeedRole::Warning => "33",
+        StatusFeedRole::Error => "31",
+        StatusFeedRole::Attention => "1;36",
+    }
+}
+
+fn terminal_size() -> (Option<usize>, Option<usize>) {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    let env_dimension = |name: &str| {
+        std::env::var(name)
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+    };
+    let width = if ok && ws.ws_col > 0 {
+        Some(ws.ws_col as usize)
+    } else {
+        env_dimension("COLUMNS")
+    };
+    let rows = if ok && ws.ws_row > 0 {
+        Some(ws.ws_row as usize)
+    } else {
+        env_dimension("LINES")
+    };
+    (width, rows)
+}
+
+/// Owns the alternate screen for a live monitor session: nothing the
+/// dashboard paints lands in scrollback, and the pane is restored on exit.
+/// SIGINT/SIGTERM handlers restore the screen before terminating because
+/// the default disposition would kill the process without running Drop.
+struct LiveScreenGuard;
+
+extern "C" fn monitor_restore_screen_on_signal(signal: libc::c_int) {
+    const RESTORE: &[u8] = b"\x1b[?1049l\x1b[?25h";
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            RESTORE.as_ptr().cast(),
+            RESTORE.len(),
+        );
+        libc::_exit(128 + signal);
+    }
+}
+
+impl LiveScreenGuard {
+    fn enter() -> Self {
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l");
+        let _ = out.flush();
+        let handler = monitor_restore_screen_on_signal as extern "C" fn(libc::c_int) as usize;
+        unsafe {
+            libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        }
+        Self
+    }
+}
+
+impl Drop for LiveScreenGuard {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?1049l\x1b[?25h");
+        let _ = out.flush();
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+    }
+}
+
+/// Wrap one rendered frame for in-place display: clamp the body to the pane
+/// height (a frame taller than the viewport would scroll, growing the pane's
+/// scrollback forever), append the read-only signpost footer, and clear each
+/// line's tail plus any leftover rows from the previous frame.
+fn compose_live_frame(content: &str, style: MonitorStyle) -> String {
+    let mut lines = content.lines().collect::<Vec<_>>();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let mut elided = 0usize;
+    if let Some(rows) = style.rows {
+        // one row for the footer, one left free so the cursor never
+        // pushes the pane into scrolling
+        let budget = rows.saturating_sub(2).max(1);
+        if lines.len() > budget {
+            elided = lines.len() - budget.saturating_sub(1);
+            lines.truncate(budget.saturating_sub(1));
+        }
+    }
+    let mut frame = String::from("\x1b[?2026h\x1b[H");
+    for line in &lines {
+        frame.push_str(line);
+        frame.push_str("\x1b[K\n");
+    }
+    if elided > 0 {
+        frame.push_str(&style.paint(&format!("… {elided} more lines — enlarge pane"), "2"));
+        frame.push_str("\x1b[K\n");
+    }
+    frame.push_str(&style.paint(&truncate_display(MONITOR_FOOTER, style.width), "2"));
+    frame.push_str("\x1b[K\n\x1b[0J\x1b[?2026l");
+    frame
+}
 
 fn render_monitor_snapshot(
     details: Option<&RunDetails>,
@@ -1937,43 +2097,84 @@ fn render_monitor_snapshot(
     clear_screen: bool,
     separator: bool,
 ) -> Result<()> {
+    let style = MonitorStyle::detect();
+    let repo = details
+        .map(|details| details.run.repo_path.as_str())
+        .or(waiting_repo)
+        .unwrap_or("-");
+    let repo_label = truncate_display(
+        &short_path(repo),
+        style
+            .width
+            .saturating_sub("Khazad-Doom Monitor • ".chars().count())
+            .max(8),
+    );
+
+    let mut buf = Vec::new();
+    writeln!(
+        buf,
+        "{} {}",
+        style.paint("Khazad-Doom Monitor", "1"),
+        style.paint(&format!("• {repo_label}"), "2")
+    )?;
+    writeln!(buf)?;
+    match details {
+        Some(details) => render_run_monitor(&mut buf, details, style)?,
+        None => render_waiting_monitor(&mut buf, style)?,
+    }
+    writeln!(buf)?;
+    let content = String::from_utf8(buf)?;
+
     let mut out = io::stdout();
     if clear_screen {
-        write!(out, "\x1b[2J\x1b[H")?;
-    } else if separator {
-        writeln!(out, "---")?;
+        write!(out, "{}", compose_live_frame(&content, style))?;
+    } else {
+        if separator {
+            writeln!(out, "---")?;
+        }
+        write!(out, "{content}")?;
     }
-
-    writeln!(out, "Khazad-Doom Monitor")?;
-    writeln!(out)?;
-    match details {
-        Some(details) => render_run_monitor(&mut out, details)?,
-        None => render_waiting_monitor(&mut out, waiting_repo.unwrap_or("-"))?,
-    }
-    writeln!(out)?;
     out.flush()?;
     Ok(())
 }
 
-fn render_waiting_monitor(out: &mut impl Write, repo: &str) -> Result<()> {
-    monitor_heading(out, "Run", "waiting")?;
-    monitor_tree(out, &format!("repo {repo}"))?;
-    monitor_tree_dim(out, "waiting for the latest active daemon-owned run")?;
-    writeln!(out)?;
-    monitor_heading(out, "Hint", "")?;
-    monitor_tree_dim(
+fn render_waiting_monitor(out: &mut impl Write, style: MonitorStyle) -> Result<()> {
+    monitor_heading(out, style, "Run", "waiting")?;
+    monitor_line(
         out,
+        style,
+        "waiting for the latest active daemon-owned run",
+        StatusFeedRole::Dim,
+        true,
+    )?;
+    writeln!(out)?;
+    monitor_heading(out, style, "Hint", "")?;
+    monitor_line(
+        out,
+        style,
         "start a run normally; this dashboard will attach when status --latest returns one",
+        StatusFeedRole::Dim,
+        true,
     )?;
     Ok(())
 }
 
-fn render_run_monitor(out: &mut impl Write, details: &RunDetails) -> Result<()> {
+fn render_run_monitor(
+    out: &mut impl Write,
+    details: &RunDetails,
+    style: MonitorStyle,
+) -> Result<()> {
     match &details.feed {
-        Some(feed) => render_feed_monitor(out, feed),
+        Some(feed) => render_feed_monitor(out, feed, style),
         None => {
-            monitor_heading(out, "Feed", "unavailable")?;
-            monitor_tree(out, "daemon status feed unavailable")
+            monitor_heading(out, style, "Feed", "unavailable")?;
+            monitor_line(
+                out,
+                style,
+                "daemon status feed unavailable",
+                StatusFeedRole::Info,
+                true,
+            )
         }
     }
 }
@@ -1986,27 +2187,86 @@ fn progress_phase_label(progress: &crate::domain::RunProgress) -> String {
     }
 }
 
-fn monitor_heading(out: &mut impl Write, label: &str, meta: &str) -> Result<()> {
-    if meta.trim().is_empty() {
-        writeln!(out, "{label}")?;
+fn monitor_heading(out: &mut impl Write, style: MonitorStyle, label: &str, meta: &str) -> Result<()> {
+    let painted = style.paint(label, monitor_role_code(StatusFeedRole::Heading));
+    let meta = meta.trim();
+    if meta.is_empty() {
+        writeln!(out, "{painted}")?;
     } else {
-        writeln!(out, "{label} {meta}")?;
+        let meta_width = style.width.saturating_sub(label.chars().count() + 1).max(1);
+        writeln!(out, "{painted} {}", truncate_display(meta, meta_width))?;
     }
     Ok(())
 }
 
-fn monitor_tree(out: &mut impl Write, text: &str) -> Result<()> {
-    writeln!(out, "└ {}", truncate_display(text, MONITOR_LINE_WIDTH))?;
+fn monitor_line(
+    out: &mut impl Write,
+    style: MonitorStyle,
+    text: &str,
+    role: StatusFeedRole,
+    is_last: bool,
+) -> Result<()> {
+    let code = monitor_role_code(role);
+    let glyph = if is_last { "└" } else { "├" };
+    let continuation = if is_last { "  " } else { "│ " };
+    let text_width = style.width.saturating_sub(2).max(1);
+    // Dim lines are low-value metadata: keep the dashboard compact by
+    // truncating them to one line instead of wrapping.
+    if role == StatusFeedRole::Dim {
+        let painted = style.paint(&truncate_display(text, text_width), code);
+        writeln!(out, "{glyph} {painted}")?;
+        return Ok(());
+    }
+    for (index, segment) in wrap_display(text, text_width).iter().enumerate() {
+        let painted = style.paint(segment, code);
+        if index == 0 {
+            writeln!(out, "{glyph} {painted}")?;
+        } else {
+            writeln!(out, "{continuation}{painted}")?;
+        }
+    }
     Ok(())
 }
 
-fn monitor_tree_unbounded(out: &mut impl Write, text: &str) -> Result<()> {
-    writeln!(out, "└ {text}")?;
-    Ok(())
-}
-
-fn monitor_tree_dim(out: &mut impl Write, text: &str) -> Result<()> {
-    monitor_tree(out, text)
+fn wrap_display(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut pieces = Vec::new();
+    for word in text.split_whitespace() {
+        let chars = word.chars().collect::<Vec<_>>();
+        if chars.len() <= max_chars {
+            pieces.push(word.to_string());
+        } else {
+            for chunk in chars.chunks(max_chars) {
+                pieces.push(chunk.iter().collect());
+            }
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for piece in pieces {
+        let piece_chars = piece.chars().count();
+        if current_chars > 0 && current_chars + 1 + piece_chars > max_chars {
+            lines.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        if current_chars > 0 {
+            current.push(' ');
+            current_chars += 1;
+        }
+        current.push_str(&piece);
+        current_chars += piece_chars;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn truncate_display(value: &str, max_chars: usize) -> String {
@@ -2360,14 +2620,153 @@ mod tests {
         details.run.error = "from run error not feed".to_string();
 
         let mut out = Vec::new();
-        render_run_monitor(&mut out, &details)?;
+        let style = MonitorStyle {
+            width: 50,
+            rows: None,
+            color: false,
+        };
+        render_run_monitor(&mut out, &details, style)?;
         let rendered = String::from_utf8(out).unwrap();
 
-        assert!(rendered.contains(long_attention));
-        assert!(rendered.contains("khazad-doom answer kd-test q-1 <answer>"));
+        // attention wraps to the pane width but keeps its full content;
+        // joining continuation lines reconstructs the original text
+        let unwrapped = rendered.replace("\n  ", " ");
+        assert!(unwrapped.contains(long_attention));
+        assert!(unwrapped.contains("khazad-doom answer kd-test q-1 <answer>"));
+        // dim metadata is truncated to a single line, not wrapped
         assert!(!rendered.contains(long_dim));
         assert!(rendered.contains('…'));
         assert!(!rendered.contains("from run error not feed"));
+        for line in rendered.lines() {
+            assert!(line.chars().count() <= 50, "line exceeds width: {line}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_lines_wrap_on_word_boundaries_with_hanging_indent() -> Result<()> {
+        let style = MonitorStyle {
+            width: 40,
+            rows: None,
+            color: false,
+        };
+        let mut out = Vec::new();
+        monitor_line(
+            &mut out,
+            style,
+            "agents 0 completed + 3 in flight • cmds 0 • dup 0 • cache 0/0",
+            StatusFeedRole::Info,
+            true,
+        )?;
+        let rendered = String::from_utf8(out).unwrap();
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert!(lines.len() > 1, "{rendered}");
+        assert!(lines[0].starts_with("└ "));
+        for continuation in &lines[1..] {
+            assert!(continuation.starts_with("  "), "{continuation}");
+        }
+        for line in &lines {
+            assert!(line.chars().count() <= 40, "line exceeds width: {line}");
+        }
+        // words survive wrapping intact ("dup" must never split into "d up")
+        assert!(rendered.replace("\n  ", " ").contains("dup 0"));
+
+        // intermediate lines use the tee glyph and rail their continuations
+        let mut mid = Vec::new();
+        monitor_line(
+            &mut mid,
+            style,
+            "agents 0 completed + 3 in flight • cmds 0 • dup 0 • cache 0/0",
+            StatusFeedRole::Info,
+            false,
+        )?;
+        let mid = String::from_utf8(mid).unwrap();
+        let mid_lines = mid.lines().collect::<Vec<_>>();
+        assert!(mid_lines[0].starts_with("├ "));
+        for continuation in &mid_lines[1..] {
+            assert!(continuation.starts_with("│ "), "{continuation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_wrap_hard_splits_words_longer_than_the_width() {
+        let wrapped = wrap_display("abcdefghij", 4);
+        assert_eq!(wrapped, vec!["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_display("short line", 96), vec!["short line"]);
+    }
+
+    #[test]
+    fn live_frame_clamps_to_pane_height_with_elision_marker_and_footer() {
+        let style = MonitorStyle {
+            width: 60,
+            rows: Some(10),
+            color: false,
+        };
+        let content = (0..20).map(|i| format!("line-{i}\n")).collect::<String>();
+        let frame = compose_live_frame(&content, style);
+
+        assert!(frame.starts_with("\x1b[?2026h\x1b[H"));
+        assert!(frame.ends_with("\x1b[0J\x1b[?2026l"));
+        // budget = rows - 2 = 8: seven content lines survive, then the
+        // elision marker, then the footer — nine written rows < ten rows,
+        // so the frame can never scroll the pane
+        assert!(frame.contains("line-6"));
+        assert!(!frame.contains("line-7"));
+        assert!(frame.contains("… 13 more lines — enlarge pane"));
+        assert!(frame.contains(MONITOR_FOOTER));
+        assert_eq!(frame.matches("\x1b[K\n").count(), 9);
+    }
+
+    #[test]
+    fn live_frame_without_known_height_keeps_all_lines_and_trims_trailing_blanks() {
+        let style = MonitorStyle {
+            width: 60,
+            rows: None,
+            color: false,
+        };
+        let frame = compose_live_frame("alpha\nbeta\n\n\n", style);
+        assert!(frame.contains("alpha\x1b[K\n"));
+        assert!(frame.contains("beta\x1b[K\n"));
+        assert!(!frame.contains("… "));
+        assert!(frame.contains(MONITOR_FOOTER));
+        // trailing blank lines are dropped; footer directly follows the body
+        assert!(frame.contains("beta\x1b[K\nread-only"));
+    }
+
+    #[test]
+    fn monitor_color_styles_follow_roles_and_plain_mode_has_no_escapes() -> Result<()> {
+        let color = MonitorStyle {
+            width: 96,
+            rows: None,
+            color: true,
+        };
+        let mut out = Vec::new();
+        monitor_line(&mut out, color, "gate failed", StatusFeedRole::Error, false)?;
+        monitor_line(&mut out, color, "worker is quiet", StatusFeedRole::Warning, false)?;
+        monitor_line(&mut out, color, "gate passed", StatusFeedRole::Success, false)?;
+        monitor_line(&mut out, color, "no operator attention", StatusFeedRole::Dim, false)?;
+        monitor_line(&mut out, color, "answer the question", StatusFeedRole::Attention, true)?;
+        monitor_heading(&mut out, color, "Run", "● running")?;
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("\x1b[31mgate failed\x1b[0m"));
+        assert!(rendered.contains("\x1b[33mworker is quiet\x1b[0m"));
+        assert!(rendered.contains("\x1b[32mgate passed\x1b[0m"));
+        assert!(rendered.contains("\x1b[2mno operator attention\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;36manswer the question\x1b[0m"));
+        assert!(rendered.contains("\x1b[1mRun\x1b[0m ● running"));
+
+        let mut plain_out = Vec::new();
+        monitor_line(
+            &mut plain_out,
+            MonitorStyle::plain(),
+            "gate failed",
+            StatusFeedRole::Error,
+            true,
+        )?;
+        monitor_heading(&mut plain_out, MonitorStyle::plain(), "Run", "● running")?;
+        let plain = String::from_utf8(plain_out).unwrap();
+        assert!(!plain.contains('\x1b'));
         Ok(())
     }
 
@@ -2647,3 +3046,4 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 }
+

@@ -851,7 +851,7 @@ fn pending_question_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<S
     {
         lines.push(line(
             format!(
-                "Pending question {} • slice={} • attempt={}",
+                "[operator] Pending question {} • slice={} • attempt={}",
                 question.id, question.slice_id, question.attempt
             ),
             StatusFeedRole::Attention,
@@ -916,7 +916,7 @@ fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
         let source = replan_source_label(proposal);
         lines.push(line(
             format!(
-                "Pending replan {} • {source} • risk={}",
+                "[operator] Pending replan {} • {source} • risk={}",
                 proposal.id,
                 display_or_dash(&proposal.risk)
             ),
@@ -1181,11 +1181,13 @@ fn dashboard_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<StatusFe
 }
 
 fn terminal_reason_attention_lines(reason: &TerminalReason) -> Vec<StatusFeedLine> {
+    // lead with the resolution owner so the operator can see at a glance
+    // whose move it is
     let mut lines = vec![line(
         format!(
-            "Terminal reason: kind={} • owner={} • retryable={} • operator_action_required={}",
-            display_or_dash(&reason.kind),
+            "[{}] Terminal reason: kind={} • retryable={} • operator_action_required={}",
             display_or_dash(&reason.resolution_owner),
+            display_or_dash(&reason.kind),
             reason.retryable,
             reason.operator_action_required
         ),
@@ -1323,7 +1325,10 @@ fn list_or_none(values: &[String]) -> String {
 }
 
 fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
-    let items = selected_slice_items(details);
+    let mut items = selected_slice_items(details);
+    // Stable sort so active/problem slices stay visible ahead of the
+    // "… N more" truncation; roadmap order is preserved within a status.
+    items.sort_by_key(|slice| slice_display_priority(slice.status));
     let active = active_worker_count(details, &items);
     let mut lines = Vec::new();
 
@@ -1334,7 +1339,7 @@ fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
             lines.push(active_line);
         }
         if let Some(worker) = &progress.worker {
-            lines.extend(worker_supervision_lines(worker, now));
+            lines.push(worker_supervision_line(worker, now));
             if let Some(warning) = worker_quiet_warning(worker, now) {
                 lines.push(line(warning, StatusFeedRole::Warning));
                 lines.push(line(
@@ -1368,27 +1373,22 @@ fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
     )
 }
 
-fn worker_supervision_lines(
-    worker: &WorkerAttemptProgress,
-    now: DateTime<Utc>,
-) -> Vec<StatusFeedLine> {
-    vec![
-        line(
-            format!("Process: {}", worker_process_label(worker)),
-            StatusFeedRole::Info,
+fn worker_supervision_line(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> StatusFeedLine {
+    let role = if timeout_exceeded(worker, now) {
+        StatusFeedRole::Warning
+    } else {
+        StatusFeedRole::Info
+    };
+    line(
+        format!(
+            "supervisor {} • {} • last event {} • timeout {}",
+            supervisor_label(worker, now),
+            worker_process_label(worker),
+            last_worker_event_label(worker, now),
+            timeout_label(worker, now)
         ),
-        line(
-            format!(
-                "Last worker event: {}",
-                last_worker_event_label(worker, now)
-            ),
-            StatusFeedRole::Info,
-        ),
-        line(
-            format!("Timeout: {}", timeout_label(worker, now)),
-            StatusFeedRole::Dim,
-        ),
-    ]
+        role,
+    )
 }
 
 fn active_worker_count(details: &RunDetails, items: &[SliceRun]) -> usize {
@@ -1427,21 +1427,13 @@ fn active_worker_line(
     } else {
         String::new()
     };
-    let mut text = format!(
-        "active {target}{attempt} • elapsed {}",
-        since_time(progress.phase_started_at, now)
-    );
-    if let Some(worker) = &progress.worker {
-        text.push_str(&format!(" • Supervisor: {}", supervisor_label(worker, now)));
-    }
-    if !progress.message.trim().is_empty() {
-        text.push_str(&format!(
-            " • {}",
-            truncate_display(&progress.message, LINE_WIDTH / 2)
-        ));
-    }
+    // supervisor state lives on the supervision line and the worker message
+    // lives in the Run block; this line only names the active work
     Some(line(
-        truncate_display(&text, LINE_WIDTH),
+        format!(
+            "active {target}{attempt} • elapsed {}",
+            since_time(progress.phase_started_at, now)
+        ),
         StatusFeedRole::Info,
     ))
 }
@@ -1459,55 +1451,30 @@ fn checks_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
         .as_ref()
         .and_then(|summary| summary.integration_repair.clone());
 
-    let mut lines = vec![line(
-        format!(
-            "verify profile {}",
-            gate_pane_verification_profile(details, summary.as_ref())
-        ),
-        StatusFeedRole::Dim,
-    )];
-    match &details.progress {
-        Some(progress) if !should_hide_current_progress(details, progress) => {
+    let mut lines = Vec::new();
+    // phase and message live in the Run block; Checks only surfaces
+    // check-specific activity (the running command and its tail)
+    if let Some(progress) = &details.progress
+        && !should_hide_current_progress(details, progress)
+    {
+        if !progress.command.trim().is_empty() && !is_worker_agent_phase(&progress.phase) {
             lines.push(line(
                 format!(
-                    "phase {} • updated {} ago",
-                    progress_phase_label(progress),
-                    since_time(progress.updated_at, now)
+                    "command {}",
+                    truncate_display(&progress.command, LINE_WIDTH)
+                ),
+                StatusFeedRole::Dim,
+            ));
+        }
+        if !progress.output_tail.trim().is_empty() {
+            lines.push(line(
+                format!(
+                    "tail {}",
+                    truncate_display(&progress.output_tail, LINE_WIDTH)
                 ),
                 StatusFeedRole::Info,
             ));
-            if !progress.command.trim().is_empty() && !is_worker_agent_phase(&progress.phase) {
-                lines.push(line(
-                    format!(
-                        "command {}",
-                        truncate_display(&progress.command, LINE_WIDTH)
-                    ),
-                    StatusFeedRole::Dim,
-                ));
-            }
-            if !progress.message.trim().is_empty() {
-                lines.push(line(
-                    format!(
-                        "message {}",
-                        truncate_display(&progress.message, LINE_WIDTH)
-                    ),
-                    StatusFeedRole::Info,
-                ));
-            }
-            if !progress.output_tail.trim().is_empty() {
-                lines.push(line(
-                    format!(
-                        "tail {}",
-                        truncate_display(&progress.output_tail, LINE_WIDTH)
-                    ),
-                    StatusFeedRole::Info,
-                ));
-            }
         }
-        _ => lines.push(line(
-            format!("phase {}", details.run.status),
-            StatusFeedRole::Dim,
-        )),
     }
 
     match &latest_gate {
@@ -1532,9 +1499,19 @@ fn checks_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
     let repair_policy = gate_pane_repair_policy(details);
     let (repair_state, repair_role) =
         gate_pane_repair_state(&repair_policy, latest_gate.as_ref(), repair.as_ref());
+    let repair_attempts = details
+        .economics
+        .as_ref()
+        .map(|economics| {
+            format!(
+                " {}/{}",
+                economics.repair_attempts, economics.repair_max_attempts
+            )
+        })
+        .unwrap_or_default();
     lines.push(line(
         format!(
-            "repair {repair_policy} • {}",
+            "repair {repair_policy}{repair_attempts} • {}",
             repair_state
                 .strip_prefix("State: ")
                 .unwrap_or(&repair_state)
@@ -1556,7 +1533,14 @@ fn checks_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
         },
     ));
 
-    block("Checks", "", lines)
+    block(
+        "Checks",
+        format!(
+            "verify {}",
+            gate_pane_verification_profile(details, summary.as_ref())
+        ),
+        lines,
+    )
 }
 
 fn dashboard_summary_suffix(summary: &str) -> String {
@@ -1595,16 +1579,14 @@ fn run_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
     let elapsed_start = progress
         .map(|progress| progress.phase_started_at)
         .unwrap_or(details.run.started_at);
-    let mut lines = vec![
-        line(
-            format!("phase {phase} • elapsed {}", since_time(elapsed_start, now)),
-            StatusFeedRole::Info,
-        ),
-        line(
-            format!("repo {}", short_path(&details.run.repo_path)),
-            StatusFeedRole::Dim,
-        ),
-    ];
+    let mut phase_line = format!("phase {phase} • elapsed {}", since_time(elapsed_start, now));
+    if let Some(progress) = progress {
+        phase_line.push_str(&format!(
+            " • updated {} ago",
+            since_time(progress.updated_at, now)
+        ));
+    }
+    let mut lines = vec![line(phase_line, StatusFeedRole::Info)];
     if let Some(profile) = compact_worker_profile(&details.worker_profile) {
         lines.push(line(format!("profile {profile}"), StatusFeedRole::Dim));
     }
@@ -1661,29 +1643,24 @@ fn economics_block(details: &RunDetails, economics: &RunEconomics) -> StatusFeed
     let active_agents = active_agent_call_count(details);
     let active_commands = active_command_count(details);
     let active_work = active_agents > 0 || active_commands > 0;
-    let mut lines = vec![
-        line(
-            format!(
-                "agents {} • cmds {} • dup {} • cache {}/{}",
-                agent_call_count_label(economics.agent_call_count, active_agents, active_work),
-                command_count_label(economics.command_execution_count, active_commands),
-                economics.duplicate_command_count,
-                economics.cache_hits,
-                economics.cache_misses
-            ),
-            StatusFeedRole::Info,
-        ),
-        line(
-            format!(
-                "repair {} {}/{} • fail-fast {}",
-                display_or_dash(&economics.repair_policy),
-                economics.repair_attempts,
-                economics.repair_max_attempts,
-                economics.gate_fail_fast
-            ),
-            StatusFeedRole::Info,
-        ),
-    ];
+    // repair policy/attempts/state are consolidated on the Checks block;
+    // zero-valued dup/cache counters are noise and stay hidden
+    let mut counters = format!(
+        "agents {} • cmds {}",
+        agent_call_count_label(economics.agent_call_count, active_agents, active_work),
+        command_count_label(economics.command_execution_count, active_commands)
+    );
+    if economics.duplicate_command_count > 0 {
+        counters.push_str(&format!(" • dup {}", economics.duplicate_command_count));
+    }
+    if economics.cache_hits > 0 || economics.cache_misses > 0 {
+        counters.push_str(&format!(
+            " • cache {}/{}",
+            economics.cache_hits, economics.cache_misses
+        ));
+    }
+    counters.push_str(&format!(" • fail-fast {}", economics.gate_fail_fast));
+    let mut lines = vec![line(counters, StatusFeedRole::Info)];
     if economics.agent_calls.iter().any(|call| {
         call.worker_evidence_kind() == "deterministic_test_double_not_real_pi_worker_evidence"
     }) {
@@ -1894,8 +1871,8 @@ fn supervisor_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> Strin
 
 fn worker_process_label(worker: &WorkerAttemptProgress) -> String {
     match worker.pid {
-        Some(pid) => format!("running pid={pid}"),
-        None => "running".to_string(),
+        Some(pid) => format!("pid={pid}"),
+        None => "pid unknown".to_string(),
     }
 }
 
@@ -1911,6 +1888,17 @@ fn last_worker_event_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -
         ),
         None => "none".to_string(),
     }
+}
+
+fn timeout_exceeded(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> bool {
+    if worker.attempt_timeout_seconds == 0 {
+        return false;
+    }
+    let elapsed = now
+        .signed_duration_since(worker.attempt_started_at)
+        .to_std()
+        .unwrap_or_default();
+    elapsed >= Duration::from_secs(worker.attempt_timeout_seconds)
 }
 
 fn timeout_label(worker: &WorkerAttemptProgress, now: DateTime<Utc>) -> String {
@@ -1994,6 +1982,18 @@ fn role_for_status(status: RunStatus) -> StatusFeedRole {
     }
 }
 
+fn slice_display_priority(status: SliceStatus) -> u8 {
+    match status {
+        SliceStatus::Running => 0,
+        SliceStatus::RepairNeeded => 1,
+        SliceStatus::Failed | SliceStatus::Blocked => 2,
+        SliceStatus::ReadyToMerge => 3,
+        SliceStatus::Interrupted | SliceStatus::Cancelled => 4,
+        SliceStatus::Pending => 5,
+        SliceStatus::Merged => 6,
+    }
+}
+
 fn role_for_slice_status(status: SliceStatus) -> StatusFeedRole {
     match status {
         SliceStatus::Merged => StatusFeedRole::Success,
@@ -2061,7 +2061,7 @@ fn short_run_id(value: &str) -> String {
     format!("{prefix}…{suffix}")
 }
 
-fn short_path(value: &str) -> String {
+pub(crate) fn short_path(value: &str) -> String {
     let text = value.trim();
     if text.is_empty() {
         return "-".to_string();
@@ -2200,6 +2200,82 @@ mod tests {
         assert_eq!(feed.blocks[5].label, "Economics");
         assert!(feed.blocks.iter().all(|block| block.label != "Commands"));
         assert!(feed.blocks.iter().all(|block| block.label != "Incidents"));
+    }
+
+    #[test]
+    fn workers_block_keeps_active_slices_visible_ahead_of_truncation() {
+        let now = Utc::now();
+        let slice = |slice_id: &str, status: SliceStatus| SliceRun {
+            run_id: "kd-test".to_string(),
+            slice_id: slice_id.to_string(),
+            status,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 0,
+            last_error: String::new(),
+        };
+        // The running slice sits past the WORKER_ITEMS cutoff in storage order.
+        let details = RunDetails {
+            run: Run {
+                id: "kd-test".to_string(),
+                repo_id: "repo".to_string(),
+                repo_path: "/tmp/repo".to_string(),
+                status: RunStatus::Running,
+                base_branch: "main".to_string(),
+                base_sha: "base".to_string(),
+                integration_branch: "khazad/kd-test/integration".to_string(),
+                selected_slice_id: String::new(),
+                error: String::new(),
+                started_at: now,
+                updated_at: now,
+            },
+            worker_profile: Default::default(),
+            slice_runs: vec![
+                slice("AF-01", SliceStatus::Merged),
+                slice("AF-02", SliceStatus::Pending),
+                slice("AF-03", SliceStatus::Pending),
+                slice("AF-04", SliceStatus::Pending),
+                slice("AF-05", SliceStatus::Pending),
+                slice("AF-06", SliceStatus::Pending),
+                slice("HERDR-07", SliceStatus::Running),
+                slice("AF-07", SliceStatus::Pending),
+                slice("AF-08", SliceStatus::RepairNeeded),
+            ],
+            generated_slices: Vec::new(),
+            progress: None,
+            incidents: Vec::new(),
+            questions: Vec::new(),
+            replan: Default::default(),
+            mission_envelope: None,
+            frontier_budget: None,
+            frontier: Default::default(),
+            events: Vec::new(),
+            economics: None,
+            primary_terminal_reason: None,
+            feed: None,
+        };
+
+        let feed = project_run_at(&details, now);
+        let workers = block_by_label(&feed, "Workers");
+        let texts = workers
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(texts[0].contains("HERDR-07"), "{texts:?}");
+        assert!(texts[1].contains("AF-08"), "{texts:?}");
+        assert!(
+            texts.last().unwrap().contains("… 3 more"),
+            "{texts:?}"
+        );
+        // the elided tail is low-priority (pending/merged), never active work
+        assert!(texts.iter().all(|text| !text.contains("AF-06")), "{texts:?}");
+        assert!(texts.iter().all(|text| !text.contains("AF-01")), "{texts:?}");
+        // stable sort keeps roadmap order within a status
+        let af_02 = texts.iter().position(|text| text.contains("AF-02"));
+        let af_03 = texts.iter().position(|text| text.contains("AF-03"));
+        assert!(af_02.unwrap() < af_03.unwrap(), "{texts:?}");
     }
 
     #[test]
@@ -2468,7 +2544,7 @@ mod tests {
             attention
                 .lines
                 .iter()
-                .any(|line| line.text.contains("owner=operator"))
+                .any(|line| line.text.starts_with("[operator] Terminal reason:"))
         );
         assert!(
             attention
@@ -2596,7 +2672,7 @@ mod tests {
             .find(|block| block.label == "Attention")
             .expect("attention block");
         assert!(attention.lines.iter().any(|line| {
-            line.text.contains("Pending replan rp-test-001")
+            line.text.starts_with("[operator] Pending replan rp-test-001")
                 && line.text.contains("risk=intent_affecting")
         }));
         assert!(attention.lines.iter().any(|line| {

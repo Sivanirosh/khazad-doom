@@ -72,6 +72,8 @@ pub const DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS: usize = 2;
 pub const DEFAULT_SLICE_REPAIR_ATTEMPTS: usize = 1;
 pub const DEFAULT_REPAIR_ATTEMPTS: usize = 1;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
+const WORKTREE_REMOVE_ATTEMPTS: usize = 3;
+const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn worker_profile_evidence(runner_name: &str, metadata: &RunnerMetadata) -> WorkerProfileEvidence {
     WorkerProfileEvidence {
@@ -5601,7 +5603,22 @@ impl Manager {
                 errors.push(format!("{}: {err}", path.display()));
             }
         }
-        let _ = std::fs::remove_dir_all(&root);
+        // a worker child that has not fully exited can transiently hold
+        // files under the root; retry briefly before treating removal as
+        // failed, and keep the final error observable instead of dropping it
+        for attempt in 0..WORKTREE_REMOVE_ATTEMPTS {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) => {
+                    if attempt + 1 == WORKTREE_REMOVE_ATTEMPTS {
+                        errors.push(format!("{}: {err}", root.display()));
+                    } else {
+                        thread::sleep(WORKTREE_REMOVE_RETRY_DELAY);
+                    }
+                }
+            }
+        }
         let _ = gitutil::worktree_prune(&run.repo_path);
         if errors.is_empty() {
             Ok(())
