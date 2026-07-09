@@ -750,6 +750,7 @@ impl Store {
             );
         }
         let now = Utc::now();
+        let run_for_apply = self.get_run(run_id)?;
         let decision = ReplanDecision {
             decision: state.as_str().to_string(),
             rationale: rationale.trim().to_string(),
@@ -766,6 +767,16 @@ impl Store {
             decided_at: now,
             applied: false,
             applied_at: None,
+            apply_status: initial_replan_apply_status(&existing, state, run_for_apply.as_ref()),
+            apply_reason: initial_replan_apply_reason(&existing, state, run_for_apply.as_ref()),
+            generated_slice_id: initial_replan_generated_slice_id(&existing, state),
+            generated_slice_commit: String::new(),
+            apply_before_checkpoint_id: String::new(),
+            apply_after_checkpoint_id: String::new(),
+            queue_before: Vec::new(),
+            queue_after: Vec::new(),
+            queue_before_hash: String::new(),
+            queue_after_hash: String::new(),
             replacement_id: replacement_id.trim().to_string(),
             revisit_condition: revisit_condition.trim().to_string(),
         };
@@ -784,6 +795,47 @@ impl Store {
         )?;
         self.get_replan_proposal(run_id, proposal_id)?
             .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision"))
+    }
+
+    pub fn replace_replan_decision(
+        &self,
+        run_id: &str,
+        proposal_id: &str,
+        decision: &ReplanDecision,
+    ) -> Result<ReplanProposal> {
+        let existing = self
+            .get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("replan proposal {proposal_id:?} for run {run_id:?} not found")
+            })?;
+        if existing.operator_decision.is_none() {
+            anyhow::bail!("replan proposal {proposal_id:?} has no decision to update");
+        }
+        let now = Utc::now();
+        let conn = self.conn()?;
+        conn.execute(
+            r#"UPDATE replan_proposals
+               SET decision_json=?1, updated_at=?2
+               WHERE run_id=?3 AND id=?4"#,
+            params![
+                serde_json::to_string(decision)?,
+                now.to_rfc3339(),
+                run_id,
+                proposal_id,
+            ],
+        )?;
+        self.get_replan_proposal(run_id, proposal_id)?
+            .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision update"))
+    }
+
+    pub fn update_run_selected_slices(&self, run_id: &str, selected_slice_id: &str) -> Result<Run> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE runs SET selected_slice_id=?1, updated_at=?2 WHERE id=?3",
+            params![selected_slice_id, Utc::now().to_rfc3339(), run_id],
+        )?;
+        self.get_run(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} disappeared after queue update"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1461,6 +1513,68 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
         },
         answer: row.get(10)?,
     })
+}
+
+fn initial_replan_apply_status(
+    proposal: &ReplanProposal,
+    state: ReplanProposalState,
+    run: Option<&Run>,
+) -> String {
+    if state != ReplanProposalState::Accepted {
+        return "not_applicable".to_string();
+    }
+    if applyable_followup_slice_id(proposal).is_none() {
+        return "not_applicable".to_string();
+    }
+    if run.is_some_and(|run| run.status == RunStatus::Completed) {
+        return "refused".to_string();
+    }
+    "pending".to_string()
+}
+
+fn initial_replan_apply_reason(
+    proposal: &ReplanProposal,
+    state: ReplanProposalState,
+    run: Option<&Run>,
+) -> String {
+    if state != ReplanProposalState::Accepted {
+        return "decision does not apply queue or slice changes".to_string();
+    }
+    if applyable_followup_slice_id(proposal).is_none() {
+        return "accepted proposal is not an add_followup_slice typed draft; no apply side effect"
+            .to_string();
+    }
+    if run.is_some_and(|run| run.status == RunStatus::Completed) {
+        return "run is already completed; accepted follow-up proposal remains unapplied and requires a new run or replacement proposal".to_string();
+    }
+    "accepted add_followup_slice typed draft queued for daemon apply checkpoint".to_string()
+}
+
+fn initial_replan_generated_slice_id(
+    proposal: &ReplanProposal,
+    state: ReplanProposalState,
+) -> String {
+    if state == ReplanProposalState::Accepted {
+        applyable_followup_slice_id(proposal).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+fn applyable_followup_slice_id(proposal: &ReplanProposal) -> Option<String> {
+    let [change] = proposal.proposed_changes.as_slice() else {
+        return None;
+    };
+    if change.kind != "add_followup_slice" {
+        return None;
+    }
+    let draft = change.followup_slice_draft()?;
+    let id = if draft.id.trim().is_empty() {
+        change.target.trim()
+    } else {
+        draft.id.trim()
+    };
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 fn token_hash(token: &str) -> String {

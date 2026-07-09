@@ -1,10 +1,10 @@
 use super::projection::project_run;
 use crate::artifact;
 use crate::domain::{
-    Event, ImplementationSummary, PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions,
-    ReplanProposal, ReplanProposalState, ReplanStatus, Run, RunDetails, RunEconomics, RunIncident,
-    RunProgress, RunStatus, SliceRun, SliceStatus, TerminalReason, WorkerProfileEvidence,
-    WorkerQuestion, replan_decision_commands,
+    Event, GeneratedSliceRecord, ImplementationSummary, PlanRevisionDecisionSummary,
+    PlanRevisionRecord, PlanRevisions, ReplanProposal, ReplanProposalState, ReplanStatus, Run,
+    RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus,
+    TerminalReason, WorkerProfileEvidence, WorkerQuestion, replan_decision_commands,
 };
 use crate::state::Store as StateStore;
 use anyhow::Result;
@@ -94,6 +94,7 @@ impl<'a> RunReadModelBuilder<'a> {
             .list_worker_questions(&run_id)
             .unwrap_or_default();
         let proposals = self.state.list_replan_proposals(&run_id)?;
+        let generated_slices = generated_slices_from_proposals(&proposals, &slice_runs);
         let replan = replan_status_from_proposals(&run_id, proposals.clone());
         let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run_id)?;
         let plan_revisions = plan_revisions_from_proposals(&run, proposals)?;
@@ -109,6 +110,7 @@ impl<'a> RunReadModelBuilder<'a> {
         let mut details = RunDetails {
             worker_profile,
             slice_runs,
+            generated_slices,
             progress,
             incidents,
             questions,
@@ -141,6 +143,47 @@ fn apply_terminal_override(run: &Run, options: &RunReadModelOptions) -> Run {
         run.updated_at = Utc::now();
     }
     run
+}
+
+fn generated_slices_from_proposals(
+    proposals: &[ReplanProposal],
+    slice_runs: &[SliceRun],
+) -> Vec<GeneratedSliceRecord> {
+    let mut records = Vec::new();
+    for proposal in proposals {
+        let Some(decision) = proposal.operator_decision.as_ref() else {
+            continue;
+        };
+        if decision.generated_slice_id.trim().is_empty() {
+            continue;
+        }
+        let slice_run = slice_runs
+            .iter()
+            .find(|slice_run| slice_run.slice_id == decision.generated_slice_id);
+        records.push(GeneratedSliceRecord {
+            slice_id: decision.generated_slice_id.clone(),
+            parent_slice_id: proposal.source.slice_id.clone(),
+            origin_proposal_id: proposal.id.clone(),
+            generation: proposal
+                .proposed_changes
+                .iter()
+                .find_map(|change| change.followup_slice_draft())
+                .and_then(|draft| (!draft.id.trim().is_empty()).then_some(1))
+                .unwrap_or(0),
+            status: slice_run
+                .map(|slice_run| slice_run.status.as_str().to_string())
+                .unwrap_or_else(|| decision.apply_status.clone()),
+            commit_sha: if decision.generated_slice_commit.trim().is_empty() {
+                slice_run
+                    .map(|slice_run| slice_run.commit_sha.clone())
+                    .unwrap_or_default()
+            } else {
+                decision.generated_slice_commit.clone()
+            },
+            applied_at: decision.applied_at,
+        });
+    }
+    records
 }
 
 pub(crate) fn replan_status_from_proposals(
@@ -790,13 +833,45 @@ fn plan_revision_decision_summary(
     decision: crate::domain::ReplanDecision,
 ) -> Result<PlanRevisionDecisionSummary> {
     let applied_at_checkpoint = if decision.applied {
-        decision
-            .applied_at
-            .map(|applied_at| format!("applied_at:{applied_at}"))
-            .unwrap_or_else(|| "applied_without_timestamp".to_string())
+        let checkpoint = if decision.apply_after_checkpoint_id.trim().is_empty() {
+            decision
+                .applied_at
+                .map(|applied_at| format!("applied_at:{applied_at}"))
+                .unwrap_or_else(|| "applied_without_timestamp".to_string())
+        } else {
+            format!(
+                "applied_at_checkpoint:{}",
+                decision.apply_after_checkpoint_id
+            )
+        };
+        if decision.queue_after_hash.trim().is_empty() {
+            checkpoint
+        } else {
+            format!(
+                "{checkpoint}; queue_after_hash:{}",
+                decision.queue_after_hash
+            )
+        }
+    } else if decision.apply_status == "refused" {
+        format!(
+            "apply_refused:{}; remediation: supersede with a valid follow-up proposal or start a new run; reason: {}",
+            decision.decided_at,
+            display_or_dash(&decision.apply_reason)
+        )
+    } else if decision.apply_status == "incomplete" {
+        format!(
+            "replan_apply_incomplete:{}; remediation: resume the run to retry idempotent apply or inspect the generated slice evidence; reason: {}",
+            decision.decided_at,
+            display_or_dash(&decision.apply_reason)
+        )
+    } else if decision.apply_status == "pending" {
+        format!(
+            "accepted_pending_apply:{}; remediation: resume the run so the daemon can apply at the next checkpoint",
+            decision.decided_at
+        )
     } else {
         format!(
-            "not_applied:{}; proposal-only replan v1 left queue/slice state unchanged",
+            "not_applied:{}; proposal-only or non-applicable decision left queue/slice state unchanged",
             decision.decided_at
         )
     };
@@ -809,6 +884,16 @@ fn plan_revision_decision_summary(
         applied: decision.applied,
         applied_at: decision.applied_at,
         applied_at_checkpoint,
+        apply_status: decision.apply_status,
+        apply_reason: decision.apply_reason,
+        generated_slice_id: decision.generated_slice_id,
+        generated_slice_commit: decision.generated_slice_commit,
+        apply_before_checkpoint_id: decision.apply_before_checkpoint_id,
+        apply_after_checkpoint_id: decision.apply_after_checkpoint_id,
+        queue_before: decision.queue_before,
+        queue_after: decision.queue_after,
+        queue_before_hash: decision.queue_before_hash,
+        queue_after_hash: decision.queue_after_hash,
         replacement_id: decision.replacement_id,
         revisit_condition: decision.revisit_condition,
     })
@@ -831,18 +916,42 @@ fn plan_revision_before_summary(run: &Run, proposal: &ReplanProposal) -> String 
 fn plan_revision_after_summary(proposal: &ReplanProposal) -> String {
     match proposal.operator_decision.as_ref() {
         Some(decision) if decision.applied => format!(
-            "{} proposal applied by {} at {}; changes: {}",
+            "{} proposal applied by {} at {}; generated_slice={}; queue_after_hash={}; changes: {}",
             proposal.state,
             decision.authorizer,
-            decision
-                .applied_at
-                .map(|applied_at| applied_at.to_rfc3339())
-                .unwrap_or_else(|| "unknown checkpoint".to_string()),
+            if decision.apply_after_checkpoint_id.trim().is_empty() {
+                decision
+                    .applied_at
+                    .map(|applied_at| applied_at.to_rfc3339())
+                    .unwrap_or_else(|| "unknown checkpoint".to_string())
+            } else {
+                decision.apply_after_checkpoint_id.clone()
+            },
+            display_or_dash(&decision.generated_slice_id),
+            display_or_dash(&decision.queue_after_hash),
+            proposed_change_summary(&proposal.proposed_changes)
+        ),
+        Some(decision) if decision.decision == "accepted" && decision.apply_status == "refused" => format!(
+            "accepted by {} but apply_refused; remediation: supersede with a valid follow-up proposal or start a new run; reason: {}; proposed changes remain: {}",
+            decision.authorizer,
+            display_or_dash(&decision.apply_reason),
+            proposed_change_summary(&proposal.proposed_changes)
+        ),
+        Some(decision) if decision.decision == "accepted" && decision.apply_status == "incomplete" => format!(
+            "accepted by {} but replan_apply_incomplete; remediation: resume the run to retry idempotent apply or inspect generated slice evidence; reason: {}; proposed changes remain: {}",
+            decision.authorizer,
+            display_or_dash(&decision.apply_reason),
+            proposed_change_summary(&proposal.proposed_changes)
+        ),
+        Some(decision) if decision.decision == "accepted" && decision.apply_status == "pending" => format!(
+            "accepted by {}; accepted_pending_apply at next daemon checkpoint; proposed changes remain: {}",
+            decision.authorizer,
             proposed_change_summary(&proposal.proposed_changes)
         ),
         Some(decision) if decision.decision == "accepted" => format!(
-            "accepted by {}; proposal-only replan v1 records applied=false, so no queue/slice mutation was applied; proposed changes remain: {}",
+            "accepted by {}; apply_status={}; no queue/slice mutation was applied; proposed changes remain: {}",
             decision.authorizer,
+            display_or_dash(&decision.apply_status),
             proposed_change_summary(&proposal.proposed_changes)
         ),
         Some(decision) if decision.decision == "rejected" => {
