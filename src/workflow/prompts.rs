@@ -17,12 +17,12 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("- The JSON slice is authoritative. GitHub/PRD text is extra context only.\n");
     prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, call the ask_operator tool with the question/options when available; return status=blocked with an ask-user finding only if that channel is unavailable or times out.\n");
     prompt.push_str("- If handoff.plan_revisions contains an accepted revision whose authorized_paths/action_class cover the intended action, proceed within that grant and cite the proposal_id in your output; ask only when the action exceeds the recorded grant.\n");
-    prompt.push_str("- Treat acceptance as minimum evidence, not an exhaustive spec: learning is allowed inside the fence; moving the fence requires approval. If TDD or code inspection reveals an additional case directly implied by the slice goal/acceptance and inside declared areas, implement the smallest clear fix and report it in summary/tests/assumptions. If it changes product intent, public API semantics, dependencies, verification policy, or required paths outside areas, return status=blocked with an ask-user finding.\n");
+    prompt.push_str("- Treat acceptance as minimum evidence, not an exhaustive spec: learning is allowed inside the fence; moving the fence requires approval. If TDD or code inspection reveals an additional case directly implied by the slice goal/acceptance and inside declared areas, implement the smallest clear fix and report it in summary/tests/assumptions. If it changes product intent, public API semantics, dependencies, verification policy, or required paths outside areas, return status=blocked with an ask-user finding or include a complete candidate_followup_slices[] draft (id, title, goal, areas, acceptance, verify, verify_profile, depends_on, must_ask_if, rationale) for daemon validation through replan.\n");
     prompt.push_str("- Preserve unrelated changes.\n");
     prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
     prompt.push_str("- Do not run daemon-owned verification commands unless needed for your own confidence; the daemon will run required checks.\n");
     prompt.push_str("- Do not approve your own evidence; acceptance_status and finding dispositions are claims plus evidence only, and the daemon/operator will attest or reject them.\n");
-    prompt.push_str("- If a complete result includes findings with action=auto-fix or action=ask-user, include finding_dispositions entries matching each finding by finding_id or 1-based finding_index. Use disposition=fixed/not_applicable/documented for terminal dispositions, or disposition=proposed when a daemon replan proposal/operator decision is required.\n");
+    prompt.push_str("- If a complete result includes findings with action=auto-fix or action=ask-user, include finding_dispositions entries matching each finding by finding_id or 1-based finding_index. Use disposition=fixed/not_applicable/documented for terminal dispositions, or disposition=proposed when a daemon replan proposal/operator decision is required; when paired with candidate_followup_slices[], leave replan_proposal_id empty for the daemon to fill.\n");
     prompt.push_str("- Do not mark actionable findings resolved without a disposition/proposal.\n");
     prompt.push_str("- Commit all intended changes on the current branch before finishing.\n");
     prompt.push_str("- Leave the worktree clean.\n");
@@ -81,7 +81,7 @@ pub fn slice_repair_prompt(
     prompt.push_str(IMPLEMENTER_STYLE_GUIDANCE);
     prompt.push_str("- Stay inside the slice areas and accepted revision grants; do not auto-authorize out-of-area changes.\n");
     prompt.push_str("- Do not change workflow policy, slice contracts, dependencies, worker profiles, or verification commands.\n");
-    prompt.push_str("- If the fix requires new intent or out-of-area authority, return status=blocked with an ask-user finding.\n");
+    prompt.push_str("- If the fix requires new intent or out-of-area authority, return status=blocked with an ask-user finding or include a complete candidate_followup_slices[] draft for daemon validation through replan.\n");
     prompt.push_str(
         "- Commit any fix on the current branch, leave the worktree clean, and return only JSON.\n",
     );
@@ -117,7 +117,7 @@ Task:
 - Do not rerun the full daemon verification suite; the daemon will rerun the integration gate.
 - If no issue exists, return status "no-op".
 - If you fix anything, commit the repair on the current branch and leave the worktree clean.
-- Repair only files covered by the integrated slices' areas; do not mutate .workflow policy/slices/profiles/verification. If repair needs out-of-area or workflow-policy changes, return finding_dispositions with disposition="proposed" so the daemon can record an operator-approved replan proposal instead of applying it silently.
+- Repair only files covered by the integrated slices' areas; do not mutate .workflow policy/slices/profiles/verification. If repair needs out-of-area or workflow-policy changes, return finding_dispositions with disposition="proposed" and include a complete candidate_followup_slices[] draft when the needed work is a follow-up slice, so the daemon can record an operator-approved replan proposal instead of applying it silently.
 - If a successful repair output includes findings with action=auto-fix or action=ask-user, include finding_dispositions entries matching each finding by finding_id or 1-based finding_index.
 - If fixing would require inventing product intent, return status "blocked" with an ask-user finding.
 - Return only JSON.

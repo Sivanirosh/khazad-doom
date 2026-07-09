@@ -31,12 +31,12 @@ use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile
 use crate::artifact;
 use crate::domain::{
     AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
-    FindingDisposition, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
-    ImplementationSummary, MergeConflictReport, OriginNotificationTarget, PlanRevisions,
-    RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange,
-    Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState, SliceRun, SliceStatus,
-    SliceValidationReport, SliceWriteResult, WorkerProfileEvidence, WorkerResult, WorkflowConfig,
-    WorkflowExitStates, replan_decision_commands,
+    FindingDisposition, FollowupSliceDraft, GateResult, Handoff, HandoffActionResult,
+    HandoffDiagnostics, ImplementationSummary, MergeConflictReport, OriginNotificationTarget,
+    PlanRevisions, RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
+    ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState,
+    SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerProfileEvidence,
+    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -2838,6 +2838,13 @@ impl Manager {
                     WorkerAttemptRunResult::Valid(worker_result) => *worker_result,
                     WorkerAttemptRunResult::Continue => continue,
                 };
+            self.create_worker_candidate_followup_slice_proposals(
+                run,
+                slice,
+                attempt,
+                &output_path,
+                &mut worker_result,
+            )?;
             self.create_worker_finding_replan_proposals(
                 run,
                 slice,
@@ -3162,6 +3169,196 @@ impl Manager {
             return Ok(check);
         }
         Ok(check)
+    }
+
+    fn create_worker_candidate_followup_slice_proposals(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        attempt: usize,
+        output_path: &Path,
+        result: &mut WorkerResult,
+    ) -> Result<bool> {
+        let drafts = result.candidate_followup_slices.clone();
+        if drafts.is_empty() {
+            return Ok(false);
+        }
+        let mut validation_slices = artifact::Store::new(&run.repo_path).load_slices()?;
+        let mut created = false;
+        for (draft_index, draft) in drafts.iter().enumerate() {
+            if let Err(err) = validate_followup_slice_draft(draft, &validation_slices) {
+                result
+                    .findings
+                    .push(invalid_candidate_followup_finding(draft_index, draft, &err));
+                continue;
+            }
+            let matching_disposition = matching_proposed_disposition_index(
+                &result.findings,
+                &result.finding_dispositions,
+                draft,
+            );
+            let trigger_finding_ids = matching_disposition
+                .map(|index| {
+                    let finding = finding_for_disposition(
+                        &result.findings,
+                        &result.finding_dispositions[index],
+                    );
+                    disposition_finding_id(index, finding, &result.finding_dispositions[index])
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let proposal = self.state.create_replan_proposal(
+                &run.id,
+                "",
+                ReplanProposalSource {
+                    kind: "worker_candidate_followup_slice".to_string(),
+                    slice_id: slice.id.clone(),
+                    phase: "slice_worker".to_string(),
+                    attempt,
+                    summary: result.summary.clone(),
+                },
+                trigger_finding_ids,
+                vec![
+                    ReplanEvidenceLink {
+                        kind: "worker_output".to_string(),
+                        path: output_path.to_string_lossy().to_string(),
+                        event_id: 0,
+                        summary: format!(
+                            "candidate_followup_slices[{draft_index}] draft {:?} emitted by worker output",
+                            draft.id
+                        ),
+                    },
+                    ReplanEvidenceLink {
+                        kind: "worker_attempt".to_string(),
+                        path: output_path.to_string_lossy().to_string(),
+                        event_id: attempt,
+                        summary: format!("slice {} worker attempt {attempt}", slice.id),
+                    },
+                ],
+                vec![ReplanProposedChange::with_followup_slice_draft(
+                    "add_followup_slice".to_string(),
+                    draft.id.clone(),
+                    followup_slice_draft_summary(draft),
+                    draft.clone(),
+                )],
+                "operator_review_required_for_followup_slice_draft",
+            )?;
+            if let Some(index) = matching_disposition {
+                result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
+            }
+            self.state.record_event(
+                &run.id,
+                "candidate_followup_slice_replan_proposal_created",
+                &json!({
+                    "source": "worker",
+                    "slice_id": slice.id,
+                    "attempt": attempt,
+                    "draft_index": draft_index,
+                    "draft_id": draft.id,
+                    "proposal_id": proposal.id,
+                    "output_path": output_path,
+                    "summary": followup_slice_draft_summary(draft),
+                }),
+            )?;
+            validation_slices.push(draft.to_slice());
+            self.notify_attention_for_replan(run, &proposal);
+            created = true;
+        }
+        Ok(created)
+    }
+
+    fn create_repair_candidate_followup_slice_proposals(
+        &self,
+        run: &Run,
+        attempt: usize,
+        output_path: &Path,
+        result: &mut RepairResult,
+    ) -> Result<bool> {
+        let drafts = result.candidate_followup_slices.clone();
+        if drafts.is_empty() {
+            return Ok(false);
+        }
+        let mut validation_slices = artifact::Store::new(&run.repo_path).load_slices()?;
+        let mut created = false;
+        for (draft_index, draft) in drafts.iter().enumerate() {
+            if let Err(err) = validate_followup_slice_draft(draft, &validation_slices) {
+                result
+                    .findings
+                    .push(invalid_candidate_followup_finding(draft_index, draft, &err));
+                continue;
+            }
+            let matching_disposition = matching_proposed_disposition_index(
+                &result.findings,
+                &result.finding_dispositions,
+                draft,
+            );
+            let trigger_finding_ids = matching_disposition
+                .map(|index| {
+                    let finding = finding_for_disposition(
+                        &result.findings,
+                        &result.finding_dispositions[index],
+                    );
+                    disposition_finding_id(index, finding, &result.finding_dispositions[index])
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let proposal = self.state.create_replan_proposal(
+                &run.id,
+                "",
+                ReplanProposalSource {
+                    kind: "repair_candidate_followup_slice".to_string(),
+                    slice_id: String::new(),
+                    phase: "integration_repair".to_string(),
+                    attempt,
+                    summary: result.summary.clone(),
+                },
+                trigger_finding_ids,
+                vec![
+                    ReplanEvidenceLink {
+                        kind: "repair_output".to_string(),
+                        path: output_path.to_string_lossy().to_string(),
+                        event_id: 0,
+                        summary: format!(
+                            "candidate_followup_slices[{draft_index}] draft {:?} emitted by repair output",
+                            draft.id
+                        ),
+                    },
+                    ReplanEvidenceLink {
+                        kind: "repair_attempt".to_string(),
+                        path: output_path.to_string_lossy().to_string(),
+                        event_id: attempt,
+                        summary: format!("integration repair attempt {attempt}"),
+                    },
+                ],
+                vec![ReplanProposedChange::with_followup_slice_draft(
+                    "add_followup_slice".to_string(),
+                    draft.id.clone(),
+                    followup_slice_draft_summary(draft),
+                    draft.clone(),
+                )],
+                "operator_review_required_for_followup_slice_draft",
+            )?;
+            if let Some(index) = matching_disposition {
+                result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
+            }
+            self.state.record_event(
+                &run.id,
+                "candidate_followup_slice_replan_proposal_created",
+                &json!({
+                    "source": "integration_repair",
+                    "attempt": attempt,
+                    "draft_index": draft_index,
+                    "draft_id": draft.id,
+                    "proposal_id": proposal.id,
+                    "output_path": output_path,
+                    "summary": followup_slice_draft_summary(draft),
+                }),
+            )?;
+            validation_slices.push(draft.to_slice());
+            self.notify_attention_for_replan(run, &proposal);
+            created = true;
+        }
+        Ok(created)
     }
 
     fn create_worker_finding_replan_proposals(
@@ -3866,6 +4063,13 @@ impl Manager {
                 )?;
                 return Ok(None);
             }
+            self.create_worker_candidate_followup_slice_proposals(
+                request.run,
+                request.slice,
+                request.attempt,
+                &repair_output_path,
+                &mut worker_result,
+            )?;
             self.create_worker_finding_replan_proposals(
                 request.run,
                 request.slice,
@@ -4302,6 +4506,13 @@ impl Manager {
             }
             result.trigger = context.trigger.to_string();
             result.attempts = attempt;
+            let created_candidate_proposal = self
+                .create_repair_candidate_followup_slice_proposals(
+                    run,
+                    attempt,
+                    &output_path,
+                    &mut result,
+                )?;
             let created_finding_proposal = self.create_repair_finding_replan_proposals(
                 run,
                 attempt,
@@ -4309,8 +4520,8 @@ impl Manager {
                 &mut result,
             )?;
             artifact::write_json(&output_path, &result)?;
-            if created_finding_proposal {
-                self.block_if_pending_replan(run, "integration repair finding proposal")?;
+            if created_candidate_proposal || created_finding_proposal {
+                self.block_if_pending_replan(run, "integration repair follow-up proposal")?;
             }
             if result.status == "blocked" {
                 return Err(BlockedError::new(format!(
@@ -5394,6 +5605,135 @@ impl Drop for ActiveRunGuard {
     }
 }
 
+fn validate_followup_slice_draft(
+    draft: &FollowupSliceDraft,
+    existing_slices: &[Slice],
+) -> Result<()> {
+    if draft.rationale.trim().is_empty() {
+        bail!("follow-up slice draft rationale is required");
+    }
+    let slice = draft.to_slice();
+    artifact::validate_slice(&slice)
+        .with_context(|| format!("follow-up slice draft {:?} is not a valid slice", draft.id))?;
+    let mut with_draft = existing_slices.to_vec();
+    with_draft.push(slice);
+    let issues = artifact::validate_slice_set(&with_draft);
+    if !issues.is_empty() {
+        let messages = issues
+            .into_iter()
+            .map(|issue| {
+                if issue.slice_id.trim().is_empty() {
+                    issue.message
+                } else {
+                    format!("{}: {}", issue.slice_id, issue.message)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "follow-up slice draft {:?} violates slice graph rules: {messages}",
+            draft.id
+        );
+    }
+    Ok(())
+}
+
+fn invalid_candidate_followup_finding(
+    draft_index: usize,
+    draft: &FollowupSliceDraft,
+    err: &anyhow::Error,
+) -> Finding {
+    let label = if draft.id.trim().is_empty() {
+        format!("#{}", draft_index + 1)
+    } else {
+        format!("{:?}", draft.id)
+    };
+    Finding {
+        id: format!("candidate-followup-slice-{}", draft_index + 1),
+        severity: "warning".to_string(),
+        action: "no-op".to_string(),
+        file: String::new(),
+        line: 0,
+        description: format!(
+            "candidate_followup_slices[{draft_index}] draft {label} rejected: {err:#}"
+        ),
+    }
+}
+
+fn followup_slice_draft_summary(draft: &FollowupSliceDraft) -> String {
+    let title = display_or_untitled(&draft.title);
+    let areas = if draft.areas.is_empty() {
+        "<none>".to_string()
+    } else {
+        draft.areas.join(",")
+    };
+    let rationale = draft.rationale.trim();
+    if rationale.is_empty() {
+        format!(
+            "Add follow-up slice {} ({title}); areas=[{areas}]",
+            draft.id
+        )
+    } else {
+        format!(
+            "Add follow-up slice {} ({title}); areas=[{areas}]; rationale: {rationale}",
+            draft.id
+        )
+    }
+}
+
+fn display_or_untitled(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "<untitled>"
+    } else {
+        trimmed
+    }
+}
+
+fn matching_proposed_disposition_index(
+    findings: &[Finding],
+    dispositions: &[FindingDisposition],
+    draft: &FollowupSliceDraft,
+) -> Option<usize> {
+    let draft_id = draft.id.trim().to_ascii_lowercase();
+    if !draft_id.is_empty() {
+        if let Some((index, _)) = dispositions.iter().enumerate().find(|(_, disposition)| {
+            is_unassigned_proposed_disposition(disposition)
+                && disposition_or_finding_mentions_draft(findings, disposition, &draft_id)
+        }) {
+            return Some(index);
+        }
+    }
+    dispositions
+        .iter()
+        .position(is_unassigned_proposed_disposition)
+}
+
+fn is_unassigned_proposed_disposition(disposition: &FindingDisposition) -> bool {
+    disposition.disposition == "proposed" && disposition.replan_proposal_id.trim().is_empty()
+}
+
+fn disposition_or_finding_mentions_draft(
+    findings: &[Finding],
+    disposition: &FindingDisposition,
+    draft_id: &str,
+) -> bool {
+    let mut haystacks = vec![
+        disposition.finding_id.as_str(),
+        disposition.rationale.as_str(),
+    ];
+    if let Some(finding) = finding_for_disposition(findings, disposition) {
+        haystacks.extend([
+            finding.id.as_str(),
+            finding.file.as_str(),
+            finding.description.as_str(),
+        ]);
+    }
+    haystacks
+        .into_iter()
+        .any(|value| value.to_ascii_lowercase().contains(draft_id))
+}
+
 fn validate_worker_result(result: &WorkerResult, slice: &Slice) -> Result<()> {
     match result.status.as_str() {
         "complete" | "blocked" | "failed" => {}
@@ -5706,17 +6046,18 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKER_ATTEMPTS, Manager, RunReadModelOptions, StartOptions,
-        repair_authority_violations, validate_repair_result, validate_worker_result,
+        MAX_WORKER_ATTEMPTS, Manager, RunReadModelBuilder, RunReadModelOptions, StartOptions,
+        repair_authority_violations, validate_followup_slice_draft, validate_repair_result,
+        validate_worker_result,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, CheckResult, CockpitMode, Finding, FindingDisposition, Handoff,
-        ImplementationSummary, OriginNotificationTarget, RepairResult, ReplanEvidenceLink,
-        ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run, RunEconomics,
-        RunStatus, Slice, SliceRun, SliceStatus, TerminalNotificationRecord, VerifyCommand,
-        VerifyProfile, WorkerResult, WorkflowConfig,
+        AcceptanceEvidence, CheckResult, CockpitMode, Finding, FindingDisposition,
+        FollowupSliceDraft, Handoff, ImplementationSummary, OriginNotificationTarget, RepairResult,
+        ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run,
+        RunEconomics, RunStatus, Slice, SliceRun, SliceStatus, TerminalNotificationRecord,
+        VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -5750,6 +6091,21 @@ mod tests {
             verify_profile: String::new(),
             verify: Vec::new(),
             verify_timeout_seconds: 0,
+        }
+    }
+
+    fn followup_draft(id: &str) -> FollowupSliceDraft {
+        FollowupSliceDraft {
+            id: id.to_string(),
+            title: format!("Follow-up {id}"),
+            goal: "Complete follow-up work".to_string(),
+            areas: vec!["src/".to_string()],
+            acceptance: vec!["follow-up acceptance is met".to_string()],
+            verify: vec!["cargo test followup".to_string()],
+            verify_profile: String::new(),
+            depends_on: vec!["slice-001".to_string()],
+            must_ask_if: vec!["intent changes".to_string()],
+            rationale: "Worker found a bounded follow-up.".to_string(),
         }
     }
 
@@ -5848,6 +6204,229 @@ mod tests {
         };
         let err = validate_repair_result(&repair).unwrap_err();
         assert!(err.to_string().contains("requires a terminal disposition"));
+    }
+
+    #[test]
+    fn replan_followup_slice_draft_validation_rejects_bad_area_empty_acceptance_duplicate_and_cycle()
+     {
+        let existing = vec![slice("slice-001")];
+        validate_followup_slice_draft(&followup_draft("slice-001-followup"), &existing).unwrap();
+
+        let mut bad_area = followup_draft("slice-bad-area");
+        bad_area.areas = vec!["src/**".to_string()];
+        assert!(
+            format!(
+                "{:#}",
+                validate_followup_slice_draft(&bad_area, &existing).unwrap_err()
+            )
+            .contains("glob")
+        );
+
+        let mut empty_acceptance = followup_draft("slice-empty-acceptance");
+        empty_acceptance.acceptance.clear();
+        assert!(
+            format!(
+                "{:#}",
+                validate_followup_slice_draft(&empty_acceptance, &existing).unwrap_err()
+            )
+            .contains("acceptance")
+        );
+
+        let mut duplicate_open = followup_draft("slice-001");
+        duplicate_open.depends_on.clear();
+        assert!(
+            format!(
+                "{:#}",
+                validate_followup_slice_draft(&duplicate_open, &existing).unwrap_err()
+            )
+            .contains("duplicate slice id")
+        );
+
+        let mut closed = slice("slice-closed");
+        closed.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        closed.closed_by_run = "kd-old".to_string();
+        closed.closed_at = "2026-07-09T15:00:00Z".to_string();
+        let mut duplicate_closed = followup_draft("slice-closed");
+        duplicate_closed.depends_on.clear();
+        assert!(
+            format!(
+                "{:#}",
+                validate_followup_slice_draft(&duplicate_closed, &[closed]).unwrap_err()
+            )
+            .contains("duplicate slice id")
+        );
+
+        let mut self_cycle = followup_draft("slice-self-cycle");
+        self_cycle.depends_on = vec!["slice-self-cycle".to_string()];
+        assert!(
+            format!(
+                "{:#}",
+                validate_followup_slice_draft(&self_cycle, &existing).unwrap_err()
+            )
+            .contains("depend on itself")
+        );
+
+        let mut bad_id = followup_draft("../bad");
+        bad_id.depends_on.clear();
+        assert!(
+            format!(
+                "{:#}",
+                validate_followup_slice_draft(&bad_id, &existing).unwrap_err()
+            )
+            .contains("path/ref safe")
+        );
+    }
+
+    #[test]
+    fn replan_candidate_followup_worker_output_creates_typed_pending_proposal_and_warning()
+    -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &parent)?;
+        let before_slice_json = fs::read_to_string(store.slice_path("slice-001"))?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
+        let run = Run {
+            id: "kd-candidate".to_string(),
+            repo_id: crate::paths::repo_id(repo.path()),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-candidate/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        store.ensure_run_dirs(&run.id)?;
+        let output_path = store.output_path(&run.id, "slice-001.worker.attempt-1.json");
+        let mut invalid = followup_draft("slice-bad-area");
+        invalid.areas = vec!["src/**".to_string()];
+        let mut result = WorkerResult {
+            slice_id: "slice-001".to_string(),
+            status: "complete".to_string(),
+            summary: "worker completed and proposed follow-ups".to_string(),
+            acceptance_status: vec![AcceptanceEvidence {
+                criterion: "done".to_string(),
+                status: "satisfied".to_string(),
+                evidence: "implemented".to_string(),
+            }],
+            findings: vec![Finding {
+                id: "needs-slice-001-followup".to_string(),
+                severity: "warning".to_string(),
+                action: "ask-user".to_string(),
+                file: String::new(),
+                line: 0,
+                description: "Create slice-001-followup".to_string(),
+            }],
+            finding_dispositions: vec![FindingDisposition {
+                finding_id: "needs-slice-001-followup".to_string(),
+                disposition: "proposed".to_string(),
+                rationale: "Create slice-001-followup from candidate draft".to_string(),
+                ..FindingDisposition::default()
+            }],
+            candidate_followup_slices: vec![
+                followup_draft("slice-001-followup"),
+                invalid,
+                followup_draft("slice-001-followup"),
+            ],
+            ..WorkerResult::default()
+        };
+
+        assert!(manager.create_worker_candidate_followup_slice_proposals(
+            &run,
+            &parent,
+            1,
+            &output_path,
+            &mut result,
+        )?);
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.id == "candidate-followup-slice-2"
+                    && finding.severity == "warning"
+                    && finding.description.contains("glob"))
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.id == "candidate-followup-slice-3"
+                    && finding.severity == "warning"
+                    && finding.description.contains("duplicate slice id"))
+        );
+        assert!(
+            !result.finding_dispositions[0]
+                .replan_proposal_id
+                .trim()
+                .is_empty()
+        );
+
+        manager.create_worker_finding_replan_proposals(
+            &run,
+            &parent,
+            1,
+            &output_path,
+            &mut result,
+        )?;
+        let pending = state.pending_replan_proposals(&run.id)?;
+        assert_eq!(pending.len(), 1);
+        let proposal = &pending[0];
+        assert_eq!(proposal.proposed_changes[0].kind, "add_followup_slice");
+        assert_eq!(proposal.proposed_changes[0].target, "slice-001-followup");
+        assert_eq!(
+            proposal.proposed_changes[0]
+                .followup_slice_draft()
+                .as_ref()
+                .unwrap()
+                .rationale,
+            "Worker found a bounded follow-up."
+        );
+        assert!(
+            proposal
+                .evidence
+                .iter()
+                .any(|link| link.kind == "worker_output")
+        );
+        assert!(
+            proposal
+                .evidence
+                .iter()
+                .any(|link| link.kind == "worker_attempt")
+        );
+        assert_eq!(
+            fs::read_to_string(store.slice_path("slice-001"))?,
+            before_slice_json
+        );
+        assert!(!store.slice_path("slice-001-followup").exists());
+
+        let model =
+            RunReadModelBuilder::new(&state).snapshot(&run, RunReadModelOptions::status(20))?;
+        let feed_text = model
+            .details
+            .feed
+            .as_ref()
+            .unwrap()
+            .attention
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(feed_text.contains("Proposed follow-up slice: slice-001-followup"));
+        assert!(feed_text.contains("khazad-doom replan accept"));
+        Ok(())
     }
 
     #[test]

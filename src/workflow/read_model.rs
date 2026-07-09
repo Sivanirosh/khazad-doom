@@ -872,7 +872,26 @@ fn proposed_change_summary(changes: &[crate::domain::ReplanProposedChange]) -> S
         .iter()
         .map(|change| {
             let target = display_or_dash(&change.target);
-            format!("{}:{}:{}", change.kind, target, change.summary)
+            if let Some(draft) = change.followup_slice_draft() {
+                let areas = if draft.areas.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    draft.areas.join(",")
+                };
+                format!(
+                    "{}:{}:{} (draft title: {}; goal: {}; areas=[{}]; acceptance={}; verify={})",
+                    change.kind,
+                    target,
+                    change.summary_text(),
+                    display_or_dash(&draft.title),
+                    display_or_dash(&draft.goal),
+                    areas,
+                    draft.acceptance.len(),
+                    draft.verify.len()
+                )
+            } else {
+                format!("{}:{}:{}", change.kind, target, change.summary_text())
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")

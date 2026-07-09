@@ -50,6 +50,42 @@
       },
       "type": "array"
     },
+    "provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "created_by": {
+          "enum": [
+            "operator",
+            "worker+daemon"
+          ],
+          "type": "string"
+        },
+        "generation": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "origin_proposal_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "parent_slice_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_slice_id",
+        "origin_proposal_id",
+        "generation",
+        "created_by",
+        "created_at"
+      ],
+      "type": "object"
+    },
     "status": {
       "enum": [
         "open",

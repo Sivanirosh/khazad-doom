@@ -1,37 +1,193 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct SliceProvenance {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub parent_slice_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub origin_proposal_id: String,
+    pub generation: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub created_by: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub created_at: String,
+}
+
+impl SliceProvenance {
+    pub fn is_empty(&self) -> bool {
+        self.parent_slice_id.is_empty()
+            && self.origin_proposal_id.is_empty()
+            && self.generation == 0
+            && self.created_by.is_empty()
+            && self.created_at.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Slice {
     pub id: String,
     pub title: String,
     pub goal: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub github_issue: String,
-    #[serde(
-        default = "default_slice_status",
-        skip_serializing_if = "is_open_status"
-    )]
     pub status: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub closed_by_run: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub closed_at: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub areas: Vec<String>,
     pub acceptance: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_ask_if: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub verify_profile: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub verify_timeout_seconds: u64,
+}
+
+const SLICE_PROVENANCE_MARKER: &str = "\u{001e}khazad_slice_provenance:";
+
+impl Slice {
+    pub fn provenance(&self) -> Option<SliceProvenance> {
+        split_slice_github_issue(&self.github_issue).1
+    }
+
+    #[allow(dead_code)]
+    pub fn set_provenance(&mut self, provenance: SliceProvenance) {
+        let github_issue = self.github_issue_text();
+        self.github_issue = encode_slice_github_issue(&github_issue, &provenance);
+    }
+
+    #[allow(dead_code)]
+    pub fn github_issue_text(&self) -> String {
+        split_slice_github_issue(&self.github_issue).0.to_string()
+    }
+}
+
+impl Serialize for Slice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (github_issue, provenance) = split_slice_github_issue(&self.github_issue);
+        let mut state = serializer.serialize_struct("Slice", 16)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("title", &self.title)?;
+        state.serialize_field("goal", &self.goal)?;
+        if !github_issue.is_empty() {
+            state.serialize_field("github_issue", github_issue)?;
+        }
+        if !is_open_status(&self.status) {
+            state.serialize_field("status", &self.status)?;
+        }
+        if !self.closed_by_run.is_empty() {
+            state.serialize_field("closed_by_run", &self.closed_by_run)?;
+        }
+        if !self.closed_at.is_empty() {
+            state.serialize_field("closed_at", &self.closed_at)?;
+        }
+        if let Some(provenance) = provenance.filter(|provenance| !provenance.is_empty()) {
+            state.serialize_field("provenance", &provenance)?;
+        }
+        if !self.depends_on.is_empty() {
+            state.serialize_field("depends_on", &self.depends_on)?;
+        }
+        if !self.areas.is_empty() {
+            state.serialize_field("areas", &self.areas)?;
+        }
+        state.serialize_field("acceptance", &self.acceptance)?;
+        if !self.must_ask_if.is_empty() {
+            state.serialize_field("must_ask_if", &self.must_ask_if)?;
+        }
+        if !self.verify_profile.is_empty() {
+            state.serialize_field("verify_profile", &self.verify_profile)?;
+        }
+        if !self.verify.is_empty() {
+            state.serialize_field("verify", &self.verify)?;
+        }
+        if !is_zero_u64(&self.verify_timeout_seconds) {
+            state.serialize_field("verify_timeout_seconds", &self.verify_timeout_seconds)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Slice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SliceWire {
+            id: String,
+            title: String,
+            goal: String,
+            #[serde(default)]
+            github_issue: String,
+            #[serde(default = "default_slice_status")]
+            status: String,
+            #[serde(default)]
+            closed_by_run: String,
+            #[serde(default)]
+            closed_at: String,
+            #[serde(default)]
+            provenance: Option<SliceProvenance>,
+            #[serde(default)]
+            depends_on: Vec<String>,
+            #[serde(default)]
+            areas: Vec<String>,
+            acceptance: Vec<String>,
+            #[serde(default)]
+            must_ask_if: Vec<String>,
+            #[serde(default)]
+            verify_profile: String,
+            #[serde(default)]
+            verify: Vec<String>,
+            #[serde(default)]
+            verify_timeout_seconds: u64,
+        }
+
+        let wire = SliceWire::deserialize(deserializer)?;
+        let github_issue = wire
+            .provenance
+            .as_ref()
+            .map(|provenance| encode_slice_github_issue(&wire.github_issue, provenance))
+            .unwrap_or(wire.github_issue);
+        Ok(Self {
+            id: wire.id,
+            title: wire.title,
+            goal: wire.goal,
+            github_issue,
+            status: wire.status,
+            closed_by_run: wire.closed_by_run,
+            closed_at: wire.closed_at,
+            depends_on: wire.depends_on,
+            areas: wire.areas,
+            acceptance: wire.acceptance,
+            must_ask_if: wire.must_ask_if,
+            verify_profile: wire.verify_profile,
+            verify: wire.verify,
+            verify_timeout_seconds: wire.verify_timeout_seconds,
+        })
+    }
+}
+
+fn encode_slice_github_issue(github_issue: &str, provenance: &SliceProvenance) -> String {
+    if provenance.is_empty() {
+        github_issue.to_string()
+    } else {
+        let payload = serde_json::to_string(provenance).unwrap_or_else(|_| "{}".to_string());
+        format!("{github_issue}{SLICE_PROVENANCE_MARKER}{payload}")
+    }
+}
+
+fn split_slice_github_issue(value: &str) -> (&str, Option<SliceProvenance>) {
+    if let Some((github_issue, payload)) = value.split_once(SLICE_PROVENANCE_MARKER) {
+        (github_issue, serde_json::from_str(payload).ok())
+    } else {
+        (value, None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +686,49 @@ pub struct Handoff {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FollowupSliceDraft {
+    pub id: String,
+    pub title: String,
+    pub goal: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub areas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verify_profile: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub must_ask_if: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+}
+
+impl FollowupSliceDraft {
+    pub fn to_slice(&self) -> Slice {
+        Slice {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            goal: self.goal.clone(),
+            github_issue: String::new(),
+            status: default_slice_status(),
+            closed_by_run: String::new(),
+            closed_at: String::new(),
+            depends_on: self.depends_on.clone(),
+            areas: self.areas.clone(),
+            acceptance: self.acceptance.clone(),
+            must_ask_if: self.must_ask_if.clone(),
+            verify_profile: self.verify_profile.clone(),
+            verify: self.verify.clone(),
+            verify_timeout_seconds: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerResult {
     pub slice_id: String,
     pub status: String,
@@ -550,6 +749,8 @@ pub struct WorkerResult {
     pub findings: Vec<Finding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finding_dispositions: Vec<FindingDisposition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_followup_slices: Vec<FollowupSliceDraft>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assumptions: Vec<String>,
 }
@@ -627,6 +828,8 @@ pub struct RepairResult {
     pub findings: Vec<Finding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finding_dispositions: Vec<FindingDisposition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_followup_slices: Vec<FollowupSliceDraft>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1133,12 +1336,97 @@ pub struct ReplanEvidenceLink {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ReplanProposedChange {
     pub kind: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
     pub summary: String,
+}
+
+const FOLLOWUP_DRAFT_MARKER: &str = "\u{001e}khazad_followup_slice_draft:";
+
+impl ReplanProposedChange {
+    pub fn with_followup_slice_draft(
+        kind: String,
+        target: String,
+        summary: String,
+        draft: FollowupSliceDraft,
+    ) -> Self {
+        Self {
+            kind,
+            target,
+            summary: encode_replan_change_summary(&summary, &draft),
+        }
+    }
+
+    pub fn summary_text(&self) -> String {
+        split_replan_change_summary(&self.summary).0.to_string()
+    }
+
+    pub fn followup_slice_draft(&self) -> Option<FollowupSliceDraft> {
+        split_replan_change_summary(&self.summary).1
+    }
+}
+
+impl Serialize for ReplanProposedChange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (summary, followup_slice_draft) = split_replan_change_summary(&self.summary);
+        let mut state = serializer.serialize_struct("ReplanProposedChange", 4)?;
+        state.serialize_field("kind", &self.kind)?;
+        if !self.target.is_empty() {
+            state.serialize_field("target", &self.target)?;
+        }
+        state.serialize_field("summary", summary)?;
+        if let Some(followup_slice_draft) = followup_slice_draft {
+            state.serialize_field("followup_slice_draft", &followup_slice_draft)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ReplanProposedChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ReplanProposedChangeWire {
+            kind: String,
+            #[serde(default)]
+            target: String,
+            summary: String,
+            #[serde(default)]
+            followup_slice_draft: Option<FollowupSliceDraft>,
+        }
+
+        let wire = ReplanProposedChangeWire::deserialize(deserializer)?;
+        let summary = wire
+            .followup_slice_draft
+            .as_ref()
+            .map(|draft| encode_replan_change_summary(&wire.summary, draft))
+            .unwrap_or(wire.summary);
+        Ok(Self {
+            kind: wire.kind,
+            target: wire.target,
+            summary,
+        })
+    }
+}
+
+fn encode_replan_change_summary(summary: &str, draft: &FollowupSliceDraft) -> String {
+    let payload = serde_json::to_string(draft).unwrap_or_else(|_| "{}".to_string());
+    format!("{summary}{FOLLOWUP_DRAFT_MARKER}{payload}")
+}
+
+fn split_replan_change_summary(value: &str) -> (&str, Option<FollowupSliceDraft>) {
+    if let Some((summary, payload)) = value.split_once(FOLLOWUP_DRAFT_MARKER) {
+        (summary, serde_json::from_str(payload).ok())
+    } else {
+        (value, None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
