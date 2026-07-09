@@ -1,0 +1,53 @@
+{
+  "id": "AF-01",
+  "title": "Typed follow-up slice drafts through replan",
+  "goal": "Implement AF-01 from docs/roadmap/auto-frontier/02-typed-drafts.md. Workers and repair workers may emit candidate_followup_slices; the daemon validates each draft using existing slice and area-contract rules and records valid drafts as pending add_followup_slice replan proposals with typed payload and evidence links. Add optional provenance to slice JSON/type/schema. Do not classify, apply, mutate queues, or add autonomy.",
+  "depends_on": [
+    "AF-00"
+  ],
+  "areas": [
+    ".workflow/slices/AF-01.json",
+    ".workflow/schema/slice.schema.json",
+    "src/artifact.rs",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "src/workflow/schema.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/mod.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "docs/design/frontier-autonomy.md",
+    "docs/design/replan-checkpoints.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Worker/repair result schemas accept optional candidate_followup_slices[] carrying full FollowupSliceDraft data without breaking legacy outputs.",
+    "Valid follow-up drafts become durable pending add_followup_slice replan proposals with typed payload, draft summary in status/feed, and evidence links to worker output/attempt.",
+    "Invalid drafts become warning findings naming the validation error; they do not crash the daemon, fail the attempt, mutate .workflow/slices, or create proposals.",
+    "Slice JSON/type/schema accept an optional provenance block while existing hand-written slices remain valid.",
+    "No classification, proposal application, queue mutation, generated slice creation, or envelope autonomy behavior is introduced."
+  ],
+  "must_ask_if": [
+    "If the implementation would create a second proposal, decision, or apply authority channel outside the existing replan mechanism, stop and ask.",
+    "If required runtime behavior cannot be implemented within the declared areas, stop and ask rather than widening scope silently.",
+    "If a dependency or prerequisite from docs/roadmap/auto-frontier/00-matrix.md is not satisfied, stop and report the blocker.",
+    "If draft validation requires changing the area contract semantics, stop and ask."
+  ],
+  "verify": [
+    "cargo fmt -- --check",
+    "cargo test replan --quiet",
+    "cargo test worker_output --quiet",
+    "target/debug/khazad-doom slices validate --repo .",
+    "scripts/validate-workflow-areas ."
+  ],
+  "verify_timeout_seconds": 1200
+}

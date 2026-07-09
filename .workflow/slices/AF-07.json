@@ -1,0 +1,49 @@
+{
+  "id": "AF-07",
+  "title": "Frontier attestation in reports and handoffs",
+  "goal": "Implement AF-07 from docs/roadmap/auto-frontier/08-attestation.md. Derive an auditable frontier block in reports/handoff/read models from envelope, proposal, decision, event, queue, and slice provenance records. Extend roadmap-truth-check so generated slices with provenance must reference an accepted proposal decision. Do not add a new truth store.",
+  "depends_on": [
+    "AF-06"
+  ],
+  "areas": [
+    ".workflow/slices/AF-07.json",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/cli.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/mod.rs",
+    "scripts/roadmap-truth-check",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "docs/design/frontier-autonomy.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Report and handoff JSON include a derived frontier block with envelope snapshot, generated-slice graph, authorizers, proposal ids, tier reason codes, budget consumption, deferred/rejected/pending fog, operator-needed stops, and shadow agreement metrics.",
+    "Runs with no frontier activity render an explicit empty state where appropriate; legacy runs remain backward-compatible.",
+    "Handoff readiness remains blocked by unresolved pending proposals and the frontier block explains those pending items.",
+    "scripts/roadmap-truth-check rejects generated slices whose provenance origin proposal is missing or not accepted, while hand-written slices without provenance still pass existing checks.",
+    "The frontier block is regeneration-equivalent from existing records; no new persisted truth store is added."
+  ],
+  "must_ask_if": [
+    "If the implementation would create a second proposal, decision, or apply authority channel outside the existing replan mechanism, stop and ask.",
+    "If required runtime behavior cannot be implemented within the declared areas, stop and ask rather than widening scope silently.",
+    "If a dependency or prerequisite from docs/roadmap/auto-frontier/00-matrix.md is not satisfied, stop and report the blocker.",
+    "If attestation would require storing a second promotion graph rather than deriving it, stop and ask."
+  ],
+  "verify": [
+    "cargo fmt -- --check",
+    "cargo test handoff --quiet",
+    "cargo test projection --quiet",
+    "cargo test roadmap_truth --quiet",
+    "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+    "target/debug/khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

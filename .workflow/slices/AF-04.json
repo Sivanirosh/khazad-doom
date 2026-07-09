@@ -1,0 +1,52 @@
+{
+  "id": "AF-04",
+  "title": "Shadow classification recording",
+  "goal": "Implement AF-04 from docs/roadmap/auto-frontier/05-shadow-mode.md. Give autonomy_level=shadow its read-only meaning: classify pending add_followup_slice proposals at existing replan checkpoints, record tier/reason-code annotations and events, and report would-have-promoted/agreement metrics. Never mutate queues, slice files, or decisions.",
+  "depends_on": [
+    "AF-03"
+  ],
+  "areas": [
+    ".workflow/slices/AF-04.json",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/artifact.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/frontier.rs",
+    "src/workflow/mod.rs",
+    "src/cli.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "docs/design/frontier-autonomy.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Shadow runs classify pending add_followup_slice proposals at existing replan checkpoints and record tier, reason codes, envelope hash, budget snapshot, and classified_at without recording decisions.",
+    "Status/feed/report/handoff render shadow annotations and frontier agreement metrics from shared projection/read model wording.",
+    "off-level runs do not classify and remain behaviorally unchanged; promote/run levels before AF-06 behave as shadow/recorded-not-active only.",
+    "Tests prove .workflow/slices and remaining queue are byte-identical between off and shadow for the same candidates.",
+    "Resume/restart reclassification semantics are durable and event history is preserved."
+  ],
+  "must_ask_if": [
+    "If the implementation would create a second proposal, decision, or apply authority channel outside the existing replan mechanism, stop and ask.",
+    "If required runtime behavior cannot be implemented within the declared areas, stop and ask rather than widening scope silently.",
+    "If a dependency or prerequisite from docs/roadmap/auto-frontier/00-matrix.md is not satisfied, stop and report the blocker.",
+    "If shadow mode would block on Tier-3 or mutate any queue/slice/decision state, stop and ask."
+  ],
+  "verify": [
+    "cargo fmt -- --check",
+    "cargo test frontier --quiet",
+    "cargo test replan --quiet",
+    "cargo test shadow --quiet",
+    "cargo test projection --quiet",
+    "target/debug/khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

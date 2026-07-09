@@ -1,0 +1,55 @@
+{
+  "id": "AF-06",
+  "title": "Envelope-delegated auto-accept levels",
+  "goal": "Implement AF-06 from docs/roadmap/auto-frontier/07-auto-accept.md after HERDR-07/RW-2 is closed. For Tier-1 add_followup_slice proposals within envelope and budget, runs at autonomy promote/run may record an accepted decision with authorizer envelope:<run_id> and source frontier_policy, then apply through the AF-05 engine. Promote creates and commits generated slices without running them; run appends and executes them serially. Enforce stop rules, budget consumption, notification for Tier-3, and the AF-00 evidence gate.",
+  "depends_on": [
+    "AF-04",
+    "AF-05",
+    "HERDR-07"
+  ],
+  "areas": [
+    ".workflow/slices/AF-06.json",
+    ".workflow/slices/",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/frontier.rs",
+    "src/workflow/mod.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "docs/design/frontier-autonomy.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "promote/run autonomy levels can auto-record accepted decisions only for Tier-1 add_followup_slice proposals within envelope and budget, with authorizer envelope:<run_id>, source frontier_policy, and reason codes.",
+    "Auto-accepted proposals apply through the AF-05 engine only; no second apply path or mutation surface is introduced.",
+    "promote commits generated slices but does not run them; run appends generated slices serially and executes them, respecting max_auto_promotions, max_generated_slices, and max_depth.",
+    "Tier-2/Tier-3/non-followup/rejected/deferred/envelope-less candidates are never auto-accepted; Tier-3 and budget/depth stops surface structured attention and RW-2 notification evidence.",
+    "Crash/resume preserves budget consumption and idempotent apply without double-spend or duplicate promotion."
+  ],
+  "must_ask_if": [
+    "If the implementation would create a second proposal, decision, or apply authority channel outside the existing replan mechanism, stop and ask.",
+    "If required runtime behavior cannot be implemented within the declared areas, stop and ask rather than widening scope silently.",
+    "If a dependency or prerequisite from docs/roadmap/auto-frontier/00-matrix.md is not satisfied, stop and report the blocker.",
+    "If the AF-00 evidence bar cannot be satisfied or encoded as a hard gate, stop and ask before granting run-level auto-authority."
+  ],
+  "verify": [
+    "cargo fmt -- --check",
+    "cargo test frontier --quiet",
+    "cargo test replan --quiet",
+    "cargo test attention_notification --quiet",
+    "cargo test auto_accept --quiet",
+    "target/debug/khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

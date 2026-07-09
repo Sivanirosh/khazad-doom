@@ -1,0 +1,52 @@
+{
+  "id": "AF-05",
+  "title": "Operator-authorized follow-up apply engine",
+  "goal": "Implement AF-05 from docs/roadmap/auto-frontier/06-apply-engine.md. Complete the idempotent apply path for operator-accepted add_followup_slice proposals carrying typed FollowupSliceDraft payloads. The daemon revalidates, writes and commits generated slice JSON with provenance before any worker can run it, appends serially at an explicit checkpoint, and records applied=true with snapshots. No auto-accept yet.",
+  "depends_on": [
+    "AF-01"
+  ],
+  "areas": [
+    ".workflow/slices/AF-05.json",
+    ".workflow/slices/",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/artifact.rs",
+    "src/gitutil.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/mod.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "docs/design/frontier-autonomy.md",
+    "docs/design/replan-checkpoints.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Operator-accepted add_followup_slice proposals with valid typed drafts are applied by one idempotent daemon path: revalidate, write generated slice with provenance, commit-before-run, append serially to the remaining queue, and record applied metadata/snapshots.",
+    "Apply-refused and apply-incomplete states are recorded and rendered with remediation; no worker launches against ambiguous or uncommitted generated slice contracts.",
+    "Rejected/deferred/non-followup proposals remain unapplied; historical accepted-unapplied proposals are not retro-applied.",
+    "Crash/resume tests cover accepted-before-apply and commit-before-queue-extension without duplicate slice files, commits, or queue entries.",
+    "All authority remains operator-only in this slice; no envelope-authorized accept or classifier-triggered decision is added."
+  ],
+  "must_ask_if": [
+    "If the implementation would create a second proposal, decision, or apply authority channel outside the existing replan mechanism, stop and ask.",
+    "If required runtime behavior cannot be implemented within the declared areas, stop and ask rather than widening scope silently.",
+    "If a dependency or prerequisite from docs/roadmap/auto-frontier/00-matrix.md is not satisfied, stop and report the blocker.",
+    "If applying generated slices would require mutating active parallel layers rather than serial append after the current layer, stop and ask."
+  ],
+  "verify": [
+    "cargo fmt -- --check",
+    "cargo test replan --quiet",
+    "cargo test apply --quiet",
+    "cargo test resume --quiet",
+    "target/debug/khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

@@ -1,0 +1,36 @@
+{
+  "id": "AF-08",
+  "title": "Dogfood autonomous frontier on a real mission",
+  "goal": "Implement AF-08 from docs/roadmap/auto-frontier/09-dogfood.md. Run the staged real-Pi dogfood proof for the autonomous frontier: Stage A shadow classification and manual accept agreement, Stage B run-level auto-promotion/execution/publication, Stage C narrowed-envelope Tier-3 stop with RW-2 notification and operator decision, plus a duplicate-closed rerun guard. Write daemon-state evidence under docs/design/evidence/frontier-dogfood-2026-07-09.md.",
+  "depends_on": [
+    "AF-07"
+  ],
+  "areas": [
+    ".workflow/slices/AF-08.json",
+    "docs/design/evidence/frontier-dogfood-2026-07-09.md",
+    "docs/design/frontier-autonomy.md",
+    "docs/roadmap/auto-frontier/00-matrix.md",
+    "docs/roadmap/auto-frontier/09-dogfood.md",
+    "docs/workflow-invariants.md"
+  ],
+  "acceptance": [
+    "Stage A proves shadow mode with a real Pi worker: candidate emitted, Tier-1 classification recorded, queue unchanged, operator manually accepts, and agreement evidence appears in the report.",
+    "Stage B proves run-level autonomy: auto-accept authorizer envelope:<run>, generated slice committed before execution, generated slice runs/closes, publication truth and handoff promotion graph are correct.",
+    "Stage C proves Tier-3 stop: narrowed envelope pauses in awaiting_replan, origin notification is observed, operator decision records and run resumes/completes.",
+    "The duplicate-closed rerun guard is observed live: a rediscovered already-closed follow-up classifies duplicate_closed and is not promoted or rerun.",
+    "Evidence doc cites daemon state/artifacts/commits only and explicitly avoids terminal text or prose-only claims."
+  ],
+  "must_ask_if": [
+    "If any staged dogfood run requires operator intent, ask with the exact daemon commands and do not fabricate evidence.",
+    "If the frontier implementation fails a stage, stop and return blocked JSON with the failing run id, evidence path, and proposed follow-up slice instead of papering over it."
+  ],
+  "verify": [
+    "test -f docs/design/evidence/frontier-dogfood-2026-07-09.md",
+    "grep -q 'Stage A' docs/design/evidence/frontier-dogfood-2026-07-09.md",
+    "grep -q 'Stage B' docs/design/evidence/frontier-dogfood-2026-07-09.md",
+    "grep -q 'Stage C' docs/design/evidence/frontier-dogfood-2026-07-09.md",
+    "grep -q 'duplicate_closed' docs/design/evidence/frontier-dogfood-2026-07-09.md",
+    "target/debug/khazad-doom slices validate --repo ."
+  ],
+  "verify_timeout_seconds": 1200
+}

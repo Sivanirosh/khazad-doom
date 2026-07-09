@@ -1,0 +1,52 @@
+{
+  "id": "AF-02",
+  "title": "Mission envelope record and budgets",
+  "goal": "Implement AF-02 from docs/roadmap/auto-frontier/03-mission-envelope.md. Add a durable per-run MissionEnvelope and FrontierBudgetState that are recorded at run start, survive restart/resume, render through shared status/watch/monitor/report/handoff projections, and grant no authority yet. Autonomy levels above off are recorded only and behave as off until later slices.",
+  "depends_on": [
+    "AF-00"
+  ],
+  "areas": [
+    ".workflow/slices/AF-02.json",
+    ".workflow/schema/",
+    "src/domain.rs",
+    "src/state.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/cli.rs",
+    "src/artifact.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/prompts.rs",
+    "src/workflow/projection.rs",
+    "src/workflow/read_model.rs",
+    "src/workflow/mod.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "docs/design/frontier-autonomy.md",
+    "docs/workflow-invariants.md",
+    "README.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Run start can record a validated MissionEnvelope with goal, allowed_areas, non_goals, verify_profile, max_auto_promotions, max_depth, max_generated_slices, autonomy_level, and must_ask_if.",
+    "Envelope and budget counters are durable run state, survive daemon restart/resume, and are included in status/watch/monitor/report/handoff from the shared projection.",
+    "Allowed areas reuse the literal-prefix area contract; invalid envelopes are rejected before worker launch with exact validation errors.",
+    "Runs without an envelope remain backward-compatible and behave as autonomy off.",
+    "No classifier, proposal decision, proposal apply, queue mutation, or auto-authority behavior is introduced."
+  ],
+  "must_ask_if": [
+    "If the implementation would create a second proposal, decision, or apply authority channel outside the existing replan mechanism, stop and ask.",
+    "If required runtime behavior cannot be implemented within the declared areas, stop and ask rather than widening scope silently.",
+    "If a dependency or prerequisite from docs/roadmap/auto-frontier/00-matrix.md is not satisfied, stop and report the blocker.",
+    "If implementing envelope support would require envelope mutation mid-run or a standing cross-run envelope, stop and ask."
+  ],
+  "verify": [
+    "cargo fmt -- --check",
+    "cargo test mission_envelope --quiet",
+    "cargo test status --quiet",
+    "cargo test handoff --quiet",
+    "target/debug/khazad-doom slices validate --repo .",
+    "scripts/validate-workflow-areas ."
+  ],
+  "verify_timeout_seconds": 1200
+}
