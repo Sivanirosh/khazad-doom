@@ -1,0 +1,32 @@
+{
+  "id": "AF-00",
+  "title": "Frontier doctrine RFC and invariant amendments",
+  "goal": "Implement the AF-00 roadmap workpackage. Create docs/design/frontier-autonomy.md as an execution-grade RFC for autonomous frontier behavior, using docs/roadmap/auto-frontier/00-matrix.md and docs/roadmap/auto-frontier/01-doctrine.md as the source plan. The RFC must reconcile autonomy with the existing replan authority channel: candidate follow-up slices are replan proposals, the mission envelope delegates only decision-recording authority, and one idempotent apply engine serves both operator and envelope-authorized accepts. Append proposed Phase-style invariant amendment records to docs/workflow-invariants.md. Keep the language obvious and explicit; avoid introducing names that imply a second workflow owner.",
+  "areas": [
+    ".workflow/slices/AF-00.json",
+    "docs/design/frontier-autonomy.md",
+    "docs/workflow-invariants.md",
+    "docs/roadmap/auto-frontier/00-matrix.md",
+    "docs/roadmap/auto-frontier/01-doctrine.md"
+  ],
+  "acceptance": [
+    "docs/design/frontier-autonomy.md exists and defines MissionEnvelope fields and validation, tier semantics with stable reason codes, the autonomy authority ladder and evidence bar, stop rules, provenance requirements, and deferral reopenings.",
+    "The RFC states that follow-up candidates use the existing replan proposal/decision/apply channel and that no separate frontier authority channel exists.",
+    "docs/workflow-invariants.md contains proposed amendment records in the existing Phase-style format, including enforcement mechanisms, violation-detecting tests, and status for mission envelopes, envelope-delegated auto-acceptance, and generated follow-up slice provenance.",
+    "AF-00 remains docs-only: no Rust, JavaScript, schema, script, or runtime behavior changes are made.",
+    "Roadmap truth lint still passes for docs/roadmap/auto-frontier/00-matrix.md."
+  ],
+  "must_ask_if": [
+    "If completing AF-00 appears to require runtime/schema/code changes, stop and ask instead of changing code.",
+    "If the RFC cannot pick explicit N/M/X evidence-bar numbers for promote/run authority, ask the operator rather than leaving the bar vague.",
+    "If the existing replan channel appears insufficient and a second authority channel seems necessary, stop and ask before documenting that direction."
+  ],
+  "verify": [
+    "test -f docs/design/frontier-autonomy.md",
+    "grep -q 'MissionEnvelope' docs/design/frontier-autonomy.md",
+    "grep -q 'reason code' docs/design/frontier-autonomy.md",
+    "grep -q 'replan proposal' docs/design/frontier-autonomy.md",
+    "grep -q 'Frontier autonomy' docs/workflow-invariants.md",
+    "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md"
+  ]
+}
