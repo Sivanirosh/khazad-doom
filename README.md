@@ -131,7 +131,7 @@ khazad-doom run --slice slice-001 --envelope mission.json --autonomy off
 
 `mission.json` uses `.workflow/schema/mission-envelope.schema.json`. Its `allowed_areas` use the same literal-prefix area contract as slice `areas`: repo-relative prefixes only, no globs, parent traversal, absolute paths, leading/trailing whitespace, or leading `./`. Khazad-Doom persists the envelope and a zeroed frontier budget for the run, survives daemon restart/resume through SQLite state, and projects both into status/watch/monitor/report/handoff artifacts.
 
-AF-02 is record-only. `autonomy_level` values `shadow`, `promote`, and `run` may be recorded for later roadmap slices, but they are explicitly effective `off`: they do not auto-propose, auto-apply, auto-generate slices, or grant authority beyond the selected Issue Slices.
+AF-04 keeps autonomy record-only for authority but makes shadow observable. `autonomy_level: "off"` performs no frontier classification. `shadow` classifies pending typed `add_followup_slice` replan proposals at existing daemon replan checkpoints, persists tier/reason codes/envelope hash/budget snapshot/classified-at, and records `frontier_classified` events without deciding or mutating queues or `.workflow/slices`. `promote` and `run` are still recorded-not-active before AF-06 and are rendered/classified as shadow observations only; they do not auto-propose, auto-apply, auto-generate slices, or grant authority beyond selected Issue Slices.
 
 ## What the gate enforces
 
@@ -234,7 +234,7 @@ khazad-doom replan reject <run-id> <proposal-id> --reason "..."
 khazad-doom replan defer <run-id> <proposal-id> --until "condition" --reason "..."
 ```
 
-Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, and an empty `replan.auto_approvable` tier. The shared feed projection renders pending/decided proposals and pauses resume/worker dispatch/repair at `awaiting_replan` while a pending proposal exists. Worker handoff JSON, final reports, implementation summaries, and branch handoffs include a `plan_revisions` queue-history section. Accepted proposals expose `authorized_paths` and `action_class`; worker prompts and daemon slice-area guards honor those grants for the source slice, while unresolved pending proposals still block `khazad-doom handoff` until the operator records an accept/reject/defer/supersede disposition.
+Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, and an empty `replan.auto_approvable` tier. The shared feed projection renders pending/decided proposals, shadow frontier annotations when present, and pauses resume/worker dispatch/repair at `awaiting_replan` while a pending proposal exists. Worker handoff JSON, final reports, implementation summaries, and branch handoffs include a `plan_revisions` queue-history section with `frontier` shadow metrics (candidate count, tier distribution, would-have-promoted outcomes, and operator agreement ratios) when classifications exist. Accepted proposals expose `authorized_paths` and `action_class`; worker prompts and daemon slice-area guards honor those grants for the source slice, while unresolved pending proposals still block `khazad-doom handoff` until the operator records an accept/reject/defer/supersede disposition.
 
 ### The Pi package: skill and monitor bridge
 

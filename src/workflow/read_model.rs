@@ -1,10 +1,12 @@
 use super::projection::project_run;
 use crate::artifact;
 use crate::domain::{
-    Event, GeneratedSliceRecord, ImplementationSummary, PlanRevisionDecisionSummary,
-    PlanRevisionRecord, PlanRevisions, ReplanProposal, ReplanProposalState, ReplanStatus, Run,
-    RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus, SliceRun, SliceStatus,
-    TerminalReason, WorkerProfileEvidence, WorkerQuestion, replan_decision_commands,
+    Event, FrontierProposalOutcome, FrontierSummary, GeneratedSliceRecord, ImplementationSummary,
+    PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions, ReplanProposal,
+    ReplanProposalState, ReplanStatus, Run, RunDetails, RunEconomics, RunIncident, RunProgress,
+    RunStatus, SliceRun, SliceStatus, TerminalReason, WorkerProfileEvidence, WorkerQuestion,
+    frontier_classification_annotation, frontier_classification_would_auto_promote,
+    replan_decision_commands,
 };
 use crate::state::Store as StateStore;
 use anyhow::Result;
@@ -739,6 +741,7 @@ pub(crate) fn plan_revisions_from_proposals(
     run: &Run,
     proposals: Vec<ReplanProposal>,
 ) -> Result<PlanRevisions> {
+    let frontier = frontier_summary_from_proposals(&proposals);
     let mut plan = PlanRevisions {
         source_of_truth: "daemon_replan_proposals".to_string(),
         queue_summary: if run.selected_slice_id.trim().is_empty() {
@@ -746,6 +749,7 @@ pub(crate) fn plan_revisions_from_proposals(
         } else {
             format!("selected slices: {}", run.selected_slice_id)
         },
+        frontier,
         ..PlanRevisions::default()
     };
     for mut proposal in proposals {
@@ -764,6 +768,92 @@ pub(crate) fn plan_revisions_from_proposals(
     }
     plan.unresolved_pending_blocks_handoff = !plan.pending.is_empty();
     Ok(plan)
+}
+
+pub(crate) fn frontier_summary_from_proposals(proposals: &[ReplanProposal]) -> FrontierSummary {
+    let mut summary = FrontierSummary::default();
+    for proposal in proposals {
+        let Some(classification) = &proposal.frontier_classification else {
+            continue;
+        };
+        summary.candidates_seen += 1;
+        *summary
+            .tier_distribution
+            .entry(classification.tier.clone())
+            .or_insert(0) += 1;
+        if frontier_classification_would_auto_promote(classification) {
+            let outcome = frontier_operator_outcome(proposal);
+            match outcome.as_str() {
+                "accepted_unchanged" => summary.agreement.accepted_unchanged += 1,
+                "accepted_modified" => summary.agreement.accepted_modified += 1,
+                "rejected" => summary.agreement.rejected += 1,
+                "deferred" => summary.agreement.deferred += 1,
+                "pending" => summary.agreement.pending += 1,
+                _ => summary.agreement.pending += 1,
+            }
+            summary.would_have_promoted.push(FrontierProposalOutcome {
+                proposal_id: proposal.id.clone(),
+                tier: classification.tier.clone(),
+                reason_codes: classification.reason_codes.clone(),
+                operator_outcome: outcome,
+                classified_at: classification.classified_at.to_rfc3339(),
+                envelope_hash: classification.envelope_hash.clone(),
+                annotation: frontier_classification_annotation(classification),
+            });
+        }
+    }
+    if summary.candidates_seen > 0 {
+        summary.agreement.tier1_total = summary.would_have_promoted.len();
+        summary.agreement.agreement_numerator = summary.agreement.accepted_unchanged;
+        summary.agreement.agreement_denominator = summary.agreement.accepted_unchanged
+            + summary.agreement.accepted_modified
+            + summary.agreement.rejected
+            + summary.agreement.deferred;
+        summary.agreement.agreement_ratio = format!(
+            "{}/{}",
+            summary.agreement.agreement_numerator, summary.agreement.agreement_denominator
+        );
+        summary.agreement.agreement_percent = if summary.agreement.agreement_denominator == 0 {
+            0.0
+        } else {
+            (summary.agreement.agreement_numerator as f64
+                / summary.agreement.agreement_denominator as f64)
+                * 100.0
+        };
+        let agreement = if summary.agreement.agreement_denominator == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.0}%", summary.agreement.agreement_percent)
+        };
+        summary.summary_line = format!(
+            "frontier shadow observations: candidates_seen={}, tier_1_would_promote={}, agreement={} ({agreement})",
+            summary.candidates_seen,
+            summary.agreement.tier1_total,
+            summary.agreement.agreement_ratio
+        );
+    }
+    summary
+}
+
+fn frontier_operator_outcome(proposal: &ReplanProposal) -> String {
+    match proposal.state {
+        ReplanProposalState::Pending => "pending".to_string(),
+        ReplanProposalState::Accepted => {
+            let replacement = proposal
+                .operator_decision
+                .as_ref()
+                .map(|decision| !decision.replacement_id.trim().is_empty())
+                .unwrap_or(false);
+            if replacement {
+                "accepted_modified".to_string()
+            } else {
+                "accepted_unchanged".to_string()
+            }
+        }
+        ReplanProposalState::Rejected => "rejected".to_string(),
+        ReplanProposalState::Deferred => "deferred".to_string(),
+        ReplanProposalState::Superseded => "accepted_modified".to_string(),
+    }
 }
 
 fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevisionRecord> {
@@ -785,6 +875,7 @@ fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevis
         authorized_paths,
         action_class: plan_revision_action_class(&proposal),
         risk: proposal.risk.clone(),
+        frontier_classification: proposal.frontier_classification.clone(),
         before_queue_or_slice_summary: plan_revision_before_summary(run, &proposal),
         after_queue_or_slice_summary: after,
         decision_commands: proposal.decision_commands.clone(),

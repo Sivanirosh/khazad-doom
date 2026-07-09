@@ -5,7 +5,7 @@ Status: proposed for AF-00; runtime implementation is deferred to AF-01..AF-08.
 
 This RFC defines the smallest autonomous-frontier behavior allowed by the roadmap. It is an execution-grade design for later slices. The daemon remains the workflow owner. Slice JSON plus daemon/run state remain workflow truth. Frontier behavior only changes who may record a bounded accept decision for one kind of existing replan proposal.
 
-AF-02 implements only the durable record surface: `khazad-doom run --envelope <mission.json> [--autonomy off|shadow|promote|run]` validates the envelope, persists it with a zeroed `FrontierBudgetState`, and projects both into status/watch/monitor/report/handoff. Every autonomy level remains effective `off` in AF-02; there is no classifier, no auto-authority, no proposal generation, and no apply path.
+AF-04 implements the shadow recording surface on top of the durable AF-02 envelope and AF-03 pure classifier. `off` runs do not classify. `shadow` runs classify pending typed `add_followup_slice` replan proposals at existing replan checkpoints and persist tier, reason codes, envelope hash, budget snapshot, classified-at, plus a `frontier_classified` event. This is record-only: no decisions, queue mutation, slice writes, proposal channel, or apply path are introduced. `promote` and `run` remain recorded-not-active before AF-06 and are treated as shadow observation only.
 
 ## Evidence and constraints
 
@@ -34,9 +34,9 @@ Introduce a per-run `MissionEnvelope` and a deterministic frontier classifier.
 - The daemon converts each candidate into a pending `add_followup_slice` replan proposal, with evidence.
 - The classifier reads the envelope, slice graph, proposal, and budget counters and returns a tier plus stable reason codes.
 - At `off`, proposals wait for the operator exactly as replan v1 does today.
-- At `shadow`, the daemon records what the classifier would have done, but mutates no queue and writes no generated slice.
-- At `promote`, Tier-1 proposals may be accepted by the daemon with `authorizer: "envelope:<run_id>"` and applied through the same idempotent replan apply engine as an operator accept. Generated slices are committed but not run in the current frontier.
-- At `run`, Tier-1 proposals may be accepted, applied, appended serially to the frontier, and run.
+- At `shadow`, the daemon records what the classifier would have done, but mutates no queue, writes no generated slice, and records no decision.
+- Before AF-06, `promote` behaves like `shadow`: recorded-not-active, classifier observations only, no envelope-authorized decisions.
+- Before AF-06, `run` behaves like `shadow`: recorded-not-active, classifier observations only, no generated work is appended or run.
 
 The classifier is policy only. It never touches git, state files, IPC, queues, or workers. Applying an accepted proposal is workflow-manager work.
 
@@ -101,8 +101,8 @@ No path normalization beyond the area contract is allowed. Different trailing-sl
 |---|---|---|
 | `off` | Operator only. | Candidate follow-ups become pending replan proposals. No classifier decision is required to continue existing behavior. |
 | `shadow` | Operator only. | Classifier tier and reason codes are recorded on proposals and reports as would-have-done data. Queue, slice files, and decisions are unchanged. |
-| `promote` | Envelope may record accepted decisions for Tier-1 `add_followup_slice` proposals within budget. | The accepted proposal is applied by the shared replan apply engine. Generated slice files are committed with provenance but are not appended to the current run queue. |
-| `run` | Same as `promote`, plus generated Tier-1 slices may be appended to the current run queue. | The frontier continues serially. No parallel autonomous frontier is granted. |
+| `promote` | Operator only until AF-06 enables envelope decisions. | AF-04 treats this as recorded-not-active shadow observation only. |
+| `run` | Operator only until AF-06 enables frontier execution. | AF-04 treats this as recorded-not-active shadow observation only. |
 
 The ladder is one-way for production runs: `off` -> `shadow` -> `promote` -> `run`. No production deployment may skip a level. Operators may lower a level at any time.
 
@@ -122,15 +122,14 @@ The classifier returns the highest required tier plus all applicable reason code
 | Tier | Name | Meaning | Mutating authority |
 |---|---|---|---|
 | Tier 0 | attest-inline | The worker already completed a discovery inside the current slice fence. The classifier may attest that no follow-up slice is needed. | None. This is not a proposal accept. |
-| Tier 1 | auto-promote | The proposal is a mechanically safe `add_followup_slice` within the envelope and within budget. | At `promote`/`run`, the daemon may record an accept decision. Apply still goes through the shared replan apply engine. |
-| Tier 2 | queue-pending | The proposal is plausible but not safe enough for envelope-authorized acceptance, or the current level is `off`/`shadow`. | Operator decision through the replan proposal channel. |
+| Tier 1 | auto-promote | The proposal is a mechanically safe `add_followup_slice` within the envelope and within budget. | After AF-06, `promote`/`run` may record an envelope accept decision. In AF-04 this is measured only. |
+| Tier 2 | queue-pending | The proposal is plausible but not safe enough for envelope-authorized acceptance, or the current level is `off`/record-only shadow. | Operator decision through the replan proposal channel. |
 | Tier 3 | ask-operator | Continuing automatically would risk intent, authority, policy, or envelope violation. | Operator decision required before this frontier can proceed. |
 
 ### Classifier rule order
 
 AF-03 implements this as `src/workflow/frontier.rs` / `promotion_policy::classify_followup_proposal`: a pure classifier over an explicit proposal view, `MissionEnvelope`, slice/proposal graph view, and
-`FrontierBudgetState`. It is policy only; it has no runtime callers in AF-03 and creates no proposal, decision, apply, queue, git, IPC, filesystem,
-worker, or clock authority.
+`FrontierBudgetState`. It is policy only. AF-04 may call it to record shadow classifications, but the classifier itself creates no proposal, decision, apply, queue, git, IPC, filesystem, worker, or clock authority.
 
 1. If there is no candidate follow-up, return no frontier work. Existing queue behavior continues.
 2. If the item is an in-slice discovery with no new runnable work, classify Tier 0.
@@ -148,7 +147,7 @@ worker, or clock authority.
 | `inline_within_slice_contract` | Tier 0 | The worker's discovery stayed inside the current slice goal, acceptance, areas, and verify authority. |
 | `inline_no_new_slice` | Tier 0 | No generated follow-up slice is needed. |
 | `frontier_disabled` | Tier 2 | The envelope is absent or `autonomy_level=off`. |
-| `shadow_observation_only` | Tier 2 side annotation | `autonomy_level=shadow`; record would-have tier and reason codes without mutation. |
+| `shadow_observation_only` | side annotation | `autonomy_level=shadow`, `promote`, or `run` before AF-06; record would-have tier and reason codes without mutation. |
 | `inside_allowed_areas` | Tier 1 positive | Every candidate area is contained by `allowed_areas`. |
 | `acceptance_present` | Tier 1 positive | Candidate slice has non-empty acceptance criteria. |
 | `verify_present` | Tier 1 positive | Candidate slice has non-empty verify commands compatible with the mission verify profile. |
