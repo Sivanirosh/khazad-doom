@@ -2264,6 +2264,144 @@ fn invalid_worker_output_pi_attempt_is_preserved_and_counted_black_box() -> Test
 }
 
 #[test]
+fn af_worker_envelope_failures_are_corrected_in_same_attempt_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_af_envelope_corrections_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    for (id, title, acceptance) in [
+        (
+            "missing-acceptance",
+            "Correct missing acceptance evidence",
+            "exact acceptance evidence is required",
+        ),
+        (
+            "missing-action",
+            "Correct missing finding action",
+            "every finding includes its action",
+        ),
+    ] {
+        write_slice(
+            repo.path(),
+            json!({
+                "id": id,
+                "title": title,
+                "goal": "Correct an invalid result envelope without repeating implementation.",
+                "acceptance": [acceptance]
+            }),
+        )?;
+    }
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add AF envelope correction slices"],
+    )?;
+
+    let fake_pi_string = path(&fake_pi).to_string();
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_PI_BIN", fake_pi_string.as_str())],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--parallel",
+            "1",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
+    let completed = wait_for_terminal_status(&bin, home.path(), &run_id, "completed")?;
+    let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
+    let inspected = json_stdout(&inspected)?;
+    let events = completed["events"].as_array().expect("events");
+    for (slice_id, expected_error, expected_payload) in [
+        (
+            "missing-acceptance",
+            "missing acceptance evidence",
+            "wrong acceptance criterion",
+        ),
+        (
+            "missing-action",
+            "missing field `action`",
+            "finding without required action",
+        ),
+    ] {
+        let slice_run = completed["slice_runs"]
+            .as_array()
+            .expect("slice runs")
+            .iter()
+            .find(|slice_run| slice_run["slice_id"].as_str() == Some(slice_id))
+            .expect("slice run");
+        assert_eq!(slice_run["attempts"], 1, "{slice_id}");
+
+        let invalid_path = artifact_path(
+            &inspected,
+            &format!("{slice_id}.worker.attempt-1.invalid-output.json"),
+        )?;
+        let invalid: Value = serde_json::from_str(&fs::read_to_string(invalid_path)?)?;
+        assert_eq!(invalid["attempt"], 1);
+        assert_eq!(invalid["envelope_retry"], 0);
+        assert!(
+            invalid["parse_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_error),
+            "unexpected {slice_id} error: {invalid:#}"
+        );
+        assert!(
+            invalid["raw_invalid_payload"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_payload),
+            "missing preserved {slice_id} payload: {invalid:#}"
+        );
+        assert!(
+            invalid["committed_diff_name_only"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("{slice_id}.txt")),
+            "initial implementation commit should be preserved: {invalid:#}"
+        );
+        let envelope_path = artifact_path(
+            &inspected,
+            &format!("{slice_id}.worker.attempt-1.envelope-1.json"),
+        )?;
+        assert!(Path::new(envelope_path).exists());
+        assert!(events.iter().any(|event| {
+            event["type"].as_str() == Some("worker_envelope_retry_succeeded")
+                && event["payload"]["slice_id"].as_str() == Some(slice_id)
+                && event["payload"]["attempt"].as_u64() == Some(1)
+                && event["payload"]["envelope_retry"].as_u64() == Some(1)
+        }));
+        assert_eq!(
+            fs::read_to_string(fake_bin.path().join(format!("{slice_id}.attempt")))?,
+            "2",
+            "{slice_id} should use one implementation call and one envelope correction"
+        );
+    }
+
+    let run_summary_path = artifact_path(&inspected, "run-summary.json")?;
+    let run_summary: Value = serde_json::from_str(&fs::read_to_string(run_summary_path)?)?;
+    assert_eq!(run_summary["economics"]["agent_call_count"], 4);
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn pi_auth_launch_failure_blocks_without_retries_or_later_layers() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -3512,6 +3650,109 @@ result = {
         for criterion in handoff["slice"].get("acceptance", [])
     ],
 }
+event = {
+    "type": "agent_end",
+    "messages": [{"role": "assistant", "content": [{"type": "text", "text": json.dumps(result)}]}],
+}
+print(json.dumps(event), flush=True)
+"#,
+    )?;
+    let mut perms = fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms)?;
+    Ok(path)
+}
+
+fn write_af_envelope_corrections_fake_pi(dir: &Path) -> TestResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("pi");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+prompt = sys.stdin.read()
+handoff_path = ""
+lines = prompt.splitlines()
+for index, line in enumerate(lines):
+    if line.strip() == "Read this handoff JSON first:" and index + 1 < len(lines):
+        handoff_path = lines[index + 1].strip()
+        break
+if not handoff_path:
+    event = {
+        "type": "agent_end",
+        "messages": [{"role": "assistant", "content": [{"type": "text", "text": json.dumps({"status": "no-op", "summary": "no repair"})}]}],
+    }
+    print(json.dumps(event), flush=True)
+    sys.exit(0)
+
+with open(handoff_path, encoding="utf-8") as fh:
+    handoff = json.load(fh)
+slice_id = handoff["slice"]["id"]
+state_path = Path(__file__).with_name(f"{slice_id}.attempt")
+attempt = int(state_path.read_text(encoding="utf-8")) + 1 if state_path.exists() else 1
+state_path.write_text(str(attempt), encoding="utf-8")
+
+if attempt == 1:
+    with open(f"{slice_id}.txt", "w", encoding="utf-8") as fh:
+        fh.write(f"implemented once for {slice_id}\n")
+    subprocess.run(["git", "add", "."], check=True)
+    subprocess.run(
+        ["git", "commit", "-m", f"fake pi implement {slice_id}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+criterion = handoff["slice"]["acceptance"][0]
+
+if attempt == 1 and slice_id == "missing-acceptance":
+    result = {
+        "slice_id": slice_id,
+        "status": "complete",
+        "summary": "implementation complete with mismatched evidence",
+        "commit_sha": sha,
+        "changed_files": [f"{slice_id}.txt"],
+        "acceptance_status": [{
+            "criterion": "wrong acceptance criterion",
+            "status": "satisfied",
+            "evidence": "the implementation commit exists",
+        }],
+    }
+elif attempt == 1 and slice_id == "missing-action":
+    result = {
+        "slice_id": slice_id,
+        "status": "complete",
+        "summary": "implementation complete with malformed finding",
+        "commit_sha": sha,
+        "changed_files": [f"{slice_id}.txt"],
+        "acceptance_status": [{
+            "criterion": criterion,
+            "status": "satisfied",
+            "evidence": "the implementation commit exists",
+        }],
+        "findings": [{
+            "severity": "warning",
+            "description": "finding without required action",
+        }],
+    }
+else:
+    result = {
+        "slice_id": slice_id,
+        "status": "complete",
+        "summary": "valid envelope for the existing implementation commit",
+        "commit_sha": sha,
+        "changed_files": [f"{slice_id}.txt"],
+        "acceptance_status": [{
+            "criterion": criterion,
+            "status": "satisfied",
+            "evidence": "re-emitted from the unchanged implementation HEAD",
+        }],
+    }
+
 event = {
     "type": "agent_end",
     "messages": [{"role": "assistant", "content": [{"type": "text", "text": json.dumps(result)}]}],

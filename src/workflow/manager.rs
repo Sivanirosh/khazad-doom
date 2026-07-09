@@ -10815,6 +10815,118 @@ mod tests {
     }
 
     #[test]
+    fn completion_publication_preserves_dirty_operator_checkout() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut first = slice("slice-001");
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        fs::write(repo.path().join("staged.txt"), "base staged\n")?;
+        fs::write(repo.path().join("unstaged.txt"), "base unstaged\n")?;
+        fs::write(repo.path().join("mixed.txt"), "base mixed\n")?;
+        gitutil::run(repo.path(), &["add", "."])?;
+        gitutil::run(
+            repo.path(),
+            &["commit", "-m", "add slice and operator files"],
+        )?;
+
+        fs::write(repo.path().join("staged.txt"), "stash seed\n")?;
+        gitutil::run(repo.path(), &["stash", "push", "-m", "operator backup"])?;
+
+        fs::write(repo.path().join("staged.txt"), "operator staged\n")?;
+        gitutil::run(repo.path(), &["add", "staged.txt"])?;
+        fs::write(repo.path().join("unstaged.txt"), "operator unstaged\n")?;
+        fs::write(repo.path().join("mixed.txt"), "operator mixed index\n")?;
+        gitutil::run(repo.path(), &["add", "mixed.txt"])?;
+        fs::write(repo.path().join("mixed.txt"), "operator mixed worktree\n")?;
+        fs::write(repo.path().join("untracked.txt"), "operator untracked\n")?;
+
+        let operator_head = gitutil::head_sha(repo.path())?;
+        let operator_branch = gitutil::current_branch(repo.path())?;
+        let operator_status = gitutil::status_porcelain(repo.path())?;
+        let operator_index = gitutil::run(repo.path(), &["write-tree"])?;
+        let operator_head_reflog =
+            gitutil::run(repo.path(), &["reflog", "show", "--format=%H:%gs", "HEAD"])?;
+        let stash_ref = gitutil::run(repo.path(), &["rev-parse", "refs/stash"])?;
+        let stash_reflog = gitutil::run(
+            repo.path(),
+            &["reflog", "show", "--format=%H:%gs", "refs/stash"],
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: true,
+            origin_notification_target: String::new(),
+            mission_envelope: None,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let integration_head = gitutil::run(repo.path(), &["rev-parse", &run.integration_branch])?;
+        assert_ne!(integration_head, operator_head);
+        assert_eq!(
+            gitutil::run(
+                repo.path(),
+                &["show", "-s", "--format=%s", &run.integration_branch],
+            )?,
+            format!("khazad(run): publish completion {}", run.id)
+        );
+
+        assert_eq!(gitutil::head_sha(repo.path())?, operator_head);
+        assert_eq!(gitutil::current_branch(repo.path())?, operator_branch);
+        assert_eq!(gitutil::status_porcelain(repo.path())?, operator_status);
+        assert_eq!(gitutil::run(repo.path(), &["write-tree"])?, operator_index);
+        assert_eq!(
+            gitutil::run(repo.path(), &["reflog", "show", "--format=%H:%gs", "HEAD"])?,
+            operator_head_reflog
+        );
+        assert_eq!(
+            gitutil::run(repo.path(), &["rev-parse", "refs/stash"])?,
+            stash_ref
+        );
+        assert_eq!(
+            gitutil::run(
+                repo.path(),
+                &["reflog", "show", "--format=%H:%gs", "refs/stash"],
+            )?,
+            stash_reflog
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("staged.txt"))?,
+            "operator staged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("unstaged.txt"))?,
+            "operator unstaged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("mixed.txt"))?,
+            "operator mixed worktree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("untracked.txt"))?,
+            "operator untracked\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn repair_authority_flags_workflow_policy_and_out_of_area_paths() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
