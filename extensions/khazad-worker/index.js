@@ -110,20 +110,21 @@ async function askOperatorInWorkerPane(socket, params, ui) {
 	const questionId = String(opened.question_id || '');
 	if (!questionId) return askOperatorUnavailable('ask_operator channel unavailable: daemon did not return a question id');
 	const question = { ...params, id: questionId, timeout_seconds: Number(opened.timeout_seconds || params.timeout_seconds || 0) };
-	const answer = await promptWorkerPaneForAnswer(ui, question);
+	let answer;
+	try {
+		answer = await promptWorkerPaneForAnswer(ui, question);
+	} catch (error) {
+		return closeWorkerQuestionWithoutAnswer(
+			socket,
+			params,
+			questionId,
+			`Pi operator prompt failed: ${error?.message || error}`,
+			{ error: String(error?.message || error) },
+		);
+	}
 	const trimmed = answer === undefined ? '' : String(answer).trim();
 	if (!trimmed) {
-		await daemonCall(socket, 'workerQuestionTimeout', {
-			run_id: params.run_id,
-			question_id: questionId,
-			token: params.token,
-		}).catch(() => undefined);
-		return toolResult('No operator answer was submitted; proceed per the blocked contract.', {
-			available: true,
-			answer: '',
-			timed_out: true,
-			question_id: questionId,
-		});
+		return closeWorkerQuestionWithoutAnswer(socket, params, questionId, 'No operator answer was submitted');
 	}
 	try {
 		await daemonCall(socket, 'answerQuestion', {
@@ -144,6 +145,27 @@ async function askOperatorInWorkerPane(socket, params, ui) {
 		answer: trimmed,
 		question_id: questionId,
 		answered_via: 'worker_pane',
+	});
+}
+
+async function closeWorkerQuestionWithoutAnswer(socket, params, questionId, message, details = {}) {
+	let closeError = '';
+	try {
+		await daemonCall(socket, 'workerQuestionTimeout', {
+			run_id: params.run_id,
+			question_id: questionId,
+			token: params.token,
+		});
+	} catch (error) {
+		closeError = String(error?.message || error);
+	}
+	return toolResult(`${message}; proceed per the blocked contract.`, {
+		available: true,
+		answer: '',
+		timed_out: true,
+		question_id: questionId,
+		...details,
+		...(closeError ? { close_error: closeError } : {}),
 	});
 }
 
