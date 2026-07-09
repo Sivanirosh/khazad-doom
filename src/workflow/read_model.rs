@@ -194,9 +194,24 @@ pub(crate) fn replan_status_from_proposals(
 ) -> ReplanStatus {
     let mut pending = Vec::new();
     let mut history = Vec::new();
+    let mut auto_approvable = Vec::new();
     for proposal in proposals {
         let proposal = enrich_replan_proposal(run_id, proposal);
         if proposal.state == ReplanProposalState::Pending {
+            if proposal
+                .frontier_classification
+                .as_ref()
+                .is_some_and(|classification| {
+                    classification.tier == "tier_1"
+                        && matches!(
+                            classification.autonomy_level,
+                            crate::domain::AutonomyLevel::Promote
+                                | crate::domain::AutonomyLevel::Run
+                        )
+                })
+            {
+                auto_approvable.push(proposal.clone());
+            }
             pending.push(proposal);
         } else {
             history.push(proposal);
@@ -218,7 +233,7 @@ pub(crate) fn replan_status_from_proposals(
         pending_attention_reason,
         pending,
         history,
-        auto_approvable: Vec::new(),
+        auto_approvable,
     }
 }
 
@@ -972,6 +987,10 @@ fn plan_revision_decision_summary(
         authorizer: decision.authorizer,
         source: decision.source,
         decided_at: decision.decided_at,
+        frontier_tier: decision.frontier_tier,
+        frontier_reason_codes: decision.frontier_reason_codes,
+        frontier_budget_before: decision.frontier_budget_before,
+        frontier_budget_after: decision.frontier_budget_after,
         applied: decision.applied,
         applied_at: decision.applied_at,
         applied_at_checkpoint,

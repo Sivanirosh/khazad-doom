@@ -731,10 +731,8 @@ pub fn frontier_classification_annotation(classification: &FrontierClassificatio
     };
     let prefix = match classification.autonomy_level {
         AutonomyLevel::Shadow => "shadow".to_string(),
-        AutonomyLevel::Promote | AutonomyLevel::Run => format!(
-            "{} recorded, not yet active",
-            classification.autonomy_level.as_str()
-        ),
+        AutonomyLevel::Promote => "promote".to_string(),
+        AutonomyLevel::Run => "run".to_string(),
         AutonomyLevel::Off => "off".to_string(),
     };
     format!("{prefix}: {outcome} ({tier}: {reasons})")
@@ -1721,6 +1719,14 @@ pub struct ReplanDecision {
     pub authorizer: String,
     pub source: String,
     pub decided_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub frontier_tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontier_reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget_before: Option<FrontierBudgetState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget_after: Option<FrontierBudgetState>,
     pub applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<DateTime<Utc>>,
@@ -1831,6 +1837,14 @@ pub struct PlanRevisionDecisionSummary {
     pub authorizer: String,
     pub source: String,
     pub decided_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub frontier_tier: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontier_reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget_before: Option<FrontierBudgetState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_budget_after: Option<FrontierBudgetState>,
     pub applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<DateTime<Utc>>,
