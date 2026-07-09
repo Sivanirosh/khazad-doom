@@ -31,12 +31,13 @@ use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile
 use crate::artifact;
 use crate::domain::{
     AgentProfilesConfig, BranchHandoff, CheckResult, CockpitMode, EvidenceAttestation, Finding,
-    FindingDisposition, FollowupSliceDraft, GateResult, Handoff, HandoffActionResult,
-    HandoffDiagnostics, ImplementationSummary, MergeConflictReport, OriginNotificationTarget,
-    PlanRevisions, RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
-    ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus, Slice, SliceExitState,
-    SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult, WorkerProfileEvidence,
-    WorkerResult, WorkflowConfig, WorkflowExitStates, replan_decision_commands,
+    FindingDisposition, FollowupSliceDraft, FrontierBudgetState, GateResult, Handoff,
+    HandoffActionResult, HandoffDiagnostics, ImplementationSummary, MergeConflictReport,
+    MissionEnvelope, OriginNotificationTarget, PlanRevisions, RepairResult, ReplanEvidenceLink,
+    ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection,
+    RunStatus, Slice, SliceExitState, SliceRun, SliceStatus, SliceValidationReport,
+    SliceWriteResult, WorkerProfileEvidence, WorkerResult, WorkflowConfig, WorkflowExitStates,
+    replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -134,6 +135,7 @@ pub struct StartOptions {
     pub parallelism: usize,
     pub allow_dirty: bool,
     pub origin_notification_target: String,
+    pub mission_envelope: Option<MissionEnvelope>,
 }
 
 #[derive(Debug, Clone)]
@@ -1235,6 +1237,11 @@ impl Manager {
         let store = artifact::Store::new(&repo.path);
         let config = store.read_config()?;
         let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
+        let mission_envelope = opts.mission_envelope.clone();
+        validate_mission_envelope(mission_envelope.as_ref(), &config)?;
+        let frontier_budget = mission_envelope
+            .as_ref()
+            .map(|_| FrontierBudgetState::default());
         self.ensure_repo_run_available(&repo.id, None)?;
         let slices = store.load_slices()?;
         if slices.is_empty() {
@@ -1306,6 +1313,11 @@ impl Manager {
             updated_at: now,
         };
         self.state.insert_run(&run)?;
+        self.state.set_frontier_state(
+            &run.id,
+            mission_envelope.as_ref(),
+            frontier_budget.as_ref(),
+        )?;
         let run_store = artifact::Store::new(&run.repo_path);
         run_store.ensure_run_dirs(&run.id)?;
         if let Some(origin) =
@@ -1345,6 +1357,10 @@ impl Manager {
                 "allow_dirty": opts.allow_dirty,
                 "status_porcelain": dirty_status,
                 "selected_slices": &selected_ids,
+                "mission_envelope": &mission_envelope,
+                "frontier_budget": &frontier_budget,
+                "autonomy_effective": "off",
+                "autonomy_note": "AF-02 records mission envelopes only; autonomy levels above off grant no authority yet",
                 "native_pi_tui_worker": native_pi_tui_worker,
                 "experimental_pi_tui_worker": native_pi_tui_worker,
                 "worker_interface": if native_pi_tui_worker { "native_pi_tui" } else { "json_wrapper" },
@@ -1386,6 +1402,18 @@ impl Manager {
                 runner_metadata.source_attribution.clone(),
             ),
         )?;
+        if let Some(envelope) = mission_envelope.as_ref() {
+            self.state.record_event(
+                &run.id,
+                "mission_envelope_recorded",
+                &json!({
+                    "mission_envelope": envelope,
+                    "frontier_budget": frontier_budget,
+                    "autonomy_effective": "off",
+                    "authority": "record_only_no_auto_authority",
+                }),
+            )?;
+        }
         self.record_cockpit_launch(&run, cockpit_mode)?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
 
@@ -1664,6 +1692,8 @@ impl Manager {
                     .then(|| read_model.details.worker_profile.clone())
             })
             .unwrap_or_default();
+        let mission_envelope = read_model.details.mission_envelope.clone();
+        let frontier_budget = read_model.details.frontier_budget.clone();
         let plan_revisions = read_model.plan_revisions;
         if plan_revisions.unresolved_pending_blocks_handoff {
             let ids = plan_revisions
@@ -1747,6 +1777,8 @@ impl Manager {
             exit_states,
             evidence_attestation,
             plan_revisions,
+            mission_envelope,
+            frontier_budget,
             summary_path: summary_path.to_string_lossy().to_string(),
             final_report_path: final_report_path.to_string_lossy().to_string(),
             push_command,
@@ -1810,6 +1842,8 @@ impl Manager {
             "incidents": details.incidents,
             "questions": details.questions,
             "replan": details.replan,
+            "mission_envelope": details.mission_envelope,
+            "frontier_budget": details.frontier_budget,
             "economics": details.economics,
             "primary_terminal_reason": details.primary_terminal_reason,
             "feed": details.feed,
@@ -2249,6 +2283,7 @@ impl Manager {
         let mut evidence_attestation = final_evidence_attestation(&gate);
         append_worker_evidence_attestation_basis(&mut evidence_attestation, &worker_profile);
         let plan_revisions = self.plan_revisions_for_run(run)?;
+        let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
         let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
             repo_path: run.repo_path.clone(),
@@ -2256,6 +2291,8 @@ impl Manager {
             base_sha: run.base_sha.clone(),
             final_sha: String::new(),
             worker_profile,
+            mission_envelope,
+            frontier_budget,
             completed_slices,
             checks,
             integration_repair: repair,
@@ -2781,6 +2818,7 @@ impl Manager {
                 &format!("{}.worker.attempt-{attempt}.json", slice.id),
             );
             let runner_metadata = runner.metadata();
+            let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
             let handoff = Handoff {
                 run_id: run.id.clone(),
                 role: "slice-worker".to_string(),
@@ -2790,6 +2828,8 @@ impl Manager {
                 slice: slice.clone(),
                 dependency_summary: ctx.dependency_summary.clone(),
                 worker_profile: worker_profile_evidence(runner.name(), &runner_metadata),
+                mission_envelope,
+                frontier_budget,
                 agent_profile: runner_metadata.profile.clone(),
                 agent_provider: runner_metadata.provider.clone(),
                 agent_model: runner_metadata.model.clone(),
@@ -4867,6 +4907,63 @@ fn primary_failure_for_terminal_summary(
         .unwrap_or_default()
 }
 
+fn validate_mission_envelope(
+    envelope: Option<&MissionEnvelope>,
+    config: &WorkflowConfig,
+) -> Result<()> {
+    let Some(envelope) = envelope else {
+        return Ok(());
+    };
+    if envelope.goal.trim().is_empty() {
+        bail!("mission envelope goal is required");
+    }
+    if envelope.allowed_areas.is_empty() {
+        bail!("mission envelope allowed_areas must contain at least one area");
+    }
+    for (index, area) in envelope.allowed_areas.iter().enumerate() {
+        artifact::validate_slice_area(area)
+            .with_context(|| format!("mission envelope allowed_areas[{index}] is invalid"))?;
+    }
+    validate_mission_text_list("non_goals", &envelope.non_goals)?;
+    validate_mission_text_list("must_ask_if", &envelope.must_ask_if)?;
+    let verify_profile = envelope.verify_profile.trim();
+    if verify_profile.is_empty() {
+        bail!(
+            "mission envelope verify_profile is required; use \"default\" or a configured profile"
+        );
+    }
+    if verify_profile != "default" && !config.verify_profiles.contains_key(verify_profile) {
+        bail!(
+            "mission envelope verify_profile {verify_profile:?} is not configured; expected \"default\" or one of [{}]",
+            config
+                .verify_profiles
+                .keys()
+                .map(|key| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for (field, value) in [
+        ("max_auto_promotions", envelope.max_auto_promotions),
+        ("max_depth", envelope.max_depth),
+        ("max_generated_slices", envelope.max_generated_slices),
+    ] {
+        if value < 0 {
+            bail!("mission envelope {field} must be >= 0");
+        }
+    }
+    Ok(())
+}
+
+fn validate_mission_text_list(field: &str, values: &[String]) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        if value.trim().is_empty() {
+            bail!("mission envelope {field}[{index}] must be non-empty");
+        }
+    }
+    Ok(())
+}
+
 fn selected_verify_profiles(slices: &[Slice]) -> Vec<String> {
     let mut profiles = Vec::new();
     for slice in slices {
@@ -6047,17 +6144,18 @@ impl Error for BlockedError {}
 mod tests {
     use super::{
         MAX_WORKER_ATTEMPTS, Manager, RunReadModelBuilder, RunReadModelOptions, StartOptions,
-        repair_authority_violations, validate_followup_slice_draft, validate_repair_result,
-        validate_worker_result,
+        repair_authority_violations, validate_followup_slice_draft, validate_mission_envelope,
+        validate_repair_result, validate_worker_result,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
-        AcceptanceEvidence, CheckResult, CockpitMode, Finding, FindingDisposition,
-        FollowupSliceDraft, Handoff, ImplementationSummary, OriginNotificationTarget, RepairResult,
-        ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run,
-        RunEconomics, RunStatus, Slice, SliceRun, SliceStatus, TerminalNotificationRecord,
-        VerifyCommand, VerifyProfile, WorkerResult, WorkflowConfig,
+        AcceptanceEvidence, AutonomyLevel, CheckResult, CockpitMode, Finding, FindingDisposition,
+        FollowupSliceDraft, FrontierBudgetState, Handoff, ImplementationSummary, MissionEnvelope,
+        OriginNotificationTarget, RepairResult, ReplanEvidenceLink, ReplanProposalSource,
+        ReplanProposalState, ReplanProposedChange, Run, RunEconomics, RunStatus, Slice, SliceRun,
+        SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile, WorkerResult,
+        WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -6091,6 +6189,20 @@ mod tests {
             verify_profile: String::new(),
             verify: Vec::new(),
             verify_timeout_seconds: 0,
+        }
+    }
+
+    fn mission_envelope() -> MissionEnvelope {
+        MissionEnvelope {
+            goal: "Complete the bounded mission".to_string(),
+            allowed_areas: vec!["src/".to_string(), "README.md".to_string()],
+            non_goals: vec!["change public API".to_string()],
+            verify_profile: "default".to_string(),
+            max_auto_promotions: 2,
+            max_depth: 1,
+            max_generated_slices: 3,
+            autonomy_level: AutonomyLevel::Shadow,
+            must_ask_if: vec!["scope expands".to_string()],
         }
     }
 
@@ -6457,6 +6569,118 @@ mod tests {
     }
 
     #[test]
+    fn mission_envelope_validation_uses_area_contract() -> Result<()> {
+        let config = WorkflowConfig::default();
+        let valid = mission_envelope();
+        validate_mission_envelope(Some(&valid), &config)?;
+
+        let mut invalid = valid.clone();
+        invalid.allowed_areas = vec!["src/*.rs".to_string()];
+        let err = validate_mission_envelope(Some(&invalid), &config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mission envelope allowed_areas[0] is invalid"),
+            "{err:?}"
+        );
+        assert!(format!("{err:?}").contains("glob"), "{err:?}");
+
+        let mut negative_budget = valid;
+        negative_budget.max_auto_promotions = -1;
+        let err = validate_mission_envelope(Some(&negative_budget), &config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mission envelope max_auto_promotions must be >= 0"),
+            "{err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_start_records_mission_envelope_for_status_report_and_handoff() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        store.write_slice(&slice("slice-001"), true)?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let db_file = paths.db_file();
+        let state = StateStore::open(&db_file)?;
+        let manager = Manager::new(paths, state.clone());
+        let envelope = mission_envelope();
+
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: true,
+            origin_notification_target: String::new(),
+            mission_envelope: Some(envelope.clone()),
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(completed.status, RunStatus::Completed);
+        let reopened_state = StateStore::open(&db_file)?;
+        let (stored_envelope, stored_budget) = reopened_state.get_frontier_state(&run.id)?;
+        assert_eq!(stored_envelope.as_ref(), Some(&envelope));
+        assert_eq!(stored_budget, Some(FrontierBudgetState::default()));
+
+        let builder = RunReadModelBuilder::new(&state);
+        let model = builder.snapshot(&completed, RunReadModelOptions::status(20))?;
+        assert_eq!(model.details.mission_envelope.as_ref(), Some(&envelope));
+        assert_eq!(
+            model.details.frontier_budget,
+            Some(FrontierBudgetState::default())
+        );
+        let mission_block = model
+            .details
+            .feed
+            .as_ref()
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.label == "Mission")
+            .expect("mission block");
+        let mission_text = mission_block
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(mission_text.contains("Complete the bounded mission"));
+        assert!(
+            mission_text
+                .contains("autonomy shadow recorded, not yet active; effective behavior off")
+        );
+
+        let summary_path =
+            ArtifactStore::new(repo.path()).output_path(&run.id, "implementation-summary.json");
+        let summary = artifact::read_json::<ImplementationSummary>(&summary_path)?;
+        assert_eq!(summary.mission_envelope.as_ref(), Some(&envelope));
+        assert_eq!(
+            summary.frontier_budget,
+            Some(FrontierBudgetState::default())
+        );
+
+        let handoff = manager.branch_handoff(&run.id, false, false, false)?;
+        assert_eq!(handoff.mission_envelope.as_ref(), Some(&envelope));
+        assert_eq!(
+            handoff.frontier_budget,
+            Some(FrontierBudgetState::default())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn recovery_marks_stale_running_runs_interrupted() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -6544,6 +6768,7 @@ mod tests {
             parallelism: 2,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -6588,6 +6813,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let preflight: serde_json::Value =
@@ -6637,6 +6863,7 @@ mod tests {
             parallelism: 2,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let failed = wait_for_run(&state, &run.id)?;
@@ -6705,6 +6932,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -6855,6 +7083,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: "agent-1".to_string(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -7231,6 +7460,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -7319,6 +7549,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -7363,6 +7594,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -7609,6 +7841,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let blocked = wait_for_run(&state, &run.id)?;
@@ -7685,6 +7918,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -7744,6 +7978,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let blocked = wait_for_run(&state, &run.id)?;
@@ -7808,6 +8043,7 @@ mod tests {
                 parallelism: 1,
                 allow_dirty: false,
                 origin_notification_target: String::new(),
+                mission_envelope: None,
             })
             .unwrap_err();
         assert!(
@@ -7875,6 +8111,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let failed = wait_for_run(&state, &run.id)?;
@@ -7915,6 +8152,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: true,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -7965,6 +8203,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -8021,6 +8260,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -8085,6 +8325,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -8139,6 +8380,7 @@ mod tests {
                 parallelism: 1,
                 allow_dirty: false,
                 origin_notification_target: String::new(),
+                mission_envelope: None,
             })
             .unwrap_err();
         assert!(err.to_string().contains("is closed"));
@@ -8209,6 +8451,7 @@ mod tests {
             parallelism: 0,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -8246,6 +8489,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let err = manager
@@ -8260,6 +8504,7 @@ mod tests {
                 parallelism: 1,
                 allow_dirty: false,
                 origin_notification_target: String::new(),
+                mission_envelope: None,
             })
             .unwrap_err();
         assert!(err.to_string().contains("already has active run"));
@@ -8303,6 +8548,7 @@ mod tests {
             parallelism: 2,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -8357,6 +8603,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
@@ -8442,6 +8689,7 @@ mod tests {
             parallelism: 1,
             allow_dirty: false,
             origin_notification_target: String::new(),
+            mission_envelope: None,
         })?;
 
         let failed = wait_for_run(&state, &run.id)?;

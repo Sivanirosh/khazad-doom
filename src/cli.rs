@@ -1,9 +1,9 @@
 use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
-    BranchHandoff, ReplanEvidenceLink, ReplanProposalSource, ReplanProposalState,
-    ReplanProposedChange, RunDetails, RunInspection, RunStatus, SliceValidationReport,
-    SliceWriteResult, StatusFeed, StatusFeedRole,
+    AutonomyLevel, BranchHandoff, MissionEnvelope, ReplanEvidenceLink, ReplanProposalSource,
+    ReplanProposalState, ReplanProposedChange, RunDetails, RunInspection, RunStatus,
+    SliceValidationReport, SliceWriteResult, StatusFeed, StatusFeedRole,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -136,6 +136,12 @@ enum CommandArgs {
         /// Optional opaque Herdr/Pi target for inert terminal-run feedback.
         #[arg(long = "origin-notification-target", default_value = "")]
         origin_notification_target: String,
+        /// Record a per-run mission envelope JSON file. AF-02 records this only; it grants no authority.
+        #[arg(long = "envelope")]
+        envelope: Option<PathBuf>,
+        /// Override the envelope autonomy level: off, shadow, promote, or run. Levels above off are recorded only in AF-02.
+        #[arg(long = "autonomy", value_parser = ["off", "shadow", "promote", "run"])]
+        autonomy: Option<String>,
         #[arg(long)]
         wait: bool,
     },
@@ -490,6 +496,8 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
             parallel,
             allow_dirty,
             origin_notification_target,
+            envelope,
+            autonomy,
             wait,
         } => run_start(
             paths,
@@ -506,6 +514,8 @@ pub fn run(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Resul
                 parallel,
                 allow_dirty,
                 origin_notification_target,
+                envelope,
+                autonomy,
                 wait,
             },
         ),
@@ -620,6 +630,8 @@ struct RunStartOptions {
     parallel: usize,
     allow_dirty: bool,
     origin_notification_target: String,
+    envelope: Option<PathBuf>,
+    autonomy: Option<String>,
     wait: bool,
 }
 
@@ -636,6 +648,8 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
     }
     let parallel = effective_cli_parallelism(opts.parallel, config.parallelism);
     let repo_path = repo.to_string_lossy().to_string();
+    let mission_envelope =
+        read_mission_envelope(opts.envelope.as_deref(), opts.autonomy.as_deref())?;
     ensure_daemon(&paths)?;
     let client = Client::new(paths);
     let result: StartRunResult = client.call(
@@ -658,6 +672,7 @@ fn run_start(paths: Paths, opts: RunStartOptions) -> Result<()> {
                 opts.origin_notification_target,
                 "KHAZAD_ORIGIN_NOTIFICATION_TARGET",
             ),
+            mission_envelope,
         },
     )?;
     let output = RunStartOutput::new(result.run_id, repo_path);
@@ -2109,6 +2124,62 @@ fn shell_quote_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn read_mission_envelope(
+    path: Option<&Path>,
+    autonomy_override: Option<&str>,
+) -> Result<Option<MissionEnvelope>> {
+    let mut envelope = if let Some(path) = path {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("read mission envelope {}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parse mission envelope JSON {}", path.display()))?;
+        warn_unknown_mission_envelope_fields(path, &value);
+        Some(
+            serde_json::from_value::<MissionEnvelope>(value)
+                .with_context(|| format!("decode mission envelope {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    if let Some(level) = autonomy_override {
+        let level = AutonomyLevel::parse(level)?;
+        match envelope.as_mut() {
+            Some(envelope) => envelope.autonomy_level = level,
+            None if level == AutonomyLevel::Off => {}
+            None => bail!(
+                "--autonomy {level} requires --envelope; AF-02 records bounded per-run envelopes only"
+            ),
+        }
+    }
+    Ok(envelope)
+}
+
+fn warn_unknown_mission_envelope_fields(path: &Path, value: &serde_json::Value) {
+    const KNOWN: &[&str] = &[
+        "goal",
+        "allowed_areas",
+        "non_goals",
+        "verify_profile",
+        "max_auto_promotions",
+        "max_depth",
+        "max_generated_slices",
+        "autonomy_level",
+        "must_ask_if",
+    ];
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in object.keys() {
+        if !KNOWN.contains(&key.as_str()) {
+            eprintln!(
+                "warning: mission envelope {} contains unknown field {key:?}; field is ignored in AF-02",
+                path.display()
+            );
+        }
+    }
+}
+
 fn effective_request_text(value: String, env_key: &str) -> String {
     if !value.trim().is_empty() {
         value
@@ -2507,6 +2578,8 @@ mod tests {
             incidents: Vec::new(),
             questions: Vec::new(),
             replan: Default::default(),
+            mission_envelope: None,
+            frontier_budget: None,
             events: options.events,
             economics: options.economics,
             primary_terminal_reason: None,

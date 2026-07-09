@@ -32,6 +32,7 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
         prompt.push_str(previous_failure);
         prompt.push('\n');
     }
+    push_mission_envelope_context(&mut prompt, handoff);
     prompt.push_str("\nSlice summary:\n");
     prompt.push_str(&must_json(&handoff.slice));
     prompt.push_str(
@@ -135,6 +136,25 @@ Integration gate evidence:
     )
 }
 
+fn push_mission_envelope_context(prompt: &mut String, handoff: &Handoff) {
+    prompt.push_str("\nMission envelope context (read-only, record-only in AF-02):\n");
+    if let Some(envelope) = &handoff.mission_envelope {
+        prompt.push_str("- This envelope does not expand the current slice's authority.\n");
+        prompt.push_str(
+            "- Autonomy levels above off are recorded only and behave as off until later slices.\n",
+        );
+        prompt.push_str(&must_json(&serde_json::json!({
+            "mission_envelope": envelope,
+            "frontier_budget": &handoff.frontier_budget,
+            "autonomy_effective": "off",
+            "authority": "record_only_no_auto_authority"
+        })));
+        prompt.push('\n');
+    } else {
+        prompt.push_str("- No mission envelope is recorded; autonomy is off.\n");
+    }
+}
+
 fn must_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unserializable>".to_string())
 }
@@ -171,6 +191,8 @@ mod tests {
             slice,
             dependency_summary: BTreeMap::new(),
             worker_profile: Default::default(),
+            mission_envelope: None,
+            frontier_budget: None,
             agent_profile: String::new(),
             agent_provider: String::new(),
             agent_model: String::new(),

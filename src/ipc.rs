@@ -1,6 +1,6 @@
 use crate::domain::{
-    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange, SliceSummary,
-    SliceValidationIssue, WorkerQuestion,
+    MissionEnvelope, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
+    ReplanProposedChange, SliceSummary, SliceValidationIssue, WorkerQuestion,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +60,8 @@ pub struct StartRunParams {
     pub allow_dirty: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_notification_target: String,
+    #[serde(default, alias = "envelope", skip_serializing_if = "Option::is_none")]
+    pub mission_envelope: Option<MissionEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

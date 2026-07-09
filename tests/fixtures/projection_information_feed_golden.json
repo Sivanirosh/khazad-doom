@@ -1,6 +1,7 @@
 {
   "required_block_order": [
     "Run",
+    "Mission",
     "Workers",
     "Attention",
     "Commands",

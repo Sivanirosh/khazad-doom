@@ -28,6 +28,7 @@ khazad-doom run --all --parallel <n>
 khazad-doom run --allow-dirty --slice <slice-id>
 khazad-doom run --cockpit direct --all
 khazad-doom run --origin-notification-target <target> --slice <slice-id>
+khazad-doom run --envelope <mission.json> --autonomy off --slice <slice-id>
 khazad-doom run --agent fake --all
 khazad-doom resume --run <run-id>
 khazad-doom status --run <run-id>
@@ -66,6 +67,7 @@ khazad-doom daemon status
 - Worker `acceptance_status` is an evidence claim, not approval. Workers must not approve their own evidence; daemon checks/gates and later human review attest or reject it separately.
 - Worker commits are required before merge.
 - Runs are clean-by-default: starting from a dirty source repo requires explicit `--allow-dirty`, and the daemon writes a preflight snapshot with base branch/SHA and dirty status.
+- Optional `--envelope <mission.json>` records a durable mission envelope plus zeroed frontier budget at run start. Envelope `allowed_areas` use the same literal-prefix area contract as slice `areas`, are persisted across restart/resume, and appear in status/watch/monitor/report/handoff. In AF-02 all autonomy levels are record-only and effective `off`; they do not auto-propose, auto-apply, auto-generate slices, or grant authority.
 - Verification/tooling failures such as missing commands, invalid verify cwd, shell spawn failures, and non-executable commands are daemon/operator environment failures, not worker auto-fix requests. Operator environment gate failures block instead of spending an integration-repair worker.
 - Declared slice `areas` are path guardrails: worker changes outside those areas block the slice as scope violations; do not add semantic scope-policing machinery. Areas are repo-relative literal path prefixes, not globs; use directory prefixes like `src/normia/` or exact files like `README.md`.
 - Mechanical daemon-owned slice verify failures may get at most one targeted in-scope slice-repair attempt after normal attempts would otherwise fail; scope violations are never auto-repaired or auto-authorized.
