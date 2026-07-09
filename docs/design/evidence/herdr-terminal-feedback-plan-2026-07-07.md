@@ -44,4 +44,4 @@ HERDR-06 records the optional origin target at run start in `.workflow/runs/<run
 
 ## Follow-up
 
-`HERDR-07` should reuse the same origin target and notification seam for mid-run attention states: awaiting operator questions, awaiting replan, and pending proposals. This is higher-value than terminal feedback for long runs because unseen questions/proposals can stall the run for hours, but it should not widen HERDR-06.
+`HERDR-07` reuses the same origin target artifact and Cockpit Herdr send/focus seam for mid-run attention states: pending worker questions, awaiting replan, and pending proposals. Attention notifications write durable records under `.workflow/runs/<run>/notifications/attention-*.json`, keyed by concrete question/proposal ids so daemon restart/resume and repeated attention checks do not spam duplicates while fresh questions/proposals still notify. Payloads remain declarative: run id, attention kind, question/proposal id, one-line reason, exact daemon `answer`/`replan` commands, and `status`/`monitor` commands. They do not answer questions, approve replans, or grant hidden planner authority.

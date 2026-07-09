@@ -1,6 +1,13 @@
-use crate::domain::{CockpitMode, Run};
+use super::events as workflow_events;
+use crate::artifact;
+use crate::domain::{
+    AttentionNotificationRecord, CockpitMode, ReplanProposal, Run, WorkerQuestion,
+    replan_decision_commands,
+};
+use crate::state::Store as StateStore;
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::Value;
+use chrono::Utc;
+use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +23,9 @@ const COCKPIT_LAYOUT_WORKER_REGION_RATIO: &str = "0.68";
 const COCKPIT_LAYOUT_WORKER_SPLIT_RATIO: &str = "0.50";
 const COCKPIT_MODE_TRANSPORT_PREFIX: &str = "__khazad_cockpit_mode=";
 const HERDR_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const ATTENTION_PAYLOAD_SCHEMA_VERSION: u64 = 1;
+const ATTENTION_DELIVERY_ADAPTER: &str = "herdr";
+const ATTENTION_DELIVERY_SURFACE: &str = "agent_send";
 static HERDR_LAYOUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -917,6 +927,385 @@ pub(crate) fn focus_default_agent_target(
     Cockpit::new(mode, adapter)
         .focus_agent(target)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
+}
+
+pub(crate) fn notify_origin_worker_question_attention(
+    state: &StateStore,
+    question: &WorkerQuestion,
+) {
+    let Ok(Some(run)) = state.get_run(&question.run_id) else {
+        return;
+    };
+    let attention_key = format!("worker-question:{}", question.id);
+    let answer_commands = vec![format!(
+        "khazad-doom answer {} {} <answer>",
+        question.run_id, question.id
+    )];
+    let status_commands = origin_attention_status_commands(&question.run_id);
+    let operator_commands = answer_commands
+        .iter()
+        .chain(status_commands.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "schema_version": ATTENTION_PAYLOAD_SCHEMA_VERSION,
+        "kind": "worker_question_pending",
+        "attention_key": attention_key,
+        "run_id": question.run_id,
+        "slice_id": question.slice_id,
+        "attempt": question.attempt,
+        "question_id": question.id,
+        "reason": format!("Worker question {} is awaiting an operator answer for slice {}.", question.id, question.slice_id),
+        "question": question.question,
+        "options": question.options,
+        "timeout_seconds": question.timeout_seconds,
+        "deadline_at": origin_attention_worker_question_deadline(question),
+        "answer_command": answer_commands[0],
+        "answer_commands": answer_commands,
+        "status_commands": status_commands,
+        "operator_commands": operator_commands,
+        "source_of_truth": "daemon_worker_questions",
+        "delivery_semantics": "visibility_only_no_auto_decision",
+    });
+    send_origin_attention(
+        state,
+        OriginAttentionRequest {
+            run: &run,
+            attention_key: &attention_key,
+            attention_kind: "worker_question_pending",
+            payload,
+            source_of_truth: "daemon_worker_questions",
+            question_id: &question.id,
+            slice_id: &question.slice_id,
+            proposal_id: "",
+            delivery_message: "worker question notification was not delivered",
+            focus_message: "worker question focus was not delivered",
+        },
+    );
+}
+
+pub(crate) fn notify_origin_replan_attention(
+    state: &StateStore,
+    run: &Run,
+    proposal: &ReplanProposal,
+) {
+    let attention_key = format!("replan-proposal:{}", proposal.id);
+    let decision_commands = replan_decision_commands(&run.id, &proposal.id);
+    let status_commands = origin_attention_status_commands(&run.id);
+    let operator_commands = decision_commands
+        .iter()
+        .chain(status_commands.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::to_value(workflow_events::ReplanNotificationPayload::new(
+        &run.id,
+        &proposal.id,
+        proposal.source.clone(),
+        &proposal.risk,
+        proposal.proposed_changes.clone(),
+        decision_commands,
+    ))
+    .unwrap_or(Value::Null);
+    if let Value::Object(fields) = &mut payload {
+        fields.insert("attention_key".to_string(), json!(attention_key));
+        fields.insert(
+            "reason".to_string(),
+            json!(format!(
+                "Replan proposal {} is pending an operator decision.",
+                proposal.id
+            )),
+        );
+        fields.insert("status_commands".to_string(), json!(status_commands));
+        fields.insert("operator_commands".to_string(), json!(operator_commands));
+        fields.insert(
+            "delivery_semantics".to_string(),
+            json!("visibility_only_no_auto_decision"),
+        );
+    }
+    send_origin_attention(
+        state,
+        OriginAttentionRequest {
+            run,
+            attention_key: &attention_key,
+            attention_kind: "replan_decision_pending",
+            payload,
+            source_of_truth: "daemon_replan_proposals",
+            question_id: "",
+            slice_id: "",
+            proposal_id: &proposal.id,
+            delivery_message: "replan proposal notification was not delivered",
+            focus_message: "replan proposal focus was not delivered",
+        },
+    );
+}
+
+struct OriginAttentionRequest<'a> {
+    run: &'a Run,
+    attention_key: &'a str,
+    attention_kind: &'static str,
+    payload: Value,
+    source_of_truth: &'static str,
+    question_id: &'a str,
+    slice_id: &'a str,
+    proposal_id: &'a str,
+    delivery_message: &'static str,
+    focus_message: &'static str,
+}
+
+fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>) {
+    let store = artifact::Store::new(&request.run.repo_path);
+    if origin_attention_record_exists(&store, &request.run.id, request.attention_key) {
+        return;
+    }
+    let origin = match store.read_origin_notification_target(&request.run.id) {
+        Ok(Some(origin)) if !origin.target.trim().is_empty() => origin,
+        Ok(_) => return,
+        Err(err) => {
+            let _ = state.record_event(
+                &request.run.id,
+                workflow_events::RUN_INCIDENT,
+                &origin_attention_failure_payload(
+                    &request,
+                    "attention_notification_failed",
+                    "origin_target_read_failed",
+                    format!(
+                        "{}: origin target read failed: {err}",
+                        request.delivery_message
+                    ),
+                ),
+            );
+            return;
+        }
+    };
+    let created_at = Utc::now().to_rfc3339();
+    if !write_origin_attention_record(
+        state,
+        &store,
+        &origin,
+        &request,
+        "pending",
+        "pending",
+        "pending",
+        "",
+        request.payload.clone(),
+        created_at.clone(),
+    ) {
+        return;
+    }
+
+    let text = serde_json::to_string_pretty(&request.payload)
+        .unwrap_or_else(|_| request.payload.to_string());
+    let mut send_status = "failed";
+    let mut focus_status = "failed";
+    let mut errors = Vec::new();
+    match send_default_agent_message(&origin.target, &text) {
+        Ok(sent) => {
+            send_status = "sent";
+            let _ = state.record_event(
+                &request.run.id,
+                workflow_events::ATTENTION_NOTIFICATION_SENT,
+                &workflow_events::AttentionDeliveryPayload {
+                    kind: request.attention_kind.to_string(),
+                    question_id: request.question_id.to_string(),
+                    slice_id: request.slice_id.to_string(),
+                    proposal_id: request.proposal_id.to_string(),
+                    adapter: sent.adapter,
+                    surface: sent.surface,
+                    target_kind: origin.target_kind.clone(),
+                },
+            );
+        }
+        Err(err) => {
+            errors.push(format!("send: {}", err.message));
+            let _ = state.record_event(
+                &request.run.id,
+                workflow_events::RUN_INCIDENT,
+                &origin_attention_failure_payload(
+                    &request,
+                    "attention_notification_failed",
+                    "delivery_failed",
+                    format!("{}: {}", request.delivery_message, err.message),
+                ),
+            );
+        }
+    }
+    match focus_default_agent_target(&origin.target) {
+        Ok(focused) => {
+            focus_status = "sent";
+            let _ = state.record_event(
+                &request.run.id,
+                workflow_events::ATTENTION_FOCUS_SENT,
+                &workflow_events::AttentionDeliveryPayload {
+                    kind: request.attention_kind.to_string(),
+                    question_id: request.question_id.to_string(),
+                    slice_id: request.slice_id.to_string(),
+                    proposal_id: request.proposal_id.to_string(),
+                    adapter: focused.adapter,
+                    surface: focused.surface,
+                    target_kind: origin.target_kind.clone(),
+                },
+            );
+        }
+        Err(err) => {
+            errors.push(format!("focus: {}", err.message));
+            let _ = state.record_event(
+                &request.run.id,
+                workflow_events::RUN_INCIDENT,
+                &origin_attention_failure_payload(
+                    &request,
+                    "attention_focus_failed",
+                    "focus_failed",
+                    format!("{}: {}", request.focus_message, err.message),
+                ),
+            );
+        }
+    }
+    let delivery_status = match (send_status, focus_status) {
+        ("sent", "sent") => "sent",
+        ("failed", "failed") => "failed",
+        _ => "partial",
+    };
+    write_origin_attention_record(
+        state,
+        &store,
+        &origin,
+        &request,
+        delivery_status,
+        send_status,
+        focus_status,
+        &errors.join("; "),
+        request.payload.clone(),
+        created_at,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_origin_attention_record(
+    state: &StateStore,
+    store: &artifact::Store,
+    origin: &crate::domain::OriginNotificationTarget,
+    request: &OriginAttentionRequest<'_>,
+    delivery_status: &str,
+    send_status: &str,
+    focus_status: &str,
+    error: &str,
+    payload: Value,
+    created_at: String,
+) -> bool {
+    let record = AttentionNotificationRecord {
+        schema_version: ATTENTION_PAYLOAD_SCHEMA_VERSION,
+        run_id: request.run.id.clone(),
+        attention_key: request.attention_key.to_string(),
+        attention_kind: request.attention_kind.to_string(),
+        delivery_status: delivery_status.to_string(),
+        send_status: send_status.to_string(),
+        focus_status: focus_status.to_string(),
+        question_id: request.question_id.to_string(),
+        slice_id: request.slice_id.to_string(),
+        proposal_id: request.proposal_id.to_string(),
+        origin_target: origin.target.clone(),
+        delivery_adapter: ATTENTION_DELIVERY_ADAPTER.to_string(),
+        delivery_surface: ATTENTION_DELIVERY_SURFACE.to_string(),
+        error: error.to_string(),
+        payload,
+        created_at,
+    };
+    let path = origin_attention_record_path(store, &request.run.id, request.attention_key);
+    if let Err(err) = artifact::write_json(path, &record) {
+        let _ = state.record_event(
+            &request.run.id,
+            workflow_events::RUN_INCIDENT,
+            &origin_attention_failure_payload(
+                request,
+                "attention_notification_record_failed",
+                "record_write_failed",
+                format!(
+                    "attention notification record for {} was not written: {err}",
+                    request.attention_key
+                ),
+            ),
+        );
+        return false;
+    }
+    true
+}
+
+fn origin_attention_failure_payload(
+    request: &OriginAttentionRequest<'_>,
+    kind: &str,
+    visibility_kind: &str,
+    message: String,
+) -> workflow_events::RunIncidentPayload {
+    let mut payload = workflow_events::RunIncidentPayload::warning(kind, message)
+        .with_extra("visibility_kind", visibility_kind)
+        .with_extra("attention_key", request.attention_key)
+        .with_extra("attention_kind", request.attention_kind)
+        .with_extra("source_of_truth", request.source_of_truth);
+    if !request.question_id.trim().is_empty() {
+        payload = payload.with_extra("question_id", request.question_id);
+    }
+    if !request.slice_id.trim().is_empty() {
+        payload = payload.with_extra("slice_id", request.slice_id);
+    }
+    if !request.proposal_id.trim().is_empty() {
+        payload = payload.with_extra("proposal_id", request.proposal_id);
+    }
+    payload
+}
+
+fn origin_attention_record_exists(
+    store: &artifact::Store,
+    run_id: &str,
+    attention_key: &str,
+) -> bool {
+    origin_attention_record_path(store, run_id, attention_key).exists()
+}
+
+fn origin_attention_record_path(
+    store: &artifact::Store,
+    run_id: &str,
+    attention_key: &str,
+) -> PathBuf {
+    store.notifications_dir(run_id).join(format!(
+        "attention-{}.json",
+        origin_attention_safe_segment(attention_key)
+    ))
+}
+
+fn origin_attention_safe_segment(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.trim_matches('_').is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
+fn origin_attention_status_commands(run_id: &str) -> Vec<String> {
+    vec![
+        format!("khazad-doom status --run {run_id}"),
+        format!("khazad-doom monitor --run {run_id}"),
+        format!("khazad-doom watch --run {run_id}"),
+    ]
+}
+
+fn origin_attention_worker_question_deadline(question: &WorkerQuestion) -> Option<String> {
+    if question.timeout_seconds == 0 {
+        return None;
+    }
+    Some(
+        (question.asked_at + chrono::Duration::seconds(question.timeout_seconds as i64))
+            .to_rfc3339(),
+    )
 }
 
 pub(crate) fn rename_default_agent_target(
@@ -1823,7 +2212,12 @@ fn herdr_layout_lock() -> &'static Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Run, RunStatus, WorkflowConfig};
+    use crate::artifact::Store as ArtifactStore;
+    use crate::domain::{
+        AttentionNotificationRecord, OriginNotificationTarget, ReplanEvidenceLink, ReplanProposal,
+        ReplanProposalSource, ReplanProposedChange, Run, RunStatus, WorkflowConfig,
+    };
+    use crate::state::Store as StateStore;
     use chrono::Utc;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1864,6 +2258,92 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
+    }
+
+    fn attention_state_store() -> Result<(tempfile::TempDir, StateStore)> {
+        let home = tempfile::tempdir()?;
+        let state = StateStore::open(home.path().join("state.sqlite"))?;
+        Ok((home, state))
+    }
+
+    fn attention_run_fixture(repo_path: &Path, run_id: &str) -> Run {
+        let now = Utc::now();
+        Run {
+            id: run_id.to_string(),
+            repo_id: "repo-fixture".to_string(),
+            repo_path: repo_path.to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base-sha".to_string(),
+            integration_branch: format!("khazad/{run_id}/integration"),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn attention_origin() -> OriginNotificationTarget {
+        OriginNotificationTarget {
+            schema_version: ATTENTION_PAYLOAD_SCHEMA_VERSION,
+            target: "agent-1".to_string(),
+            target_kind: "opaque".to_string(),
+            delivery_adapter: ATTENTION_DELIVERY_ADAPTER.to_string(),
+            delivery_surface: ATTENTION_DELIVERY_SURFACE.to_string(),
+            source: "test".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn attention_records(
+        store: &ArtifactStore,
+        run_id: &str,
+    ) -> Result<Vec<AttentionNotificationRecord>> {
+        let dir = store.notifications_dir(run_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records: Vec<AttentionNotificationRecord> = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("attention-") && name.ends_with(".json") {
+                records.push(artifact::read_json(entry.path())?);
+            }
+        }
+        records.sort_by(|left, right| left.attention_key.cmp(&right.attention_key));
+        Ok(records)
+    }
+
+    fn attention_replan_proposal(
+        state: &StateStore,
+        run_id: &str,
+        id: &str,
+    ) -> Result<ReplanProposal> {
+        state.create_replan_proposal(
+            run_id,
+            id,
+            ReplanProposalSource {
+                kind: "worker_finding".to_string(),
+                slice_id: "slice-001".to_string(),
+                phase: "slice_worker".to_string(),
+                attempt: 1,
+                summary: "needs operator review".to_string(),
+            },
+            vec![format!("finding-{id}")],
+            vec![ReplanEvidenceLink {
+                kind: "worker_output".to_string(),
+                path: "worker-output.json".to_string(),
+                event_id: 0,
+                summary: "evidence".to_string(),
+            }],
+            vec![ReplanProposedChange {
+                kind: "follow_up_or_revision".to_string(),
+                target: "slice-001".to_string(),
+                summary: "revise scope".to_string(),
+            }],
+            "operator_review_required",
+        )
     }
 
     impl CockpitAdapter for FakeCockpitAdapter {
@@ -2078,6 +2558,125 @@ mod tests {
                 .push(format!("agent_send:{target}:{text}"));
             Ok(())
         }
+    }
+
+    #[test]
+    fn attention_notification_no_origin_noops_for_worker_question() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        let (_home, state) = attention_state_store()?;
+        let run = attention_run_fixture(repo.path(), "kd-attention-no-origin");
+        state.insert_run(&run)?;
+        let question = state.insert_worker_question(
+            "q-no-origin",
+            &run.id,
+            "slice-001",
+            1,
+            "choose?",
+            &["a".to_string(), "b".to_string()],
+            0,
+        )?;
+
+        notify_origin_worker_question_attention(&state, &question);
+
+        assert!(attention_records(&artifact_store, &run.id)?.is_empty());
+        assert!(state.get_events(&run.id, 100)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn attention_notification_worker_question_dedupes_and_notifies_new_question() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        let (_home, state) = attention_state_store()?;
+        let run = attention_run_fixture(repo.path(), "kd-attention-worker-question");
+        state.insert_run(&run)?;
+        artifact_store.write_origin_notification_target(&run.id, &attention_origin())?;
+        let first = state.insert_worker_question(
+            "q-1",
+            &run.id,
+            "slice-001",
+            1,
+            "choose?",
+            &["a".to_string()],
+            30,
+        )?;
+        let second = state.insert_worker_question(
+            "q-2",
+            &run.id,
+            "slice-001",
+            1,
+            "choose again?",
+            &["b".to_string()],
+            30,
+        )?;
+
+        notify_origin_worker_question_attention(&state, &first);
+        let event_count_after_first = state.get_events(&run.id, 100)?.len();
+        notify_origin_worker_question_attention(&state, &first);
+        assert_eq!(
+            state.get_events(&run.id, 100)?.len(),
+            event_count_after_first
+        );
+        notify_origin_worker_question_attention(&state, &second);
+
+        let records = attention_records(&artifact_store, &run.id)?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].attention_key, "worker-question:q-1");
+        assert_eq!(records[1].attention_key, "worker-question:q-2");
+        assert_eq!(records[0].origin_target, "agent-1");
+        assert_eq!(
+            records[0].payload["answer_commands"][0],
+            "khazad-doom answer kd-attention-worker-question q-1 <answer>"
+        );
+        assert_eq!(
+            records[0].payload["status_commands"][0],
+            "khazad-doom status --run kd-attention-worker-question"
+        );
+        assert_eq!(
+            records[0].payload["delivery_semantics"],
+            "visibility_only_no_auto_decision"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attention_notification_replan_dedupes_and_notifies_new_proposal() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        let (_home, state) = attention_state_store()?;
+        let run = attention_run_fixture(repo.path(), "kd-attention-replan");
+        state.insert_run(&run)?;
+        artifact_store.write_origin_notification_target(&run.id, &attention_origin())?;
+        let first = attention_replan_proposal(&state, &run.id, "rp-1")?;
+        let second = attention_replan_proposal(&state, &run.id, "rp-2")?;
+
+        notify_origin_replan_attention(&state, &run, &first);
+        let event_count_after_first = state.get_events(&run.id, 100)?.len();
+        notify_origin_replan_attention(&state, &run, &first);
+        assert_eq!(
+            state.get_events(&run.id, 100)?.len(),
+            event_count_after_first
+        );
+        notify_origin_replan_attention(&state, &run, &second);
+
+        let records = attention_records(&artifact_store, &run.id)?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].attention_key, "replan-proposal:rp-1");
+        assert_eq!(records[1].attention_key, "replan-proposal:rp-2");
+        assert_eq!(
+            records[0].payload["decision_commands"][0],
+            "khazad-doom replan accept kd-attention-replan rp-1 --reason <reason>"
+        );
+        assert_eq!(
+            records[0].payload["status_commands"][1],
+            "khazad-doom monitor --run kd-attention-replan"
+        );
+        assert_eq!(
+            records[0].payload["delivery_semantics"],
+            "visibility_only_no_auto_decision"
+        );
+        Ok(())
     }
 
     #[test]
