@@ -2023,11 +2023,7 @@ struct LiveScreenGuard;
 extern "C" fn monitor_restore_screen_on_signal(signal: libc::c_int) {
     const RESTORE: &[u8] = b"\x1b[?1049l\x1b[?25h";
     unsafe {
-        libc::write(
-            libc::STDOUT_FILENO,
-            RESTORE.as_ptr().cast(),
-            RESTORE.len(),
-        );
+        libc::write(libc::STDOUT_FILENO, RESTORE.as_ptr().cast(), RESTORE.len());
         libc::_exit(128 + signal);
     }
 }
@@ -2187,7 +2183,12 @@ fn progress_phase_label(progress: &crate::domain::RunProgress) -> String {
     }
 }
 
-fn monitor_heading(out: &mut impl Write, style: MonitorStyle, label: &str, meta: &str) -> Result<()> {
+fn monitor_heading(
+    out: &mut impl Write,
+    style: MonitorStyle,
+    label: &str,
+    meta: &str,
+) -> Result<()> {
     let painted = style.paint(label, monitor_role_code(StatusFeedRole::Heading));
     let meta = meta.trim();
     if meta.is_empty() {
@@ -2743,10 +2744,34 @@ mod tests {
         };
         let mut out = Vec::new();
         monitor_line(&mut out, color, "gate failed", StatusFeedRole::Error, false)?;
-        monitor_line(&mut out, color, "worker is quiet", StatusFeedRole::Warning, false)?;
-        monitor_line(&mut out, color, "gate passed", StatusFeedRole::Success, false)?;
-        monitor_line(&mut out, color, "no operator attention", StatusFeedRole::Dim, false)?;
-        monitor_line(&mut out, color, "answer the question", StatusFeedRole::Attention, true)?;
+        monitor_line(
+            &mut out,
+            color,
+            "worker is quiet",
+            StatusFeedRole::Warning,
+            false,
+        )?;
+        monitor_line(
+            &mut out,
+            color,
+            "gate passed",
+            StatusFeedRole::Success,
+            false,
+        )?;
+        monitor_line(
+            &mut out,
+            color,
+            "no operator attention",
+            StatusFeedRole::Dim,
+            false,
+        )?;
+        monitor_line(
+            &mut out,
+            color,
+            "answer the question",
+            StatusFeedRole::Attention,
+            true,
+        )?;
         monitor_heading(&mut out, color, "Run", "● running")?;
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("\x1b[31mgate failed\x1b[0m"));
@@ -3046,4 +3071,3 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 }
-
