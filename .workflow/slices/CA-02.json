@@ -2,7 +2,9 @@
   "id": "CA-02",
   "title": "Recoverable terminalization and atomic artifacts",
   "goal": "Turn terminalization into an invariant-bearing recoverable protocol and make authoritative JSON artifact replacement crash-safe, so mandatory persistence failures can never be discarded before cleanup.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260710-ca-02",
+  "closed_at": "2026-07-10T19:39:24.287958239Z",
   "depends_on": [
     "CA-01"
   ],
