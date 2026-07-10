@@ -2,7 +2,9 @@
   "id": "ASK-FALLBACK-01",
   "title": "ask_operator recommended timeout fallback",
   "goal": "Let the worker-only ask_operator action carry an explicit bounded LLM recommendation that the daemon atomically applies after 60 seconds without an operator answer, while retaining blocked behavior for missing, invalid, or hard-authorization recommendations.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260710-ask-fallback",
+  "closed_at": "2026-07-10T02:05:43.233076566Z",
   "areas": [
     ".workflow/khazad.json",
     "src/domain.rs",
