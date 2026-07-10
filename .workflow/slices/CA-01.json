@@ -2,7 +2,9 @@
   "id": "CA-01",
   "title": "Verification purity and explicit publication",
   "goal": "Make daemon-owned verification observationally pure and make completion publication stage only explicit daemon-owned paths, with behavior-first regressions for verification side effects and publication confinement.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260710-ca-01",
+  "closed_at": "2026-07-10T18:06:53.225040618Z",
   "depends_on": [
     "ASK-FALLBACK-01"
   ],
