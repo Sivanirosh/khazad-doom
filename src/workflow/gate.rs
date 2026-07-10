@@ -1191,6 +1191,77 @@ mod tests {
     }
 
     #[test]
+    fn ca01_red_mutating_success_must_fail_and_restore() -> Result<()> {
+        let (_home, gate) = test_gate()?;
+        let worktree = tempfile::tempdir()?;
+        crate::gitutil::run(worktree.path(), &["init", "-b", "main"])?;
+        crate::gitutil::run(
+            worktree.path(),
+            &["config", "user.email", "test@example.com"],
+        )?;
+        crate::gitutil::run(worktree.path(), &["config", "user.name", "Test User"])?;
+        fs::write(worktree.path().join("tracked.txt"), "baseline\n")?;
+        crate::gitutil::commit_all(worktree.path(), "fixture")?;
+        let mut slice = slice("slice-001");
+        slice.verify = vec!["printf changed > tracked.txt".to_string()];
+
+        let result = gate.run_integration_gate(
+            IntegrationGateRequest {
+                slices: &[slice],
+                integration_worktree: worktree.path(),
+                config: &WorkflowConfig::default(),
+            },
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(result.commands[0].status, "failed");
+        assert_eq!(
+            result.commands[0].failure_kind,
+            "verification_mutated_worktree"
+        );
+        assert_eq!(
+            fs::read(worktree.path().join("tracked.txt"))?,
+            b"baseline\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ca01_red_mutating_failure_must_report_mutation_and_restore() -> Result<()> {
+        let (_home, gate) = test_gate()?;
+        let worktree = tempfile::tempdir()?;
+        crate::gitutil::run(worktree.path(), &["init", "-b", "main"])?;
+        crate::gitutil::run(
+            worktree.path(),
+            &["config", "user.email", "test@example.com"],
+        )?;
+        crate::gitutil::run(worktree.path(), &["config", "user.name", "Test User"])?;
+        fs::write(worktree.path().join("tracked.txt"), "baseline\n")?;
+        crate::gitutil::commit_all(worktree.path(), "fixture")?;
+        let mut slice = slice("slice-001");
+        slice.verify = vec!["printf changed > tracked.txt; false".to_string()];
+
+        let result = gate.run_integration_gate(
+            IntegrationGateRequest {
+                slices: &[slice],
+                integration_worktree: worktree.path(),
+                config: &WorkflowConfig::default(),
+            },
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(
+            result.commands[0].failure_kind,
+            "verification_mutated_worktree"
+        );
+        assert_eq!(
+            fs::read(worktree.path().join("tracked.txt"))?,
+            b"baseline\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn slice_verification_failure_preserves_check_summary_text() -> Result<()> {
         let (_home, gate) = test_gate()?;
         let worktree = tempfile::tempdir()?;
