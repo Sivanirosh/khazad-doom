@@ -14,6 +14,8 @@
     "src/workflow/prompts.rs",
     "src/workflow/attention.rs",
     "src/workflow/read_model.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/cockpit.rs",
     "src/workflow/projection.rs",
     "extensions/khazad-worker/index.js",
     "extensions/khazad-worker/index.test.mjs",
