@@ -1577,6 +1577,344 @@ fn final_sha_advertises_publication_commit_with_close_records() -> TestResult {
 }
 
 #[test]
+fn completion_publication_manifest_excludes_filter_side_effects() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PUB-MANIFEST-01",
+            "title": "Explicit publication manifest regression",
+            "goal": "Publish only daemon-owned completion artifacts.",
+            "depends_on": [],
+            "acceptance": ["PUB-MANIFEST-01.txt exists"],
+            "verify": ["test -f PUB-MANIFEST-01.txt"]
+        }),
+    )?;
+    fs::write(repo.path().join("unrelated-tracked.txt"), "baseline\n")?;
+    fs::write(
+        repo.path().join(".gitattributes"),
+        ".workflow/reports/*.json filter=publication-inject\n",
+    )?;
+    let filter = repo.path().join("publication-filter.sh");
+    fs::write(
+        &filter,
+        concat!(
+            "#!/bin/sh\n",
+            "cat\n",
+            "printf 'operator edit\\n' > unrelated-tracked.txt\n",
+            "printf 'operator scratch\\n' > unrelated-untracked.txt\n"
+        ),
+    )?;
+    git(
+        repo.path(),
+        &[
+            "config",
+            "filter.publication-inject.clean",
+            &format!("sh {}", path(&filter)),
+        ],
+    )?;
+    git(
+        repo.path(),
+        &["config", "filter.publication-inject.smudge", "cat"],
+    )?;
+    git(repo.path(), &["add", "."])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add publication manifest regression"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PUB-MANIFEST-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let handoff = json_stdout(&kd_ok(&bin, home.path(), &["handoff", "--run", &run_id])?)?;
+    let final_sha = handoff["final_sha"].as_str().expect("final sha");
+    assert_eq!(
+        git(
+            repo.path(),
+            &["show", &format!("{final_sha}:unrelated-tracked.txt")],
+        )?,
+        "baseline"
+    );
+    assert!(
+        git(
+            repo.path(),
+            &[
+                "ls-tree",
+                "--name-only",
+                final_sha,
+                "unrelated-untracked.txt",
+            ],
+        )?
+        .is_empty()
+    );
+    let receipt = completed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "completion_publication_committed")
+        .expect("publication receipt event");
+    let staged = receipt["payload"]["staged_path_bytes_hex"]
+        .as_array()
+        .expect("staged path receipt");
+    for expected in [
+        ".workflow/slices/PUB-MANIFEST-01.json".to_string(),
+        format!(".workflow/reports/{run_id}-implementation-summary.json"),
+        format!(".workflow/reports/{run_id}-final-report.json"),
+    ] {
+        assert!(
+            staged.contains(&Value::String(hex::encode(expected.as_bytes()))),
+            "publication receipt omitted {expected}: {receipt:#}"
+        );
+    }
+    assert_eq!(staged.len(), 3);
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn verification_mutation_blocks_without_repair_publication_or_final_sha() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-01",
+            "title": "Verification purity regression",
+            "goal": "Block verification side effects before merge or publication.",
+            "depends_on": [],
+            "acceptance": ["PURITY-01.txt exists"],
+            "verify": ["printf 'verification side effect\\n' > verification-side-effect.txt && test -f PURITY-01.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add purity regression slice"],
+    )?;
+    let base_sha = git(repo.path(), &["rev-parse", "HEAD"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let blocked = wait_for_terminal_status(&bin, home.path(), &run_id, "blocked")?;
+    assert!(
+        blocked["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verification command changed the worktree"),
+        "unexpected blocked reason: {blocked:#}"
+    );
+    assert_eq!(blocked["slice_runs"][0]["attempts"], 1);
+    assert_eq!(blocked["economics"]["agent_call_count"], 1);
+    let integration_branch = blocked["run"]["integration_branch"]
+        .as_str()
+        .expect("integration branch");
+    assert_eq!(
+        git(repo.path(), &["rev-parse", integration_branch])?,
+        base_sha
+    );
+    assert!(
+        git(
+            repo.path(),
+            &[
+                "ls-tree",
+                "--name-only",
+                integration_branch,
+                &format!(".workflow/reports/{run_id}-final-report.json"),
+            ],
+        )?
+        .is_empty()
+    );
+    assert!(
+        blocked["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| { event["type"].as_str() != Some("completion_publication_committed") })
+    );
+
+    let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
+    let inspected = json_stdout(&inspected)?;
+    let check_path = artifact_path(&inspected, "PURITY-01.check.attempt-1.json")?;
+    let check: Value = serde_json::from_str(&fs::read_to_string(check_path)?)?;
+    assert_eq!(check["failure_kind"], "verification_mutated_worktree");
+    assert_eq!(
+        check["verification_commands"][0]["verification_workspace"]["restored"]["digest"],
+        check["verification_commands"][0]["verification_workspace"]["before"]["digest"]
+    );
+    assert!(
+        check["verification_commands"][0]["verification_workspace"]["after"]
+            ["untracked_path_bytes_hex"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String(hex::encode("verification-side-effect.txt")))
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn integration_verification_mutation_has_no_repair_publication_or_final_sha() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    let config_path = repo.path().join(".workflow/khazad.json");
+    let mut config: Value = serde_json::from_str(&fs::read_to_string(&config_path)?)?;
+    config["verify_profiles"] = json!({
+        "purity": {
+            "commands": [{
+                "command": "printf 'integration verification side effect\\n' > integration-verification-side-effect.txt",
+                "timeout_seconds": 30
+            }]
+        }
+    });
+    fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-02",
+            "title": "Integration verification purity regression",
+            "goal": "Block integration verification side effects before publication.",
+            "depends_on": [],
+            "acceptance": ["PURITY-02.txt exists"],
+            "verify_profile": "purity",
+            "verify": ["test -f PURITY-02.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add integration purity regression slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-02",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let blocked = wait_for_terminal_status(&bin, home.path(), &run_id, "blocked")?;
+    assert!(
+        blocked["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("integration gate needs operator environment fix"),
+        "unexpected blocked reason: {blocked:#}"
+    );
+    assert_eq!(blocked["economics"]["agent_call_count"], 1);
+    let integration_branch = blocked["run"]["integration_branch"]
+        .as_str()
+        .expect("integration branch");
+    git(
+        repo.path(),
+        &["show", &format!("{integration_branch}:PURITY-02.txt")],
+    )?;
+    for path_in_tree in [
+        "integration-verification-side-effect.txt".to_string(),
+        format!(".workflow/reports/{run_id}-final-report.json"),
+        format!(".workflow/reports/{run_id}-implementation-summary.json"),
+    ] {
+        assert!(
+            git(
+                repo.path(),
+                &["ls-tree", "--name-only", integration_branch, &path_in_tree],
+            )?
+            .is_empty(),
+            "unexpected publication path {path_in_tree}"
+        );
+    }
+    let open_slice: Value = serde_json::from_str(&git(
+        repo.path(),
+        &[
+            "show",
+            &format!("{integration_branch}:.workflow/slices/PURITY-02.json"),
+        ],
+    )?)?;
+    assert_eq!(open_slice["status"].as_str().unwrap_or("open"), "open");
+
+    let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
+    let inspected = json_stdout(&inspected)?;
+    let summary_path = artifact_path(&inspected, "implementation-summary.json")?;
+    let summary: Value = serde_json::from_str(&fs::read_to_string(summary_path)?)?;
+    assert!(summary["final_sha"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(
+        summary["integration_gate"]["commands"][0]["failure_kind"],
+        "verification_mutated_worktree"
+    );
+    assert_eq!(
+        summary["integration_gate"]["commands"][0]["verification_workspace"]["restored"]["digest"],
+        summary["integration_gate"]["commands"][0]["verification_workspace"]["before"]["digest"]
+    );
+    assert!(
+        blocked["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| { event["type"].as_str() != Some("completion_publication_committed") })
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn daemon_status_responds_while_raw_socket_client_is_idle_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
