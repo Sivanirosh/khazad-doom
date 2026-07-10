@@ -1,8 +1,9 @@
 use crate::domain::{
     MissionEnvelope, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
     ReplanProposedChange, SliceSummary, SliceValidationIssue, WorkerQuestion,
+    WorkerQuestionAnswerSource,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +101,30 @@ pub struct WorkerAskParams {
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub timeout_seconds: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_recommendation_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub recommended_answer: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_recommendation_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub rationale: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_recommendation_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub bounded_within_current_slice_or_mission_authority: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_recommendation_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub reversible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,10 +133,20 @@ pub struct WorkerAskResult {
     pub state: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer: String,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_source: Option<WorkerQuestionAnswerSource>,
+    #[serde(default)]
     pub timed_out: bool,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommended_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommendation_rationale: String,
+    #[serde(default)]
+    pub fallback_eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -137,6 +172,8 @@ pub struct AnswerQuestionParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerQuestionResult {
     pub question: WorkerQuestion,
+    #[serde(default)]
+    pub applied: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +322,26 @@ pub struct ListSlicesResult {
     pub slices: Vec<SliceSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<SliceValidationIssue>,
+}
+
+fn deserialize_recommendation_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(value) => value,
+        _ => String::new(),
+    })
+}
+
+fn deserialize_recommendation_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(matches!(
+        Value::deserialize(deserializer)?,
+        Value::Bool(true)
+    ))
 }
 
 fn is_zero(value: &usize) -> bool {

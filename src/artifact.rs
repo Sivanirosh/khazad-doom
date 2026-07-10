@@ -1397,15 +1397,26 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_config_uses_parallelism_three() {
+    fn ensure_default_config_uses_runtime_defaults() {
         let repo = tempfile::tempdir().unwrap();
         let store = Store::new(repo.path());
         store.ensure_layout().unwrap();
 
         let config = store.read_config().unwrap();
         assert_eq!(config.parallelism, 3);
+        assert_eq!(config.worker_question_timeout_seconds, 60);
         assert!(store.area_contract_path().exists());
         assert!(!store.workflow_dir().join("agents.toml").exists());
+    }
+
+    #[test]
+    fn partial_config_keeps_worker_question_timeout_default() {
+        let config: crate::domain::WorkflowConfig = serde_json::from_value(serde_json::json!({
+            "parallelism": 1
+        }))
+        .unwrap();
+
+        assert_eq!(config.worker_question_timeout_seconds, 60);
     }
 
     #[test]

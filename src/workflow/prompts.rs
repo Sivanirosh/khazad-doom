@@ -15,7 +15,8 @@ pub fn worker_prompt(handoff_path: &str, handoff: &Handoff, previous_failure: &s
     prompt.push_str("\n- Work only in the provided worktree.\n");
     prompt.push_str("- Implement only the slice described in the handoff.\n");
     prompt.push_str("- The JSON slice is authoritative. GitHub/PRD text is extra context only.\n");
-    prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, call the ask_operator tool with the question/options when available; return status=blocked with an ask-user finding only if that channel is unavailable or times out.\n");
+    prompt.push_str("- If the slice gives enough authority, proceed. If you must invent intent, call the ask_operator tool with the question/options when available. Always include your original recommended_answer and rationale; attest bounded_within_current_slice_or_mission_authority and reversible only when both are true. An eligible exact-option recommendation may be daemon-applied at the 60-second deadline; otherwise timeout remains status=blocked with an ask-user finding.\n");
+    prompt.push_str("- Never mark an ask_operator timeout fallback eligible for scope expansion, destructive or irreversible actions, credentials/secrets, permissions, release/push/handoff authorization, or any choice outside the existing JSON Slice or mission envelope. Those questions must still block without an operator answer.\n");
     prompt.push_str("- If handoff.plan_revisions contains an accepted revision whose authorized_paths/action_class cover the intended action, proceed within that grant and cite the proposal_id in your output; ask only when the action exceeds the recorded grant.\n");
     prompt.push_str("- Treat acceptance as minimum evidence, not an exhaustive spec: learning is allowed inside the fence; moving the fence requires approval. If TDD or code inspection reveals an additional case directly implied by the slice goal/acceptance and inside declared areas, implement the smallest clear fix and report it in summary/tests/assumptions. If it changes product intent, public API semantics, dependencies, verification policy, or required paths outside areas, return status=blocked with an ask-user finding or include a complete candidate_followup_slices[] draft (id, title, goal, areas, acceptance, verify, verify_profile, depends_on, must_ask_if, rationale) for daemon validation through replan.\n");
     prompt.push_str("- Preserve unrelated changes.\n");
@@ -210,5 +211,8 @@ mod tests {
         assert!(prompt.contains("learning is allowed inside the fence"));
         assert!(prompt.contains("directly implied by the slice goal/acceptance"));
         assert!(prompt.contains("status=blocked with an ask-user finding"));
+        assert!(prompt.contains("original recommended_answer and rationale"));
+        assert!(prompt.contains("eligible exact-option recommendation"));
+        assert!(prompt.contains("Never mark an ask_operator timeout fallback eligible"));
     }
 }

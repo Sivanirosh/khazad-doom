@@ -212,8 +212,8 @@ struct IntegrationRepairContext<'a> {
     economics: RunEconomicsRecorder,
 }
 
-struct SupervisedWorkerJobResult {
-    data: crate::agent::ResultData,
+struct SupervisedWorkerJobOutcome {
+    result: Result<crate::agent::ResultData>,
     operator_pause: Duration,
 }
 
@@ -907,7 +907,7 @@ impl Manager {
         job: Job,
         cancel: &CancellationToken,
         context: WorkerAttemptContext,
-    ) -> Result<SupervisedWorkerJobResult> {
+    ) -> SupervisedWorkerJobOutcome {
         self.run_supervised_worker_job_with(job, cancel, context, move |job, cancel, events| {
             runner.run(job, cancel, events)
         })
@@ -919,7 +919,7 @@ impl Manager {
         cancel: &CancellationToken,
         context: WorkerAttemptContext,
         run_job: F,
-    ) -> Result<SupervisedWorkerJobResult>
+    ) -> SupervisedWorkerJobOutcome
     where
         F: FnOnce(
             Job,
@@ -929,18 +929,12 @@ impl Manager {
     {
         job.termination_grace_seconds = context.termination_grace_seconds;
         let events = Some(self.worker_event_sink(&context));
-        if context.timeout_seconds == 0 {
-            return run_job(job, cancel.clone(), events).map(|data| SupervisedWorkerJobResult {
-                data,
-                operator_pause: Duration::ZERO,
-            });
-        }
-
         let attempt_cancel = CancellationToken::new();
         let timed_out = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let parent_cancel = cancel.clone();
-        let timeout = Duration::from_secs(context.timeout_seconds);
+        let timeout =
+            (context.timeout_seconds > 0).then(|| Duration::from_secs(context.timeout_seconds));
         let timeout_cancel = attempt_cancel.clone();
         let timeout_flag = timed_out.clone();
         let done_flag = done.clone();
@@ -956,14 +950,12 @@ impl Manager {
                 let delta = now.saturating_duration_since(last_tick);
                 last_tick = now;
                 let paused = state
-                    .get_progress(&supervisor_context.run_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|progress| {
-                        progress.phase == "awaiting_operator"
-                            && progress.slice_id == supervisor_context.slice_id
-                            && progress.attempt == supervisor_context.attempt
-                    });
+                    .has_pending_worker_question(
+                        &supervisor_context.run_id,
+                        &supervisor_context.slice_id,
+                        supervisor_context.attempt,
+                    )
+                    .unwrap_or(false);
                 if paused {
                     if let Ok(mut total) = supervisor_operator_pause.lock() {
                         *total += delta;
@@ -978,44 +970,48 @@ impl Manager {
                     timeout_cancel.cancel();
                     return;
                 }
-                if active_elapsed >= timeout {
+                if timeout.is_some_and(|limit| active_elapsed >= limit) {
                     timeout_flag.store(true, Ordering::SeqCst);
                     timeout_cancel.cancel();
                     return;
                 }
-                thread::sleep(Duration::from_millis(100));
+                thread::park_timeout(Duration::from_millis(100));
             }
         });
+        let supervisor_thread = supervisor.thread().clone();
 
-        let result = run_job(job, attempt_cancel, events);
+        let mut result = run_job(job, attempt_cancel, events);
         done.store(true, Ordering::SeqCst);
+        supervisor_thread.unpark();
         let _ = supervisor.join();
         if timed_out.load(Ordering::SeqCst) {
             let message = format!(
                 "worker attempt {} exceeded worker_attempt_timeout_seconds={}",
                 context.attempt, context.timeout_seconds
             );
-            self.state.record_event(
-                &context.run_id,
-                "worker_attempt_timeout",
-                &workflow_events::WorkerAttemptTimeoutPayload::new(
-                    &context.phase,
-                    &context.slice_id,
-                    context.attempt,
-                    context.timeout_seconds,
-                    &message,
-                ),
-            )?;
-            bail!(message);
+            result = self
+                .state
+                .record_event(
+                    &context.run_id,
+                    "worker_attempt_timeout",
+                    &workflow_events::WorkerAttemptTimeoutPayload::new(
+                        &context.phase,
+                        &context.slice_id,
+                        context.attempt,
+                        context.timeout_seconds,
+                        &message,
+                    ),
+                )
+                .and_then(|()| Err(anyhow!(message)));
         }
         let operator_pause = operator_pause
             .lock()
             .map(|duration| *duration)
             .unwrap_or(Duration::ZERO);
-        result.map(|data| SupervisedWorkerJobResult {
-            data,
+        SupervisedWorkerJobOutcome {
+            result,
             operator_pause,
-        })
+        }
     }
 
     fn run_recorded_agent_job(
@@ -1031,9 +1027,11 @@ impl Manager {
         let runner_name = runner.name().to_string();
         let runner_metadata = runner.metadata();
         let started_at = Instant::now();
-        match self.run_supervised_worker_job(runner, job, cancel, context.clone()) {
-            Ok(result) => {
-                let duration = started_at.elapsed().saturating_sub(result.operator_pause);
+        let outcome = self.run_supervised_worker_job(runner, job, cancel, context.clone());
+        let operator_pause = outcome.operator_pause;
+        match outcome.result {
+            Ok(data) => {
+                let duration = started_at.elapsed().saturating_sub(operator_pause);
                 economics.record_agent_call(agent_call(
                     call.phase,
                     call.slice_id,
@@ -1043,16 +1041,12 @@ impl Manager {
                     &runner_metadata,
                     "succeeded",
                     duration,
-                    result.operator_pause,
-                    Some(&result.data.usage),
+                    operator_pause,
+                    Some(&data.usage),
                     "",
                 ));
-                self.record_contract_warnings(
-                    &context,
-                    &runner_name,
-                    &result.data.contract_warnings,
-                );
-                Ok(result.data)
+                self.record_contract_warnings(&context, &runner_name, &data.contract_warnings);
+                Ok(data)
             }
             Err(err) => {
                 let error = err.to_string();
@@ -1064,8 +1058,8 @@ impl Manager {
                     runner_name.as_str(),
                     &runner_metadata,
                     "failed",
-                    started_at.elapsed(),
-                    Duration::ZERO,
+                    started_at.elapsed().saturating_sub(operator_pause),
+                    operator_pause,
                     None,
                     &error,
                 ));
@@ -1102,7 +1096,7 @@ impl Manager {
         let run = run.clone();
         let output_path = output_path.to_path_buf();
         let context_for_job = context.clone();
-        match self.run_supervised_worker_job_with(
+        let outcome = self.run_supervised_worker_job_with(
             job,
             cancel,
             context.clone(),
@@ -1119,9 +1113,11 @@ impl Manager {
                     &output_path,
                 )
             },
-        ) {
-            Ok(result) => {
-                let duration = started_at.elapsed().saturating_sub(result.operator_pause);
+        );
+        let operator_pause = outcome.operator_pause;
+        match outcome.result {
+            Ok(data) => {
+                let duration = started_at.elapsed().saturating_sub(operator_pause);
                 economics.record_agent_call(agent_call(
                     call.phase,
                     call.slice_id,
@@ -1131,16 +1127,12 @@ impl Manager {
                     &runner_metadata,
                     "succeeded",
                     duration,
-                    result.operator_pause,
-                    Some(&result.data.usage),
+                    operator_pause,
+                    Some(&data.usage),
                     "",
                 ));
-                self.record_contract_warnings(
-                    &context,
-                    &runner_name,
-                    &result.data.contract_warnings,
-                );
-                Ok(result.data)
+                self.record_contract_warnings(&context, &runner_name, &data.contract_warnings);
+                Ok(data)
             }
             Err(err) => {
                 let error = err.to_string();
@@ -1152,8 +1144,8 @@ impl Manager {
                     runner_name.as_str(),
                     &runner_metadata,
                     "failed",
-                    started_at.elapsed(),
-                    Duration::ZERO,
+                    started_at.elapsed().saturating_sub(operator_pause),
+                    operator_pause,
                     None,
                     &error,
                 ));
@@ -1854,9 +1846,18 @@ impl Manager {
             &workflow_events::RunCancelRequestedPayload::new(reason, active),
         )?;
         if !active && matches!(run.status, RunStatus::Running | RunStatus::Pending) {
+            self.state.cancel_active_slice_runs(run_id, reason)?;
+            self.state.prepare_run_terminal_transition(
+                run_id,
+                RunStatus::Cancelled,
+                reason,
+                reason,
+                &format!(
+                    "run reached terminal state cancelled before the question was answered: {reason}"
+                ),
+            )?;
             self.state
                 .update_run(run_id, RunStatus::Cancelled, reason)?;
-            self.state.cancel_active_slice_runs(run_id, reason)?;
             self.state.record_event(
                 run_id,
                 workflow_events::RUN_CANCELLED,
@@ -2022,9 +2023,15 @@ impl Manager {
                 )?,
             }
             self.state.interrupt_active_slice_runs(&run.id, reason)?;
-            let interrupted_questions = self
-                .state
-                .interrupt_pending_worker_questions(&run.id, reason)?;
+            let interrupted_questions = self.state.prepare_run_terminal_transition(
+                &run.id,
+                RunStatus::Interrupted,
+                reason,
+                reason,
+                reason,
+            )?;
+            self.state
+                .update_run(&run.id, RunStatus::Interrupted, reason)?;
             if interrupted_questions > 0 {
                 self.state.record_event(
                     &run.id,
@@ -2032,7 +2039,6 @@ impl Manager {
                     &json!({ "count": interrupted_questions, "reason": reason }),
                 )?;
             }
-            self.state.mark_run_interrupted(&run.id, reason)?;
             self.state.record_event(
                 &run.id,
                 "daemon_recovery_completed",
@@ -2370,16 +2376,15 @@ impl Manager {
             worker_token,
             native_pi_tui_worker,
         );
-        let (terminal_status, terminal_message) = match &outcome {
+        let (terminal_status, terminal_message, progress_message) = match &outcome {
             Ok(_) => {
                 let message = "run completed; handoff artifacts are ready".to_string();
-                self.mark_progress(&run.id, "completed", "", 0, "", &message);
                 let _ = self.state.record_event(
                     &run.id,
                     workflow_events::RUN_COMPLETED,
                     &workflow_events::RunCompletedPayload::new(&run.id),
                 );
-                (RunStatus::Completed, String::new())
+                (RunStatus::Completed, String::new(), message)
             }
             Err(err) => {
                 let status = classify_run_failure(err);
@@ -2398,28 +2403,35 @@ impl Manager {
                 };
                 if status == RunStatus::Cancelled {
                     let _ = self.state.cancel_active_slice_runs(&run.id, &message);
-                    self.mark_progress(&run.id, "cancelled", "", 0, "", &message);
                     let _ = self.state.record_event(
                         &run.id,
                         workflow_events::RUN_CANCELLED,
                         &workflow_events::RunCancelledPayload::new(&message),
                     );
                 } else {
-                    let phase = if status == RunStatus::Blocked {
-                        "blocked"
-                    } else {
-                        "failed"
-                    };
-                    self.mark_progress(&run.id, phase, "", 0, "", &message);
                     let _ = self.state.record_event(
                         &run.id,
                         workflow_events::RUN_ERROR,
                         &workflow_events::RunErrorPayload::new(&message),
                     );
                 }
-                (status, message)
+                (status, message.clone(), message)
             }
         };
+        let question_interruption_reason = if terminal_message.is_empty() {
+            format!("run reached terminal state {terminal_status} before the question was answered")
+        } else {
+            format!(
+                "run reached terminal state {terminal_status} before the question was answered: {terminal_message}"
+            )
+        };
+        let _ = self.state.prepare_run_terminal_transition(
+            &run.id,
+            terminal_status,
+            &terminal_message,
+            &progress_message,
+            &question_interruption_reason,
+        );
         let _ = self.write_terminal_run_summary(&run, terminal_status, &terminal_message);
         let _ = self
             .state
@@ -2774,6 +2786,7 @@ impl Manager {
         let mut evidence_attestation = final_evidence_attestation(&gate);
         append_worker_evidence_attestation_basis(&mut evidence_attestation, &worker_profile);
         let plan_revisions = self.plan_revisions_for_run(&run)?;
+        let worker_questions = self.state.list_worker_questions(&run.id)?;
         let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
         let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -2793,6 +2806,7 @@ impl Manager {
             evidence_attestation,
             economics: economics.snapshot(),
             plan_revisions,
+            worker_questions,
             created_at: Utc::now(),
         };
 
@@ -3684,6 +3698,8 @@ impl Manager {
         let mut secondary_failures: Vec<String> = Vec::new();
         for attempt in 1..=MAX_WORKER_ATTEMPTS {
             check_cancelled(cancel)?;
+            self.state
+                .activate_slice_attempt(&run.id, &slice.id, attempt)?;
             let output_path = store.output_path(
                 &run.id,
                 &format!("{}.worker.attempt-{attempt}.json", slice.id),
@@ -7267,8 +7283,9 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKER_ATTEMPTS, Manager, ResumeOptions, RunReadModelBuilder, RunReadModelOptions,
-        StartOptions, queue_snapshot_hash, repair_authority_violations, selected_slice_ids,
+        AgentCallContext, MAX_WORKER_ATTEMPTS, Manager, ResumeOptions, RunEconomicsRecorder,
+        RunReadModelBuilder, RunReadModelOptions, StartOptions, WorkerAttemptContext,
+        queue_snapshot_hash, repair_authority_violations, selected_slice_ids,
         validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
         validate_worker_result,
     };
@@ -7280,8 +7297,8 @@ mod tests {
         ImplementationSummary, MissionEnvelope, OriginNotificationTarget, RepairResult,
         ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
         ReplanProposedChange, Run, RunEconomics, RunStatus, Slice, SliceProvenance, SliceRun,
-        SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile, WorkerResult,
-        WorkflowConfig,
+        SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile,
+        WorkerQuestionAnswerSource, WorkerQuestionRecommendation, WorkerResult, WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -7420,6 +7437,142 @@ mod tests {
                 snapshot.insert(rel, fs::read(entry_path)?);
             }
         }
+        Ok(())
+    }
+
+    struct OperatorPauseRunner {
+        fail: bool,
+    }
+
+    impl Runner for OperatorPauseRunner {
+        fn run(
+            &self,
+            _job: Job,
+            _cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            thread::sleep(Duration::from_millis(300));
+            if self.fail {
+                anyhow::bail!("injected worker failure after operator pause");
+            }
+            Ok(ResultData {
+                output: None,
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "operator-pause-test"
+        }
+    }
+
+    fn record_zero_timeout_operator_pause(fail: bool) -> Result<RunEconomics> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-zero-timeout-pause", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Running,
+            branch: "khazad/test/slice-001".to_string(),
+            commit_sha: String::new(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        state.open_active_worker_question_with_recommendation(
+            "q-zero-timeout-pause",
+            &run.id,
+            "slice-001",
+            1,
+            "Choose?",
+            &["A".to_string(), "B".to_string()],
+            60,
+            &WorkerQuestionRecommendation::default(),
+            "worker_question_asked",
+            |question| Ok(json!({ "question_id": question.id })),
+            "awaiting operator answer",
+        )?;
+        let manager = Manager::new(paths, state);
+        let context = WorkerAttemptContext::new(
+            &run.id,
+            "worker",
+            "slice-001",
+            1,
+            &WorkflowConfig {
+                worker_attempt_timeout_seconds: 0,
+                ..WorkflowConfig::default()
+            },
+            false,
+        );
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: repo.path().to_path_buf(),
+            json_schema: String::new(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+        };
+
+        let economics = RunEconomicsRecorder::new("test", true, 1, 0);
+        let outcome = manager.run_recorded_agent_job(
+            Arc::new(OperatorPauseRunner { fail }),
+            job,
+            &CancellationToken::new(),
+            context,
+            &economics,
+            AgentCallContext {
+                phase: "worker",
+                slice_id: "slice-001",
+                attempt: 1,
+            },
+        );
+        if fail {
+            let error = outcome.expect_err("runner should fail after the operator pause");
+            assert!(error.to_string().contains("injected worker failure"));
+        } else {
+            outcome?;
+        }
+        Ok(economics.snapshot())
+    }
+
+    #[test]
+    fn zero_attempt_timeout_still_records_operator_pause_economics() -> Result<()> {
+        let snapshot = record_zero_timeout_operator_pause(false)?;
+        assert_eq!(snapshot.agent_calls.len(), 1);
+        assert_eq!(snapshot.agent_calls[0].status, "succeeded");
+        assert!(
+            snapshot.agent_calls[0].operator_pause_ms >= 150,
+            "expected zero-timeout economics to track operator pause, got {}ms",
+            snapshot.agent_calls[0].operator_pause_ms
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_worker_call_preserves_operator_pause_economics() -> Result<()> {
+        let snapshot = record_zero_timeout_operator_pause(true)?;
+        assert_eq!(snapshot.agent_calls.len(), 1);
+        let call = &snapshot.agent_calls[0];
+        assert_eq!(call.status, "failed");
+        assert!(call.error.contains("injected worker failure"));
+        assert!(
+            call.operator_pause_ms >= 150,
+            "expected failed-call economics to track operator pause, got {}ms",
+            call.operator_pause_ms
+        );
+        assert!(
+            call.duration_ms <= 200,
+            "expected net failed-call duration to exclude operator pause, got {}ms",
+            call.duration_ms
+        );
         Ok(())
     }
 
@@ -10383,6 +10536,69 @@ mod tests {
             1
         );
 
+        state.update_run(&run.id, RunStatus::Running, "")?;
+        state.update_slice_status(&run.id, "slice-001", SliceStatus::Running, "")?;
+        state.activate_slice_attempt(&run.id, "slice-001", 1)?;
+        let recommendation = WorkerQuestionRecommendation {
+            recommended_answer: "A".to_string(),
+            rationale: "A is the smallest reversible option".to_string(),
+            bounded_within_current_slice_or_mission_authority: true,
+            reversible: true,
+        };
+        state.open_active_worker_question_with_recommendation(
+            "q-report-operator",
+            &run.id,
+            "slice-001",
+            1,
+            "Operator or fallback?",
+            &["A".to_string(), "B".to_string()],
+            60,
+            &recommendation,
+            "worker_question_asked",
+            |question| Ok(json!({ "question_id": question.id })),
+            "awaiting operator answer",
+        )?;
+        state.answer_worker_question_cas(
+            &run.id,
+            "q-report-operator",
+            "B",
+            WorkerQuestionAnswerSource::Operator,
+            "worker_question_answered",
+            &json!({
+                "question_id": "q-report-operator",
+                "answer": "B",
+                "answer_source": "operator"
+            }),
+            "operator answered; worker resuming",
+        )?;
+        state.open_active_worker_question_with_recommendation(
+            "q-report-fallback",
+            &run.id,
+            "slice-001",
+            1,
+            "Apply recommendation at deadline?",
+            &["A".to_string(), "B".to_string()],
+            1,
+            &recommendation,
+            "worker_question_asked",
+            |question| Ok(json!({ "question_id": question.id })),
+            "awaiting operator answer",
+        )?;
+        thread::sleep(Duration::from_millis(1_100));
+        state.answer_worker_question_cas(
+            &run.id,
+            "q-report-fallback",
+            "A",
+            WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+            "worker_question_answered",
+            &json!({
+                "question_id": "q-report-fallback",
+                "answer": "A",
+                "answer_source": "llm_recommendation_timeout"
+            }),
+            "recommendation applied; worker resuming",
+        )?;
+        state.update_slice_status(&run.id, "slice-001", SliceStatus::Merged, "")?;
         state.update_run(
             &run.id,
             RunStatus::Interrupted,
@@ -10425,6 +10641,35 @@ mod tests {
             artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
         assert_eq!(summary.final_sha, head_after);
         assert_eq!(summary.completed_slices.len(), 1);
+        assert_eq!(summary.worker_questions.len(), 2);
+        let operator = summary
+            .worker_questions
+            .iter()
+            .find(|question| question.id == "q-report-operator")
+            .expect("operator question audit");
+        assert_eq!(operator.answer, "B");
+        assert_eq!(
+            operator.answer_source,
+            Some(WorkerQuestionAnswerSource::Operator)
+        );
+        let fallback = summary
+            .worker_questions
+            .iter()
+            .find(|question| question.id == "q-report-fallback")
+            .expect("fallback question audit");
+        assert_eq!(fallback.answer, "A");
+        assert_eq!(fallback.recommended_answer, "A");
+        assert_eq!(
+            fallback.recommendation_rationale,
+            "A is the smallest reversible option"
+        );
+        assert_eq!(
+            fallback.answer_source,
+            Some(WorkerQuestionAnswerSource::LlmRecommendationTimeout)
+        );
+        let implementation_summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
+        assert_eq!(implementation_summary.worker_questions.len(), 2);
         Ok(())
     }
 
@@ -10988,7 +11233,11 @@ mod tests {
 
         let failed = wait_for_run(&state, &run.id)?;
         assert_eq!(failed.status, RunStatus::Failed);
-        assert!(failed.error.contains("outside slice areas"));
+        assert!(
+            failed.error.contains("outside slice areas"),
+            "unexpected failure: {}",
+            failed.error
+        );
         assert!(failed.error.contains("slice-001.txt"));
         let check: CheckResult =
             artifact::read_json(store.output_path(&run.id, "slice-001.check.attempt-1.json"))?;
@@ -11494,7 +11743,12 @@ mod tests {
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
-        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(
+            completed.status,
+            RunStatus::Completed,
+            "unexpected failure: {}",
+            completed.error
+        );
         let slice_runs = state.get_slice_runs(&run.id)?;
         assert_eq!(slice_runs[0].status, SliceStatus::Merged);
         assert_eq!(slice_runs[0].attempts, 3);

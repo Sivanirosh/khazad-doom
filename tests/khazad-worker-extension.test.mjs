@@ -160,6 +160,65 @@ test('ask_operator uses same-pane Pi UI when available', async () => {
 	assert.deepEqual(requests[1].params, { run_id: 'kd-run', question_id: 'q-1', answer: 'yes' });
 });
 
+test('ask_operator same-pane cancellation preserves an auto-applied recommendation', async () => {
+	const tool = registerExtension().tools.get('ask_operator');
+
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') {
+				return {
+					question_id: 'q-auto',
+					state: 'pending',
+					timeout_seconds: 60,
+					deadline_at: '2026-07-10T00:01:00+00:00',
+					recommended_answer: 'yes',
+					recommendation_rationale: 'yes stays inside the slice',
+					fallback_eligible: true,
+				};
+			}
+			if (request.method === 'workerQuestionTimeout') {
+				return {
+					question_id: 'q-auto',
+					state: 'answered',
+					answer: 'yes',
+					answer_source: 'llm_recommendation_timeout',
+				};
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			const result = await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'slice-001',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				() =>
+					tool.execute(
+						'tool-call',
+						{
+							question: 'Proceed?',
+							options: ['yes', 'no'],
+							recommended_answer: 'yes',
+							rationale: 'yes stays inside the slice',
+							bounded_within_current_slice_or_mission_authority: true,
+							reversible: true,
+						},
+						undefined,
+						undefined,
+						{ ui: { async select() { return undefined; } } },
+					),
+			);
+
+			assert.equal(result.details.available, true);
+			assert.equal(result.details.answer, 'yes');
+			assert.equal(result.details.timed_out, undefined);
+			assert.equal(result.details.answered_via, 'llm_recommendation_timeout');
+		},
+	);
+});
+
 test('ask_operator falls back to daemon workerAsk when worker-pane UI is unavailable', async () => {
 	const tool = registerExtension().tools.get('ask_operator');
 	let seenRequest;

@@ -149,6 +149,34 @@ async function withDaemonServer(handler, fn) {
 	}
 }
 
+test('ask_operator reports unavailable when the daemon closes without a response', async () => {
+	const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'khazad-worker-dropped-daemon-'));
+	const socketPath = path.join(tmp, 'daemon.sock');
+	const server = net.createServer((socket) => {
+		socket.on('data', () => socket.end());
+	});
+	await new Promise((resolve) => server.listen(socketPath, resolve));
+	try {
+		const tool = registeredTools().get('ask_operator');
+		await withEnv(
+			{
+				KHAZAD_DAEMON_SOCKET: socketPath,
+				KHAZAD_RUN_ID: 'kd-run',
+				KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+				KHAZAD_WORKER_TOKEN: 'secret-token',
+			},
+			async () => {
+				const result = await tool.execute('call-dropped', { question: 'Choose?' });
+				assert.equal(result.details.available, false);
+				assert.equal(result.details.answer, '');
+				assert.match(result.content[0].text, /channel unavailable/);
+			},
+		);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+});
+
 test('ask_operator prompts in the worker Pi pane and records the answer through daemon state', async () => {
 	const tool = registeredTools().get('ask_operator');
 	const requests = [];
@@ -378,6 +406,346 @@ test('ask_operator uses daemon workerAsk channel when worker-pane UI is unavaila
 					assert.equal(result.details.available, true);
 					assert.equal(result.details.answer, 'A');
 					assert.equal(result.details.question_id, 'q-1');
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator forwards bounded recommendation data and returns a headless timeout fallback as an answer', async () => {
+	const tool = registeredTools().get('ask_operator');
+	assert.equal(tool.parameters.properties.recommended_answer.type, 'string');
+	assert.equal(tool.parameters.properties.rationale.type, 'string');
+	assert.equal(tool.parameters.properties.bounded_within_current_slice_or_mission_authority.type, 'boolean');
+	assert.equal(tool.parameters.properties.reversible.type, 'boolean');
+
+	await withDaemonServer(
+		(request) => {
+			assert.equal(request.method, 'workerAsk');
+			assert.equal(request.params.recommended_answer, 'A');
+			assert.equal(request.params.rationale, 'A is the smallest reversible option');
+			assert.equal(request.params.bounded_within_current_slice_or_mission_authority, true);
+			assert.equal(request.params.reversible, true);
+			return {
+				question_id: 'q-fallback',
+				state: 'answered',
+				answer: 'A',
+				answer_source: 'llm_recommendation_timeout',
+			};
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute('call-fallback', {
+						question: 'Choose?',
+						options: ['A', 'B'],
+						recommended_answer: 'A',
+						rationale: 'A is the smallest reversible option',
+						bounded_within_current_slice_or_mission_authority: true,
+						reversible: true,
+					});
+					assert.equal(result.details.available, true);
+					assert.equal(result.details.answer, 'A');
+					assert.equal(result.details.timed_out, undefined);
+					assert.equal(result.details.answered_via, 'llm_recommendation_timeout');
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator never treats a headless interruption reason as an answer', async () => {
+	const tool = registeredTools().get('ask_operator');
+	await withDaemonServer(
+		() => ({
+			question_id: 'q-interrupted',
+			state: 'interrupted',
+			answer: 'superseded by worker attempt 2',
+		}),
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute('call-interrupted', { question: 'Choose?' });
+					assert.equal(result.details.available, false);
+					assert.equal(result.details.answer, '');
+					assert.match(result.content[0].text, /ended as interrupted/);
+					assert.doesNotMatch(result.content[0].text, /Operator answered/);
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator same-pane expiry returns an already-applied daemon recommendation', async () => {
+	const tool = registeredTools().get('ask_operator');
+	const deadline = new Date(Date.now() + 2_000).toISOString();
+	let promptTitle = '';
+	let promptTimeout = 0;
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') {
+				return {
+					question_id: 'q-expired',
+					state: 'pending',
+					timeout_seconds: 60,
+					deadline_at: deadline,
+					recommended_answer: 'A',
+					recommendation_rationale: 'A is reversible',
+					fallback_eligible: true,
+				};
+			}
+			if (request.method === 'workerQuestionTimeout') {
+				return {
+					question_id: 'q-expired',
+					state: 'answered',
+					answer: 'A',
+					answer_source: 'llm_recommendation_timeout',
+				};
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-expired',
+						{
+							question: 'Choose?',
+							options: ['A', 'B'],
+							recommended_answer: 'A',
+							rationale: 'A is reversible',
+							bounded_within_current_slice_or_mission_authority: true,
+							reversible: true,
+						},
+						undefined,
+						undefined,
+						{ ui: { async select(title, _choices, options) { promptTitle = title; promptTimeout = options?.timeout || 0; return undefined; } } },
+					);
+					assert.match(promptTitle, new RegExp(deadline.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+					assert.match(promptTitle, /Eligible fallback: A/);
+					assert.ok(promptTimeout > 0 && promptTimeout <= 2_000, `expected remaining deadline timeout, got ${promptTimeout}`);
+					assert.equal(result.details.answer, 'A');
+					assert.equal(result.details.timed_out, undefined);
+					assert.equal(result.details.answered_via, 'llm_recommendation_timeout');
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator same-pane answer race returns the durable fallback winner', async () => {
+	const tool = registeredTools().get('ask_operator');
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') return { question_id: 'q-race', state: 'pending', timeout_seconds: 60 };
+			if (request.method === 'answerQuestion') {
+				return {
+					question: {
+						id: 'q-race',
+						state: 'answered',
+						answer: 'A',
+						answer_source: 'llm_recommendation_timeout',
+					},
+					applied: false,
+				};
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-race',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{ ui: { async select() { return 'B'; } } },
+					);
+					assert.equal(result.details.answer, 'A');
+					assert.equal(result.details.answered_via, 'llm_recommendation_timeout');
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator same-pane accepts a legacy answer response without state', async () => {
+	const tool = registeredTools().get('ask_operator');
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') return { question_id: 'q-legacy-answer', state: 'pending', timeout_seconds: 60 };
+			if (request.method === 'answerQuestion') {
+				return { question: { id: 'q-legacy-answer', answer: 'B' }, applied: true };
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-legacy-answer',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{ ui: { async select() { return 'B'; } } },
+					);
+					assert.equal(result.details.available, true);
+					assert.equal(result.details.answer, 'B');
+					assert.equal(result.details.answered_via, 'worker_pane');
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator same-pane answer race never exposes an interruption reason as an answer', async () => {
+	const tool = registeredTools().get('ask_operator');
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') return { question_id: 'q-interrupted-race', state: 'pending', timeout_seconds: 60 };
+			if (request.method === 'answerQuestion') {
+				return {
+					question: {
+						id: 'q-interrupted-race',
+						state: 'interrupted',
+						answer: 'superseded by worker attempt 2',
+					},
+					applied: false,
+				};
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-interrupted-race',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{ ui: { async select() { return 'B'; } } },
+					);
+					assert.equal(result.details.available, false);
+					assert.equal(result.details.answer, '');
+					assert.equal(result.details.question_id, 'q-interrupted-race');
+					assert.match(result.content[0].text, /ended as interrupted/);
+					assert.doesNotMatch(result.content[0].text, /Operator answered/);
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator same-pane answer race preserves a timed-out blocked outcome', async () => {
+	const tool = registeredTools().get('ask_operator');
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') return { question_id: 'q-timeout-race', state: 'pending', timeout_seconds: 60 };
+			if (request.method === 'answerQuestion') {
+				return {
+					question: { id: 'q-timeout-race', state: 'timed_out', answer: '' },
+					applied: false,
+				};
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-timeout-race',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{ ui: { async select() { return 'B'; } } },
+					);
+					assert.equal(result.details.available, true);
+					assert.equal(result.details.answer, '');
+					assert.equal(result.details.timed_out, true);
+					assert.equal(result.details.question_id, 'q-timeout-race');
+				},
+			);
+		},
+	);
+});
+
+test('ask_operator same-pane timeout race preserves an interrupted outcome', async () => {
+	const tool = registeredTools().get('ask_operator');
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') return { question_id: 'q-timeout-interrupted', state: 'pending', timeout_seconds: 60 };
+			if (request.method === 'workerQuestionTimeout') {
+				return {
+					id: 'q-timeout-interrupted',
+					state: 'interrupted',
+					answer: 'run reached a terminal state before the question was answered',
+				};
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const result = await tool.execute(
+						'call-timeout-interrupted',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{ ui: { async select() { return undefined; } } },
+					);
+					assert.equal(result.details.available, false);
+					assert.equal(result.details.answer, '');
+					assert.equal(result.details.timed_out, undefined);
+					assert.equal(result.details.question_id, 'q-timeout-interrupted');
+					assert.match(result.content[0].text, /ended as interrupted/);
 				},
 			);
 		},

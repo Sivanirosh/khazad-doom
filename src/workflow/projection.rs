@@ -870,6 +870,21 @@ fn pending_question_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<S
                 ));
             }
         }
+        if question.fallback_eligible {
+            lines.push(line(
+                format!("Eligible timeout fallback: {}", question.recommended_answer),
+                StatusFeedRole::Attention,
+            ));
+            lines.push(line(
+                format!("Fallback rationale: {}", question.recommendation_rationale),
+                StatusFeedRole::Attention,
+            ));
+        } else {
+            lines.push(line(
+                "Eligible timeout fallback: none; timeout will block",
+                StatusFeedRole::Attention,
+            ));
+        }
         lines.push(line(
             format!("Answer command: {}", question_answer_command(question)),
             StatusFeedRole::Attention,
@@ -883,10 +898,9 @@ fn pending_question_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<S
 }
 
 fn question_deadline_label(question: &crate::domain::WorkerQuestion, now: DateTime<Utc>) -> String {
-    if question.timeout_seconds == 0 {
+    let Some(deadline) = question.deadline_at else {
         return "Deadline: none configured; waiting indefinitely".to_string();
-    }
-    let deadline = question.asked_at + chrono::Duration::seconds(question.timeout_seconds as i64);
+    };
     let remaining = if deadline >= now {
         format!(
             "remaining {}",
@@ -1361,6 +1375,43 @@ fn workers_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
         if items.len() > WORKER_ITEMS {
             lines.push(line(
                 format!("… {} more", items.len() - WORKER_ITEMS),
+                StatusFeedRole::Dim,
+            ));
+        }
+    }
+
+    if let Some(question) = details
+        .questions
+        .iter()
+        .rev()
+        .find(|question| question.state != "pending")
+    {
+        let source = question
+            .answer_source
+            .map(|source| source.as_str())
+            .unwrap_or("none");
+        lines.push(line(
+            format!(
+                "ask_operator {} • state={} • answer_source={} • answer={}",
+                question.id,
+                question.state,
+                source,
+                display_or_dash(&question.answer)
+            ),
+            if question.state == "answered" {
+                StatusFeedRole::Info
+            } else {
+                StatusFeedRole::Warning
+            },
+        ));
+        if !question.recommended_answer.is_empty() || !question.recommendation_rationale.is_empty()
+        {
+            lines.push(line(
+                format!(
+                    "original recommendation={} • rationale={}",
+                    display_or_dash(&question.recommended_answer),
+                    display_or_dash(&question.recommendation_rationale)
+                ),
                 StatusFeedRole::Dim,
             ));
         }
@@ -2265,13 +2316,16 @@ mod tests {
 
         assert!(texts[0].contains("HERDR-07"), "{texts:?}");
         assert!(texts[1].contains("AF-08"), "{texts:?}");
+        assert!(texts.last().unwrap().contains("… 3 more"), "{texts:?}");
+        // the elided tail is low-priority (pending/merged), never active work
         assert!(
-            texts.last().unwrap().contains("… 3 more"),
+            texts.iter().all(|text| !text.contains("AF-06")),
             "{texts:?}"
         );
-        // the elided tail is low-priority (pending/merged), never active work
-        assert!(texts.iter().all(|text| !text.contains("AF-06")), "{texts:?}");
-        assert!(texts.iter().all(|text| !text.contains("AF-01")), "{texts:?}");
+        assert!(
+            texts.iter().all(|text| !text.contains("AF-01")),
+            "{texts:?}"
+        );
         // stable sort keeps roadmap order within a status
         let af_02 = texts.iter().position(|text| text.contains("AF-02"));
         let af_03 = texts.iter().position(|text| text.contains("AF-03"));
@@ -2286,7 +2340,7 @@ mod tests {
         let noisy_profile =
             "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast"
                 .to_string();
-        let details = RunDetails {
+        let mut details = RunDetails {
             run: Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
@@ -2351,12 +2405,19 @@ mod tests {
                 slice_id: "slice-1".to_string(),
                 attempt: 1,
                 question: long_question.clone(),
-                options: Vec::new(),
+                options: vec!["A".to_string(), "B".to_string()],
                 timeout_seconds: 1800,
+                recommended_answer: "A".to_string(),
+                recommendation_rationale: "A is the smallest reversible option".to_string(),
+                bounded_within_current_slice_or_mission_authority: true,
+                reversible: true,
+                fallback_eligible: true,
+                deadline_at: Some(now + chrono::Duration::seconds(1800)),
                 state: "pending".to_string(),
                 asked_at: now,
                 answered_at: None,
                 answer: String::new(),
+                answer_source: None,
             }],
             replan: Default::default(),
             mission_envelope: None,
@@ -2441,6 +2502,18 @@ mod tests {
                 .any(|line| line.text == question_line)
         );
         assert!(feed.attention.iter().any(|line| line.text == question_line));
+        assert!(
+            attention
+                .lines
+                .iter()
+                .any(|line| { line.text == "Eligible timeout fallback: A" })
+        );
+        assert!(attention.lines.iter().any(|line| {
+            line.text == "Fallback rationale: A is the smallest reversible option"
+        }));
+        assert!(attention.lines.iter().any(|line| {
+            line.text.starts_with("Deadline: ") && line.text.contains("remaining")
+        }));
 
         let checks = block_by_label(&feed, "Checks");
         assert!(checks.lines.iter().any(|line| {
@@ -2467,6 +2540,26 @@ mod tests {
             )
         );
         assert!(!economics.lines[0].text.contains("Agent calls:"));
+
+        let question = &mut details.questions[0];
+        question.state = "answered".to_string();
+        question.answer = "A".to_string();
+        question.answer_source =
+            Some(crate::domain::WorkerQuestionAnswerSource::LlmRecommendationTimeout);
+        question.recommended_answer = "A".to_string();
+        question.recommendation_rationale = "A is the smallest reversible option".to_string();
+        question.fallback_eligible = true;
+        question.answered_at = Some(now);
+        let resolved_feed = project_run_at(&details, now);
+        let resolved_workers = block_by_label(&resolved_feed, "Workers");
+        assert!(resolved_workers.lines.iter().any(|line| {
+            line.text
+                .contains("answer_source=llm_recommendation_timeout")
+        }));
+        assert!(resolved_workers.lines.iter().any(|line| {
+            line.text.contains("original recommendation=A")
+                && line.text.contains("A is the smallest reversible option")
+        }));
     }
 
     fn block_by_label<'a>(feed: &'a StatusFeed, label: &str) -> &'a StatusFeedBlock {
@@ -2672,7 +2765,8 @@ mod tests {
             .find(|block| block.label == "Attention")
             .expect("attention block");
         assert!(attention.lines.iter().any(|line| {
-            line.text.starts_with("[operator] Pending replan rp-test-001")
+            line.text
+                .starts_with("[operator] Pending replan rp-test-001")
                 && line.text.contains("risk=intent_affecting")
         }));
         assert!(attention.lines.iter().any(|line| {

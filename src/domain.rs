@@ -208,7 +208,10 @@ pub struct WorkflowConfig {
     pub verify_timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_attempt_timeout_seconds: u64,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(
+        default = "default_worker_question_timeout_seconds",
+        skip_serializing_if = "is_zero_u64"
+    )]
     pub worker_question_timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_no_output_warning_seconds: u64,
@@ -239,7 +242,7 @@ impl Default for WorkflowConfig {
             parallelism: 3,
             verify_timeout_seconds: 600,
             worker_attempt_timeout_seconds: 0,
-            worker_question_timeout_seconds: 1800,
+            worker_question_timeout_seconds: 60,
             worker_no_output_warning_seconds: 900,
             worker_termination_grace_seconds: 30,
             integration_repair: default_integration_repair_policy(),
@@ -1562,6 +1565,8 @@ pub struct ImplementationSummary {
     pub economics: RunEconomics,
     #[serde(default)]
     pub plan_revisions: PlanRevisions,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_questions: Vec<WorkerQuestion>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1703,6 +1708,58 @@ fn default_status_feed_role() -> StatusFeedRole {
     StatusFeedRole::Info
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerQuestionRecommendation {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommended_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bounded_within_current_slice_or_mission_authority: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reversible: bool,
+}
+
+impl WorkerQuestionRecommendation {
+    pub fn is_eligible(&self, options: &[String]) -> bool {
+        !self.recommended_answer.is_empty()
+            && !self.rationale.trim().is_empty()
+            && self.bounded_within_current_slice_or_mission_authority
+            && self.reversible
+            && options
+                .iter()
+                .filter(|option| {
+                    !option.trim().is_empty() && option.as_str() == self.recommended_answer
+                })
+                .count()
+                == 1
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerQuestionAnswerSource {
+    Operator,
+    LlmRecommendationTimeout,
+}
+
+impl WorkerQuestionAnswerSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::LlmRecommendationTimeout => "llm_recommendation_timeout",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "operator" => Some(Self::Operator),
+            "llm_recommendation_timeout" => Some(Self::LlmRecommendationTimeout),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerQuestion {
     pub id: String,
@@ -1715,12 +1772,38 @@ pub struct WorkerQuestion {
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommended_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommendation_rationale: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bounded_within_current_slice_or_mission_authority: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reversible: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
     pub state: String,
     pub asked_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_source: Option<WorkerQuestionAnswerSource>,
+}
+
+impl WorkerQuestion {
+    pub fn recommendation(&self) -> WorkerQuestionRecommendation {
+        WorkerQuestionRecommendation {
+            recommended_answer: self.recommended_answer.clone(),
+            rationale: self.recommendation_rationale.clone(),
+            bounded_within_current_slice_or_mission_authority: self
+                .bounded_within_current_slice_or_mission_authority,
+            reversible: self.reversible,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2261,6 +2344,10 @@ pub const SLICE_STATUS_CLOSED: &str = "closed";
 
 fn default_slice_status() -> String {
     SLICE_STATUS_OPEN.to_string()
+}
+
+fn default_worker_question_timeout_seconds() -> u64 {
+    60
 }
 
 pub fn default_integration_repair_policy() -> String {

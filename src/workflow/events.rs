@@ -540,6 +540,16 @@ pub(crate) struct WorkerQuestionAskedPayload {
     pub timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommended_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommendation_rationale: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bounded_within_current_slice_or_mission_authority: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reversible: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_eligible: bool,
     pub answer_command: String,
 }
 
@@ -553,6 +563,12 @@ impl WorkerQuestionAskedPayload {
             options: question.options.clone(),
             timeout_seconds: question.timeout_seconds,
             deadline_at,
+            recommended_answer: question.recommended_answer.clone(),
+            recommendation_rationale: question.recommendation_rationale.clone(),
+            bounded_within_current_slice_or_mission_authority: question
+                .bounded_within_current_slice_or_mission_authority,
+            reversible: question.reversible,
+            fallback_eligible: question.fallback_eligible,
             answer_command: format!(
                 "khazad-doom answer {} {} <answer>",
                 question.run_id, question.id
@@ -567,18 +583,27 @@ pub(crate) struct WorkerQuestionAnsweredPayload {
     pub slice_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub answer_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommended_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommendation_rationale: String,
 }
 
 impl WorkerQuestionAnsweredPayload {
-    pub(crate) fn new(
-        question_id: impl Into<String>,
-        slice_id: impl Into<String>,
+    pub(crate) fn from_question(
+        question: &WorkerQuestion,
         answer: impl Into<String>,
+        answer_source: crate::domain::WorkerQuestionAnswerSource,
     ) -> Self {
         Self {
-            question_id: question_id.into(),
-            slice_id: slice_id.into(),
+            question_id: question.id.clone(),
+            slice_id: question.slice_id.clone(),
             answer: answer.into(),
+            answer_source: answer_source.as_str().to_string(),
+            recommended_answer: question.recommended_answer.clone(),
+            recommendation_rationale: question.recommendation_rationale.clone(),
         }
     }
 }

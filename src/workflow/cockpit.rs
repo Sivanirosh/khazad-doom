@@ -963,6 +963,11 @@ pub(crate) fn notify_origin_worker_question_attention(
         "options": question.options,
         "timeout_seconds": question.timeout_seconds,
         "deadline_at": origin_attention_worker_question_deadline(question),
+        "recommended_answer": question.recommended_answer,
+        "recommendation_rationale": question.recommendation_rationale,
+        "bounded_within_current_slice_or_mission_authority": question.bounded_within_current_slice_or_mission_authority,
+        "reversible": question.reversible,
+        "fallback_eligible": question.fallback_eligible,
         "answer_command": answer_commands[0],
         "answer_commands": answer_commands,
         "status_commands": status_commands,
@@ -1302,13 +1307,7 @@ fn origin_attention_status_commands(run_id: &str) -> Vec<String> {
 }
 
 fn origin_attention_worker_question_deadline(question: &WorkerQuestion) -> Option<String> {
-    if question.timeout_seconds == 0 {
-        return None;
-    }
-    Some(
-        (question.asked_at + chrono::Duration::seconds(question.timeout_seconds as i64))
-            .to_rfc3339(),
-    )
+    question.deadline_at.map(|deadline| deadline.to_rfc3339())
 }
 
 pub(crate) fn rename_default_agent_target(
@@ -2621,7 +2620,7 @@ mod tests {
         let run = attention_run_fixture(repo.path(), "kd-attention-worker-question");
         state.insert_run(&run)?;
         artifact_store.write_origin_notification_target(&run.id, &attention_origin())?;
-        let first = state.insert_worker_question(
+        let first = state.insert_worker_question_with_recommendation(
             "q-1",
             &run.id,
             "slice-001",
@@ -2629,6 +2628,12 @@ mod tests {
             "choose?",
             &["a".to_string()],
             30,
+            &crate::domain::WorkerQuestionRecommendation {
+                recommended_answer: "a".to_string(),
+                rationale: "a is bounded and reversible".to_string(),
+                bounded_within_current_slice_or_mission_authority: true,
+                reversible: true,
+            },
         )?;
         let second = state.insert_worker_question(
             "q-2",
@@ -2665,6 +2670,16 @@ mod tests {
         assert_eq!(
             records[0].payload["delivery_semantics"],
             "visibility_only_no_auto_decision"
+        );
+        assert_eq!(records[0].payload["recommended_answer"], "a");
+        assert_eq!(
+            records[0].payload["recommendation_rationale"],
+            "a is bounded and reversible"
+        );
+        assert_eq!(records[0].payload["fallback_eligible"], true);
+        assert_eq!(
+            records[0].payload["deadline_at"],
+            first.deadline_at.expect("durable deadline").to_rfc3339()
         );
         Ok(())
     }

@@ -212,7 +212,7 @@ Runs also expose an `incidents` array in status JSON and monitor output. A final
 
 ### Operator questions
 
-If a Pi worker reaches a slice `must_ask_if` fence, it can call the shipped `ask_operator` tool instead of immediately returning blocked JSON. The daemon persists the question, marks progress as `awaiting_operator`, and status/monitor output shows the full question, options, deadline, and answer command:
+If a Pi worker reaches a slice `must_ask_if` fence, it can call the shipped `ask_operator` tool instead of immediately returning blocked JSON. The call carries the worker's original `recommended_answer`, rationale, and explicit bounded-authority/reversible attestations. The daemon persists that audit data, marks progress as `awaiting_operator`, and status/monitor output shows the full question, options, exact deadline, eligible fallback, rationale, and answer command:
 
 ```bash
 khazad-doom questions --run <run-id>
@@ -220,9 +220,11 @@ khazad-doom answer <run-id> <question-id> "your answer"
 khazad-doom attend --run <run-id>
 ```
 
-In native Pi TUI workers, the worker pane is the answer surface. The worker-only `ask_operator` tool first records the pending question through daemon `workerAskOpen`, then opens the normal Pi `ctx.ui.select`/`ctx.ui.input` dialog in that same worker session. The selected answer is submitted through daemon `answerQuestion` before the worker continues. The monitor bridge and Dashboard remain read-only painters; CLI `khazad-doom answer` and `/khazad-answer` are explicit fallback/debug paths, and Herdr scrollback, terminal text, phone/remote messages, and freeform terminal typing never own the answer.
+In native Pi TUI workers, the worker pane is the answer surface. The worker-only `ask_operator` tool first records the pending question through daemon `workerAskOpen`, then opens the normal Pi `ctx.ui.select`/`ctx.ui.input` dialog in that same worker session. The dialog shows the daemon's exact deadline and eligible fallback before it fires. A selected answer is submitted through daemon `answerQuestion`. Dialog expiry/cancellation consults daemon state so a recommendation already committed at the deadline is returned as a successful answer instead of being changed back to `timed_out`. The headless `workerAsk` path follows the same durable result. The monitor bridge and Dashboard remain read-only painters; CLI `khazad-doom answer` and `/khazad-answer` are explicit fallback/debug paths, and Herdr scrollback, terminal text, phone/remote messages, and freeform terminal typing never own the answer.
 
-The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, `KHAZAD_ATTEMPT`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk` or `workerAskOpen`. `worker_question_timeout_seconds` in `.workflow/khazad.json` sets the daemon-owned question timeout; `0` means wait forever. If no answer arrives before the timeout, or the in-pane Pi dialog is cancelled, the question is marked `timed_out` and the worker falls back to the existing blocked contract. If the daemon restarts while a question is pending, the stale question is marked `interrupted`; answering requires resuming the run and answering the fresh pending question for the active worker attempt.
+The worker receives `KHAZAD_DAEMON_SOCKET`, `KHAZAD_RUN_ID`, `KHAZAD_SLICE_ID`, `KHAZAD_ATTEMPT`, and a per-run `KHAZAD_WORKER_TOKEN`; the daemon validates the token before accepting `workerAsk` or `workerAskOpen`. The built-in and repository `worker_question_timeout_seconds` value is `60`; `0` still means wait forever. At the absolute daemon-owned deadline, a recommendation is eligible only when it exactly matches one non-empty declared option, has a non-empty rationale, and both bounded-within-current-slice-or-mission-authority and reversible attestations are true. The daemon atomically records either the first operator answer or the eligible recommendation with `answer_source: operator` or `answer_source: llm_recommendation_timeout`; the loser receives the durable winner. Missing, malformed, empty, non-option, or ineligible recommendations remain `timed_out` and use the existing blocked contract.
+
+Timeout fallback must never authorize scope expansion, destructive or irreversible work, credentials/secrets, permissions, release/push/handoff actions, or work outside the current JSON Slice or mission envelope. Those hard cases block without an operator answer. If the daemon restarts while a question is pending, the stale question is marked `interrupted`; answering requires resuming the run and answering the fresh pending question for the active worker attempt, and no recommendation is fabricated for the lost worker.
 
 ### Replan proposals
 
@@ -326,7 +328,7 @@ KHAZAD_PI_BIN=/path/to/pi KHAZAD_PI_ARGS="--some-arg" khazad-doom run --agent pi
   "parallelism": 3,
   "verify_timeout_seconds": 600,
   "worker_attempt_timeout_seconds": 0,
-  "worker_question_timeout_seconds": 3600,
+  "worker_question_timeout_seconds": 60,
   "worker_no_output_warning_seconds": 900,
   "worker_termination_grace_seconds": 30,
   "integration_repair": "auto",
@@ -363,7 +365,7 @@ Khazad-Doom does not use a hidden global workflow timeout. Runs are daemon-owned
 Worker supervision has separate knobs:
 
 - `worker_attempt_timeout_seconds`: explicit per-worker-attempt cap. `0` disables fatal timeout, which is the default.
-- `worker_question_timeout_seconds`: daemon-owned operator question timeout. `0` waits indefinitely; this repo currently uses `3600` as an interim high-value guardrail.
+- `worker_question_timeout_seconds`: daemon-owned operator question timeout. The built-in and this repository use `60`; `0` waits indefinitely. At the deadline only an exact-option, bounded-authority, reversible recommendation may auto-apply.
 - `worker_no_output_warning_seconds`: advisory quiet-worker warning threshold for monitor/watch/status. Missing output alone is not failure.
 - `worker_termination_grace_seconds`: grace period used when Khazad-Doom asks a Pi worker process to stop before force-kill escalation.
 

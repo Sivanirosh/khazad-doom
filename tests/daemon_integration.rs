@@ -794,6 +794,7 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
     kd_ok(&bin, home_restart.path(), &["daemon", "start"])?;
     let interrupted =
         wait_for_terminal_status(&bin, home_restart.path(), &restart_run_id, "interrupted")?;
+    assert_eq!(interrupted["progress"]["phase"], "interrupted");
     assert_eq!(interrupted["questions"][0]["state"], "interrupted");
     let stale_answer = kd(
         &bin,
@@ -833,6 +834,155 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
     wait_for_status(&bin, home_restart.path(), &restart_run_id, "completed")?;
     guard_restart.stop();
 
+    Ok(())
+}
+
+#[test]
+fn ask_operator_terminal_same_pane_question_cannot_revive_on_resume() -> TestResult {
+    let bin = binary_path();
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_operator_question_fake_pi(fake_bin.path())?;
+    let fake_pi_string = path(&fake_pi).to_string();
+    let resumed_fake_bin = tempfile::tempdir()?;
+    let resumed_fake_pi = write_quiet_fake_pi(resumed_fake_bin.path())?;
+    let resumed_fake_pi_string = path(&resumed_fake_pi).to_string();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    fs::write(
+        repo.path().join(".workflow/khazad.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "agent": "pi",
+                "parallelism": 1,
+                "worker_attempt_timeout_seconds": 0,
+                "worker_question_timeout_seconds": 3
+            }))?
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-ask-terminal-resume",
+            "title": "Terminal same-pane question",
+            "goal": "Never revive a question from a terminal worker attempt.",
+            "acceptance": ["old question stays interrupted across resume"],
+            "verify": ["test -f slice-ask-terminal-resume.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add terminal same-pane question slice"],
+    )?;
+
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[
+            ("KHAZAD_PI_BIN", fake_pi_string.as_str()),
+            ("KHAZAD_FAKE_PI_OPERATOR_MODE", "same_pane"),
+        ],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let awaiting = wait_for_pending_question(&bin, home.path(), &run_id)?;
+    let old_question = awaiting["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["state"] == "pending")
+        })
+        .expect("same-pane pending question");
+    let old_question_id = old_question["id"]
+        .as_str()
+        .expect("old question id")
+        .to_string();
+    assert_eq!(old_question["attempt"], 1);
+
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &run_id,
+            "--reason",
+            "cancel same-pane question",
+        ],
+    )?;
+    let cancelled = wait_for_terminal_status(&bin, home.path(), &run_id, "cancelled")?;
+    assert_eq!(cancelled["progress"]["phase"], "cancelled");
+    let old_question = cancelled["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["id"] == old_question_id)
+        })
+        .expect("durable old question");
+    assert_eq!(old_question["state"], "interrupted");
+    assert!(old_question["answer_source"].is_null());
+
+    let summary_path = repo
+        .path()
+        .join(".workflow/runs")
+        .join(&run_id)
+        .join("outputs/run-summary.json");
+    let summary = wait_for_json_file(&summary_path)?;
+    assert_eq!(summary["progress"]["phase"], "cancelled");
+    assert_eq!(summary["questions"][0]["state"], "interrupted");
+
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "resume",
+            "--run",
+            &run_id,
+            "--agent",
+            "pi",
+            "--pi-bin",
+            resumed_fake_pi_string.as_str(),
+        ],
+    )?;
+    let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let old_question = completed["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["id"] == old_question_id)
+        })
+        .expect("old question after resume");
+    assert_eq!(old_question["attempt"], 1);
+    assert_eq!(old_question["state"], "interrupted");
+    assert!(old_question["answer_source"].is_null());
+    assert!(completed["events"].as_array().is_some_and(|events| {
+        events.iter().all(|event| {
+            event["type"] != "worker_question_answered"
+                || event["payload"]["question_id"] != old_question_id
+        })
+    }));
+
+    guard.stop();
     Ok(())
 }
 
@@ -3296,6 +3446,23 @@ fn wait_for_pending_question(bin: &Path, home: &Path, run_id: &str) -> TestResul
     }
 }
 
+fn wait_for_json_file(path: &Path) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => return Ok(serde_json::from_str(&contents)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for JSON file {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_terminal_status(
     bin: &Path,
     home: &Path,
@@ -3964,11 +4131,11 @@ with open(handoff_path, encoding="utf-8") as fh:
 
 mode = os.environ.get("KHAZAD_FAKE_PI_OPERATOR_MODE", "answer")
 slice_id = handoff["slice"]["id"]
+run_id = handoff["run_id"]
 if mode == "answer" and "timeout" in slice_id:
     mode = "timeout"
 if mode == "answer" and "unavailable" in slice_id:
     mode = "unavailable"
-run_id = handoff["run_id"]
 attempt = int(os.environ.get("KHAZAD_ATTEMPT", "0") or "0")
 question_text = f"Which operator answer should {slice_id} use on attempt {attempt}?"
 
@@ -3994,8 +4161,15 @@ params = {
     "options": ["alpha", "bravo"],
     "timeout_seconds": 1 if mode == "timeout" else int(os.environ.get("KHAZAD_FAKE_PI_OPERATOR_TIMEOUT", "30")),
 }
+if mode == "same_pane":
+    params.update({
+        "recommended_answer": "alpha",
+        "rationale": "alpha is the bounded reversible fixture choice",
+        "bounded_within_current_slice_or_mission_authority": True,
+        "reversible": True,
+    })
 try:
-    result = daemon_call("workerAsk", params)
+    result = daemon_call("workerAskOpen" if mode == "same_pane" else "workerAsk", params)
 except Exception as exc:
     emit({
         "slice_id": slice_id,
@@ -4008,6 +4182,10 @@ except Exception as exc:
         }],
     })
     sys.exit(0)
+
+if mode == "same_pane":
+    while True:
+        time.sleep(1)
 
 if result.get("timed_out"):
     emit({

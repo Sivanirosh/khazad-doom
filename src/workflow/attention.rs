@@ -72,6 +72,9 @@ impl OperatorAttention {
             "options": question.options,
             "timeout_seconds": question.timeout_seconds,
             "deadline_at": worker_question_deadline(question),
+            "recommended_answer": question.recommended_answer,
+            "recommendation_rationale": question.recommendation_rationale,
+            "fallback_eligible": question.fallback_eligible,
             "answer_command": worker_question_answer_command(question),
             "source_of_truth": "daemon_worker_questions",
         });
@@ -527,13 +530,7 @@ pub(crate) fn worker_question_answer_command(question: &WorkerQuestion) -> Strin
 }
 
 pub(crate) fn worker_question_deadline(question: &WorkerQuestion) -> Option<String> {
-    if question.timeout_seconds == 0 {
-        return None;
-    }
-    Some(
-        (question.asked_at + chrono::Duration::seconds(question.timeout_seconds as i64))
-            .to_rfc3339(),
-    )
+    question.deadline_at.map(|deadline| deadline.to_rfc3339())
 }
 
 fn terminal_feedback_status_supported(status: RunStatus) -> bool {
@@ -876,8 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn worker_question_deadline_uses_timeout_seconds() {
+    fn worker_question_deadline_uses_the_durable_absolute_deadline() {
         let now = Utc::now();
+        let deadline = now + chrono::Duration::from_std(Duration::from_secs(5)).unwrap();
         let question = WorkerQuestion {
             id: "q-deadline".to_string(),
             run_id: "run".to_string(),
@@ -886,15 +884,22 @@ mod tests {
             question: "choose".to_string(),
             options: Vec::new(),
             timeout_seconds: 5,
+            recommended_answer: String::new(),
+            recommendation_rationale: String::new(),
+            bounded_within_current_slice_or_mission_authority: false,
+            reversible: false,
+            fallback_eligible: false,
+            deadline_at: Some(deadline),
             state: "pending".to_string(),
             asked_at: now,
             answered_at: None,
             answer: String::new(),
+            answer_source: None,
         };
 
         assert_eq!(
             worker_question_deadline(&question),
-            Some((now + chrono::Duration::from_std(Duration::from_secs(5)).unwrap()).to_rfc3339())
+            Some(deadline.to_rfc3339())
         );
     }
 }
