@@ -12,6 +12,39 @@ mod state;
 mod workflow;
 
 fn main() {
+    let mut args = std::env::args();
+    let _executable = args.next();
+    if args.next().as_deref() == Some(workflow::COMMAND_SUPERVISOR_ARG) {
+        let result_fd = args.next().and_then(|value| value.parse::<i32>().ok());
+        let command = args.next();
+        let (Some(result_fd), Some(command)) = (result_fd, command) else {
+            eprintln!(
+                "khazad-doom: verification command supervisor omitted its result descriptor or command"
+            );
+            std::process::exit(125);
+        };
+        if let Err(err) = workflow::protect_command_supervisor_result(result_fd) {
+            eprintln!("khazad-doom: verification command supervisor result setup failed: {err:#}");
+            std::process::exit(125);
+        }
+        match workflow::run_command_supervisor(&command) {
+            Ok(code) => {
+                if let Err(err) = workflow::write_command_supervisor_result(result_fd, None) {
+                    eprintln!(
+                        "khazad-doom: verification command supervision result failed: {err:#}"
+                    );
+                    std::process::exit(125);
+                }
+                std::process::exit(code)
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                let _ = workflow::write_command_supervisor_result(result_fd, Some(&message));
+                eprintln!("khazad-doom: verification command supervision failed: {message}");
+                std::process::exit(125);
+            }
+        }
+    }
     if let Err(err) = cli::run(std::env::args().skip(1)) {
         eprintln!("khazad-doom: {err:#}");
         std::process::exit(1);

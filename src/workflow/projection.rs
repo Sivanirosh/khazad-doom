@@ -403,6 +403,7 @@ fn gate_pane_gate_result_from_economics(details: &RunDetails) -> Option<GateResu
             cache_hit: command.cache_hit,
             skip_reason: command.skip_reason.clone(),
             failure_kind: String::new(),
+            verification_workspace: None,
         })
         .collect::<Vec<_>>();
     if commands.is_empty() {
@@ -429,8 +430,13 @@ fn gate_pane_gate_result_from_economics(details: &RunDetails) -> Option<GateResu
     Some(GateResult {
         status: status.to_string(),
         summary: summary.to_string(),
+        verification_cancelled: false,
+        failure_kind: String::new(),
+        verification_workspace: None,
         commands,
         findings: Vec::new(),
+        approved_workspace: None,
+        publication_identity: Vec::new(),
     })
 }
 

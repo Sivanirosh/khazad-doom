@@ -1,11 +1,12 @@
 use crate::domain::{
-    AgentProfilesConfig, ArtifactEntry, Handoff, ImplementationSummary, OriginNotificationTarget,
-    RunCheckpoint, Slice, SliceSummary, SliceValidationIssue, SliceValidationReport,
-    SliceWriteResult, TerminalNotificationRecord, WorkflowConfig,
+    AgentProfilesConfig, ArtifactEntry, GateResult, GitWorktreeSnapshotEvidence, Handoff,
+    ImplementationSummary, OriginNotificationTarget, RunCheckpoint, Slice, SliceSummary,
+    SliceValidationIssue, SliceValidationReport, SliceWriteResult, TerminalNotificationRecord,
+    WorkflowConfig,
 };
 use crate::gitutil;
 use anyhow::{Context, Result, bail};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
@@ -88,6 +89,100 @@ pub struct SliceClosureIncident {
 #[derive(Debug, Clone, Default)]
 pub struct SliceClosureReport {
     pub incidents: Vec<SliceClosureIncident>,
+    pub closed_slice_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletionPublicationManifest {
+    run_id: String,
+    closed_slice_ids: Vec<String>,
+    gate_approval: GitWorktreeSnapshotEvidence,
+    gate_publication_identity: Vec<u8>,
+    exact: gitutil::ExactPathManifest,
+}
+
+#[derive(Debug, Clone)]
+enum CompletionPublicationArtifact {
+    ClosedSlice(String),
+    ImplementationSummary,
+    FinalReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionPublicationPathReceipt {
+    pub path_bytes_hex: String,
+    pub mode: String,
+    pub object_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionPublicationReceipt {
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub closed_slice_ids: Vec<String>,
+    pub committed: bool,
+    pub commit_sha: String,
+    pub parent_sha: String,
+    pub tree_sha: String,
+    pub staged_path_bytes_hex: Vec<String>,
+    pub manifest_entries: Vec<CompletionPublicationPathReceipt>,
+}
+
+fn exact_completion_publication_receipt(
+    receipt: &CompletionPublicationReceipt,
+) -> Result<gitutil::ExactPathCommitReceipt> {
+    Ok(gitutil::ExactPathCommitReceipt {
+        committed: receipt.committed,
+        commit_sha: receipt.commit_sha.clone(),
+        parent_sha: receipt.parent_sha.clone(),
+        tree_sha: receipt.tree_sha.clone(),
+        staged_path_bytes: receipt
+            .staged_path_bytes_hex
+            .iter()
+            .map(|path| hex::decode(path).context("decode publication receipt path"))
+            .collect::<Result<Vec<_>>>()?,
+        manifest_entries: receipt
+            .manifest_entries
+            .iter()
+            .map(|entry| {
+                Ok(gitutil::ExactPathCommitEntry {
+                    path_bytes: hex::decode(&entry.path_bytes_hex)
+                        .context("decode publication manifest receipt path")?,
+                    mode: entry.mode.clone(),
+                    object_id: entry.object_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn completion_publication_receipt(
+    receipt: gitutil::ExactPathCommitReceipt,
+    manifest: &CompletionPublicationManifest,
+) -> CompletionPublicationReceipt {
+    CompletionPublicationReceipt {
+        run_id: manifest.run_id.clone(),
+        closed_slice_ids: manifest.closed_slice_ids.clone(),
+        committed: receipt.committed,
+        commit_sha: receipt.commit_sha,
+        parent_sha: receipt.parent_sha,
+        tree_sha: receipt.tree_sha,
+        staged_path_bytes_hex: receipt
+            .staged_path_bytes
+            .into_iter()
+            .map(hex::encode)
+            .collect(),
+        manifest_entries: receipt
+            .manifest_entries
+            .into_iter()
+            .map(|entry| CompletionPublicationPathReceipt {
+                path_bytes_hex: hex::encode(entry.path_bytes),
+                mode: entry.mode,
+                object_id: entry.object_id,
+            })
+            .collect(),
+    }
 }
 
 impl SliceClosureReport {
@@ -103,6 +198,10 @@ impl Store {
         Self {
             repo_path: repo_path.as_ref().to_path_buf(),
         }
+    }
+
+    pub(crate) fn repo_path(&self) -> &Path {
+        &self.repo_path
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
@@ -483,20 +582,21 @@ impl Store {
             let path = self.slice_path(slice_id);
             if !path.exists() {
                 report.incidents.push(SliceClosureIncident {
-                    severity: "warning".to_string(),
-                    kind: "slice_close_skipped".to_string(),
+                    severity: "error".to_string(),
+                    kind: "slice_close_missing".to_string(),
                     slice_id: slice_id.clone(),
                     path: path.to_string_lossy().to_string(),
                     message: format!(
-                        "slice metadata for {slice_id} was not present at {}; closure skipped",
+                        "required slice close record for {slice_id} was not present at {}",
                         path.display()
                     ),
-                    policy: "preserve_handoff_ready_missing_metadata".to_string(),
+                    policy: "block_completion_publication_on_missing_close_record".to_string(),
                 });
                 continue;
             }
-            if let Err(err) = self.close_slice_file(slice_id, run_id, closed_at) {
-                report.incidents.push(SliceClosureIncident {
+            match self.close_slice_file(slice_id, run_id, closed_at) {
+                Ok(()) => report.closed_slice_ids.push(slice_id.clone()),
+                Err(err) => report.incidents.push(SliceClosureIncident {
                     severity: "error".to_string(),
                     kind: "slice_close_failed".to_string(),
                     slice_id: slice_id.clone(),
@@ -506,7 +606,7 @@ impl Store {
                         path.display()
                     ),
                     policy: "block_handoff_on_close_failure".to_string(),
-                });
+                }),
             }
         }
         report
@@ -557,11 +657,400 @@ impl Store {
         Ok(path)
     }
 
-    pub fn commit_completion_publication(&self, run_id: &str) -> Result<()> {
-        gitutil::commit_all(
-            &self.repo_path,
-            &format!("khazad(run): publish completion {run_id}"),
+    #[cfg(test)]
+    pub fn completion_publication_manifest(
+        &self,
+        run_id: &str,
+        closed_slice_ids: &[String],
+    ) -> Result<CompletionPublicationManifest> {
+        let gate_approval = gitutil::completion_publication_approval(&self.repo_path)?;
+        let gate_publication_identity =
+            gitutil::completion_publication_root_identity(&self.repo_path)?;
+        self.pin_completion_publication_manifest(
+            run_id,
+            closed_slice_ids,
+            gate_approval,
+            gate_publication_identity,
         )
+    }
+
+    pub fn completion_publication_manifest_for_gate(
+        &self,
+        run_id: &str,
+        closed_slice_ids: &[String],
+        gate: &GateResult,
+    ) -> Result<CompletionPublicationManifest> {
+        if gate.status != "passed" {
+            bail!("completion publication requires a passed integration gate");
+        }
+        let gate_approval = gate
+            .approved_workspace
+            .clone()
+            .context("passed integration gate omitted its approved workspace identity")?;
+        if gate.publication_identity.is_empty() {
+            bail!("passed integration gate omitted its publication identity");
+        }
+        self.pin_completion_publication_manifest(
+            run_id,
+            closed_slice_ids,
+            gate_approval,
+            gate.publication_identity.clone(),
+        )
+    }
+
+    fn completion_publication_manifest_for_recovery(
+        &self,
+        run_id: &str,
+        closed_slice_ids: &[String],
+    ) -> Result<CompletionPublicationManifest> {
+        // Recovery validates immutable commit and journal identities; it must not try to
+        // acquire a second real-index lock merely to reconstruct semantic path bytes.
+        let root_identity = gitutil::completion_publication_root_identity(&self.repo_path)?;
+        self.pin_completion_publication_manifest(
+            run_id,
+            closed_slice_ids,
+            GitWorktreeSnapshotEvidence::default(),
+            root_identity,
+        )
+    }
+
+    fn completion_publication_artifacts(
+        &self,
+        run_id: &str,
+        closed_slice_ids: &[String],
+    ) -> Result<Vec<(PathBuf, CompletionPublicationArtifact)>> {
+        if !is_safe_slice_id(run_id) {
+            bail!("unsafe completion publication run id {run_id:?}");
+        }
+        let mut canonical_slice_ids = closed_slice_ids.to_vec();
+        for slice_id in &canonical_slice_ids {
+            if !is_safe_slice_id(slice_id) {
+                bail!("unsafe completion publication slice id {slice_id:?}");
+            }
+        }
+        canonical_slice_ids.sort();
+        if canonical_slice_ids.windows(2).any(|ids| ids[0] == ids[1]) {
+            bail!("completion publication repeats a closed slice id");
+        }
+        let mut artifacts = Vec::new();
+        for slice_id in canonical_slice_ids {
+            artifacts.push((
+                self.repo_relative_publication_path(&self.slice_path(&slice_id))?,
+                CompletionPublicationArtifact::ClosedSlice(slice_id),
+            ));
+        }
+        artifacts.push((
+            self.repo_relative_publication_path(&self.implementation_summary_report_path(run_id))?,
+            CompletionPublicationArtifact::ImplementationSummary,
+        ));
+        artifacts.push((
+            self.repo_relative_publication_path(&self.final_report_artifact_path(run_id))?,
+            CompletionPublicationArtifact::FinalReport,
+        ));
+        artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(artifacts)
+    }
+
+    fn pin_completion_publication_manifest(
+        &self,
+        run_id: &str,
+        closed_slice_ids: &[String],
+        gate_approval: GitWorktreeSnapshotEvidence,
+        gate_publication_identity: Vec<u8>,
+    ) -> Result<CompletionPublicationManifest> {
+        let artifacts = self.completion_publication_artifacts(run_id, closed_slice_ids)?;
+        let root_identity = gitutil::completion_publication_root_identity(&self.repo_path)?;
+        let mut entries = Vec::with_capacity(artifacts.len());
+        for (path, _) in &artifacts {
+            let absolute = self.repo_path.join(path);
+            let expected_bytes = fs::read(&absolute).with_context(|| {
+                format!(
+                    "completion publication artifact is missing or unreadable: {}",
+                    absolute.display()
+                )
+            })?;
+            entries.push(gitutil::ExactPathManifestEntry {
+                path: path.clone(),
+                expected_bytes,
+                expected_mode: "100644".to_string(),
+            });
+        }
+        let mut canonical_slice_ids = closed_slice_ids.to_vec();
+        canonical_slice_ids.sort();
+        if gitutil::completion_publication_root_identity(&self.repo_path)? != root_identity {
+            bail!(
+                "completion publication root/repository identity changed while pinning semantics"
+            );
+        }
+        if root_identity != gate_publication_identity {
+            bail!("completion publication root/repository identity diverged from the passed gate");
+        }
+        let manifest = CompletionPublicationManifest {
+            run_id: run_id.to_string(),
+            closed_slice_ids: canonical_slice_ids,
+            gate_approval,
+            gate_publication_identity,
+            exact: gitutil::ExactPathManifest {
+                root_identity,
+                entries,
+            },
+        };
+        self.validate_completion_publication_manifest_semantics(&manifest)?;
+        Ok(manifest)
+    }
+
+    fn validate_completion_publication_manifest_semantics(
+        &self,
+        manifest: &CompletionPublicationManifest,
+    ) -> Result<()> {
+        let artifacts =
+            self.completion_publication_artifacts(&manifest.run_id, &manifest.closed_slice_ids)?;
+        let mut entries = BTreeMap::new();
+        for entry in &manifest.exact.entries {
+            if entry.expected_mode != "100644" {
+                bail!(
+                    "completion publication semantic artifact {} must have mode 100644",
+                    entry.path.display()
+                );
+            }
+            if entries
+                .insert(entry.path.clone(), entry.expected_bytes.as_slice())
+                .is_some()
+            {
+                bail!("completion publication semantic manifest repeats a path");
+            }
+        }
+        let expected_paths = artifacts
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        if entries.keys().cloned().collect::<BTreeSet<_>>() != expected_paths {
+            bail!("completion publication semantic manifest path set is not exact");
+        }
+
+        let mut implementation = None;
+        let mut final_report = None;
+        for (path, artifact) in artifacts {
+            let bytes = entries
+                .get(&path)
+                .copied()
+                .context("completion publication semantic manifest omitted an artifact")?;
+            match artifact {
+                CompletionPublicationArtifact::ClosedSlice(expected_slice_id) => {
+                    let slice: Slice = serde_json::from_slice(bytes).with_context(|| {
+                        format!(
+                            "completion publication slice {} is not valid JSON",
+                            path.display()
+                        )
+                    })?;
+                    validate_slice(&slice).with_context(|| {
+                        format!(
+                            "completion publication slice {} failed validation",
+                            path.display()
+                        )
+                    })?;
+                    if slice.id != expected_slice_id
+                        || slice.status != crate::domain::SLICE_STATUS_CLOSED
+                        || slice.closed_by_run != manifest.run_id
+                        || slice.closed_at.trim().is_empty()
+                    {
+                        bail!(
+                            "completion publication slice {} is not closed by run {} as slice {}",
+                            path.display(),
+                            manifest.run_id,
+                            expected_slice_id
+                        );
+                    }
+                }
+                CompletionPublicationArtifact::ImplementationSummary => {
+                    implementation = Some(bytes);
+                }
+                CompletionPublicationArtifact::FinalReport => {
+                    final_report = Some(bytes);
+                }
+            }
+        }
+        let implementation = implementation.context("implementation summary was not pinned")?;
+        let final_report = final_report.context("final report was not pinned")?;
+        if implementation != final_report {
+            bail!("completion publication reports do not contain the same pinned summary bytes");
+        }
+        let summary: ImplementationSummary = serde_json::from_slice(implementation)
+            .context("completion publication report is not a valid implementation summary")?;
+        if summary.run_id != manifest.run_id
+            || summary.integration_gate.status != "passed"
+            || !summary.final_sha.is_empty()
+        {
+            bail!(
+                "completion publication report does not describe a passed, pre-publication summary for run {}",
+                manifest.run_id
+            );
+        }
+        let completed_ids = summary
+            .completed_slices
+            .iter()
+            .map(|result| result.slice_id.clone())
+            .collect::<Vec<_>>();
+        let completed_set = completed_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let expected_set = manifest
+            .closed_slice_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if completed_ids.len() != completed_set.len() || !expected_set.is_subset(&completed_set) {
+            bail!(
+                "completion publication report does not include every closed-slice manifest identity"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn find_completion_publication(
+        &self,
+        run_id: &str,
+        expected_branch: &str,
+        closed_slice_ids: &[String],
+    ) -> Result<Option<CompletionPublicationReceipt>> {
+        let artifacts = self.completion_publication_artifacts(run_id, closed_slice_ids)?;
+        if artifacts
+            .iter()
+            .any(|(path, _)| !self.repo_path.join(path).is_file())
+        {
+            let head_message =
+                gitutil::run(&self.repo_path, &["show", "-s", "--format=%B", "HEAD"])?;
+            if head_message.trim_end() == format!("khazad(run): publish completion {run_id}") {
+                bail!(
+                    "completion publication commit at HEAD was found but its current manifest could not be captured"
+                );
+            }
+            return Ok(None);
+        }
+        let manifest =
+            self.completion_publication_manifest_for_recovery(run_id, closed_slice_ids)?;
+        gitutil::find_exact_path_commit(
+            &self.repo_path,
+            &manifest.exact,
+            &format!("khazad(run): publish completion {run_id}"),
+            &format!("refs/heads/{expected_branch}"),
+        )
+        .map(|receipt| receipt.map(|receipt| completion_publication_receipt(receipt, &manifest)))
+    }
+
+    pub fn commit_completion_publication(
+        &self,
+        run_id: &str,
+        expected_branch: &str,
+        manifest: &CompletionPublicationManifest,
+    ) -> Result<CompletionPublicationReceipt> {
+        if run_id != manifest.run_id {
+            bail!(
+                "completion publication run {} does not match pinned manifest run {}",
+                run_id,
+                manifest.run_id
+            );
+        }
+        self.validate_completion_publication_manifest_semantics(manifest)?;
+        let receipt = gitutil::commit_exact_paths_with_approval(
+            &self.repo_path,
+            &manifest.exact,
+            &manifest.gate_approval,
+            &manifest.gate_publication_identity,
+            &format!("khazad(run): publish completion {run_id}"),
+            &format!("refs/heads/{expected_branch}"),
+        )?;
+        Ok(completion_publication_receipt(receipt, manifest))
+    }
+
+    pub fn validate_completion_publication(
+        &self,
+        expected_branch: &str,
+        manifest: &CompletionPublicationManifest,
+        receipt: &CompletionPublicationReceipt,
+    ) -> Result<()> {
+        self.validate_completion_publication_manifest_semantics(manifest)?;
+        if receipt.run_id != manifest.run_id
+            || receipt.closed_slice_ids != manifest.closed_slice_ids
+        {
+            bail!("completion publication receipt semantics do not match its pinned manifest");
+        }
+        gitutil::validate_exact_path_receipt(
+            &self.repo_path,
+            &manifest.exact,
+            &format!("refs/heads/{expected_branch}"),
+            &exact_completion_publication_receipt(receipt)?,
+        )
+    }
+
+    pub fn validate_completion_publication_receipt_at_ref(
+        &self,
+        expected_branch: &str,
+        receipt: &CompletionPublicationReceipt,
+    ) -> Result<()> {
+        let exact = exact_completion_publication_receipt(receipt)?;
+        gitutil::validate_exact_path_receipt_at_ref(
+            &self.repo_path,
+            &format!("refs/heads/{expected_branch}"),
+            &exact,
+        )?;
+        let mut canonical_slice_ids = receipt.closed_slice_ids.clone();
+        canonical_slice_ids.sort();
+        if receipt.run_id.is_empty() || canonical_slice_ids != receipt.closed_slice_ids {
+            bail!("completion publication receipt omitted canonical run/slice semantics");
+        }
+        let artifacts =
+            self.completion_publication_artifacts(&receipt.run_id, &receipt.closed_slice_ids)?;
+        if exact
+            .manifest_entries
+            .iter()
+            .any(|entry| entry.mode != "100644")
+        {
+            bail!("completion publication receipt contains a non-regular JSON artifact mode");
+        }
+        let blobs = gitutil::exact_path_receipt_blobs(&self.repo_path, &exact)?;
+        let mut entries = Vec::with_capacity(artifacts.len());
+        for (path, _) in artifacts {
+            let raw_path = path
+                .to_str()
+                .context("completion publication semantic path was not UTF-8")?
+                .as_bytes()
+                .to_vec();
+            let expected_bytes = blobs.get(&raw_path).cloned().with_context(|| {
+                format!(
+                    "completion publication receipt omitted semantic path {}",
+                    path.display()
+                )
+            })?;
+            entries.push(gitutil::ExactPathManifestEntry {
+                path,
+                expected_bytes,
+                expected_mode: "100644".to_string(),
+            });
+        }
+        if entries.len() != blobs.len() {
+            bail!("completion publication receipt contains paths outside its run/slice semantics");
+        }
+        self.validate_completion_publication_manifest_semantics(&CompletionPublicationManifest {
+            run_id: receipt.run_id.clone(),
+            closed_slice_ids: receipt.closed_slice_ids.clone(),
+            gate_approval: GitWorktreeSnapshotEvidence::default(),
+            gate_publication_identity: Vec::new(),
+            exact: gitutil::ExactPathManifest {
+                root_identity: gitutil::completion_publication_root_identity(&self.repo_path)?,
+                entries,
+            },
+        })
+    }
+
+    fn repo_relative_publication_path(&self, path: &Path) -> Result<PathBuf> {
+        path.strip_prefix(&self.repo_path)
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "completion publication path {} is outside repository {}",
+                    path.display(),
+                    self.repo_path.display()
+                )
+            })
     }
 
     pub fn list_run_artifacts(&self, run_id: &str) -> Result<Vec<ArtifactEntry>> {
@@ -1292,6 +1781,72 @@ mod tests {
         Slice, Store, dependency_layers, parse_agent_profiles_toml, topological_order,
         validate_slice, validate_slice_set,
     };
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn install_blocking_publication_pause(repo: &std::path::Path) {
+        let marker = repo.join("publication-filter.marker");
+        let release = repo.join("publication-filter.release");
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&release);
+        crate::gitutil::pause_next_publication_after_capture(repo, &marker, &release);
+    }
+
+    fn wait_for_publication_pause(repo: &std::path::Path) -> String {
+        let marker = repo.join("publication-filter.marker");
+        let release = repo.join("publication-filter.release");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(path) = fs::read_to_string(&marker)
+                && !path.is_empty()
+            {
+                return path;
+            }
+            if Instant::now() >= deadline {
+                let _ = fs::write(&release, "release\n");
+                panic!("timed out waiting for publication capture pause");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn exact_manifest_entry(
+        repo: &std::path::Path,
+        path: impl Into<std::path::PathBuf>,
+    ) -> crate::gitutil::ExactPathManifestEntry {
+        let path = path.into();
+        #[cfg(unix)]
+        let expected_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(repo.join(&path)).unwrap().permissions().mode() & 0o111 == 0 {
+                "100644"
+            } else {
+                "100755"
+            }
+            .to_string()
+        };
+        #[cfg(not(unix))]
+        let expected_mode = "100644".to_string();
+        crate::gitutil::ExactPathManifestEntry {
+            expected_bytes: fs::read(repo.join(&path)).unwrap(),
+            expected_mode,
+            path,
+        }
+    }
+
+    fn exact_manifest(
+        repo: &std::path::Path,
+        entries: Vec<crate::gitutil::ExactPathManifestEntry>,
+    ) -> crate::gitutil::ExactPathManifest {
+        crate::gitutil::ExactPathManifest {
+            root_identity: crate::gitutil::completion_publication_root_identity(repo).unwrap(),
+            entries,
+        }
+    }
 
     fn valid_slice(id: &str) -> Slice {
         Slice {
@@ -1310,6 +1865,51 @@ mod tests {
             verify: Vec::new(),
             verify_timeout_seconds: 0,
         }
+    }
+
+    fn write_completion_publication_fixture(store: &Store, run_id: &str, slice_ids: &[&str]) {
+        store.ensure_layout().unwrap();
+        for slice_id in slice_ids {
+            let mut slice = valid_slice(slice_id);
+            slice.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+            slice.closed_by_run = run_id.to_string();
+            slice.closed_at = "2026-07-10T00:00:00Z".to_string();
+            super::write_json(store.slice_path(slice_id), &slice).unwrap();
+        }
+        let gate = crate::domain::GateResult {
+            status: "passed".to_string(),
+            ..Default::default()
+        };
+        let summary = crate::domain::ImplementationSummary {
+            run_id: run_id.to_string(),
+            repo_path: store.repo_path.to_string_lossy().into_owned(),
+            integration_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            final_sha: String::new(),
+            worker_profile: crate::domain::WorkerProfileEvidence::default(),
+            mission_envelope: None,
+            frontier_budget: None,
+            completed_slices: slice_ids
+                .iter()
+                .map(|slice_id| crate::domain::WorkerResult {
+                    slice_id: (*slice_id).to_string(),
+                    status: "completed".to_string(),
+                    ..crate::domain::WorkerResult::default()
+                })
+                .collect(),
+            checks: Vec::new(),
+            integration_repair: crate::domain::RepairResult::default(),
+            pre_repair_integration_gate: None,
+            integration_gate: gate,
+            exit_states: crate::domain::WorkflowExitStates::default(),
+            evidence_attestation: crate::domain::EvidenceAttestation::default(),
+            economics: crate::domain::RunEconomics::default(),
+            plan_revisions: crate::domain::PlanRevisions::default(),
+            worker_questions: Vec::new(),
+            created_at: chrono::Utc::now(),
+        };
+        store.write_implementation_summary(&summary).unwrap();
+        store.write_final_report(&summary).unwrap();
     }
 
     #[test]
@@ -1472,5 +2072,2556 @@ mod tests {
             .map(|layer| layer.iter().map(|slice| slice.id.as_str()).collect())
             .collect();
         assert_eq!(ids, vec![vec!["slice-001", "slice-002"], vec!["slice-003"]]);
+    }
+
+    #[test]
+    fn completion_publication_does_not_stage_unrelated_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        std::fs::write(repo.path().join("unrelated-tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        std::fs::write(repo.path().join("unrelated-tracked.txt"), "operator edit\n").unwrap();
+        std::fs::write(
+            repo.path().join("unrelated-untracked.txt"),
+            "operator scratch\n",
+        )
+        .unwrap();
+
+        let closed_slice_ids = ["slice-001".to_string()];
+        assert!(
+            store
+                .find_completion_publication("run-1", "main", &closed_slice_ids)
+                .unwrap()
+                .is_none()
+        );
+        let manifest = store
+            .completion_publication_manifest("run-1", &closed_slice_ids)
+            .unwrap();
+        let receipt = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap();
+        assert!(receipt.committed);
+        assert_eq!(
+            receipt.commit_sha,
+            crate::gitutil::head_sha(repo.path()).unwrap()
+        );
+        assert_eq!(
+            receipt.parent_sha,
+            crate::gitutil::run(repo.path(), &["rev-parse", "HEAD^"]).unwrap()
+        );
+        assert_eq!(
+            receipt.tree_sha,
+            crate::gitutil::run(repo.path(), &["rev-parse", "HEAD^{tree}"]).unwrap()
+        );
+        assert_eq!(receipt.staged_path_bytes_hex.len(), 3);
+        assert_eq!(receipt.manifest_entries.len(), 3);
+        assert!(
+            receipt
+                .manifest_entries
+                .iter()
+                .all(|entry| entry.mode == "100644" && !entry.object_id.is_empty())
+        );
+        assert!(
+            store
+                .find_completion_publication("run-1", "main", &closed_slice_ids)
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["show", "HEAD:unrelated-tracked.txt"]).unwrap(),
+            "baseline"
+        );
+        assert!(
+            crate::gitutil::run(
+                repo.path(),
+                &["ls-tree", "--name-only", "HEAD", "unrelated-untracked.txt"]
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let status = crate::gitutil::status_porcelain(repo.path()).unwrap();
+        assert!(status.contains("unrelated-tracked.txt"));
+        assert!(status.contains("unrelated-untracked.txt"));
+    }
+
+    #[test]
+    fn completion_publication_rejects_head_advance_after_gate_approval() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let gate = crate::domain::GateResult {
+            status: "passed".to_string(),
+            approved_workspace: Some(
+                crate::gitutil::completion_publication_approval(repo.path()).unwrap(),
+            ),
+            publication_identity: crate::gitutil::completion_publication_root_identity(repo.path())
+                .unwrap(),
+            ..crate::domain::GateResult::default()
+        };
+        let store = Store::new(repo.path());
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        crate::gitutil::run(
+            repo.path(),
+            &["commit", "--allow-empty", "-m", "concurrent"],
+        )
+        .unwrap();
+
+        let manifest = store
+            .completion_publication_manifest_for_gate("run-1", &["slice-001".to_string()], &gate)
+            .unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("passed gate"), "{err:#}");
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn completion_publication_rejects_index_change_after_gate_approval() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let gate = crate::domain::GateResult {
+            status: "passed".to_string(),
+            approved_workspace: Some(
+                crate::gitutil::completion_publication_approval(repo.path()).unwrap(),
+            ),
+            publication_identity: crate::gitutil::completion_publication_root_identity(repo.path())
+                .unwrap(),
+            ..crate::domain::GateResult::default()
+        };
+        let store = Store::new(repo.path());
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        crate::gitutil::run(repo.path(), &["update-index", "--index-version", "4"]).unwrap();
+        let manifest = store
+            .completion_publication_manifest_for_gate("run-1", &["slice-001".to_string()], &gate)
+            .unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("passed gate"), "{err:#}");
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn completion_publication_rejects_semantically_valid_replacement_after_pin() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let mut replacement: Slice = super::read_json(store.slice_path("slice-001")).unwrap();
+        replacement.title = "concurrent but still semantically valid".to_string();
+        super::write_json(store.slice_path("slice-001"), &replacement).unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("pinned semantic manifest"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rejects_mode_change_after_semantic_pin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let report = store.final_report_artifact_path("run-1");
+        let mut permissions = fs::metadata(&report).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&report, permissions).unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("pinned semantic manifest"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rejects_symlinked_repository_ancestor_before_pinning() {
+        let parent = tempfile::tempdir().unwrap();
+        let actual_parent = parent.path().join("actual");
+        let alias_parent = parent.path().join("alias");
+        let repo_path = actual_parent.join("integration");
+        fs::create_dir_all(&repo_path).unwrap();
+        crate::gitutil::run(&repo_path, &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(&repo_path, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(&repo_path, &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo_path.join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(&repo_path, "initial").unwrap();
+        std::os::unix::fs::symlink(&actual_parent, &alias_parent).unwrap();
+        let aliased_repo = alias_parent.join("integration");
+
+        let err = crate::gitutil::completion_publication_root_identity(&aliased_repo).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("publication directory component"),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_root_replacement_after_semantic_pin() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo_path = parent.path().join("integration");
+        let parked_path = parent.path().join("parked-integration");
+        fs::create_dir(&repo_path).unwrap();
+        crate::gitutil::run(&repo_path, &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(&repo_path, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(&repo_path, &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo_path.join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(&repo_path, "initial").unwrap();
+        let store = Store::new(&repo_path);
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let original_head = crate::gitutil::head_sha(&repo_path).unwrap();
+
+        fs::rename(&repo_path, &parked_path).unwrap();
+        fs::create_dir(&repo_path).unwrap();
+        crate::gitutil::run(&repo_path, &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(&repo_path, &["config", "user.email", "outside@example.com"]).unwrap();
+        crate::gitutil::run(&repo_path, &["config", "user.name", "Outside"]).unwrap();
+        fs::write(repo_path.join("outside.txt"), "outside\n").unwrap();
+        crate::gitutil::commit_all(&repo_path, "outside initial").unwrap();
+        for entry in &manifest.exact.entries {
+            let path = repo_path.join(&entry.path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &entry.expected_bytes).unwrap();
+        }
+        let replacement_head = crate::gitutil::head_sha(&repo_path).unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("identity diverged"), "{err:#}");
+        assert_eq!(
+            crate::gitutil::head_sha(&parked_path).unwrap(),
+            original_head
+        );
+        assert_eq!(
+            crate::gitutil::head_sha(&repo_path).unwrap(),
+            replacement_head
+        );
+    }
+
+    #[test]
+    fn normal_and_recovery_publication_manifests_have_identical_semantics() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let store = Store::new(repo.path());
+        let slice_ids = vec!["slice-001".to_string()];
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+
+        let normal = store
+            .completion_publication_manifest("run-1", &slice_ids)
+            .unwrap();
+        let recovery = store
+            .completion_publication_manifest_for_recovery("run-1", &slice_ids)
+            .unwrap();
+
+        assert_eq!(normal.run_id, recovery.run_id);
+        assert_eq!(normal.closed_slice_ids, recovery.closed_slice_ids);
+        assert_eq!(
+            normal.gate_publication_identity,
+            recovery.gate_publication_identity
+        );
+        assert_eq!(normal.exact, recovery.exact);
+        store
+            .validate_completion_publication_manifest_semantics(&normal)
+            .unwrap();
+        store
+            .validate_completion_publication_manifest_semantics(&recovery)
+            .unwrap();
+    }
+
+    #[test]
+    fn completion_receipt_rejects_commit_resident_wrong_run_semantics() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let semantic_manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        for path in [
+            store.implementation_summary_report_path("run-1"),
+            store.final_report_artifact_path("run-1"),
+        ] {
+            let mut summary: serde_json::Value = super::read_json(&path).unwrap();
+            summary["run_id"] = serde_json::Value::String("run-other".to_string());
+            super::write_json(path, &summary).unwrap();
+        }
+        let malicious_manifest = exact_manifest(
+            repo.path(),
+            semantic_manifest
+                .exact
+                .entries
+                .iter()
+                .map(|entry| exact_manifest_entry(repo.path(), entry.path.clone()))
+                .collect(),
+        );
+        let exact = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &malicious_manifest,
+            "malicious publication fixture",
+            "refs/heads/main",
+        )
+        .unwrap();
+        let receipt = super::completion_publication_receipt(exact, &semantic_manifest);
+
+        let err = store
+            .validate_completion_publication_receipt_at_ref("main", &receipt)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("does not describe a passed, pre-publication summary"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn completion_publication_commit_failure_unstages_only_manifest_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        crate::gitutil::run(repo.path(), &["config", "user.name", ""]).unwrap();
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("publication commit failed"));
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.slice_path("slice-001").is_file());
+        assert!(store.implementation_summary_report_path("run-1").is_file());
+        assert!(store.final_report_artifact_path("run-1").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rejects_a_symlinked_manifest_parent() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::write(outside.path().join("report.json"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("publication")).unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![crate::gitutil::ExactPathManifestEntry {
+                path: std::path::PathBuf::from("publication/report.json"),
+                expected_bytes: b"outside\n".to_vec(),
+                expected_mode: "100644".to_string(),
+            }],
+        );
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("non-directory parent"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert_eq!(
+            fs::read(outside.path().join("report.json")).unwrap(),
+            b"outside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_parent_substitution_cannot_redirect_capture() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        fs::write(outside.path().join("report.json"), "outside\n").unwrap();
+        let path = std::path::PathBuf::from("publication/report.json");
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), path.clone())],
+        );
+        crate::gitutil::substitute_next_publication_parent_during_open(
+            repo.path(),
+            &path,
+            outside.path(),
+        );
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("non-directory parent"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert_eq!(
+            fs::read(outside.path().join("report.json")).unwrap(),
+            b"outside\n"
+        );
+        assert!(
+            crate::gitutil::run(
+                repo.path(),
+                &["ls-tree", "--name-only", "HEAD", "publication/report.json"]
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rejects_whole_worktree_substitution() {
+        let main = tempfile::tempdir().unwrap();
+        let worktrees = tempfile::tempdir().unwrap();
+        let integration = worktrees.path().join("integration");
+        let parked = worktrees.path().join("parked-integration");
+        let marker = worktrees.path().join("publication-captured");
+        let release = worktrees.path().join("publication-release");
+        crate::gitutil::run(main.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(main.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(main.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(main.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(main.path(), "initial").unwrap();
+        crate::gitutil::run(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "integration",
+                integration.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "inside\n").unwrap();
+        let before = crate::gitutil::head_sha(&integration).unwrap();
+        let manifest = exact_manifest(
+            &integration,
+            vec![exact_manifest_entry(
+                &integration,
+                "publication/report.json",
+            )],
+        );
+        crate::gitutil::pause_next_publication_after_capture(&integration, &marker, &release);
+        let publication_root = integration.clone();
+        let publication_manifest = manifest.clone();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &publication_manifest,
+                "publication",
+                "refs/heads/integration",
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for whole-root substitution pause"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        fs::rename(&integration, &parked).unwrap();
+        fs::create_dir(&integration).unwrap();
+        fs::copy(parked.join(".git"), integration.join(".git")).unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "outside\n").unwrap();
+        fs::write(&release, "release\n").unwrap();
+
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("worktree root changed"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::gitutil::run(main.path(), &["rev-parse", "integration"]).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(integration.join("publication/report.json")).unwrap(),
+            b"outside\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_git_subprocesses_stay_on_pinned_admin_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = parent.path().join("main");
+        let integration = parent.path().join("integration");
+        let parked_common = parent.path().join("parked-common.git");
+        let marker = parent.path().join("publication-captured");
+        let release = parent.path().join("publication-release");
+        fs::create_dir(&main).unwrap();
+        crate::gitutil::run(&main, &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(&main, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(&main, &["config", "user.name", "Test User"]).unwrap();
+        fs::write(main.join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(&main, "initial").unwrap();
+        crate::gitutil::run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "integration",
+                integration.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            &integration,
+            vec![exact_manifest_entry(
+                &integration,
+                "publication/report.json",
+            )],
+        );
+        let original_ref = crate::gitutil::run(&main, &["rev-parse", "integration"]).unwrap();
+        crate::gitutil::pause_next_publication_after_capture(&integration, &marker, &release);
+        let publication_root = integration.clone();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/integration",
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for admin-directory substitution pause"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        fs::rename(main.join(".git"), &parked_common).unwrap();
+        let copy = Command::new("cp")
+            .args(["-a"])
+            .arg(&parked_common)
+            .arg(main.join(".git"))
+            .status()
+            .unwrap();
+        assert!(copy.success());
+        let replacement_ref = crate::gitutil::run(&main, &["rev-parse", "integration"]).unwrap();
+        let replacement_index = fs::read(main.join(".git/worktrees/integration/index")).unwrap();
+        let replacement_objects = crate::gitutil::run(&main, &["count-objects", "-v"]).unwrap();
+        fs::write(&release, "release\n").unwrap();
+
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("administrative directory changed"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::gitutil::run(&main, &["rev-parse", "integration"]).unwrap(),
+            replacement_ref
+        );
+        assert_eq!(
+            fs::read(main.join(".git/worktrees/integration/index")).unwrap(),
+            replacement_index
+        );
+        assert_eq!(
+            crate::gitutil::run(&main, &["count-objects", "-v"]).unwrap(),
+            replacement_objects
+        );
+        assert_eq!(
+            crate::gitutil::run(
+                parent.path(),
+                &[
+                    &format!("--git-dir={}", parked_common.display()),
+                    "rev-parse",
+                    "refs/heads/integration",
+                ],
+            )
+            .unwrap(),
+            original_ref
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_nested_ref_parent_substitution() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = parent.path().join("main");
+        let integration = parent.path().join("integration");
+        fs::create_dir(&main).unwrap();
+        crate::gitutil::run(&main, &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(&main, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(&main, &["config", "user.name", "Test User"]).unwrap();
+        fs::write(main.join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(&main, "initial").unwrap();
+        crate::gitutil::run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "integration/nested",
+                integration.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            &integration,
+            vec![exact_manifest_entry(
+                &integration,
+                "publication/report.json",
+            )],
+        );
+        let before = crate::gitutil::run(&main, &["rev-parse", "integration/nested"]).unwrap();
+        install_blocking_publication_pause(&integration);
+        let publication_root = integration.clone();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/integration/nested",
+            )
+        });
+        wait_for_publication_pause(&integration);
+        let ref_parent = main.join(".git/refs/heads/integration");
+        let parked = main.join(".git/refs/heads/integration.parked");
+        fs::rename(&ref_parent, &parked).unwrap();
+        assert!(
+            Command::new("cp")
+                .args(["-a"])
+                .arg(&parked)
+                .arg(&ref_parent)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(integration.join("publication-filter.release"), "release\n").unwrap();
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ref parent directory changed"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::gitutil::run(&main, &["rev-parse", "integration/nested"]).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(parked.join("nested")).unwrap().trim(),
+            before
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_loose_ref_leaf_substitution() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        install_blocking_publication_pause(repo.path());
+        let publication_root = repo.path().to_path_buf();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/main",
+            )
+        });
+        wait_for_publication_pause(repo.path());
+        let reference = repo.path().join(".git/refs/heads/main");
+        let parked = repo.path().join(".git/refs/heads/main.parked");
+        fs::rename(&reference, &parked).unwrap();
+        fs::copy(&parked, &reference).unwrap();
+        fs::write(repo.path().join("publication-filter.release"), "release\n").unwrap();
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("loose Git ref changed"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert_eq!(fs::read_to_string(parked).unwrap().trim(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_index_leaf_substitution() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = parent.path().join("main");
+        let integration = parent.path().join("integration");
+        fs::create_dir(&main).unwrap();
+        crate::gitutil::run(&main, &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(&main, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(&main, &["config", "user.name", "Test User"]).unwrap();
+        fs::write(main.join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(&main, "initial").unwrap();
+        crate::gitutil::run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "integration",
+                integration.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            &integration,
+            vec![exact_manifest_entry(
+                &integration,
+                "publication/report.json",
+            )],
+        );
+        let before = crate::gitutil::run(&main, &["rev-parse", "integration"]).unwrap();
+        install_blocking_publication_pause(&integration);
+        let publication_root = integration.clone();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/integration",
+            )
+        });
+        wait_for_publication_pause(&integration);
+        let index = main.join(".git/worktrees/integration/index");
+        let parked = main.join(".git/worktrees/integration/index.parked");
+        fs::rename(&index, &parked).unwrap();
+        fs::copy(&parked, &index).unwrap();
+        let replacement = fs::read(&index).unwrap();
+        fs::write(integration.join("publication-filter.release"), "release\n").unwrap();
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("Git index changed"), "{err:#}");
+        assert_eq!(
+            crate::gitutil::run(&main, &["rev-parse", "integration"]).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(index).unwrap(), replacement);
+        assert_eq!(fs::read(parked).unwrap(), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rejects_invalid_existing_loose_object_content() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        let report = repo.path().join("publication/report.json");
+        let report_bytes = format!("collision-fixture-{:016x}\n", rand::random::<u64>());
+        fs::write(&report, &report_bytes).unwrap();
+        let object_id = crate::gitutil::run(
+            repo.path(),
+            &["hash-object", "--no-filters", report.to_str().unwrap()],
+        )
+        .unwrap();
+        let fanout = repo.path().join(".git/objects").join(&object_id[..2]);
+        fs::create_dir_all(&fanout).unwrap();
+        let object = fanout.join(&object_id[2..]);
+        fs::write(&object, b"not a valid loose object").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("existing loose Git object content"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert_eq!(fs::read(object).unwrap(), b"not a valid loose object");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_object_fanout_substitution() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        let report = repo.path().join("publication/report.json");
+        fs::write(&report, "inside-object-fanout-test\n").unwrap();
+        let object_id = crate::gitutil::run(
+            repo.path(),
+            &["hash-object", "--no-filters", report.to_str().unwrap()],
+        )
+        .unwrap();
+        let fanout = repo.path().join(".git/objects").join(&object_id[..2]);
+        fs::create_dir_all(&fanout).unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        install_blocking_publication_pause(repo.path());
+        let publication_root = repo.path().to_path_buf();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/main",
+            )
+        });
+        wait_for_publication_pause(repo.path());
+        let parked = repo.path().join(".git/objects/parked-fanout");
+        fs::rename(&fanout, &parked).unwrap();
+        fs::create_dir(&fanout).unwrap();
+        fs::write(repo.path().join("publication-filter.release"), "release\n").unwrap();
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("object fanout changed"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert!(fs::read_dir(&fanout).unwrap().next().is_none());
+        assert!(fs::read_dir(&parked).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_object_directory_substitution() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        install_blocking_publication_pause(repo.path());
+        let publication_root = repo.path().to_path_buf();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/main",
+            )
+        });
+        wait_for_publication_pause(repo.path());
+        let objects = repo.path().join(".git/objects");
+        let parked = repo.path().join(".git/objects.parked");
+        fs::rename(&objects, &parked).unwrap();
+        assert!(
+            Command::new("cp")
+                .args(["-a"])
+                .arg(&parked)
+                .arg(&objects)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let replacement_entries = fs::read_dir(&objects).unwrap().count();
+        fs::write(repo.path().join("publication-filter.release"), "release\n").unwrap();
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("object directory changed"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert_eq!(fs::read_dir(objects).unwrap().count(), replacement_entries);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_packed_ref_leaf_substitution() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        crate::gitutil::run(repo.path(), &["pack-refs", "--all", "--prune"]).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        install_blocking_publication_pause(repo.path());
+        let publication_root = repo.path().to_path_buf();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/main",
+            )
+        });
+        wait_for_publication_pause(repo.path());
+        let packed = repo.path().join(".git/packed-refs");
+        let parked = repo.path().join(".git/packed-refs.parked");
+        fs::rename(&packed, &parked).unwrap();
+        fs::copy(&parked, &packed).unwrap();
+        fs::write(repo.path().join("publication-filter.release"), "release\n").unwrap();
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("packed Git refs changed"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert!(!repo.path().join(".git/refs/heads/main").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_restores_ref_hook_worktree_and_config_mutations() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        let config = repo.path().join(".git/config");
+        fs::write(
+            &hook,
+            format!(
+                r#"#!/bin/sh
+if [ "${{KHAZAD_PUBLICATION_REF_TRANSACTION:-}}" = 1 ] && [ "$1" = committed ]; then
+    printf hook-side-effect > "$GIT_WORK_TREE/hook-side-effect"
+    printf '\n[hook-side-effect]\n\tvalue = changed\n' >> '{}'
+fi
+exit 0
+"#,
+                config.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let config_before = fs::read(&config).unwrap();
+        let index_before = fs::read(repo.path().join(".git/index")).unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("ref hook changed worktree or local configuration"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(
+            fs::read(repo.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        assert!(!repo.path().join("hook-side-effect").exists());
+        assert_eq!(
+            fs::read(repo.path().join("publication/report.json")).unwrap(),
+            b"inside\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_runs_configured_reference_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("configured-hook-ran");
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        fs::create_dir(repo.path().join(".githooks")).unwrap();
+        let hook = repo.path().join(".githooks/reference-transaction");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nif [ \"${{KHAZAD_PUBLICATION_REF_TRANSACTION:-}}\" = 1 ]; then\n  printf configured > '{}'\n  printf 'configured hook refused publication\\n' >&2\n  exit 1\nfi\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "core.hooksPath", ".githooks"]).unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("configured hook refused publication"),
+            "{err:#}"
+        );
+        assert!(marker.is_file(), "configured reference hook did not run");
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_creates_missing_effective_reflog_hierarchy() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "core.logAllRefUpdates", "true"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::remove_dir_all(repo.path().join(".git/logs")).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let receipt = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap();
+
+        let log = fs::read_to_string(repo.path().join(".git/logs/refs/heads/main")).unwrap();
+        assert!(
+            log.lines()
+                .any(|line| line
+                    .starts_with(&format!("{} {} ", receipt.parent_sha, receipt.commit_sha))),
+            "missing publication ref update in effective reflog: {log}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_publication_removes_only_its_created_reflog_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "core.logAllRefUpdates", "true"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::remove_dir_all(repo.path().join(".git/logs/refs")).unwrap();
+        fs::create_dir(repo.path().join(".git/logs/refs")).unwrap();
+        fs::create_dir(repo.path().join(".git/logs/operator-state")).unwrap();
+        fs::write(
+            repo.path().join(".git/logs/operator-state/marker"),
+            "preserve\n",
+        )
+        .unwrap();
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            "#!/bin/sh\n[ \"$1\" != prepared ] || exit 1\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("ref compare-and-swap failed"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        let preexisting_refs = repo.path().join(".git/logs/refs");
+        assert!(
+            preexisting_refs.is_dir(),
+            "failed transaction removed a pre-existing reflog directory"
+        );
+        assert!(
+            fs::read_dir(&preexisting_refs).unwrap().next().is_none(),
+            "failed transaction left its operation-created reflog child"
+        );
+        assert_eq!(
+            fs::read(repo.path().join(".git/logs/operator-state/marker")).unwrap(),
+            b"preserve\n"
+        );
+        assert!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_preserves_disabled_reflog_behavior() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        crate::gitutil::run(repo.path(), &["config", "core.logAllRefUpdates", "false"]).unwrap();
+        fs::remove_dir_all(repo.path().join(".git/logs")).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let receipt = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap();
+
+        assert!(receipt.committed);
+        assert!(!repo.path().join(".git/logs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_updates_existing_reflog_when_auto_creation_is_disabled() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let reflog = repo.path().join(".git/logs/refs/heads/main");
+        let reflog_before = fs::read(&reflog).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "core.logAllRefUpdates", "false"]).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let receipt = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap();
+
+        let reflog_after = fs::read(&reflog).unwrap();
+        assert!(receipt.committed);
+        assert_eq!(
+            reflog_after.iter().filter(|byte| **byte == b'\n').count(),
+            reflog_before.iter().filter(|byte| **byte == b'\n').count() + 1
+        );
+        assert!(
+            String::from_utf8_lossy(&reflog_after).contains(&receipt.commit_sha),
+            "publication reflog omitted {}",
+            receipt.commit_sha
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_restores_ignored_ref_hook_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored-hook-state\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = repo.path().join("ignored-hook-state");
+        fs::write(&ignored, "baseline ignored bytes\n").unwrap();
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            r#"#!/bin/sh
+if [ "${KHAZAD_PUBLICATION_REF_TRANSACTION:-}" = 1 ] && [ "$1" = committed ]; then
+    printf changed-by-hook > "$GIT_WORK_TREE/ignored-hook-state"
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("ref hook changed worktree or local configuration"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        assert_eq!(fs::read(&ignored).unwrap(), b"baseline ignored bytes\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_blocks_before_hooks_when_ignored_lease_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored-hook-state\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = repo.path().join("ignored-hook-state");
+        fs::write(&ignored, "baseline ignored bytes\n").unwrap();
+        let _writer = fs::OpenOptions::new().write(true).open(&ignored).unwrap();
+        let marker = repo.path().join("hook-ran");
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf hook-ran > '{}'\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("acquire ignored publication write leases"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        assert_eq!(fs::read(&ignored).unwrap(), b"baseline ignored bytes\n");
+        assert!(
+            !marker.exists(),
+            "publication hook ran without a safe lease"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_restores_replaced_ignored_file_and_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored-hook-state\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = repo.path().join("ignored-hook-state");
+        fs::write(&ignored, "baseline ignored bytes\n").unwrap();
+        let mut original_permissions = fs::metadata(&ignored).unwrap().permissions();
+        original_permissions.set_mode(0o640);
+        fs::set_permissions(&ignored, original_permissions).unwrap();
+        let original_metadata = fs::metadata(&ignored).unwrap();
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            r#"#!/bin/sh
+if [ "${KHAZAD_PUBLICATION_REF_TRANSACTION:-}" = 1 ] && [ "$1" = committed ]; then
+    rm -f "$GIT_WORK_TREE/ignored-hook-state"
+    printf replacement-by-hook > "$GIT_WORK_TREE/ignored-hook-state"
+    chmod 0600 "$GIT_WORK_TREE/ignored-hook-state"
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("ref hook changed worktree or local configuration"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        assert_eq!(fs::read(&ignored).unwrap(), b"baseline ignored bytes\n");
+        let restored_metadata = fs::metadata(&ignored).unwrap();
+        assert_eq!(restored_metadata.mode(), original_metadata.mode());
+        assert_eq!(restored_metadata.mtime(), original_metadata.mtime());
+        assert_eq!(
+            restored_metadata.mtime_nsec(),
+            original_metadata.mtime_nsec()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_backup_failure_uses_memory_fallback_before_ignored_file_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored-hook-state\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = repo.path().join("ignored-hook-state");
+        fs::write(&ignored, "baseline ignored bytes\n").unwrap();
+        crate::gitutil::fail_next_publication_lazy_backup(&ignored);
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            r#"#!/bin/sh
+if [ "${KHAZAD_PUBLICATION_REF_TRANSACTION:-}" = 1 ] && [ "$1" = committed ]; then
+    printf mutation-must-not-land > "$GIT_WORK_TREE/ignored-hook-state"
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("ref hook changed worktree or local configuration"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        assert_eq!(fs::read(&ignored).unwrap(), b"baseline ignored bytes\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_lazy_backup_failures_cancel_and_reap_writer_before_lease_release() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::time::{Duration, Instant};
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(
+            repo.path().join(".gitignore"),
+            "ignored-hook-state\nwriter-survived\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = repo.path().join("ignored-hook-state");
+        fs::write(&ignored, "baseline ignored bytes\n").unwrap();
+        let ignored_metadata_before = fs::metadata(&ignored).unwrap();
+        let index_before = fs::read(repo.path().join(".git/index")).unwrap();
+        crate::gitutil::fail_next_publication_lazy_backup(&ignored);
+        crate::gitutil::fail_next_publication_memory_backup(&ignored);
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            r#"#!/bin/sh
+if [ "${KHAZAD_PUBLICATION_REF_TRANSACTION:-}" = 1 ] && [ "$1" = committed ]; then
+    target="$GIT_WORK_TREE/ignored-hook-state"
+    marker="$GIT_WORK_TREE/writer-survived"
+    setsid -w env -i PATH="$PATH" sh -c '
+        exec </dev/null >/dev/null 2>&1
+        trap "" TERM
+        printf mutation-must-not-land > "$1"
+        printf survived > "$2"
+    ' sh "$target" "$marker" &
+    wait
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let head_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let started = Instant::now();
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "backup failure waited for the kernel lease-break timeout: {:?}",
+            started.elapsed()
+        );
+        let error = format!("{err:#}");
+        assert!(
+            error.contains("verification_restoration_failed")
+                && error.contains("ignored publication lease monitor failed"),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), head_before);
+        assert_eq!(fs::read(&ignored).unwrap(), b"baseline ignored bytes\n");
+        let ignored_metadata_after = fs::metadata(&ignored).unwrap();
+        assert_eq!(
+            (
+                ignored_metadata_after.dev(),
+                ignored_metadata_after.ino(),
+                ignored_metadata_after.mode(),
+                ignored_metadata_after.uid(),
+                ignored_metadata_after.gid(),
+                ignored_metadata_after.nlink(),
+                ignored_metadata_after.len(),
+                ignored_metadata_after.mtime(),
+                ignored_metadata_after.mtime_nsec(),
+            ),
+            (
+                ignored_metadata_before.dev(),
+                ignored_metadata_before.ino(),
+                ignored_metadata_before.mode(),
+                ignored_metadata_before.uid(),
+                ignored_metadata_before.gid(),
+                ignored_metadata_before.nlink(),
+                ignored_metadata_before.len(),
+                ignored_metadata_before.mtime(),
+                ignored_metadata_before.mtime_nsec(),
+            )
+        );
+        assert!(!repo.path().join("writer-survived").exists());
+        assert_eq!(
+            fs::read(repo.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        let journal = fs::read(repo.path().join(".git/index.lock")).unwrap();
+        let magic = b"KHAZAD-INDEX-TRANSACTION-V1\0";
+        assert!(
+            journal.starts_with(magic),
+            "backup failure did not retain its durable recovery journal"
+        );
+        assert_eq!(
+            u32::from_be_bytes(journal[magic.len()..magic.len() + 4].try_into().unwrap()),
+            u32::MAX,
+            "retained recovery journal was not durably marked abandoned"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_restores_mutated_ignored_hardlink_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::create_dir(repo.path().join("ignored")).unwrap();
+        let first = repo.path().join("ignored/first");
+        let second = repo.path().join("ignored/second");
+        fs::write(&first, "shared baseline bytes\n").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            r#"#!/bin/sh
+if [ "${KHAZAD_PUBLICATION_REF_TRANSACTION:-}" = 1 ] && [ "$1" = committed ]; then
+    printf changed-by-hook > "$GIT_WORK_TREE/ignored/second"
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("ref hook changed worktree or local configuration"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"shared baseline bytes\n");
+        assert_eq!(fs::read(&second).unwrap(), b"shared baseline bytes\n");
+        let first_metadata = fs::metadata(&first).unwrap();
+        let second_metadata = fs::metadata(&second).unwrap();
+        assert_eq!(first_metadata.ino(), second_metadata.ino());
+        assert_eq!(first_metadata.nlink(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_ignored_hardlink_outside_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored-state\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = repo.path().join("ignored-state");
+        fs::write(&ignored, "shared bytes\n").unwrap();
+        fs::hard_link(&ignored, outside.path().join("outside-link")).unwrap();
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+
+        let err = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("hard-link group escapes the captured worktree"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("outside-link")).unwrap(),
+            b"shared bytes\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_does_not_read_unchanged_large_ignored_file() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join(".gitignore"), "ignored-cache\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let ignored = fs::File::create(repo.path().join("ignored-cache")).unwrap();
+        ignored.set_len(8 * 1024 * 1024 * 1024).unwrap();
+        drop(ignored);
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let started = Instant::now();
+
+        let receipt = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap();
+
+        assert!(receipt.committed);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "unchanged sparse ignored file was copied or read: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_rejects_packed_ref_change_after_overlay_copy() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let approved = crate::gitutil::head_sha(repo.path()).unwrap();
+        crate::gitutil::run(
+            repo.path(),
+            &["commit", "--allow-empty", "-m", "concurrent packed target"],
+        )
+        .unwrap();
+        let concurrent = crate::gitutil::head_sha(repo.path()).unwrap();
+        crate::gitutil::run(repo.path(), &["reset", "--hard", &approved]).unwrap();
+        crate::gitutil::run(repo.path(), &["pack-refs", "--all", "--prune"]).unwrap();
+        assert!(!repo.path().join(".git/refs/heads/main").exists());
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let marker = repo.path().join("packed-overlay-copied");
+        let release = repo.path().join("packed-overlay-release");
+        crate::gitutil::pause_next_publication_after_packed_ref_copy(
+            repo.path(),
+            &marker,
+            &release,
+        );
+        let publication_root = repo.path().to_path_buf();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/main",
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for packed-ref overlay copy"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let packed = repo.path().join(".git/packed-refs");
+        let bytes = fs::read(&packed).unwrap();
+        let changed = String::from_utf8(bytes)
+            .unwrap()
+            .replace(&approved, &concurrent);
+        fs::write(&packed, changed).unwrap();
+        fs::write(&release, "release\n").unwrap();
+
+        let err = publisher.join().unwrap().unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("packed Git refs content changed"),
+            "{err:#}"
+        );
+        assert!(!repo.path().join(".git/refs/heads/main").exists());
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), concurrent);
+    }
+
+    #[test]
+    fn completion_publication_supports_a_packed_integration_ref() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        crate::gitutil::run(repo.path(), &["pack-refs", "--all", "--prune"]).unwrap();
+        assert!(!repo.path().join(".git/refs/heads/main").exists());
+        fs::create_dir(repo.path().join("publication")).unwrap();
+        fs::write(repo.path().join("publication/report.json"), "inside\n").unwrap();
+        let manifest = exact_manifest(
+            repo.path(),
+            vec![exact_manifest_entry(repo.path(), "publication/report.json")],
+        );
+        let receipt = crate::gitutil::commit_exact_paths(
+            repo.path(),
+            &manifest,
+            "publication",
+            "refs/heads/main",
+        )
+        .unwrap();
+        assert!(receipt.committed);
+        assert_eq!(
+            crate::gitutil::head_sha(repo.path()).unwrap(),
+            receipt.commit_sha
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_publication_git_subprocesses_stay_on_pinned_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let integration = parent.path().join("integration");
+        let parked = parent.path().join("parked-integration");
+        let marker = parent.path().join("publication-captured");
+        let release = parent.path().join("publication-release");
+        fs::create_dir(&integration).unwrap();
+        crate::gitutil::run(&integration, &["init", "-b", "integration"]).unwrap();
+        crate::gitutil::run(&integration, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(&integration, &["config", "user.name", "Test User"]).unwrap();
+        fs::write(integration.join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(&integration, "initial").unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "inside\n").unwrap();
+        let before = crate::gitutil::head_sha(&integration).unwrap();
+        let manifest = exact_manifest(
+            &integration,
+            vec![exact_manifest_entry(
+                &integration,
+                "publication/report.json",
+            )],
+        );
+        crate::gitutil::pause_next_publication_after_capture(&integration, &marker, &release);
+        let publication_root = integration.clone();
+        let publisher = thread::spawn(move || {
+            crate::gitutil::commit_exact_paths(
+                &publication_root,
+                &manifest,
+                "publication",
+                "refs/heads/integration",
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for pinned-root publication pause"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        fs::rename(&integration, &parked).unwrap();
+        fs::create_dir(&integration).unwrap();
+        crate::gitutil::run(&integration, &["init", "-b", "integration"]).unwrap();
+        crate::gitutil::run(
+            &integration,
+            &["config", "user.email", "outside@example.com"],
+        )
+        .unwrap();
+        crate::gitutil::run(&integration, &["config", "user.name", "Outside"]).unwrap();
+        fs::write(integration.join("outside.txt"), "outside\n").unwrap();
+        crate::gitutil::commit_all(&integration, "outside initial").unwrap();
+        fs::create_dir(integration.join("publication")).unwrap();
+        fs::write(integration.join("publication/report.json"), "outside\n").unwrap();
+        let outside_head = crate::gitutil::head_sha(&integration).unwrap();
+        let outside_index = fs::read(integration.join(".git/index")).unwrap();
+        let outside_objects = crate::gitutil::run(&integration, &["count-objects", "-v"]).unwrap();
+        fs::write(&release, "release\n").unwrap();
+
+        let err = publisher.join().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("worktree root changed"),
+            "{err:#}"
+        );
+        assert_eq!(crate::gitutil::head_sha(&parked).unwrap(), before);
+        assert_eq!(
+            crate::gitutil::head_sha(&integration).unwrap(),
+            outside_head
+        );
+        assert_eq!(
+            fs::read(integration.join(".git/index")).unwrap(),
+            outside_index
+        );
+        assert_eq!(
+            crate::gitutil::run(&integration, &["count-objects", "-v"]).unwrap(),
+            outside_objects,
+            "a publication Git subprocess wrote to the replacement repository"
+        );
+        assert_eq!(
+            fs::read(integration.join("publication/report.json")).unwrap(),
+            b"outside\n"
+        );
+    }
+
+    #[test]
+    fn completion_publication_refuses_a_pre_staged_index() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        std::fs::write(repo.path().join("unrelated.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        std::fs::write(repo.path().join("unrelated.txt"), "staged operator edit\n").unwrap();
+        crate::gitutil::run(repo.path(), &["add", "unrelated.txt"]).unwrap();
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("pre-staged index"), "{err:#}");
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"]).unwrap(),
+            "unrelated.txt"
+        );
+
+        crate::gitutil::run(repo.path(), &["reset", "--mixed", "HEAD"]).unwrap();
+        std::fs::write(repo.path().join("intent-to-add.txt"), "operator scratch\n").unwrap();
+        crate::gitutil::run(
+            repo.path(),
+            &["add", "--intent-to-add", "intent-to-add.txt"],
+        )
+        .unwrap();
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+        assert!(err.to_string().contains("pre-staged index"), "{err:#}");
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert!(
+            !crate::gitutil::run(repo.path(), &["ls-files", "intent-to-add.txt"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completion_publication_preserves_unrelated_index_flags_and_hidden_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        fs::write(repo.path().join("skip.txt"), "baseline skip\n").unwrap();
+        fs::write(repo.path().join("assume.txt"), "baseline assume\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        crate::gitutil::run(
+            repo.path(),
+            &["update-index", "--skip-worktree", "skip.txt"],
+        )
+        .unwrap();
+        crate::gitutil::run(
+            repo.path(),
+            &["update-index", "--assume-unchanged", "assume.txt"],
+        )
+        .unwrap();
+        fs::write(repo.path().join("skip.txt"), "hidden skip bytes\n").unwrap();
+        fs::write(repo.path().join("assume.txt"), "hidden assume bytes\n").unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+
+        let receipt = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap();
+
+        assert!(receipt.committed);
+        assert!(
+            crate::gitutil::run(repo.path(), &["ls-files", "-v", "skip.txt"])
+                .unwrap()
+                .starts_with("S ")
+        );
+        assert!(
+            crate::gitutil::run(repo.path(), &["ls-files", "-v", "assume.txt"])
+                .unwrap()
+                .starts_with("h ")
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("skip.txt")).unwrap(),
+            "hidden skip bytes\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("assume.txt")).unwrap(),
+            "hidden assume bytes\n"
+        );
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["show", "HEAD:skip.txt"]).unwrap(),
+            "baseline skip"
+        );
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["show", "HEAD:assume.txt"]).unwrap(),
+            "baseline assume"
+        );
+    }
+
+    #[test]
+    fn completion_publication_recovery_repairs_ref_before_index_crash_state() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let ids = vec!["slice-001".to_string()];
+        let manifest = store
+            .completion_publication_manifest("run-1", &ids)
+            .unwrap();
+        let parent_sha = crate::gitutil::head_sha(repo.path()).unwrap();
+        crate::gitutil::abandon_next_publication_after_ref_cas(repo.path());
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("simulated process loss after completion publication ref update")
+        );
+        let publication_sha = crate::gitutil::head_sha(repo.path()).unwrap();
+        assert_ne!(publication_sha, parent_sha);
+        assert!(
+            !crate::gitutil::status_porcelain(repo.path())
+                .unwrap()
+                .is_empty()
+        );
+
+        #[cfg(unix)]
+        {
+            let index_path = crate::gitutil::run(
+                repo.path(),
+                &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+            )
+            .unwrap();
+            let mut lock_path = std::ffi::OsString::from(index_path.trim());
+            lock_path.push(".lock");
+            let recovery_owner = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(std::path::PathBuf::from(lock_path))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(recovery_owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB,) },
+                0
+            );
+            let concurrent = store
+                .find_completion_publication("run-1", "main", &ids)
+                .unwrap_err();
+            assert!(
+                format!("{concurrent:#}").contains("another completion publication recovery"),
+                "{concurrent:#}"
+            );
+        }
+
+        let recovered = store
+            .find_completion_publication("run-1", "main", &ids)
+            .unwrap()
+            .expect("recover exact publication");
+
+        assert_eq!(recovered.commit_sha, publication_sha);
+        assert!(
+            crate::gitutil::status_porcelain(repo.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completion_publication_recovery_does_not_overwrite_same_path_staging() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let ids = vec!["slice-001".to_string()];
+        let manifest = store
+            .completion_publication_manifest("run-1", &ids)
+            .unwrap();
+        let pinned_final_report = fs::read(store.final_report_artifact_path("run-1")).unwrap();
+        let receipt = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap();
+        crate::gitutil::run(repo.path(), &["read-tree", &receipt.parent_sha]).unwrap();
+        fs::write(
+            store.final_report_artifact_path("run-1"),
+            "operator staged\n",
+        )
+        .unwrap();
+        crate::gitutil::run(
+            repo.path(),
+            &["add", ".workflow/reports/run-1-final-report.json"],
+        )
+        .unwrap();
+        fs::write(
+            store.final_report_artifact_path("run-1"),
+            &pinned_final_report,
+        )
+        .unwrap();
+        let index_path = crate::gitutil::run(
+            repo.path(),
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .unwrap();
+        let before = fs::read(index_path.trim()).unwrap();
+
+        let err = store
+            .find_completion_publication("run-1", "main", &ids)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("without an exact durable transaction journal"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(index_path.trim()).unwrap(), before);
+    }
+
+    #[test]
+    fn completion_publication_refuses_the_wrong_head_attachment() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let main_before = crate::gitutil::head_sha(repo.path()).unwrap();
+        crate::gitutil::run(repo.path(), &["switch", "-c", "wrong-publication-branch"]).unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("HEAD attachment changed"));
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["rev-parse", "refs/heads/main"]).unwrap(),
+            main_before
+        );
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["branch", "--show-current"]).unwrap(),
+            "wrong-publication-branch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rejects_concurrent_manifest_content_change() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        install_blocking_publication_pause(repo.path());
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let repo_path = repo.path().to_path_buf();
+        let race = thread::spawn(move || {
+            let filtered_path = wait_for_publication_pause(&repo_path);
+            fs::write(
+                repo_path.join(filtered_path),
+                "{\"version\":\"concurrent\"}\n",
+            )
+            .unwrap();
+            fs::write(repo_path.join("publication-filter.release"), "release\n").unwrap();
+        });
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        race.join().unwrap();
+        assert!(err.to_string().contains("manifest path changed"));
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), before);
+        assert!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fs::read_to_string(repo.path().join("publication-filter.marker"))
+                .unwrap()
+                .starts_with(".workflow/")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_rolls_back_final_window_manifest_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let original_head = crate::gitutil::head_sha(repo.path()).unwrap();
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        let marker = repo.path().join(".git/final-window-once");
+        let target = store.final_report_artifact_path("run-1");
+        let target_before = fs::read(&target).unwrap();
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = prepared ] && [ ! -e '{}' ]; then\n  : > '{}'\n  printf concurrent > '{}'\nfi\nexit 0\n",
+                marker.display(),
+                marker.display(),
+                target.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("inputs changed during ref compare-and-swap"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::gitutil::head_sha(repo.path()).unwrap(),
+            original_head
+        );
+        assert_eq!(fs::read(target).unwrap(), target_before);
+    }
+
+    #[test]
+    fn completion_publication_rolls_back_manifest_change_after_index_install() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let original_head = crate::gitutil::head_sha(repo.path()).unwrap();
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let final_report = store.final_report_artifact_path("run-1");
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        crate::gitutil::mutate_next_publication_after_index_install(
+            repo.path(),
+            final_report.strip_prefix(repo.path()).unwrap(),
+            b"concurrent\n",
+        );
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("state changed during index installation"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::gitutil::head_sha(repo.path()).unwrap(),
+            original_head
+        );
+        assert!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&final_report).unwrap(), b"concurrent\n");
+    }
+
+    #[test]
+    fn completion_publication_inverse_recovers_post_install_ref_movement() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let original_head = crate::gitutil::head_sha(repo.path()).unwrap();
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let ids = vec!["slice-001".to_string()];
+        let manifest = store
+            .completion_publication_manifest("run-1", &ids)
+            .unwrap();
+        crate::gitutil::rewind_next_publication_after_index_install(repo.path());
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("durable journal retained"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::gitutil::head_sha(repo.path()).unwrap(),
+            original_head
+        );
+        let index_lock = crate::gitutil::run(
+            repo.path(),
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        )
+        .unwrap();
+        assert!(std::path::Path::new(index_lock.trim()).is_file());
+
+        assert!(
+            store
+                .find_completion_publication("run-1", "main", &ids)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!std::path::Path::new(index_lock.trim()).exists());
+    }
+
+    #[test]
+    fn completion_publication_cas_does_not_overwrite_concurrent_head() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        install_blocking_publication_pause(repo.path());
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        let before = crate::gitutil::head_sha(repo.path()).unwrap();
+        let tree = crate::gitutil::run(repo.path(), &["rev-parse", "HEAD^{tree}"]).unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let repo_path = repo.path().to_path_buf();
+        let before_for_race = before.clone();
+        let race = thread::spawn(move || {
+            wait_for_publication_pause(&repo_path);
+            let concurrent = crate::gitutil::run(
+                &repo_path,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &before_for_race,
+                    "-m",
+                    "concurrent head",
+                ],
+            )
+            .unwrap();
+            crate::gitutil::run(
+                &repo_path,
+                &[
+                    "update-ref",
+                    "refs/heads/main",
+                    &concurrent,
+                    &before_for_race,
+                ],
+            )
+            .unwrap();
+            fs::write(repo_path.join("publication-filter.release"), "release\n").unwrap();
+            concurrent
+        });
+
+        let err = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap_err();
+
+        let concurrent = race.join().unwrap();
+        assert!(err.to_string().contains("HEAD changed"));
+        assert_eq!(crate::gitutil::head_sha(repo.path()).unwrap(), concurrent);
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["show", "-s", "--format=%s", "HEAD"]).unwrap(),
+            "concurrent head"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_publication_holds_index_lock_across_ref_transaction() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::gitutil::run(repo.path(), &["init", "-b", "main"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.email", "test@example.com"]).unwrap();
+        crate::gitutil::run(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        install_blocking_publication_pause(repo.path());
+        fs::write(repo.path().join("unrelated.txt"), "baseline\n").unwrap();
+        crate::gitutil::commit_all(repo.path(), "initial").unwrap();
+        fs::write(repo.path().join("unrelated.txt"), "concurrent edit\n").unwrap();
+
+        write_completion_publication_fixture(&store, "run-1", &["slice-001"]);
+        let manifest = store
+            .completion_publication_manifest("run-1", &["slice-001".to_string()])
+            .unwrap();
+        let repo_path = repo.path().to_path_buf();
+        let race = thread::spawn(move || {
+            wait_for_publication_pause(&repo_path);
+            let output = Command::new("git")
+                .args(["add", "unrelated.txt"])
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+            fs::write(repo_path.join("publication-filter.release"), "release\n").unwrap();
+            output
+        });
+
+        let receipt = store
+            .commit_completion_publication("run-1", "main", &manifest)
+            .unwrap();
+
+        let concurrent_add = race.join().unwrap();
+        assert!(receipt.committed);
+        assert!(!concurrent_add.status.success());
+        assert!(String::from_utf8_lossy(&concurrent_add.stderr).contains("index.lock"));
+        assert!(
+            crate::gitutil::run(repo.path(), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::gitutil::run(repo.path(), &["show", "HEAD:unrelated.txt"]).unwrap(),
+            "baseline"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("unrelated.txt")).unwrap(),
+            "concurrent edit\n"
+        );
     }
 }

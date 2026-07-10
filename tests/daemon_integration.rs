@@ -2,6 +2,8 @@ mod daemon;
 
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Read;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1476,6 +1478,170 @@ fn herdr_worker_wrapper_real() -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_ref_hook_descendants_are_reaped_before_completion() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+    let marker = repo.path().join("escaped-publication-hook");
+    let hook = repo.path().join(".git/hooks/reference-transaction");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+if [ "${{KHAZAD_PUBLICATION_REF_TRANSACTION:-}}" != 1 ] || [ "$1" != committed ]; then
+    exit 0
+fi
+target=
+while read old new ref; do
+    target=$new
+done
+setsid sh -c '
+    ( sleep 1
+      printf escaped > "$1"
+      env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+        git -C "$2" update-ref refs/heads/hook-late "$3"
+    ) </dev/null >/dev/null 2>&1 &
+' sh '{}' '{}' "$target" </dev/null >/dev/null 2>&1 &
+exit 0
+"#,
+            marker.display(),
+            repo.path().display()
+        ),
+    )?;
+    let mut mode = fs::metadata(&hook)?.permissions();
+    mode.set_mode(0o755);
+    fs::set_permissions(&hook, mode)?;
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "HOOK-PUB-01",
+            "title": "Publication hook supervision",
+            "goal": "Publish without escaped hook descendants.",
+            "acceptance": ["fake output exists"],
+            "verify": ["test -f HOOK-PUB-01.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add hook publication slice"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    thread::sleep(Duration::from_millis(1_500));
+
+    assert!(
+        !marker.exists(),
+        "detached publication hook descendant survived supervision"
+    );
+    let hook_ref = Command::new("git")
+        .args(["show-ref", "--verify", "refs/heads/hook-late"])
+        .current_dir(repo.path())
+        .output()?;
+    assert!(
+        !hook_ref.status.success(),
+        "detached publication hook changed a ref after publication"
+    );
+    guard.stop();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_ref_hook_worktree_and_config_side_effects_are_restored() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+    let config_path = repo.path().join(".git/config");
+    let hook = repo.path().join(".git/hooks/reference-transaction");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+if [ "${{KHAZAD_PUBLICATION_REF_TRANSACTION:-}}" = 1 ] && [ "$1" = committed ]; then
+    printf hook-side-effect > "$GIT_WORK_TREE/hook-side-effect"
+    printf '\n[hook-side-effect]\n\tvalue = changed\n' >> '{}'
+fi
+exit 0
+"#,
+            config_path.display()
+        ),
+    )?;
+    let mut mode = fs::metadata(&hook)?.permissions();
+    mode.set_mode(0o755);
+    fs::set_permissions(&hook, mode)?;
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "HOOK-PUB-02",
+            "title": "Publication hook restoration",
+            "goal": "Reject and restore publication hook mutations.",
+            "acceptance": ["fake output exists"],
+            "verify": ["test -f HOOK-PUB-02.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add hook restoration slice"])?;
+    let config_before_run = fs::read(&config_path)?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let failed = wait_for_status(&bin, home.path(), &run_id, "failed")?;
+
+    assert_eq!(fs::read(&config_path)?, config_before_run);
+    assert!(
+        failed["events"].as_array().unwrap().iter().any(|event| {
+            event
+                .to_string()
+                .contains("ref hook changed worktree or local configuration")
+        }),
+        "failed run omitted publication-hook mutation evidence: {failed:#}"
+    );
+    guard.stop();
+    Ok(())
+}
+
 #[test]
 fn final_sha_advertises_publication_commit_with_close_records() -> TestResult {
     let bin = binary_path();
@@ -1572,6 +1738,45 @@ fn final_sha_advertises_publication_commit_with_close_records() -> TestResult {
     )?;
     daemon::publication::assert_handoff_targets_integration_branch(&handoff, integration_branch);
 
+    fs::write(
+        repo.path().join("operator-after-publication.txt"),
+        "advanced\n",
+    )?;
+    git(repo.path(), &["add", "operator-after-publication.txt"])?;
+    let advanced_tree = git(repo.path(), &["write-tree"])?;
+    let advanced = git(
+        repo.path(),
+        &[
+            "commit-tree",
+            &advanced_tree,
+            "-p",
+            final_sha,
+            "-m",
+            "advance after publication",
+        ],
+    )?;
+    git(repo.path(), &["reset", "--hard", "HEAD"])?;
+    git(
+        repo.path(),
+        &[
+            "update-ref",
+            &format!("refs/heads/{integration_branch}"),
+            &advanced,
+            final_sha,
+        ],
+    )?;
+    let rejected = kd(&bin, home.path(), &["handoff", "--run", &run_id])?;
+    assert!(
+        !rejected.status.success(),
+        "advanced handoff unexpectedly succeeded"
+    );
+    let rejection = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        rejection.contains("moved from recorded completion publication")
+            || rejection.contains("advanced beyond completion publication"),
+        "unexpected advanced-handoff rejection: {rejection}"
+    );
+
     guard.stop();
     Ok(())
 }
@@ -1647,6 +1852,15 @@ fn completion_publication_manifest_excludes_filter_side_effects() -> TestResult 
         .expect("run_id")
         .to_string();
     let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    assert_eq!(
+        fs::read(repo.path().join("unrelated-tracked.txt"))?,
+        b"baseline\n",
+        "publication clean filters must not mutate unrelated tracked bytes"
+    );
+    assert!(
+        !repo.path().join("unrelated-untracked.txt").exists(),
+        "publication clean filters must not create unrelated files"
+    );
     let handoff = json_stdout(&kd_ok(&bin, home.path(), &["handoff", "--run", &run_id])?)?;
     let final_sha = handoff["final_sha"].as_str().expect("final sha");
     assert_eq!(
@@ -1789,6 +2003,606 @@ fn verification_mutation_blocks_without_repair_publication_or_final_sha() -> Tes
             .as_array()
             .unwrap()
             .contains(&Value::String(hex::encode("verification-side-effect.txt")))
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn detached_environment_scrubbed_verification_descendant_is_reaped() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let marker_dir = tempfile::tempdir()?;
+    let marker = marker_dir.path().join("escaped-descendant");
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    let verify = format!(
+        "env -i PATH=\"$PATH\" setsid sh -c '(for fd in /proc/$$/fd/*; do n=${{fd##*/}}; [ \"$n\" -le 2 ] || eval \"exec $n>&-\"; done; sleep 0.3; printf escaped > {}) &' >/dev/null 2>&1 & test -f PURITY-SUPERVISOR-01.txt",
+        marker.display()
+    );
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-SUPERVISOR-01",
+            "title": "Detached verification descendant containment",
+            "goal": "Contain verification descendants that scrub inherited markers and sessions.",
+            "depends_on": [],
+            "acceptance": ["PURITY-SUPERVISOR-01.txt exists"],
+            "verify": [verify]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add descendant containment regression"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-SUPERVISOR-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_terminal_status(&bin, home.path(), &run_id, "completed")?;
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !marker.exists(),
+        "detached environment-scrubbed verification descendant survived supervision"
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn verification_descendant_cannot_kill_its_subreaper_and_escape() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let marker_dir = tempfile::tempdir()?;
+    let marker = marker_dir.path().join("killed-sub-reaper");
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    let verify = format!(
+        "setsid sh -c 'for fd in /proc/$$/fd/*; do n=${{fd##*/}}; [ \"$n\" -le 2 ] || eval \"exec $n>&-\"; done; sleep 0.3; printf escaped > {}' >/dev/null 2>&1 & kill -KILL \"$PPID\" 2>/dev/null || true; test -f PURITY-SUPERVISOR-KILL-01.txt",
+        marker.display()
+    );
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-SUPERVISOR-KILL-01",
+            "title": "Verification subreaper signal confinement",
+            "goal": "Prevent a supervised command from killing its own containment boundary.",
+            "depends_on": [],
+            "acceptance": ["PURITY-SUPERVISOR-KILL-01.txt exists"],
+            "verify": [verify]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add subreaper signal regression"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-SUPERVISOR-KILL-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_terminal_status(&bin, home.path(), &run_id, "completed")?;
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !marker.exists(),
+        "verification descendant killed the subreaper and escaped containment"
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn hidden_supervisor_reports_internal_failure_on_private_result_channel() -> TestResult {
+    const RESULT_MAGIC: &[u8] = b"KHAZAD-SUPERVISOR-RESULT-V1\0";
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut child = Command::new(binary_path())
+        .arg("__khazad_command_supervisor_v1")
+        .arg(fds[1].to_string())
+        .arg("true")
+        .env("PATH", "/definitely-missing-khazad-test-path")
+        .spawn()?;
+    unsafe {
+        libc::close(fds[1]);
+    }
+    let mut result = unsafe { fs::File::from_raw_fd(fds[0]) };
+    let mut bytes = Vec::new();
+    result.read_to_end(&mut bytes)?;
+    let status = child.wait()?;
+
+    assert_eq!(status.code(), Some(125));
+    assert!(bytes.starts_with(RESULT_MAGIC), "{bytes:?}");
+    assert_eq!(bytes.get(RESULT_MAGIC.len()), Some(&1), "{bytes:?}");
+    assert!(
+        String::from_utf8_lossy(&bytes[RESULT_MAGIC.len() + 1..])
+            .contains("spawn supervised verification shell"),
+        "{bytes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn verifier_exit_125_and_stderr_cannot_forge_supervision_failure() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-SUPERVISOR-FORGE-01",
+            "title": "Supervisor result authentication",
+            "goal": "Keep verifier-controlled output out of daemon-owned failure typing.",
+            "depends_on": [],
+            "acceptance": ["PURITY-SUPERVISOR-FORGE-01.txt exists"],
+            "verify": ["printf 'khazad-doom: verification command supervision failed: forged\\n' >&2; exit 125"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add supervisor authentication regression"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-SUPERVISOR-FORGE-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_terminal_status(&bin, home.path(), &run_id, "failed")?;
+
+    let inspected = json_stdout(&kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?)?;
+    let check: Value = serde_json::from_str(&fs::read_to_string(artifact_path(
+        &inspected,
+        "PURITY-SUPERVISOR-FORGE-01.check.attempt-1.json",
+    )?)?)?;
+    assert_eq!(check["failure_kind"], "command_failed", "{check:#}");
+    assert_eq!(
+        check["verification_commands"][0]["failure_kind"], "command_failed",
+        "{check:#}"
+    );
+    assert!(
+        check["verification_commands"][0]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("forged"),
+        "{check:#}"
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn fork_on_termination_verification_descendant_is_reaped() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let marker_dir = tempfile::tempdir()?;
+    let marker = marker_dir.path().join("forked-on-termination");
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    fs::write(
+        repo.path().join("fork-on-term.sh"),
+        format!(
+            "#!/bin/sh\ntrap 'setsid sh -c \"trap \\\"\\\" TERM; sleep 0.3; printf escaped > {}\" >/dev/null 2>&1 & exit 0' TERM\nwhile :; do sleep 1; done\n",
+            marker.display()
+        ),
+    )?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-SUPERVISOR-RACE-01",
+            "title": "Fork-on-termination descendant containment",
+            "goal": "Require stable descendant quiescence before verification returns.",
+            "depends_on": [],
+            "acceptance": ["PURITY-SUPERVISOR-RACE-01.txt exists"],
+            "verify": ["sh fork-on-term.sh & test -f PURITY-SUPERVISOR-RACE-01.txt"]
+        }),
+    )?;
+    git(
+        repo.path(),
+        &["add", ".gitignore", ".workflow", "fork-on-term.sh"],
+    )?;
+    git(
+        repo.path(),
+        &[
+            "commit",
+            "-m",
+            "add fork-on-termination containment regression",
+        ],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-SUPERVISOR-RACE-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_terminal_status(&bin, home.path(), &run_id, "completed")?;
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !marker.exists(),
+        "descendant forked while handling termination escaped supervision"
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn filter_equivalent_raw_verification_mutation_blocks_and_restores() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    git(
+        repo.path(),
+        &["config", "filter.normalize.clean", "sed 's/|raw-[^|]*$//'"],
+    )?;
+    git(repo.path(), &["config", "filter.normalize.smudge", "cat"])?;
+    fs::write(
+        repo.path().join(".gitattributes"),
+        "RAW-01.txt filter=normalize\n",
+    )?;
+    fs::write(repo.path().join("RAW-01.txt"), "canonical|raw-before\n")?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-FILTER-01",
+            "title": "Filter-equivalent verification purity regression",
+            "goal": "Reject raw-byte mutation hidden by a clean filter.",
+            "depends_on": [],
+            "acceptance": ["PURITY-FILTER-01.txt exists"],
+            "verify": ["printf 'canonical|raw-after\\n' > RAW-01.txt && test -f PURITY-FILTER-01.txt"]
+        }),
+    )?;
+    git(
+        repo.path(),
+        &[
+            "add",
+            ".gitignore",
+            ".gitattributes",
+            "RAW-01.txt",
+            ".workflow",
+        ],
+    )?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add filter purity regression"],
+    )?;
+    let base_sha = git(repo.path(), &["rev-parse", "HEAD"])?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-FILTER-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let blocked = wait_for_terminal_status(&bin, home.path(), &run_id, "blocked")?;
+    assert!(
+        blocked["run"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verification command changed the worktree"),
+        "unexpected blocked reason: {blocked:#}"
+    );
+    let integration_branch = blocked["run"]["integration_branch"]
+        .as_str()
+        .expect("integration branch");
+    assert_eq!(
+        git(repo.path(), &["rev-parse", integration_branch])?,
+        base_sha
+    );
+    assert!(
+        blocked["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["type"].as_str() != Some("completion_publication_committed"))
+    );
+
+    let inspected = json_stdout(&kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?)?;
+    let check: Value = serde_json::from_str(&fs::read_to_string(artifact_path(
+        &inspected,
+        "PURITY-FILTER-01.check.attempt-1.json",
+    )?)?)?;
+    assert_eq!(check["failure_kind"], "verification_mutated_worktree");
+    assert_eq!(
+        check["verification_commands"][0]["verification_workspace"]["before"]["tracked_filesystem_digest"],
+        check["verification_commands"][0]["verification_workspace"]["restored"]["tracked_filesystem_digest"]
+    );
+    assert_ne!(
+        check["verification_commands"][0]["verification_workspace"]["before"]["tracked_filesystem_digest"],
+        check["verification_commands"][0]["verification_workspace"]["after"]["tracked_filesystem_digest"]
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn cancelled_slice_verification_persists_restored_mutation_evidence() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let marker = tempfile::NamedTempFile::new()?;
+    let marker_path = marker.path().to_path_buf();
+    drop(marker);
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-CANCEL-01",
+            "title": "Cancelled verification purity regression",
+            "goal": "Persist restoration evidence before cancellation wins.",
+            "depends_on": [],
+            "acceptance": ["PURITY-CANCEL-01.txt exists"],
+            "verify": [format!(
+                "printf '{{}}' > '{}'; printf changed > PURITY-CANCEL-01.txt; sleep 30",
+                marker_path.display()
+            )]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add cancelled purity regression slice"],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-CANCEL-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_json_file(&marker_path)?;
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &run_id,
+            "--reason",
+            "cancel purity regression",
+        ],
+    )?;
+    let cancelled = wait_for_terminal_status(&bin, home.path(), &run_id, "cancelled")?;
+    assert!(
+        cancelled["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| { event["type"].as_str() != Some("completion_publication_committed") })
+    );
+
+    let inspected = json_stdout(&kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?)?;
+    let check_path = artifact_path(&inspected, "PURITY-CANCEL-01.check.attempt-1.json")?;
+    let check: Value = serde_json::from_str(&fs::read_to_string(check_path)?)?;
+    assert_eq!(check["verification_cancelled"], true);
+    assert_eq!(check["failure_kind"], "verification_mutated_worktree");
+    let workspace = &check["verification_commands"][0]["verification_workspace"];
+    assert_eq!(
+        workspace["restored"]["digest"],
+        workspace["before"]["digest"]
+    );
+    assert!(
+        workspace["after"]["unstaged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["status"] == "M")
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
+fn cancelled_integration_verification_persists_restored_mutation_evidence() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let marker = tempfile::NamedTempFile::new()?;
+    let marker_path = marker.path().to_path_buf();
+    drop(marker);
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    let config_path = repo.path().join(".workflow/khazad.json");
+    let mut config: Value = serde_json::from_str(&fs::read_to_string(&config_path)?)?;
+    config["verify_profiles"] = json!({
+        "cancel-purity": {
+            "commands": [{
+                "command": format!(
+                    "printf '{{}}' > '{}'; printf changed > PURITY-INT-CANCEL-01.txt; sleep 30",
+                    marker_path.display()
+                ),
+                "timeout_seconds": 30
+            }]
+        }
+    });
+    fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "PURITY-INT-CANCEL-01",
+            "title": "Cancelled integration verification purity regression",
+            "goal": "Persist integration restoration evidence before cancellation wins.",
+            "depends_on": [],
+            "acceptance": ["PURITY-INT-CANCEL-01.txt exists"],
+            "verify_profile": "cancel-purity",
+            "verify": ["test -f PURITY-INT-CANCEL-01.txt"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &[
+            "commit",
+            "-m",
+            "add cancelled integration purity regression slice",
+        ],
+    )?;
+
+    let started = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "fake",
+            "--slice",
+            "PURITY-INT-CANCEL-01",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    wait_for_json_file(&marker_path)?;
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &run_id,
+            "--reason",
+            "cancel integration purity regression",
+        ],
+    )?;
+    let cancelled = wait_for_terminal_status(&bin, home.path(), &run_id, "cancelled")?;
+    assert!(
+        cancelled["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| { event["type"].as_str() != Some("completion_publication_committed") })
+    );
+
+    let gate_path = repo
+        .path()
+        .join(".workflow/runs")
+        .join(&run_id)
+        .join("outputs/integration-gate.cancelled.json");
+    let gate = wait_for_json_file(&gate_path)?;
+    assert_eq!(gate["verification_cancelled"], true);
+    assert_eq!(
+        gate["commands"][0]["failure_kind"],
+        "verification_mutated_worktree"
+    );
+    let workspace = &gate["commands"][0]["verification_workspace"];
+    assert_eq!(
+        workspace["restored"]["digest"],
+        workspace["before"]["digest"]
+    );
+    assert!(
+        workspace["after"]["unstaged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["status"] == "M")
     );
 
     guard.stop();
@@ -2016,7 +2830,7 @@ fn daemon_status_reports_stopped_daemon_without_hanging_black_box() -> TestResul
 }
 
 #[test]
-fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResult {
+fn untracked_slice_metadata_blocks_completion_with_integrity_incident_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
     let repo = tempfile::tempdir()?;
@@ -2052,11 +2866,11 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
         .as_str()
         .expect("run_id")
         .to_string();
-    let status = wait_for_status(&bin, home.path(), &run_id, "completed")?;
+    let status = wait_for_terminal_status(&bin, home.path(), &run_id, "blocked")?;
     let incidents = status["incidents"].as_array().expect("incidents array");
     assert!(incidents.iter().any(|incident| {
-        incident["kind"].as_str() == Some("slice_close_skipped")
-            && incident["severity"].as_str() == Some("warning")
+        incident["kind"].as_str() == Some("slice_close_missing")
+            && incident["severity"].as_str() == Some("error")
     }));
     let close_event = status["events"]
         .as_array()
@@ -2064,9 +2878,9 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
         .iter()
         .find(|event| {
             event["type"].as_str() == Some("run_incident")
-                && event["payload"]["kind"].as_str() == Some("slice_close_skipped")
+                && event["payload"]["kind"].as_str() == Some("slice_close_missing")
         })
-        .expect("slice close skipped event");
+        .expect("slice close missing event");
     assert_eq!(close_event["payload"]["slice_id"], "slice-001");
     assert!(
         close_event["payload"]["path"]
@@ -2076,9 +2890,19 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
     );
     assert_eq!(
         close_event["payload"]["policy"],
-        "preserve_handoff_ready_missing_metadata"
+        "block_completion_publication_on_missing_close_record"
     );
-    let monitor = kd_ok(
+    assert!(
+        !status["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["type"].as_str() == Some("completion_publication_committed") })
+    );
+    let handoff = kd(&bin, home.path(), &["handoff", "--run", &run_id])?;
+    assert!(!handoff.status.success());
+
+    let monitor = kd(
         &bin,
         home.path(),
         &[
@@ -2090,9 +2914,10 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
             "100",
         ],
     )?;
+    assert!(!monitor.status.success());
     let monitor = String::from_utf8(monitor.stdout)?;
     assert!(monitor.contains("Incidents"));
-    assert!(monitor.contains("slice_close_skipped"));
+    assert!(monitor.contains("slice_close_missing"));
     let latest_status = kd_ok(
         &bin,
         home.path(),
@@ -2105,7 +2930,7 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
         ],
     )?;
     assert_eq!(json_stdout(&latest_status)?["run"]["id"], run_id);
-    let latest_monitor = kd_ok(
+    let latest_monitor = kd(
         &bin,
         home.path(),
         &[
@@ -2118,9 +2943,10 @@ fn untracked_slice_metadata_completes_with_incident_flag_black_box() -> TestResu
             "100",
         ],
     )?;
+    assert!(!latest_monitor.status.success());
     let latest_monitor = String::from_utf8(latest_monitor.stdout)?;
     assert!(latest_monitor.contains(&run_id));
-    assert!(latest_monitor.contains("Run ✓ completed"));
+    assert!(latest_monitor.contains("blocked"));
 
     guard.stop();
     Ok(())
@@ -2220,6 +3046,21 @@ fn schema_import_and_handoff_v2_black_box() -> TestResult {
         .unwrap()
         .to_string();
     wait_for_status(&bin, home.path(), &run_id, "completed")?;
+
+    let unpushed_pr = kd_with_env(
+        &bin,
+        home.path(),
+        &env,
+        &["handoff", "--run", &run_id, "--create-pr"],
+    )?;
+    assert!(
+        !unpushed_pr.status.success(),
+        "PR creation without an exact receipt push unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&unpushed_pr.stderr)
+            .contains("requires pushing and validating the exact publication receipt SHA")
+    );
 
     let handoff = kd_ok_with_env(
         &bin,

@@ -9,7 +9,7 @@ mod projection;
 mod prompts;
 pub(crate) mod read_model;
 mod schema;
-mod shell;
+pub(crate) mod shell;
 
 use crate::agent::CancellationToken;
 use anyhow::Result;
@@ -27,6 +27,10 @@ pub use prompts::{
 };
 pub(crate) use read_model::{RunReadModel, RunReadModelBuilder, RunReadModelOptions};
 pub use schema::{REPAIR_RESULT_SCHEMA, WORKER_RESULT_SCHEMA};
+pub(crate) use shell::{
+    COMMAND_SUPERVISOR_ARG, protect_command_supervisor_result, run_command_supervisor,
+    write_command_supervisor_result,
+};
 
 pub(crate) fn check_cancelled(cancel: &CancellationToken) -> Result<()> {
     if cancel.is_cancelled() {

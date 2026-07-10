@@ -1212,6 +1212,8 @@ pub struct CheckResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tests_run: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_commands: Vec<GateCommandResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
     pub attempt: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1219,6 +1221,8 @@ pub struct CheckResult {
     #[serde(rename = "worktree_clean")]
     pub worktree_ok: bool,
     pub commit_found: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verification_cancelled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub failure_kind: String,
 }
@@ -1281,6 +1285,51 @@ pub struct RepairResult {
     pub candidate_followup_slices: Vec<FollowupSliceDraft>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GitPathChangeEvidence {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_bytes_hex: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GitWorktreeSnapshotEvidence {
+    pub digest: String,
+    pub repository_id: String,
+    pub worktree_id: String,
+    pub head_sha: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub head_attachment: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub index_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tracked_filesystem_digest: String,
+    #[serde(default)]
+    pub staged: Vec<GitPathChangeEvidence>,
+    #[serde(default)]
+    pub unstaged: Vec<GitPathChangeEvidence>,
+    #[serde(default)]
+    pub untracked_path_bytes_hex: Vec<String>,
+    #[serde(default)]
+    pub nonignored_empty_directory_path_bytes_hex: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VerificationWorkspaceEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<GitWorktreeSnapshotEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<GitWorktreeSnapshotEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<GitWorktreeSnapshotEvidence>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub after_capture_error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub restoration_error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence_error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateCommandResult {
     pub command: String,
@@ -1301,16 +1350,28 @@ pub struct GateCommandResult {
     pub skip_reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub failure_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_workspace: Option<VerificationWorkspaceEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GateResult {
     pub status: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verification_cancelled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_workspace: Option<VerificationWorkspaceEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<GateCommandResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_workspace: Option<GitWorktreeSnapshotEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publication_identity: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

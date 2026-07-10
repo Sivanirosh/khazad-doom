@@ -2069,21 +2069,18 @@ impl Manager {
         let config = store.read_config()?;
         let effective_push = !dry_run && (push || config.handoff.push);
         let effective_create_pr = !dry_run && (create_pr || config.handoff.create_pr);
+        if effective_create_pr && !effective_push {
+            return Err(BlockedError::new(
+                "handoff PR creation requires pushing and validating the exact publication receipt SHA in the same action"
+                    .to_string(),
+            )
+            .into());
+        }
         let diagnostics = handoff_diagnostics(&run.repo_path);
         let summary_path = store.output_path(&run.id, "implementation-summary.json");
         let final_report_path = store.output_path(&run.id, "final-report.json");
         let summary = artifact::read_json::<ImplementationSummary>(&summary_path).ok();
         let read_model = self.run_read_model(&run, RunReadModelOptions::status(500))?;
-        let final_sha = gitutil::run(&run.repo_path, &["rev-parse", &run.integration_branch])
-            .ok()
-            .filter(|sha| !sha.is_empty())
-            .or_else(|| {
-                summary
-                    .as_ref()
-                    .map(|summary| summary.final_sha.clone())
-                    .filter(|sha| !sha.is_empty())
-            })
-            .unwrap_or_default();
         let completed_slices: Vec<String> = summary
             .as_ref()
             .map(|summary| {
@@ -2094,6 +2091,32 @@ impl Manager {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let publication_events = self.state.get_events(&run.id, 100_000)?;
+        let receipt_event = publication_events
+            .iter()
+            .rev()
+            .find(|event| event.typ == "completion_publication_committed")
+            .ok_or_else(|| {
+                BlockedError::new(
+                    "handoff is not ready; completed run has no durable completion publication receipt"
+                        .to_string(),
+                )
+            })?;
+        let receipt: artifact::CompletionPublicationReceipt =
+            serde_json::from_value(receipt_event.payload.clone())
+                .context("decode durable completion publication receipt for handoff")?;
+        if summary
+            .as_ref()
+            .is_none_or(|summary| summary.final_sha != receipt.commit_sha)
+        {
+            return Err(BlockedError::new(format!(
+                "handoff summary final SHA does not match durable completion publication receipt {}; operator reconciliation is required",
+                receipt.commit_sha
+            ))
+            .into());
+        }
+        store.validate_completion_publication_receipt_at_ref(&run.integration_branch, &receipt)?;
+        let final_sha = receipt.commit_sha;
         let exit_states = summary
             .as_ref()
             .map(|summary| summary.exit_states.clone())
@@ -2176,10 +2199,11 @@ impl Manager {
             final_sha,
             final_report_path.display()
         );
+        let push_refspec = format!("{}:refs/heads/{}", final_sha, run.integration_branch);
         let push_command = format!(
-            "git -C {} push -u origin {}",
+            "git -C {} push origin {}",
             sh_quote(&run.repo_path),
-            sh_quote(&run.integration_branch)
+            sh_quote(&push_refspec)
         );
         let pr_command = format!(
             "cd {} && gh pr create --base {} --head {} --title {} --body-file {}",
@@ -2191,16 +2215,25 @@ impl Manager {
         );
         let mut actions = Vec::new();
         if effective_push {
-            actions.push(run_handoff_command(
+            let push_action = run_handoff_command(
                 "push",
                 &run.repo_path,
-                &["push", "-u", "origin", &run.integration_branch],
+                &["push", "origin", &push_refspec],
                 &push_command,
-            )?);
+            )?;
+            if push_action.status != "passed" {
+                return Err(BlockedError::new(format!(
+                    "handoff did not push validated publication receipt {final_sha}; PR creation is blocked: {}",
+                    push_action.output
+                ))
+                .into());
+            }
+            actions.push(push_action);
+            validate_remote_handoff_ref(&run.repo_path, &run.integration_branch, &final_sha)?;
         }
         if effective_create_pr {
             let body = final_report_path.to_string_lossy().to_string();
-            actions.push(run_external_command(
+            let pr_action = run_external_command(
                 "create_pr",
                 &run.repo_path,
                 "gh",
@@ -2217,7 +2250,16 @@ impl Manager {
                     &body,
                 ],
                 &pr_command,
-            )?);
+            )?;
+            if pr_action.status != "passed" {
+                return Err(BlockedError::new(format!(
+                    "handoff PR creation failed for validated publication receipt {final_sha}: {}",
+                    pr_action.output
+                ))
+                .into());
+            }
+            validate_remote_handoff_ref(&run.repo_path, &run.integration_branch, &final_sha)?;
+            actions.push(pr_action);
         }
         Ok(BranchHandoff {
             run_id: run.id,
@@ -2495,20 +2537,25 @@ impl Manager {
             "creating integration worktree",
         );
         let setup_phase = economics.start_phase("integration_setup");
-        match integration_mode {
-            IntegrationMode::Fresh => gitutil::worktree_add(
-                &run.repo_path,
-                &integration_worktree,
-                &run.integration_branch,
-                &run.base_sha,
-            )
-            .context("create integration worktree")?,
-            IntegrationMode::Existing => gitutil::worktree_add_existing(
-                &run.repo_path,
-                &integration_worktree,
-                &run.integration_branch,
-            )
-            .context("create existing integration worktree")?,
+        let reuse_recovery_worktree = matches!(integration_mode, IntegrationMode::Existing)
+            && integration_worktree.is_dir()
+            && gitutil::has_retained_completion_publication_journal(&integration_worktree)?;
+        if !reuse_recovery_worktree {
+            match integration_mode {
+                IntegrationMode::Fresh => gitutil::worktree_add(
+                    &run.repo_path,
+                    &integration_worktree,
+                    &run.integration_branch,
+                    &run.base_sha,
+                )
+                .context("create integration worktree")?,
+                IntegrationMode::Existing => gitutil::worktree_add_existing(
+                    &run.repo_path,
+                    &integration_worktree,
+                    &run.integration_branch,
+                )
+                .context("create existing integration worktree")?,
+            }
         }
         setup_phase.finish();
 
@@ -2680,6 +2727,8 @@ impl Manager {
             cancel,
         )?;
         gate_phase.finish();
+        self.stop_after_cancelled_integration_gate(&store, &run.id, &gate)?;
+        check_cancelled(cancel)?;
 
         let mut pre_repair_gate = None;
         let repair = if should_run_integration_repair(repair_policy, &gate) {
@@ -2743,6 +2792,8 @@ impl Manager {
                 cancel,
             )?;
             rerun_phase.finish();
+            self.stop_after_cancelled_integration_gate(&store, &run.id, &gate)?;
+            check_cancelled(cancel)?;
             repair
         } else {
             skipped_repair_result(repair_policy, &gate)
@@ -2752,9 +2803,24 @@ impl Manager {
             .iter()
             .map(|slice| slice.slice_id.clone())
             .collect();
-        let publication_already_current = gate.status == "passed"
-            && completion_publication_is_current(&integration_store, &run.id, &completed_slice_ids);
+        let publication_events = self.state.get_events(&run.id, 100_000).unwrap_or_default();
+        let recorded_publication_commit =
+            latest_completion_publication_commit(&publication_events).map(str::to_string);
+        let existing_publication = if gate.status == "passed" {
+            existing_completion_publication(
+                &integration_store,
+                &run.id,
+                &run.integration_branch,
+                &completed_slice_ids,
+                recorded_publication_commit.as_deref(),
+            )?
+        } else {
+            None
+        };
+        let publication_already_current = existing_publication.is_some();
+        let mut publication_slice_ids = Vec::new();
         if gate.status == "passed" && !publication_already_current {
+            check_cancelled(cancel)?;
             let closure_report = integration_store.close_slices_if_present(
                 &completed_slice_ids,
                 &run.id,
@@ -2780,6 +2846,7 @@ impl Manager {
                 )
                 .into());
             }
+            publication_slice_ids = closure_report.closed_slice_ids;
         }
         let exit_states = final_exit_states(&gate, &completed_slices);
         let worker_profile = worker_profile_evidence(runner.name(), &runner.metadata());
@@ -2810,14 +2877,62 @@ impl Manager {
             created_at: Utc::now(),
         };
 
-        if !publication_already_current {
-            integration_store
-                .write_implementation_summary(&summary)
-                .context("write implementation summary")?;
-            integration_store.write_final_report(&summary)?;
-            integration_store.commit_completion_publication(&run.id)?;
+        if gate.status == "passed" {
+            if let Some(receipt) = existing_publication {
+                let manifest = integration_store.completion_publication_manifest_for_gate(
+                    &run.id,
+                    &completed_slice_ids,
+                    &gate,
+                )?;
+                integration_store.validate_completion_publication(
+                    &run.integration_branch,
+                    &manifest,
+                    &receipt,
+                )?;
+                summary.final_sha = receipt.commit_sha.clone();
+                if !completion_publication_event_exists(
+                    &self.state.get_events(&run.id, 500).unwrap_or_default(),
+                    &receipt.commit_sha,
+                ) {
+                    self.state.record_event(
+                        &run.id,
+                        "completion_publication_committed",
+                        &receipt,
+                    )?;
+                }
+            } else {
+                integration_store
+                    .write_implementation_summary(&summary)
+                    .context("write implementation summary")?;
+                integration_store.write_final_report(&summary)?;
+                let manifest = integration_store.completion_publication_manifest_for_gate(
+                    &run.id,
+                    &publication_slice_ids,
+                    &gate,
+                )?;
+                check_cancelled(cancel)?;
+                let receipt = integration_store.commit_completion_publication(
+                    &run.id,
+                    &run.integration_branch,
+                    &manifest,
+                )?;
+                if !receipt.committed {
+                    return Err(BlockedError::new(
+                        "completion publication manifest had no changes but no exact prior publication receipt was found; operator reconciliation is required"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                integration_store.validate_completion_publication(
+                    &run.integration_branch,
+                    &manifest,
+                    &receipt,
+                )?;
+                summary.final_sha = receipt.commit_sha.clone();
+                self.state
+                    .record_event(&run.id, "completion_publication_committed", &receipt)?;
+            }
         }
-        summary.final_sha = gitutil::head_sha(&integration_worktree).unwrap_or_default();
         artifact::write_json(
             store.output_path(&run.id, "implementation-summary.json"),
             &summary,
@@ -2837,6 +2952,34 @@ impl Manager {
             bail!("integration gate failed: {}", gate.summary);
         }
         Ok(summary)
+    }
+
+    fn stop_after_cancelled_integration_gate(
+        &self,
+        store: &artifact::Store,
+        run_id: &str,
+        gate: &GateResult,
+    ) -> Result<()> {
+        if !gate.verification_cancelled {
+            return Ok(());
+        }
+        let path = store.output_path(run_id, "integration-gate.cancelled.json");
+        artifact::write_json(&path, gate)?;
+        self.state
+            .record_event(run_id, "integration_gate_cancelled", gate)?;
+        if gate.failure_kind == "verification_restoration_failed"
+            || gate
+                .commands
+                .iter()
+                .any(|command| command.failure_kind == "verification_restoration_failed")
+        {
+            return Err(BlockedError::new(
+                "cancelled integration verification could not restore its worktree; operator intervention is required"
+                    .to_string(),
+            )
+            .into());
+        }
+        Err(CancelledError::new("run cancelled").into())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3047,11 +3190,11 @@ impl Manager {
                     &summary,
                 ),
             )?;
-            if parent_cancelled || parallel_results_all_cancelled(&results) {
-                return Err(CancelledError::new("run cancelled").into());
-            }
             if parallel_results_any_blocked(&results) {
                 return Err(BlockedError::new(summary).into());
+            }
+            if parent_cancelled || parallel_results_all_cancelled(&results) {
+                return Err(CancelledError::new("run cancelled").into());
             }
             bail!(summary);
         }
@@ -3873,11 +4016,16 @@ impl Manager {
                     failure_kind: worker_attempt_failure_kind(&check, &worker_result),
                     summary: &last_failure,
                     evidence_path: &check_path,
-                    retry_disposition: worker_attempt_retry_disposition(attempt),
+                    retry_disposition: worker_attempt_retry_disposition(attempt, &check),
                     repair_disposition: worker_attempt_repair_disposition(attempt, &check),
                     primary_failure: primary_failure.as_deref(),
                     secondary_failures: &secondary_failures,
                 })?;
+            }
+            if check.verification_cancelled
+                && check.failure_kind != "verification_restoration_failed"
+            {
+                return Err(CancelledError::new("run cancelled").into());
             }
             if check_failure_needs_operator(&check) {
                 let message = final_attempt_failure_message(
@@ -3981,11 +4129,13 @@ impl Manager {
             status: "passed".to_string(),
             summary: "lightweight checks passed".to_string(),
             tests_run: Vec::new(),
+            verification_commands: Vec::new(),
             findings: Vec::new(),
             attempt: ctx.attempt,
             worker_head: String::new(),
             worktree_ok: true,
             commit_found: true,
+            verification_cancelled: false,
             failure_kind: String::new(),
         };
 
@@ -4088,6 +4238,8 @@ impl Manager {
             cancel,
         )?;
         check.tests_run = verification.tests_run;
+        check.verification_commands = verification.commands;
+        check.verification_cancelled = verification.verification_cancelled;
         if let Some(failure) = verification.failure {
             check.status = "failed".to_string();
             check.summary = failure.summary;
@@ -5582,6 +5734,45 @@ impl Manager {
         if !root.exists() {
             return Ok(());
         }
+        let integration = root.join("integration");
+        if integration.is_dir()
+            && gitutil::has_retained_completion_publication_journal(&integration)?
+        {
+            let mut errors = Vec::new();
+            for entry in std::fs::read_dir(&root)? {
+                let path = entry?.path();
+                if path == integration {
+                    continue;
+                }
+                let removal = if path.is_dir() {
+                    gitutil::worktree_remove(&run.repo_path, &path)
+                } else {
+                    std::fs::remove_file(&path).map_err(anyhow::Error::from)
+                };
+                if let Err(err) = removal {
+                    errors.push(format!("{}: {err:#}", path.display()));
+                }
+            }
+            let _ = gitutil::worktree_prune(&run.repo_path);
+            if !errors.is_empty() {
+                bail!(
+                    "preserve retained completion publication journal while preparing resume: {}",
+                    errors.join("; ")
+                );
+            }
+            self.state.record_event(
+                &run.id,
+                workflow_events::RUN_INCIDENT,
+                &workflow_events::RunIncidentPayload::warning(
+                    "publication_recovery_worktree_retained",
+                    format!(
+                        "retained integration worktree for completion publication recovery: {}",
+                        integration.display()
+                    ),
+                ),
+            )?;
+            return Ok(());
+        }
         std::fs::remove_dir_all(&root).with_context(|| {
             format!(
                 "remove stale run worktree dir before resume {}",
@@ -5607,6 +5798,15 @@ impl Manager {
         let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
         if !root.exists() {
             return Ok(());
+        }
+        for entry in std::fs::read_dir(&root)? {
+            let path = entry?.path();
+            if path.is_dir() && gitutil::has_retained_completion_publication_journal(&path)? {
+                bail!(
+                    "retained completion publication recovery journal prevents worktree cleanup: {}",
+                    path.display()
+                );
+            }
         }
         let mut errors = Vec::new();
         for entry in std::fs::read_dir(&root)? {
@@ -5734,8 +5934,10 @@ fn worker_attempt_failure_kind<'a>(check: &'a CheckResult, result: &'a WorkerRes
     }
 }
 
-fn worker_attempt_retry_disposition(attempt: usize) -> &'static str {
-    if attempt < MAX_WORKER_ATTEMPTS {
+fn worker_attempt_retry_disposition(attempt: usize, check: &CheckResult) -> &'static str {
+    if check_failure_needs_operator(check) {
+        "operator_intervention_required"
+    } else if attempt < MAX_WORKER_ATTEMPTS {
         "next_worker_attempt"
     } else {
         "normal_worker_attempts_exhausted"
@@ -6254,15 +6456,69 @@ fn read_worker_result(
     .ok()
 }
 
-fn completion_publication_is_current(
+fn existing_completion_publication(
     store: &artifact::Store,
     run_id: &str,
+    expected_branch: &str,
     completed_slice_ids: &[String],
-) -> bool {
-    store.publication_reports_exist(run_id)
-        && completed_slice_ids
+    recorded_commit_sha: Option<&str>,
+) -> Result<Option<artifact::CompletionPublicationReceipt>> {
+    let head = gitutil::head_sha(store.repo_path())?;
+    if let Some(recorded_commit_sha) = recorded_commit_sha
+        && head != recorded_commit_sha
+    {
+        return Err(BlockedError::new(format!(
+            "integration branch moved from recorded completion publication {recorded_commit_sha} to {head}; operator reconciliation is required"
+        ))
+        .into());
+    }
+    if let Some(receipt) =
+        store.find_completion_publication(run_id, expected_branch, completed_slice_ids)?
+    {
+        if head != receipt.commit_sha {
+            return Err(BlockedError::new(format!(
+                "integration branch advanced beyond completion publication {} to {}; operator reconciliation is required",
+                receipt.commit_sha, head
+            ))
+            .into());
+        }
+        return Ok(Some(receipt));
+    }
+    if !store.publication_reports_exist(run_id)
+        || !completed_slice_ids
             .iter()
             .all(|slice_id| slice_closed_by_run_or_absent(store, slice_id, run_id))
+    {
+        if let Some(recorded_commit_sha) = recorded_commit_sha {
+            return Err(BlockedError::new(format!(
+                "recorded completion publication {recorded_commit_sha} is missing its reports or closed-slice metadata; operator reconciliation is required"
+            ))
+            .into());
+        }
+        return Ok(None);
+    }
+    if let Some(recorded_commit_sha) = recorded_commit_sha {
+        return Err(BlockedError::new(format!(
+            "recorded completion publication {recorded_commit_sha} does not match the current manifest; operator reconciliation is required"
+        ))
+        .into());
+    }
+    Ok(None)
+}
+
+fn latest_completion_publication_commit(events: &[crate::domain::Event]) -> Option<&str> {
+    events.iter().rev().find_map(|event| {
+        (event.typ == "completion_publication_committed")
+            .then(|| event.payload["commit_sha"].as_str())
+            .flatten()
+    })
+}
+
+fn completion_publication_event_exists(events: &[crate::domain::Event], commit_sha: &str) -> bool {
+    events.iter().any(|event| {
+        event.typ == "completion_publication_committed"
+            && event.payload["commit_sha"].as_str() == Some(commit_sha)
+    })
 }
 
 fn slice_closed_by_run_or_absent(store: &artifact::Store, slice_id: &str, run_id: &str) -> bool {
@@ -6533,6 +6789,35 @@ fn acceptance_from_issue_body(body: &str) -> Vec<String> {
     } else {
         criteria
     }
+}
+
+fn validate_remote_handoff_ref(repo_path: &str, branch: &str, expected_sha: &str) -> Result<()> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let output = gitutil::run(
+        repo_path,
+        &["ls-remote", "--exit-code", "--heads", "origin", &remote_ref],
+    )
+    .with_context(|| format!("validate remote handoff ref {remote_ref}"))?;
+    let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next().ok_or_else(|| {
+        BlockedError::new(format!(
+            "remote handoff ref {remote_ref} is absent after receipt push"
+        ))
+    })?;
+    let mut fields = line.split_whitespace();
+    let actual_sha = fields.next().unwrap_or_default();
+    let actual_ref = fields.next().unwrap_or_default();
+    if actual_sha != expected_sha
+        || actual_ref != remote_ref
+        || fields.next().is_some()
+        || lines.next().is_some()
+    {
+        return Err(BlockedError::new(format!(
+            "remote handoff ref {remote_ref} does not equal validated publication receipt {expected_sha}; found {actual_sha} {actual_ref}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn run_handoff_command(
@@ -7283,22 +7568,24 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCallContext, MAX_WORKER_ATTEMPTS, Manager, ResumeOptions, RunEconomicsRecorder,
-        RunReadModelBuilder, RunReadModelOptions, StartOptions, WorkerAttemptContext,
+        AgentCallContext, MAX_WORKER_ATTEMPTS, Manager, RepairPolicy, ResumeOptions,
+        RunEconomicsRecorder, RunReadModelBuilder, RunReadModelOptions, StartOptions,
+        WorkerAttemptContext, check_failure_needs_operator, existing_completion_publication,
         queue_snapshot_hash, repair_authority_violations, selected_slice_ids,
-        validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
-        validate_worker_result,
+        should_run_integration_repair, validate_followup_slice_draft, validate_mission_envelope,
+        validate_repair_result, validate_worker_result, worker_attempt_retry_disposition,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         AcceptanceEvidence, AutonomyLevel, CheckResult, CockpitMode, Finding, FindingDisposition,
-        FollowupSliceDraft, FrontierBudgetState, FrontierClassification, Handoff,
-        ImplementationSummary, MissionEnvelope, OriginNotificationTarget, RepairResult,
-        ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
-        ReplanProposedChange, Run, RunEconomics, RunStatus, Slice, SliceProvenance, SliceRun,
-        SliceStatus, TerminalNotificationRecord, VerifyCommand, VerifyProfile,
-        WorkerQuestionAnswerSource, WorkerQuestionRecommendation, WorkerResult, WorkflowConfig,
+        FollowupSliceDraft, FrontierBudgetState, FrontierClassification, GateCommandResult,
+        GateResult, Handoff, ImplementationSummary, MissionEnvelope, OriginNotificationTarget,
+        RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
+        ReplanProposalState, ReplanProposedChange, Run, RunEconomics, RunStatus, Slice,
+        SliceProvenance, SliceRun, SliceStatus, TerminalNotificationRecord, VerifyCommand,
+        VerifyProfile, WorkerQuestionAnswerSource, WorkerQuestionRecommendation, WorkerResult,
+        WorkflowConfig,
     };
     use crate::gitutil;
     use crate::paths::Paths;
@@ -7333,6 +7620,48 @@ mod tests {
             verify: Vec::new(),
             verify_timeout_seconds: 0,
         }
+    }
+
+    fn write_publication_reports(
+        store: &ArtifactStore,
+        run_id: &str,
+        slice_ids: &[&str],
+    ) -> Result<()> {
+        let gate = GateResult {
+            status: "passed".to_string(),
+            ..Default::default()
+        };
+        let summary = ImplementationSummary {
+            run_id: run_id.to_string(),
+            repo_path: store.repo_path().to_string_lossy().into_owned(),
+            integration_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            final_sha: String::new(),
+            worker_profile: crate::domain::WorkerProfileEvidence::default(),
+            mission_envelope: None,
+            frontier_budget: None,
+            completed_slices: slice_ids
+                .iter()
+                .map(|slice_id| WorkerResult {
+                    slice_id: (*slice_id).to_string(),
+                    status: "completed".to_string(),
+                    ..WorkerResult::default()
+                })
+                .collect(),
+            checks: Vec::new(),
+            integration_repair: RepairResult::default(),
+            pre_repair_integration_gate: None,
+            integration_gate: gate,
+            exit_states: crate::domain::WorkflowExitStates::default(),
+            evidence_attestation: crate::domain::EvidenceAttestation::default(),
+            economics: RunEconomics::default(),
+            plan_revisions: crate::domain::PlanRevisions::default(),
+            worker_questions: Vec::new(),
+            created_at: Utc::now(),
+        };
+        store.write_implementation_summary(&summary)?;
+        store.write_final_report(&summary)?;
+        Ok(())
     }
 
     fn mission_envelope() -> MissionEnvelope {
@@ -7465,6 +7794,55 @@ mod tests {
         fn name(&self) -> &str {
             "operator-pause-test"
         }
+    }
+
+    #[test]
+    fn outer_gate_restoration_failure_outranks_coincident_cancellation() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-outer-gate-restoration", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let manager = Manager::new(paths, state);
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let gate = GateResult {
+            status: "failed".to_string(),
+            summary: "integration workspace could not be restored".to_string(),
+            verification_cancelled: true,
+            failure_kind: "verification_restoration_failed".to_string(),
+            verification_workspace: Some(crate::domain::VerificationWorkspaceEvidence {
+                restoration_error: "injected outer guard restoration failure".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = manager
+            .stop_after_cancelled_integration_gate(&store, &run.id, &gate)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("operator intervention is required"),
+            "{err:#}"
+        );
+        let recorded: GateResult =
+            artifact::read_json(store.output_path(&run.id, "integration-gate.cancelled.json"))?;
+        assert_eq!(recorded.failure_kind, "verification_restoration_failed");
+        assert_eq!(
+            recorded
+                .verification_workspace
+                .as_ref()
+                .map(|evidence| evidence.restoration_error.as_str()),
+            Some("injected outer guard restoration failure")
+        );
+        Ok(())
     }
 
     fn record_zero_timeout_operator_pause(fail: bool) -> Result<RunEconomics> {
@@ -9233,6 +9611,7 @@ mod tests {
         let store = ArtifactStore::new(repo.path());
         store.ensure_layout()?;
         store.write_slice(&slice("slice-001"), true)?;
+        gitutil::commit_all(repo.path(), "add mission slice")?;
 
         let home = tempfile::tempdir()?;
         let paths = Paths {
@@ -9259,7 +9638,12 @@ mod tests {
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
-        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(
+            completed.status,
+            RunStatus::Completed,
+            "{}",
+            completed.error
+        );
         let reopened_state = StateStore::open(&db_file)?;
         let (stored_envelope, stored_budget) = reopened_state.get_frontier_state(&run.id)?;
         assert_eq!(stored_envelope.as_ref(), Some(&envelope));
@@ -9663,6 +10047,7 @@ mod tests {
 
         let completed = wait_for_run(&state, &run.id)?;
         assert_eq!(completed.status, RunStatus::Completed);
+        let events = wait_for_event(&state, &run.id, "worktrees_cleaned")?;
         assert_eq!(completed.selected_slice_id, "slice-001,slice-002");
         let slice_runs = state.get_slice_runs(&run.id)?;
         assert_eq!(slice_runs.len(), 2);
@@ -9768,7 +10153,6 @@ mod tests {
         );
         assert!(!store.origin_path(&run.id).exists());
         assert!(!store.notifications_dir(&run.id).exists());
-        let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| event.typ == "run_completed"));
         assert!(events.iter().any(|event| event.typ == "worktrees_cleaned"));
         assert!(
@@ -10478,6 +10862,116 @@ mod tests {
     }
 
     #[test]
+    fn completion_publication_recovery_blocks_an_advanced_branch() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        gitutil::commit_all(repo.path(), "initial")?;
+
+        let mut closed = slice("slice-001");
+        closed.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        closed.closed_by_run = "run-1".to_string();
+        closed.closed_at = Utc::now().to_rfc3339();
+        artifact::write_json(store.slice_path("slice-001"), &closed)?;
+        write_publication_reports(&store, "run-1", &["slice-001"])?;
+        let manifest =
+            store.completion_publication_manifest("run-1", &["slice-001".to_string()])?;
+        let receipt = store.commit_completion_publication("run-1", "main", &manifest)?;
+
+        std::fs::write(
+            repo.path().join("unrelated-after-publication.txt"),
+            "advance\n",
+        )?;
+        gitutil::commit_all(repo.path(), "unrelated branch advance")?;
+        let advanced_head = gitutil::head_sha(repo.path())?;
+        assert_ne!(advanced_head, receipt.commit_sha);
+
+        let err_without_event = existing_completion_publication(
+            &store,
+            "run-1",
+            "main",
+            &["slice-001".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err_without_event
+                .to_string()
+                .contains("advanced beyond completion publication")
+        );
+        assert!(err_without_event.to_string().contains(&receipt.commit_sha));
+        assert!(err_without_event.to_string().contains(&advanced_head));
+
+        let err_with_event = existing_completion_publication(
+            &store,
+            "run-1",
+            "main",
+            &["slice-001".to_string()],
+            Some(&receipt.commit_sha),
+        )
+        .unwrap_err();
+        assert!(err_with_event.to_string().contains("moved from recorded"));
+        assert!(err_with_event.to_string().contains(&receipt.commit_sha));
+        assert!(err_with_event.to_string().contains(&advanced_head));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_publication_recovery_blocks_dirty_or_missing_manifest_without_event() -> Result<()>
+    {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        gitutil::commit_all(repo.path(), "initial")?;
+
+        let mut closed = slice("slice-001");
+        closed.status = crate::domain::SLICE_STATUS_CLOSED.to_string();
+        closed.closed_by_run = "run-1".to_string();
+        closed.closed_at = Utc::now().to_rfc3339();
+        artifact::write_json(store.slice_path("slice-001"), &closed)?;
+        write_publication_reports(&store, "run-1", &["slice-001"])?;
+        let manifest =
+            store.completion_publication_manifest("run-1", &["slice-001".to_string()])?;
+        let receipt = store.commit_completion_publication("run-1", "main", &manifest)?;
+        let final_report = store.final_report_artifact_path("run-1");
+        let published_report = std::fs::read(&final_report)?;
+
+        std::fs::write(&final_report, "operator edit\n")?;
+        let dirty_err = existing_completion_publication(
+            &store,
+            "run-1",
+            "main",
+            &["slice-001".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{dirty_err:#}").contains("same pinned summary bytes"),
+            "{dirty_err:#}"
+        );
+        assert_eq!(gitutil::head_sha(repo.path())?, receipt.commit_sha);
+
+        std::fs::write(&final_report, published_report)?;
+        std::fs::remove_file(&final_report)?;
+        let missing_err = existing_completion_publication(
+            &store,
+            "run-1",
+            "main",
+            &["slice-001".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{missing_err:#}").contains("current manifest could not be captured"),
+            "{missing_err:#}"
+        );
+        assert_eq!(gitutil::head_sha(repo.path())?, receipt.commit_sha);
+        Ok(())
+    }
+
+    #[test]
     fn resume_after_completion_publication_is_idempotent() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -10511,7 +11005,12 @@ mod tests {
         })?;
 
         let completed = wait_for_run(&state, &run.id)?;
-        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(
+            completed.status,
+            RunStatus::Completed,
+            "{}",
+            completed.error
+        );
         let preflight_path = store.output_path(&run.id, "preflight.json");
         let mut legacy_preflight: serde_json::Value = artifact::read_json(&preflight_path)?;
         let legacy_object = legacy_preflight
@@ -10535,6 +11034,11 @@ mod tests {
                 .count(),
             1
         );
+        let deleted = rusqlite::Connection::open(home.path().join("state.sqlite"))?.execute(
+            "DELETE FROM events WHERE run_id = ?1 AND type = 'completion_publication_committed'",
+            [&run.id],
+        )?;
+        assert_eq!(deleted, 1, "fixture removes the post-commit receipt event");
 
         state.update_run(&run.id, RunStatus::Running, "")?;
         state.update_slice_status(&run.id, "slice-001", SliceStatus::Running, "")?;
@@ -10636,6 +11140,15 @@ mod tests {
             .find(|event| event.typ == "run_resumed")
             .expect("run_resumed event");
         assert_eq!(resumed_event.payload["native_pi_tui_worker"], true);
+        let reconciled_receipts = events
+            .iter()
+            .filter(|event| event.typ == "completion_publication_committed")
+            .collect::<Vec<_>>();
+        assert_eq!(reconciled_receipts.len(), 1);
+        assert_eq!(
+            reconciled_receipts[0].payload["commit_sha"].as_str(),
+            Some(head_after.as_str())
+        );
         assert_eq!(resumed_event.payload["experimental_pi_tui_worker"], true);
         let summary: ImplementationSummary =
             artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
@@ -10670,6 +11183,116 @@ mod tests {
         let implementation_summary: ImplementationSummary =
             artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
         assert_eq!(implementation_summary.worker_questions.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_cleanup_preserves_retained_publication_recovery_journal() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-retained-publication-journal".to_string();
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let integration_branch = format!("khazad/{run_id}/integration");
+        gitutil::run(repo.path(), &["branch", &integration_branch, &base_sha])?;
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id: repo_id.clone(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Failed,
+            base_branch: "master".to_string(),
+            base_sha,
+            integration_branch: integration_branch.clone(),
+            selected_slice_id: "slice-001".to_string(),
+            error: "publication failed".to_string(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        let integration = paths
+            .repo_worktree_dir(&repo_id, &run_id)
+            .join("integration");
+        fs::create_dir_all(integration.parent().unwrap())?;
+        gitutil::worktree_add_existing(repo.path(), &integration, &integration_branch)?;
+        gitutil::retain_test_completion_publication_journal(&integration)?;
+
+        let manager = Manager::with_runner(paths, state, Arc::new(FakeRunner));
+        let err = manager.cleanup_run_worktrees(&run).unwrap_err();
+
+        assert!(err.to_string().contains("recovery journal"), "{err:#}");
+        assert!(integration.is_dir());
+        assert!(gitutil::has_retained_completion_publication_journal(
+            &integration
+        )?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cleanup_and_resume_preserve_process_loss_publication_journal() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-process-loss-publication-journal".to_string();
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let integration_branch = format!("khazad/{run_id}/integration");
+        gitutil::run(repo.path(), &["branch", &integration_branch, &base_sha])?;
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id: repo_id.clone(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Failed,
+            base_branch: "master".to_string(),
+            base_sha,
+            integration_branch: integration_branch.clone(),
+            selected_slice_id: "slice-001".to_string(),
+            error: "daemon exited during publication".to_string(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        let integration = paths
+            .repo_worktree_dir(&repo_id, &run_id)
+            .join("integration");
+        fs::create_dir_all(integration.parent().unwrap())?;
+        gitutil::worktree_add_existing(repo.path(), &integration, &integration_branch)?;
+        let mut former_owner = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()?;
+        let dead_owner_pid = former_owner.id();
+        assert!(former_owner.wait()?.success());
+        gitutil::retain_test_process_loss_completion_publication_journal(
+            &integration,
+            dead_owner_pid,
+        )?;
+
+        let manager = Manager::with_runner(paths, state, Arc::new(FakeRunner));
+        let cleanup_err = manager.cleanup_run_worktrees(&run).unwrap_err();
+        assert!(
+            cleanup_err.to_string().contains("recovery journal"),
+            "{cleanup_err:#}"
+        );
+        assert!(integration.is_dir());
+
+        manager.prepare_resume_worktrees(&run)?;
+        assert!(integration.is_dir());
+        assert!(gitutil::has_retained_completion_publication_journal(
+            &integration
+        )?);
         Ok(())
     }
 
@@ -10940,6 +11563,56 @@ mod tests {
         assert_eq!(setup_commands.len(), 3);
         assert!(setup_commands.iter().all(|command| !command.cache_hit));
         Ok(())
+    }
+
+    #[test]
+    fn verification_precommand_change_blocks_slice_retry_and_integration_repair() {
+        let failure_kind = "verification_precommand_changed".to_string();
+        let check = CheckResult {
+            slice_id: "slice-001".to_string(),
+            status: "failed".to_string(),
+            summary: "workspace changed before verification command".to_string(),
+            tests_run: Vec::new(),
+            verification_commands: Vec::new(),
+            findings: Vec::new(),
+            attempt: 1,
+            worker_head: String::new(),
+            worktree_ok: false,
+            commit_found: true,
+            verification_cancelled: false,
+            failure_kind: failure_kind.clone(),
+        };
+        assert!(check_failure_needs_operator(&check));
+        assert_eq!(
+            worker_attempt_retry_disposition(1, &check),
+            "operator_intervention_required"
+        );
+
+        let gate = GateResult {
+            status: "failed".to_string(),
+            summary: "workspace changed before integration verification".to_string(),
+            verification_cancelled: false,
+            failure_kind: String::new(),
+            verification_workspace: None,
+            commands: vec![GateCommandResult {
+                command: "cargo test".to_string(),
+                status: "failed".to_string(),
+                exit_code: None,
+                output: "command was not started".to_string(),
+                cwd: ".".to_string(),
+                dedupe_key: String::new(),
+                duration_ms: 0,
+                cache_hit: false,
+                skip_reason: String::new(),
+                failure_kind,
+                verification_workspace: None,
+            }],
+            findings: Vec::new(),
+            approved_workspace: None,
+            publication_identity: Vec::new(),
+        };
+        assert!(!should_run_integration_repair(RepairPolicy::Auto, &gate));
+        assert!(!should_run_integration_repair(RepairPolicy::Always, &gate));
     }
 
     #[test]
@@ -11246,7 +11919,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_workflow_slices_do_not_fail_successful_finalization() -> Result<()> {
+    fn missing_slice_close_record_blocks_completion_publication() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
         let store = ArtifactStore::new(repo.path());
@@ -11276,15 +11949,23 @@ mod tests {
             mission_envelope: None,
         })?;
 
-        let completed = wait_for_run(&state, &run.id)?;
-        assert_eq!(completed.status, RunStatus::Completed);
-        let summary: ImplementationSummary =
-            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
-        assert_eq!(summary.completed_slices.len(), 1);
+        let failed = wait_for_run(&state, &run.id)?;
+        assert_eq!(failed.status, RunStatus::Blocked);
+        assert!(
+            failed.error.contains("slice closure failed"),
+            "unexpected failure: {}",
+            failed.error
+        );
+        assert!(
+            store
+                .find_completion_publication(&run.id, "main", &["slice-001".to_string()])?
+                .is_none(),
+            "completion publication was created without the required close record"
+        );
         let events = state.get_events(&run.id, 100)?;
         assert!(events.iter().any(|event| {
             event.typ == "run_incident"
-                && event.payload["kind"].as_str() == Some("slice_close_skipped")
+                && event.payload["kind"].as_str() == Some("slice_close_missing")
         }));
         Ok(())
     }
@@ -11888,6 +12569,25 @@ mod tests {
             .into_iter()
             .find(|record| record.terminal_status == status)
             .ok_or_else(|| anyhow::anyhow!("missing terminal notification for {status}"))
+    }
+
+    fn wait_for_event(
+        state: &StateStore,
+        run_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<crate::domain::Event>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = state.get_events(run_id, 100)?;
+            if events.iter().any(|event| event.typ == event_type) {
+                return Ok(events);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run {run_id} did not record event {event_type:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn wait_for_run(state: &StateStore, run_id: &str) -> Result<crate::domain::Run> {
