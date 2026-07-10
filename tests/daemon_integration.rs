@@ -2,16 +2,39 @@ mod daemon;
 
 use serde_json::{Value, json};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+#[test]
+fn atomic_json_writer_child_replaces_complete_artifact() -> TestResult {
+    let bin = binary_path();
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("run-summary.json");
+    fs::write(&path, b"{\"version\":\"old\"}\n")?;
+    let mut child = Command::new(&bin)
+        .arg("__khazad_atomic_json_write_v1")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("atomic JSON writer stdin")
+        .write_all(b"{\"version\":\"new\"}\n")?;
+    let status = child.wait()?;
+    assert!(status.success());
+    let replaced: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    assert_eq!(replaced["version"], "new");
+    Ok(())
+}
 
 #[test]
 fn roadmap_truth_lint_rejects_done_status_without_closed_slice_evidence() -> TestResult {

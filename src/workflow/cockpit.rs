@@ -40,7 +40,7 @@ pub(crate) struct CockpitRunRequest {
 
 impl CockpitRunRequest {
     pub fn for_run(run: &Run, khazad_home: &Path) -> Self {
-        let binary = khazad_child_binary();
+        let binary = crate::paths::khazad_child_binary();
         let binary = shell_quote(&binary.to_string_lossy());
         let run_id = shell_quote(&run.id);
         Self {
@@ -461,7 +461,7 @@ impl CockpitUnavailable {
 
 #[allow(dead_code)]
 pub(crate) fn gate_activity_pane_command(run_id: &str) -> String {
-    let binary = khazad_child_binary();
+    let binary = crate::paths::khazad_child_binary();
     let painter_command = format!(
         "{} cockpit paint-gate-activity --run {} --interval-ms 1000",
         shell_quote(&binary.to_string_lossy()),
@@ -479,7 +479,7 @@ pub(crate) fn worker_activity_pane_command(
     status_path: &Path,
     exit_path: &Path,
 ) -> String {
-    let binary = khazad_child_binary();
+    let binary = crate::paths::khazad_child_binary();
     let painter_command = format!(
         "{} cockpit paint-worker-activity --stdout {} --status {} --exit {}",
         shell_quote(&binary.to_string_lossy()),
@@ -2159,43 +2159,16 @@ fn is_text_file_busy(err: &std::io::Error) -> bool {
     }
 }
 
-fn khazad_child_binary() -> PathBuf {
-    reusable_khazad_binary(std::env::current_exe().ok().as_deref())
-        .unwrap_or_else(|| PathBuf::from("khazad-doom"))
-}
-
-fn reusable_khazad_binary(current_exe: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = current_exe {
-        if is_executable(path) {
-            return Some(path.to_path_buf());
-        }
-        if let Some(stripped) = strip_linux_deleted_exe_suffix(path)
-            && is_executable(&stripped)
-        {
-            return Some(stripped);
-        }
-    }
-    find_executable_in_path("khazad-doom")
-}
-
-fn strip_linux_deleted_exe_suffix(path: &Path) -> Option<PathBuf> {
-    path.to_string_lossy()
-        .strip_suffix(" (deleted)")
-        .map(PathBuf::from)
-}
-
 fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     let name = OsStr::new(name);
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
 }
 
 fn display_args(args: &[String]) -> String {
@@ -3360,17 +3333,6 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
         assert!(command.contains("/tmp/kd.exit.json"));
         assert!(command.contains("wait \"$khazad_wrapper_pid\""));
         assert!(command.contains("wrapper artifacts remain authoritative"));
-    }
-
-    #[test]
-    fn reusable_binary_strips_linux_deleted_current_exe_suffix() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let installed = temp.path().join("khazad-doom");
-        fs::write(&installed, b"fake khazad")?;
-        let deleted = PathBuf::from(format!("{} (deleted)", installed.display()));
-
-        assert_eq!(reusable_khazad_binary(Some(&deleted)), Some(installed));
-        Ok(())
     }
 
     #[test]

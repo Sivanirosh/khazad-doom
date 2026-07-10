@@ -8,9 +8,13 @@
   ],
   "areas": [
     "src/artifact.rs",
+    "src/agent.rs",
+    "src/main.rs",
+    "src/paths.rs",
     "src/state.rs",
     "src/domain.rs",
     "src/workflow/manager.rs",
+    "src/workflow/economics.rs",
     "src/workflow/read_model.rs",
     "src/workflow/events.rs",
     "tests/daemon_integration.rs",

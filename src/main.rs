@@ -14,7 +14,8 @@ mod workflow;
 fn main() {
     let mut args = std::env::args();
     let _executable = args.next();
-    if args.next().as_deref() == Some(workflow::COMMAND_SUPERVISOR_ARG) {
+    let internal_command = args.next();
+    if internal_command.as_deref() == Some(workflow::COMMAND_SUPERVISOR_ARG) {
         let result_fd = args.next().and_then(|value| value.parse::<i32>().ok());
         let command = args.next();
         let (Some(result_fd), Some(command)) = (result_fd, command) else {
@@ -44,6 +45,18 @@ fn main() {
                 std::process::exit(125);
             }
         }
+    }
+    if internal_command.as_deref() == Some(artifact::ATOMIC_JSON_WRITER_ARG) {
+        let path = args.next();
+        if path.is_none() || args.next().is_some() {
+            eprintln!("khazad-doom: atomic JSON writer requires exactly one destination path");
+            std::process::exit(125);
+        }
+        if let Err(err) = artifact::write_json_from_stdin(path.expect("checked destination path")) {
+            eprintln!("khazad-doom: atomic JSON replacement failed: {err:#}");
+            std::process::exit(125);
+        }
+        return;
     }
     if let Err(err) = cli::run(std::env::args().skip(1)) {
         eprintln!("khazad-doom: {err:#}");

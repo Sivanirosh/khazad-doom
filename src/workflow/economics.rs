@@ -1,10 +1,10 @@
 use crate::agent::{RunnerMetadata, Usage};
+use crate::artifact;
 use crate::domain::{
     AgentCallEconomics, CommandExecutionEconomics, DuplicateCommandEconomics, PhaseDuration,
     RunEconomics,
 };
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,15 +125,11 @@ impl RunEconomicsRecorder {
         let Some(path) = path_guard.as_ref() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(snapshot) {
-            let tmp_path = path.with_extension("json.tmp");
-            if fs::write(&tmp_path, bytes).is_ok() {
-                let _ = fs::rename(tmp_path, path);
-            }
-        }
+        // This is a live, non-authoritative telemetry projection: terminal truth
+        // remains in SQLite and final reports. It is still written through the
+        // shared replacement seam so a reader observes either a complete prior
+        // snapshot or a complete newer snapshot, never a truncated JSON file.
+        let _ = artifact::write_json(path, snapshot);
     }
 }
 
@@ -235,5 +231,29 @@ fn refresh_command_counts(economics: &mut RunEconomics) {
         economics
             .sla_violations
             .push("duplicate daemon command executions detected".to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunEconomicsRecorder;
+    use crate::artifact;
+    use crate::domain::RunEconomics;
+
+    #[test]
+    fn live_snapshot_uses_complete_json_artifact_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("outputs/economics.json");
+        let recorder =
+            RunEconomicsRecorder::new("auto", true, 2, 1).with_snapshot_path(path.clone());
+
+        let snapshot: RunEconomics = artifact::read_json(&path).unwrap();
+        assert_eq!(snapshot.repair_policy, "auto");
+        assert!(snapshot.gate_fail_fast);
+
+        let phase = recorder.start_phase("worker_dispatch");
+        phase.finish();
+        let updated: RunEconomics = artifact::read_json(&path).unwrap();
+        assert!(updated.phase_durations.contains_key("worker_dispatch"));
     }
 }

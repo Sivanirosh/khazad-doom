@@ -34,6 +34,8 @@ Standing rejections:
 - No hidden global workflow timeout exists by default. A run continues until it reaches a terminal state, is cancelled, or is marked interrupted/recovered by daemon startup logic.
 - Time limits are explicit policy knobs for specific work: verification/gate command timeouts and, when configured, per-worker-attempt timeouts.
 - The daemon owns worker prompts, state, worktrees, scheduling, repair, integration gates, cleanup, progress snapshots, status/monitor output, handoff JSON, and artifact inspection.
+- Authoritative JSON artifacts are crash-durable only on Unix runtimes. Every replacement uses a same-directory create-new temporary file, complete write plus file synchronization, atomic rename, and parent-directory synchronization; a failure before rename preserves the old complete JSON, while a failure after rename reports uncertain durability with the new complete JSON still readable. Non-Unix runtimes fail closed before an authoritative JSON write rather than silently providing a weaker guarantee. The private legacy-wrapper `status.json` and `exit.json` coordination records invoke this same seam through the daemon binary rather than using shell redirection, so supervision reads only complete snapshots.
+- Live `economics.json` is a non-authoritative telemetry projection: SQLite lifecycle state and final reports remain authoritative, and a telemetry write failure cannot change a run outcome. Its successful replacements nevertheless use the same JSON seam, so status/read-model consumers never observe truncated telemetry JSON.
 
 ## Slice lifecycle and integration
 
@@ -75,8 +77,9 @@ Standing rejections:
 ## Cancellation, interruption, and resume
 
 - `cancel` requests cancellation through daemon state and worker process signalling; it is an explicit operator action, not a side effect of closing a monitor, status follower, or CLI session.
-- Before a completed, blocked, failed, cancelled, or interrupted run is advertised, the daemon transactionally interrupts every still-pending worker question, deactivates its active slice attempt, and projects the terminal phase for the run summary. A resumed attempt never reactivates an old question or its deadline, even if the numeric attempt is reused.
-- If the daemon starts and discovers active runs from a previous process, it marks them `interrupted`, records recovery events, and cleans daemon-managed worktrees where possible.
+- Terminalization is a daemon-owned recoverable protocol: a first-commit-wins durable intent transaction interrupts every still-pending worker question, deactivates active slice attempts, and projects terminal progress; the daemon then atomically replaces `run-summary.json`; one SQLite transaction publishes matching `runs.status`/primary error plus its canonical terminal event; only then does it perform notification bookkeeping and worktree cleanup. A mandatory intent, summary, status, or terminal-event failure leaves the public run nonterminal with the exact durable intent for recovery. Unstarted `pending` slice rows are planned work rather than active attempts and remain pending so an explicit resume can distinguish and schedule them; a resumed attempt never reactivates an old question or its deadline, even if the numeric attempt is reused.
+- If daemon startup or explicit resume encounters an incomplete terminal transition, it reconciles that exact daemon-owned intent before considering interruption or new work. It never infers an outcome from renderer, pane, or summary output; canonical terminal events, notification bookkeeping, and cleanup claims are idempotent. Cleanup or visibility failures are non-authoritative incidents and never replace the primary terminal reason.
+- If the daemon starts and discovers an active run with no durable terminal intent from a previous process, it first records an `interrupted` intent and then runs the same terminalization protocol.
 - `resume` is explicit. It uses durable checkpoint/run state for remaining work and never claims to resurrect a lost worker process.
 
 ## Verification and gates

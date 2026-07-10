@@ -32,6 +32,46 @@ pub struct WorkerQuestionAnswerTransition {
     pub applied: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalTransition {
+    pub status: RunStatus,
+    pub error: String,
+    pub progress_message: String,
+    pub question_interruption_reason: String,
+    pub summary_written: bool,
+    pub committed: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTransitionFaultStage {
+    BeforeTerminalEvent,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_TRANSITION_FAULT: std::cell::RefCell<Option<TerminalTransitionFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_terminal_transition_fault(stage: TerminalTransitionFaultStage) {
+    TERMINAL_TRANSITION_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_terminal_transition_fault(stage: TerminalTransitionFaultStage) -> bool {
+    TERMINAL_TRANSITION_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProgressScope {
     phase: String,
@@ -162,6 +202,19 @@ impl Store {
                 type TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS terminal_transitions (
+                run_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                progress_message TEXT NOT NULL DEFAULT '',
+                question_interruption_reason TEXT NOT NULL DEFAULT '',
+                intended_at TEXT NOT NULL,
+                summary_written_at TEXT NOT NULL DEFAULT '',
+                committed_at TEXT NOT NULL DEFAULT '',
+                notification_bookkept_at TEXT NOT NULL DEFAULT '',
+                cleanup_started_at TEXT NOT NULL DEFAULT '',
+                cleanup_completed_at TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS run_progress (
                 run_id TEXT PRIMARY KEY,
@@ -340,6 +393,24 @@ impl Store {
             "frontier_classification_json",
             "frontier_classification_json TEXT NOT NULL DEFAULT ''",
         )?;
+        ensure_column(
+            &conn,
+            "terminal_transitions",
+            "notification_bookkept_at",
+            "notification_bookkept_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "terminal_transitions",
+            "cleanup_started_at",
+            "cleanup_started_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "terminal_transitions",
+            "cleanup_completed_at",
+            "cleanup_completed_at TEXT NOT NULL DEFAULT ''",
+        )?;
         Ok(())
     }
 
@@ -435,6 +506,7 @@ impl Store {
         Ok((mission_envelope, frontier_budget))
     }
 
+    #[cfg(test)]
     pub fn update_run(&self, run_id: &str, status: RunStatus, error: &str) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -466,13 +538,61 @@ impl Store {
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("run {run_id:?} not found"))?;
         let current_status = RunStatus::parse(&current_status)?;
-        if !matches!(current_status, RunStatus::Pending | RunStatus::Running)
-            && current_status != status
-        {
+        let existing_intent = tx
+            .query_row(
+                r#"SELECT status, error, progress_message, question_interruption_reason,
+                          summary_written_at, committed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                terminal_transition_tuple_from_row,
+            )
+            .optional()?
+            .map(terminal_transition_from_tuple)
+            .transpose()?;
+        if let Some(existing_intent) = existing_intent {
+            if existing_intent.status != status
+                || existing_intent.error != error
+                || existing_intent.progress_message != progress_message
+                || existing_intent.question_interruption_reason != question_interruption_reason
+            {
+                anyhow::bail!(
+                    "run {run_id:?} already has durable terminal intent {} and cannot be changed to {status}",
+                    existing_intent.status
+                );
+            }
+            tx.commit()?;
+            return Ok(0);
+        }
+        if !matches!(current_status, RunStatus::Pending | RunStatus::Running) {
             anyhow::bail!(
-                "run {run_id:?} is already {current_status}; cannot transition it to {status}"
+                "run {run_id:?} is already {current_status}; cannot prepare terminal transition to {status}"
             );
         }
+
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            r#"INSERT INTO terminal_transitions
+               (run_id, status, error, progress_message, question_interruption_reason, intended_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+            params![
+                run_id,
+                status.as_str(),
+                error,
+                progress_message,
+                question_interruption_reason,
+                now,
+            ],
+        )?;
+        let intent_payload = serde_json::to_string(&serde_json::json!({
+            "status": status,
+            "error": error,
+            "progress_message": progress_message,
+            "question_interruption_reason": question_interruption_reason,
+        }))?;
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'terminal_transition_intended', ?2, ?3)",
+            params![run_id, intent_payload, now],
+        )?;
 
         let pending_questions = {
             let mut stmt = tx.prepare(
@@ -490,7 +610,6 @@ impl Store {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let now = Utc::now().to_rfc3339();
         let interrupted = tx.execute(
             r#"UPDATE worker_questions
                SET state='interrupted', answered_at=?1, answer=?2, answer_source=''
@@ -525,7 +644,8 @@ impl Store {
         tx.execute(
             r#"UPDATE slice_runs
                SET status=?1, last_error=?2
-               WHERE run_id=?3 AND status IN ('running', 'repair_needed')"#,
+               WHERE run_id=?3
+                 AND status IN ('running', 'repair_needed', 'ready_to_merge')"#,
             params![interrupted_slice_status.as_str(), slice_error, run_id],
         )?;
         tx.execute(
@@ -559,6 +679,343 @@ impl Store {
         tx.commit()?;
         debug_assert_eq!(interrupted, pending_questions.len());
         Ok(interrupted)
+    }
+
+    pub(crate) fn terminal_transition(&self, run_id: &str) -> Result<Option<TerminalTransition>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                r#"SELECT status, error, progress_message, question_interruption_reason,
+                          summary_written_at, committed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                terminal_transition_tuple_from_row,
+            )
+            .optional()?;
+        row.map(terminal_transition_from_tuple).transpose()
+    }
+
+    pub(crate) fn mark_terminal_summary_written<T: Serialize>(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        event_payload: &T,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transition = tx
+            .query_row(
+                r#"SELECT status, error, progress_message, question_interruption_reason,
+                          summary_written_at, committed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                terminal_transition_tuple_from_row,
+            )
+            .optional()?
+            .map(terminal_transition_from_tuple)
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} has no durable terminal intent"))?;
+        if transition.summary_written {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if transition.committed {
+            anyhow::bail!(
+                "run {run_id:?} has committed terminal state without a durable terminal summary marker"
+            );
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE terminal_transitions SET summary_written_at=?1 WHERE run_id=?2",
+            params![now, run_id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                run_id,
+                event_type,
+                serde_json::to_string(event_payload)?,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn commit_terminal_transition<T: Serialize>(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        event_payload: &T,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transition = tx
+            .query_row(
+                r#"SELECT status, error, progress_message, question_interruption_reason,
+                          summary_written_at, committed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                terminal_transition_tuple_from_row,
+            )
+            .optional()?
+            .map(terminal_transition_from_tuple)
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} has no durable terminal intent"))?;
+        if !transition.summary_written {
+            anyhow::bail!(
+                "run {run_id:?} cannot publish terminal state before its terminal summary is durable"
+            );
+        }
+        let (current_status, current_error) = tx
+            .query_row(
+                "SELECT status, error FROM runs WHERE id=?1",
+                params![run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} not found"))?;
+        let current_status = RunStatus::parse(&current_status)?;
+        if transition.committed {
+            if current_status != transition.status || current_error != transition.error {
+                anyhow::bail!(
+                    "run {run_id:?} has committed terminal intent {} but inconsistent public state {}",
+                    transition.status,
+                    current_status
+                );
+            }
+            tx.commit()?;
+            return Ok(false);
+        }
+        if !matches!(current_status, RunStatus::Pending | RunStatus::Running) {
+            anyhow::bail!(
+                "run {run_id:?} is already {current_status}; cannot publish terminal state {}",
+                transition.status
+            );
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE runs SET status=?1, error=?2, updated_at=?3 WHERE id=?4",
+            params![transition.status.as_str(), transition.error, now, run_id],
+        )?;
+        #[cfg(test)]
+        if take_terminal_transition_fault(TerminalTransitionFaultStage::BeforeTerminalEvent) {
+            anyhow::bail!("injected terminal state/event commit failure");
+        }
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                run_id,
+                event_type,
+                serde_json::to_string(event_payload)?,
+                now
+            ],
+        )?;
+        tx.execute(
+            "UPDATE terminal_transitions SET committed_at=?1 WHERE run_id=?2",
+            params![now, run_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn reopen_run_for_resume(&self, run_id: &str) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transition = tx
+            .query_row(
+                r#"SELECT status, error, progress_message, question_interruption_reason,
+                          summary_written_at, committed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                terminal_transition_tuple_from_row,
+            )
+            .optional()?
+            .map(terminal_transition_from_tuple)
+            .transpose()?;
+        if transition
+            .as_ref()
+            .is_some_and(|transition| !transition.committed)
+        {
+            anyhow::bail!(
+                "run {run_id:?} has an incomplete terminalization; reconcile it before resuming"
+            );
+        }
+        let changed = tx.execute(
+            "UPDATE runs SET status=?1, error='', updated_at=?2 WHERE id=?3",
+            params![RunStatus::Running.as_str(), Utc::now().to_rfc3339(), run_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("run {run_id:?} disappeared while reopening for resume");
+        }
+        tx.execute(
+            "DELETE FROM terminal_transitions WHERE run_id=?1",
+            params![run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn terminal_transition_needs_reconciliation(&self, run_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                r#"SELECT committed_at, notification_bookkept_at, cleanup_started_at,
+                          cleanup_completed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.is_some_and(
+            |(committed_at, notification_bookkept_at, cleanup_started_at, cleanup_completed_at)| {
+                committed_at.trim().is_empty()
+                    || notification_bookkept_at.trim().is_empty()
+                    || (cleanup_started_at.trim().is_empty()
+                        && cleanup_completed_at.trim().is_empty())
+            },
+        ))
+    }
+
+    pub(crate) fn terminal_transition_run_ids_needing_reconciliation(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id
+               FROM terminal_transitions
+               WHERE committed_at=''
+                  OR notification_bookkept_at=''
+                  OR (cleanup_started_at='' AND cleanup_completed_at='')
+               ORDER BY intended_at ASC, run_id ASC"#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut run_ids = Vec::new();
+        for row in rows {
+            run_ids.push(row?);
+        }
+        Ok(run_ids)
+    }
+
+    pub(crate) fn terminal_notification_bookkept(&self, run_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT notification_bookkept_at FROM terminal_transitions WHERE run_id=?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|bookkept_at| !bookkept_at.trim().is_empty()))
+    }
+
+    pub(crate) fn mark_terminal_notification_bookkept(&self, run_id: &str) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (committed_at, notification_bookkept_at): (String, String) = tx
+            .query_row(
+                "SELECT committed_at, notification_bookkept_at FROM terminal_transitions WHERE run_id=?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} has no durable terminal intent"))?;
+        if committed_at.trim().is_empty() {
+            anyhow::bail!(
+                "run {run_id:?} cannot record terminal notification bookkeeping before terminal state commit"
+            );
+        }
+        if !notification_bookkept_at.trim().is_empty() {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE terminal_transitions SET notification_bookkept_at=?1 WHERE run_id=?2",
+            params![Utc::now().to_rfc3339(), run_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn claim_terminal_cleanup(&self, run_id: &str) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (committed_at, notification_bookkept_at, cleanup_started_at, cleanup_completed_at): (
+            String,
+            String,
+            String,
+            String,
+        ) = tx
+            .query_row(
+                r#"SELECT committed_at, notification_bookkept_at, cleanup_started_at,
+                          cleanup_completed_at
+                   FROM terminal_transitions WHERE run_id=?1"#,
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} has no durable terminal intent"))?;
+        if committed_at.trim().is_empty() || notification_bookkept_at.trim().is_empty() {
+            anyhow::bail!(
+                "run {run_id:?} cannot clean worktrees before terminal state and notification bookkeeping"
+            );
+        }
+        if !cleanup_started_at.trim().is_empty() || !cleanup_completed_at.trim().is_empty() {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE terminal_transitions SET cleanup_started_at=?1 WHERE run_id=?2",
+            params![Utc::now().to_rfc3339(), run_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn mark_terminal_cleanup_completed<T: Serialize>(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        event_payload: &T,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (cleanup_started_at, cleanup_completed_at): (String, String) = tx
+            .query_row(
+                "SELECT cleanup_started_at, cleanup_completed_at FROM terminal_transitions WHERE run_id=?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("run {run_id:?} has no durable terminal intent"))?;
+        if cleanup_started_at.trim().is_empty() {
+            anyhow::bail!("run {run_id:?} has no durable cleanup claim");
+        }
+        if !cleanup_completed_at.trim().is_empty() {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE terminal_transitions SET cleanup_completed_at=?1 WHERE run_id=?2",
+            params![now, run_id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                run_id,
+                event_type,
+                serde_json::to_string(event_payload)?,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn upsert_slice_run(&self, slice_run: &SliceRun) -> Result<()> {
@@ -686,26 +1143,6 @@ impl Store {
             )
             .optional()?;
         Ok(pending.is_some())
-    }
-
-    pub fn cancel_active_slice_runs(&self, run_id: &str, reason: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            r#"UPDATE slice_runs SET status=?1, last_error=?2
-               WHERE run_id=?3 AND status IN ('pending', 'running', 'repair_needed')"#,
-            params![SliceStatus::Cancelled.as_str(), reason, run_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn interrupt_active_slice_runs(&self, run_id: &str, reason: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            r#"UPDATE slice_runs SET status=?1, last_error=?2
-               WHERE run_id=?3 AND status IN ('pending', 'running', 'repair_needed', 'ready_to_merge')"#,
-            params![SliceStatus::Interrupted.as_str(), reason, run_id],
-        )?;
-        Ok(())
     }
 
     pub fn record_event<T: Serialize>(&self, run_id: &str, typ: &str, payload: &T) -> Result<()> {
@@ -1896,21 +2333,6 @@ impl Store {
         Ok(events)
     }
 
-    pub fn cancel_running_runs(&self, reason: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE runs SET status=?1, error=?2, updated_at=?3 WHERE status IN (?4, ?5)",
-            params![
-                RunStatus::Cancelled.as_str(),
-                reason,
-                Utc::now().to_rfc3339(),
-                RunStatus::Running.as_str(),
-                RunStatus::Pending.as_str()
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn active_runs(&self) -> Result<Vec<Run>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -2036,6 +2458,7 @@ type RunTuple = (
     String,
     String,
 );
+type TerminalTransitionTuple = (String, String, String, String, String, String);
 
 type SliceRunTuple = (String, String, String, String, String, i64, String);
 type EventTuple = (i64, String, String, String, String);
@@ -2087,6 +2510,19 @@ fn run_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunTuple> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+    ))
+}
+
+fn terminal_transition_tuple_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TerminalTransitionTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
     ))
 }
 
@@ -2180,6 +2616,25 @@ fn run_from_tuple(row: RunTuple) -> Result<Run> {
         error,
         started_at: parse_time("started_at", &started_at)?,
         updated_at: parse_time("updated_at", &updated_at)?,
+    })
+}
+
+fn terminal_transition_from_tuple(row: TerminalTransitionTuple) -> Result<TerminalTransition> {
+    let (
+        status,
+        error,
+        progress_message,
+        question_interruption_reason,
+        summary_written_at,
+        committed_at,
+    ) = row;
+    Ok(TerminalTransition {
+        status: RunStatus::parse(&status)?,
+        error,
+        progress_message,
+        question_interruption_reason,
+        summary_written: !summary_written_at.trim().is_empty(),
+        committed: !committed_at.trim().is_empty(),
     })
 }
 
@@ -3688,6 +4143,15 @@ mod tests {
             attempts: 1,
             last_error: String::new(),
         })?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: "run-terminal-question".to_string(),
+            slice_id: "slice-002".to_string(),
+            status: SliceStatus::Pending,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 0,
+            last_error: String::new(),
+        })?;
         open_active_test_question(
             &store,
             "q-terminal-question",
@@ -3728,6 +4192,24 @@ mod tests {
             .get_progress("run-terminal-question")?
             .expect("terminal progress");
         assert_eq!(progress.phase, "cancelled");
+        let slice_runs = store.get_slice_runs("run-terminal-question")?;
+        assert_eq!(
+            slice_runs
+                .iter()
+                .find(|slice_run| slice_run.slice_id == "slice-001")
+                .expect("active slice")
+                .status,
+            SliceStatus::Cancelled
+        );
+        assert_eq!(
+            slice_runs
+                .iter()
+                .find(|slice_run| slice_run.slice_id == "slice-002")
+                .expect("unstarted slice")
+                .status,
+            SliceStatus::Pending,
+            "terminalization must not erase resumable planned work"
+        );
 
         store.update_progress(
             "run-terminal-question",
@@ -3794,6 +4276,140 @@ mod tests {
                 .get_events("run-terminal-question", 100)?
                 .iter()
                 .all(|event| event.typ != "worker_question_answered")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminalization_intent_is_first_commit_wins_and_idempotent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-terminal-first-commit-wins",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+
+        assert_eq!(
+            store.prepare_run_terminal_transition(
+                "run-terminal-first-commit-wins",
+                RunStatus::Cancelled,
+                "operator cancelled",
+                "operator cancelled",
+                "run cancelled before question answer",
+            )?,
+            0
+        );
+        assert_eq!(
+            store.prepare_run_terminal_transition(
+                "run-terminal-first-commit-wins",
+                RunStatus::Cancelled,
+                "operator cancelled",
+                "operator cancelled",
+                "run cancelled before question answer",
+            )?,
+            0,
+            "an exact retry must not duplicate terminal intent side effects"
+        );
+        let conflict = store.prepare_run_terminal_transition(
+            "run-terminal-first-commit-wins",
+            RunStatus::Failed,
+            "different failure",
+            "different failure",
+            "different interruption reason",
+        );
+        assert!(conflict.is_err());
+        assert_eq!(
+            store
+                .get_events("run-terminal-first-commit-wins", 100)?
+                .iter()
+                .filter(|event| event.typ == "terminal_transition_intended")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_run("run-terminal-first-commit-wins")?
+                .expect("run exists")
+                .status,
+            RunStatus::Running
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminalization_state_and_event_commit_roll_back_together_on_event_failure() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-terminal-transaction",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        store.prepare_run_terminal_transition(
+            "run-terminal-transaction",
+            RunStatus::Failed,
+            "integration gate failed",
+            "integration gate failed",
+            "run failed before question answer",
+        )?;
+        store.mark_terminal_summary_written(
+            "run-terminal-transaction",
+            "terminal_summary_written",
+            &serde_json::json!({"path": "/tmp/run-summary.json"}),
+        )?;
+
+        inject_terminal_transition_fault(TerminalTransitionFaultStage::BeforeTerminalEvent);
+        let failed = store.commit_terminal_transition(
+            "run-terminal-transaction",
+            "run_error",
+            &serde_json::json!({"error": "integration gate failed"}),
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            store
+                .get_run("run-terminal-transaction")?
+                .expect("run remains present")
+                .status,
+            RunStatus::Running
+        );
+        let transition = store
+            .terminal_transition("run-terminal-transaction")?
+            .expect("durable retry intent");
+        assert_eq!(transition.status, RunStatus::Failed);
+        assert_eq!(transition.error, "integration gate failed");
+        assert!(transition.summary_written);
+        assert!(!transition.committed);
+        assert!(
+            store
+                .get_events("run-terminal-transaction", 100)?
+                .iter()
+                .all(|event| event.typ != "run_error")
+        );
+
+        assert!(store.commit_terminal_transition(
+            "run-terminal-transaction",
+            "run_error",
+            &serde_json::json!({"error": "integration gate failed"}),
+        )?);
+        assert_eq!(
+            store
+                .get_run("run-terminal-transaction")?
+                .expect("terminal run")
+                .status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            store
+                .get_events("run-terminal-transaction", 100)?
+                .iter()
+                .filter(|event| event.typ == "run_error")
+                .count(),
+            1
         );
         Ok(())
     }

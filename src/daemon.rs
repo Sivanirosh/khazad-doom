@@ -887,7 +887,8 @@ impl Server {
                 if active > 0 {
                     bail!("cannot stop daemon while {active} run(s) are active");
                 }
-                self.store.cancel_running_runs("daemon stopped")?;
+                self.manager
+                    .terminalize_inactive_runs_for_shutdown("daemon stopped")?;
                 Ok(HandleOutcome {
                     result: json!({ "status": "stopping" }),
                     should_shutdown: true,

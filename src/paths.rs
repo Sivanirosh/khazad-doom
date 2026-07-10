@@ -65,6 +65,60 @@ impl Paths {
     }
 }
 
+/// Finds a reusable Khazad-Doom executable for commands spawned by a long-lived
+/// daemon. Linux reports a replaced running executable as `… (deleted)`;
+/// prefer the replacement at the stripped path, then PATH, instead of handing
+/// that non-executable procfs display path to a child process.
+pub(crate) fn khazad_child_binary() -> PathBuf {
+    reusable_khazad_binary(std::env::current_exe().ok().as_deref())
+        .unwrap_or_else(|| PathBuf::from("khazad-doom"))
+}
+
+pub(crate) fn reusable_khazad_binary(current_exe: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = current_exe {
+        if is_executable(path) {
+            return Some(path.to_path_buf());
+        }
+        if let Some(stripped) = strip_linux_deleted_exe_suffix(path)
+            && is_executable(&stripped)
+        {
+            return Some(stripped);
+        }
+    }
+    find_executable_in_path("khazad-doom")
+}
+
+fn strip_linux_deleted_exe_suffix(path: &Path) -> Option<PathBuf> {
+    path.to_string_lossy()
+        .strip_suffix(" (deleted)")
+        .map(PathBuf::from)
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 pub fn repo_id(abs_path: impl AsRef<Path>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(abs_path.as_ref().to_string_lossy().as_bytes());
@@ -75,6 +129,39 @@ pub fn repo_id(abs_path: impl AsRef<Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reusable_binary_strips_linux_deleted_current_exe_suffix() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let installed = temp.path().join("khazad-doom");
+        std::fs::write(&installed, b"fake khazad")?;
+        let mut permissions = std::fs::metadata(&installed)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&installed, permissions)?;
+        let deleted = PathBuf::from(format!("{} (deleted)", installed.display()));
+
+        assert_eq!(reusable_khazad_binary(Some(&deleted)), Some(installed));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reusable_binary_rejects_non_executable_candidates() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let candidate = temp.path().join("khazad-doom");
+        std::fs::write(&candidate, b"not executable")?;
+        let mut permissions = std::fs::metadata(&candidate)?.permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&candidate, permissions)?;
+
+        assert!(!is_executable(&candidate));
+        Ok(())
+    }
 
     #[test]
     fn ensure_creates_operator_agent_profiles_file() {

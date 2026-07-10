@@ -46,7 +46,9 @@ use crate::domain::{
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
-use crate::state::{ProgressReporter, ProgressScope, Repo, Store as StateStore};
+use crate::state::{
+    ProgressReporter, ProgressScope, Repo, Store as StateStore, TerminalTransition,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rand::RngCore;
@@ -74,6 +76,38 @@ pub const DEFAULT_REPAIR_ATTEMPTS: usize = 1;
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
 const WORKTREE_REMOVE_ATTEMPTS: usize = 3;
 const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalizationFaultStage {
+    SummaryWrite,
+    Notification,
+    Cleanup,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINALIZATION_FAULT: std::cell::RefCell<Option<TerminalizationFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_terminalization_fault(stage: TerminalizationFaultStage) {
+    TERMINALIZATION_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_terminalization_fault(stage: TerminalizationFaultStage) -> bool {
+    TERMINALIZATION_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
 
 fn worker_profile_evidence(runner_name: &str, metadata: &RunnerMetadata) -> WorkerProfileEvidence {
     WorkerProfileEvidence {
@@ -1846,7 +1880,6 @@ impl Manager {
             &workflow_events::RunCancelRequestedPayload::new(reason, active),
         )?;
         if !active && matches!(run.status, RunStatus::Running | RunStatus::Pending) {
-            self.state.cancel_active_slice_runs(run_id, reason)?;
             self.state.prepare_run_terminal_transition(
                 run_id,
                 RunStatus::Cancelled,
@@ -1856,13 +1889,11 @@ impl Manager {
                     "run reached terminal state cancelled before the question was answered: {reason}"
                 ),
             )?;
-            self.state
-                .update_run(run_id, RunStatus::Cancelled, reason)?;
-            self.state.record_event(
-                run_id,
-                workflow_events::RUN_CANCELLED,
-                &workflow_events::RunCancelledPayload::new(reason),
-            )?;
+            let transition = self
+                .state
+                .terminal_transition(run_id)?
+                .ok_or_else(|| anyhow!("run {run_id:?} lost its durable cancellation intent"))?;
+            self.terminalize_or_reconcile(&run, &transition)?;
         }
         Ok(active)
     }
@@ -1872,6 +1903,22 @@ impl Manager {
             .state
             .get_run(&opts.run_id)?
             .ok_or_else(|| anyhow!("run {:?} not found", opts.run_id))?;
+        if self
+            .state
+            .terminal_transition_needs_reconciliation(&run.id)?
+        {
+            let transition = self
+                .state
+                .terminal_transition(&run.id)?
+                .ok_or_else(|| anyhow!("run {:?} lost its durable terminal intent", run.id))?;
+            self.terminalize_or_reconcile(&run, &transition)?;
+            return self.state.get_run(&run.id)?.ok_or_else(|| {
+                anyhow!(
+                    "run {:?} disappeared during terminal reconciliation",
+                    run.id
+                )
+            });
+        }
         if !matches!(
             run.status,
             RunStatus::Interrupted | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Blocked
@@ -1953,7 +2000,7 @@ impl Manager {
                 last_error: String::new(),
             })?;
         }
-        self.state.update_run(&run.id, RunStatus::Running, "")?;
+        self.state.reopen_run_for_resume(&run.id)?;
         let config = store.read_config()?;
         let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
         let native_pi_tui_worker = (opts.native_pi_tui_worker
@@ -2001,28 +2048,70 @@ impl Manager {
             .ok_or_else(|| anyhow!("run {:?} not found after resume", run.id))
     }
 
+    pub fn terminalize_inactive_runs_for_shutdown(&self, reason: &str) -> Result<usize> {
+        let reason = if reason.trim().is_empty() {
+            "daemon stopped"
+        } else {
+            reason
+        };
+        let runs = self.state.active_runs()?;
+        for run in &runs {
+            if let Some(transition) = self.state.terminal_transition(&run.id)? {
+                self.terminalize_or_reconcile(run, &transition)?;
+                continue;
+            }
+            self.state.prepare_run_terminal_transition(
+                &run.id,
+                RunStatus::Cancelled,
+                reason,
+                reason,
+                &format!(
+                    "run reached terminal state cancelled before the question was answered: {reason}"
+                ),
+            )?;
+            let transition = self
+                .state
+                .terminal_transition(&run.id)?
+                .ok_or_else(|| anyhow!("run {:?} lost its durable shutdown intent", run.id))?;
+            self.terminalize_or_reconcile(run, &transition)?;
+        }
+        Ok(runs.len())
+    }
+
     pub fn recover_interrupted_runs(&self) -> Result<usize> {
+        let mut recovered_run_ids = BTreeSet::new();
+        for run_id in self
+            .state
+            .terminal_transition_run_ids_needing_reconciliation()?
+        {
+            let run = self
+                .state
+                .get_run(&run_id)?
+                .ok_or_else(|| anyhow!("terminal transition refers to missing run {run_id:?}"))?;
+            let transition = self
+                .state
+                .terminal_transition(&run_id)?
+                .ok_or_else(|| anyhow!("run {run_id:?} lost its durable terminal intent"))?;
+            self.terminalize_or_reconcile(&run, &transition)?;
+            recovered_run_ids.insert(run_id);
+        }
+
         let runs = self.state.active_runs()?;
         let reason = "daemon restarted before run reached a terminal state";
         for run in &runs {
+            if recovered_run_ids.contains(&run.id) {
+                continue;
+            }
+            if let Some(transition) = self.state.terminal_transition(&run.id)? {
+                self.terminalize_or_reconcile(run, &transition)?;
+                recovered_run_ids.insert(run.id.clone());
+                continue;
+            }
             self.state.record_event(
                 &run.id,
                 "daemon_recovery_started",
                 &json!({ "reason": reason }),
             )?;
-            match self.cleanup_run_worktrees(run) {
-                Ok(()) => self.state.record_event(
-                    &run.id,
-                    "daemon_recovery_worktrees_cleaned",
-                    &json!({ "run_id": run.id }),
-                )?,
-                Err(err) => self.state.record_event(
-                    &run.id,
-                    "daemon_recovery_cleanup_error",
-                    &workflow_events::RunErrorPayload::new(err.to_string()),
-                )?,
-            }
-            self.state.interrupt_active_slice_runs(&run.id, reason)?;
             let interrupted_questions = self.state.prepare_run_terminal_transition(
                 &run.id,
                 RunStatus::Interrupted,
@@ -2030,8 +2119,11 @@ impl Manager {
                 reason,
                 reason,
             )?;
-            self.state
-                .update_run(&run.id, RunStatus::Interrupted, reason)?;
+            let transition = self
+                .state
+                .terminal_transition(&run.id)?
+                .ok_or_else(|| anyhow!("run {:?} lost its durable recovery intent", run.id))?;
+            self.terminalize_or_reconcile(run, &transition)?;
             if interrupted_questions > 0 {
                 self.state.record_event(
                     &run.id,
@@ -2044,8 +2136,9 @@ impl Manager {
                 "daemon_recovery_completed",
                 &json!({ "status": RunStatus::Interrupted, "reason": reason }),
             )?;
+            recovered_run_ids.insert(run.id.clone());
         }
-        Ok(runs.len())
+        Ok(recovered_run_ids.len())
     }
 
     pub fn branch_handoff(
@@ -2304,12 +2397,16 @@ impl Manager {
         })
     }
 
-    fn write_terminal_run_summary(
+    fn write_terminal_run_summary_artifact(
         &self,
         run: &Run,
         status: RunStatus,
         message: &str,
-    ) -> Result<()> {
+    ) -> Result<(serde_json::Value, PathBuf)> {
+        #[cfg(test)]
+        if take_terminalization_fault(TerminalizationFaultStage::SummaryWrite) {
+            bail!("injected terminal summary persistence failure");
+        }
         let store = artifact::Store::new(&run.repo_path);
         store.ensure_run_dirs(&run.id)?;
         let read_model = self.run_read_model(
@@ -2351,24 +2448,192 @@ impl Manager {
         });
         let summary_path = store.output_path(&run.id, "run-summary.json");
         artifact::write_json(&summary_path, &summary)?;
+        Ok((summary, summary_path))
+    }
+
+    fn notify_terminal_transition(
+        &self,
+        run: &Run,
+        status: RunStatus,
+        message: &str,
+        summary: &serde_json::Value,
+        summary_path: &Path,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if take_terminalization_fault(TerminalizationFaultStage::Notification) {
+            bail!("injected terminal notification failure");
+        }
+        let read_model = self.run_read_model(
+            run,
+            RunReadModelOptions::terminal_summary(status, message.to_string()),
+        )?;
+        let details = read_model.details;
+        let attention = OperatorAttention::new(self.state.clone());
+        attention.worker_pane_terminal_rename(WorkerPaneTerminalRename {
+            run,
+            events: &details.events,
+            slice_runs: &details.slice_runs,
+        });
+        attention.terminal_transition_notification(TerminalTransitionNotification {
+            run,
+            status,
+            progress: details.progress.as_ref(),
+            summary,
+            summary_path,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn write_terminal_run_summary(
+        &self,
+        run: &Run,
+        status: RunStatus,
+        message: &str,
+    ) -> Result<()> {
+        let (summary, summary_path) =
+            self.write_terminal_run_summary_artifact(run, status, message)?;
         self.state.record_event(
             &run.id,
             workflow_events::TERMINAL_SUMMARY_WRITTEN,
             &workflow_events::TerminalSummaryWrittenPayload::new(&summary_path),
         )?;
-        let attention = OperatorAttention::new(self.state.clone());
-        attention.worker_pane_terminal_rename(WorkerPaneTerminalRename {
-            run,
-            events: &events,
-            slice_runs: &slice_runs,
-        });
-        attention.terminal_transition_notification(TerminalTransitionNotification {
-            run,
-            status,
-            progress: progress.as_ref(),
-            summary: &summary,
-            summary_path: &summary_path,
-        });
+        self.notify_terminal_transition(run, status, message, &summary, &summary_path)
+    }
+
+    fn terminal_summary_matches_intent(
+        summary: &serde_json::Value,
+        run: &Run,
+        transition: &TerminalTransition,
+    ) -> bool {
+        summary.get("run_id").and_then(serde_json::Value::as_str) == Some(run.id.as_str())
+            && summary.get("status").and_then(serde_json::Value::as_str)
+                == Some(transition.status.as_str())
+            && summary.get("message").and_then(serde_json::Value::as_str)
+                == Some(transition.error.as_str())
+    }
+
+    fn terminalize_or_reconcile(&self, run: &Run, transition: &TerminalTransition) -> Result<()> {
+        let store = artifact::Store::new(&run.repo_path);
+        let summary_path = store.output_path(&run.id, "run-summary.json");
+        let (summary, summary_path) = if transition.summary_written {
+            match artifact::read_json::<serde_json::Value>(&summary_path) {
+                Ok(summary) if Self::terminal_summary_matches_intent(&summary, run, transition) => {
+                    (summary, summary_path)
+                }
+                Ok(_) | Err(_) => self.write_terminal_run_summary_artifact(
+                    run,
+                    transition.status,
+                    &transition.error,
+                )?,
+            }
+        } else {
+            self.write_terminal_run_summary_artifact(run, transition.status, &transition.error)?
+        };
+        if !transition.summary_written {
+            self.state.mark_terminal_summary_written(
+                &run.id,
+                workflow_events::TERMINAL_SUMMARY_WRITTEN,
+                &workflow_events::TerminalSummaryWrittenPayload::new(&summary_path),
+            )?;
+        }
+        match transition.status {
+            RunStatus::Completed => {
+                self.state.commit_terminal_transition(
+                    &run.id,
+                    workflow_events::RUN_COMPLETED,
+                    &workflow_events::RunCompletedPayload::new(&run.id),
+                )?;
+            }
+            RunStatus::Cancelled => {
+                self.state.commit_terminal_transition(
+                    &run.id,
+                    workflow_events::RUN_CANCELLED,
+                    &workflow_events::RunCancelledPayload::new(&transition.error),
+                )?;
+            }
+            RunStatus::Blocked | RunStatus::Failed | RunStatus::Interrupted => {
+                self.state.commit_terminal_transition(
+                    &run.id,
+                    workflow_events::RUN_ERROR,
+                    &workflow_events::RunErrorPayload::new(&transition.error),
+                )?;
+            }
+            RunStatus::Pending | RunStatus::Running => {
+                bail!(
+                    "run {:?} has a non-terminal durable transition {}",
+                    run.id,
+                    transition.status
+                );
+            }
+        }
+        let terminal_run = self
+            .state
+            .get_run(&run.id)?
+            .ok_or_else(|| anyhow!("run {:?} disappeared while terminalizing", run.id))?;
+        if !self.state.terminal_notification_bookkept(&run.id)? {
+            if let Err(err) = self.notify_terminal_transition(
+                &terminal_run,
+                transition.status,
+                &transition.error,
+                &summary,
+                &summary_path,
+            ) {
+                let incident = workflow_events::RunIncidentPayload::warning(
+                    "terminal_notification_bookkeeping_failed",
+                    format!("terminal notification bookkeeping failed: {err:#}"),
+                );
+                if let Err(record_err) =
+                    self.state
+                        .record_event(&run.id, workflow_events::RUN_INCIDENT, &incident)
+                {
+                    eprintln!(
+                        "khazad-doom: could not record non-authoritative terminal notification incident for {}: {record_err:#}",
+                        run.id
+                    );
+                }
+            }
+            self.state.mark_terminal_notification_bookkept(&run.id)?;
+        }
+        if self.state.claim_terminal_cleanup(&run.id)? {
+            #[cfg(test)]
+            if take_terminalization_fault(TerminalizationFaultStage::Cleanup) {
+                let cleanup_error = "injected terminal cleanup failure";
+                self.state.record_event(
+                    &run.id,
+                    "worktree_cleanup_error",
+                    &workflow_events::RunErrorPayload::new(cleanup_error),
+                )?;
+                return Ok(());
+            }
+            match self.cleanup_run_worktrees(&terminal_run) {
+                Ok(()) => {
+                    if let Err(err) = self.state.mark_terminal_cleanup_completed(
+                        &run.id,
+                        workflow_events::WORKTREES_CLEANED,
+                        &workflow_events::RunCompletedPayload::new(&run.id),
+                    ) {
+                        eprintln!(
+                            "khazad-doom: could not record non-authoritative worktree cleanup for {}: {err:#}",
+                            run.id
+                        );
+                    }
+                }
+                Err(err) => {
+                    let cleanup_error = err.to_string();
+                    if let Err(record_err) = self.state.record_event(
+                        &run.id,
+                        "worktree_cleanup_error",
+                        &workflow_events::RunErrorPayload::new(&cleanup_error),
+                    ) {
+                        eprintln!(
+                            "khazad-doom: could not record non-authoritative worktree cleanup failure for {}: {record_err:#}",
+                            run.id
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2418,81 +2683,58 @@ impl Manager {
             worker_token,
             native_pi_tui_worker,
         );
-        let (terminal_status, terminal_message, progress_message) = match &outcome {
-            Ok(_) => {
-                let message = "run completed; handoff artifacts are ready".to_string();
-                let _ = self.state.record_event(
-                    &run.id,
-                    workflow_events::RUN_COMPLETED,
-                    &workflow_events::RunCompletedPayload::new(&run.id),
-                );
-                (RunStatus::Completed, String::new(), message)
-            }
-            Err(err) => {
-                let status = classify_run_failure(err);
-                let raw_message = format!("{err:#}");
-                let message = if status == RunStatus::Cancelled {
-                    latest_cancel_reason(&self.state.get_events(&run.id, 200).unwrap_or_default())
-                        .trim()
-                        .to_string()
-                } else {
-                    String::new()
-                };
-                let message = if message.is_empty() {
-                    raw_message
-                } else {
-                    message
-                };
-                if status == RunStatus::Cancelled {
-                    let _ = self.state.cancel_active_slice_runs(&run.id, &message);
-                    let _ = self.state.record_event(
-                        &run.id,
-                        workflow_events::RUN_CANCELLED,
-                        &workflow_events::RunCancelledPayload::new(&message),
-                    );
-                } else {
-                    let _ = self.state.record_event(
-                        &run.id,
-                        workflow_events::RUN_ERROR,
-                        &workflow_events::RunErrorPayload::new(&message),
-                    );
+        let terminalization = (|| -> Result<()> {
+            let (terminal_status, terminal_message, progress_message) = match &outcome {
+                Ok(_) => (
+                    RunStatus::Completed,
+                    String::new(),
+                    "run completed; handoff artifacts are ready".to_string(),
+                ),
+                Err(err) => {
+                    let status = classify_run_failure(err);
+                    let raw_message = format!("{err:#}");
+                    let cancel_reason = if status == RunStatus::Cancelled {
+                        latest_cancel_reason(&self.state.get_events(&run.id, 200)?)
+                            .trim()
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    let message = if cancel_reason.is_empty() {
+                        raw_message
+                    } else {
+                        cancel_reason
+                    };
+                    (status, message.clone(), message)
                 }
-                (status, message.clone(), message)
-            }
-        };
-        let question_interruption_reason = if terminal_message.is_empty() {
-            format!("run reached terminal state {terminal_status} before the question was answered")
-        } else {
-            format!(
-                "run reached terminal state {terminal_status} before the question was answered: {terminal_message}"
-            )
-        };
-        let _ = self.state.prepare_run_terminal_transition(
-            &run.id,
-            terminal_status,
-            &terminal_message,
-            &progress_message,
-            &question_interruption_reason,
-        );
-        let _ = self.write_terminal_run_summary(&run, terminal_status, &terminal_message);
-        let _ = self
-            .state
-            .update_run(&run.id, terminal_status, &terminal_message);
-        match self.cleanup_run_worktrees(&run) {
-            Ok(()) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    workflow_events::WORKTREES_CLEANED,
-                    &workflow_events::RunCompletedPayload::new(&run.id),
-                );
-            }
-            Err(err) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    "worktree_cleanup_error",
-                    &workflow_events::RunErrorPayload::new(err.to_string()),
-                );
-            }
+            };
+            let question_interruption_reason = if terminal_message.is_empty() {
+                format!(
+                    "run reached terminal state {terminal_status} before the question was answered"
+                )
+            } else {
+                format!(
+                    "run reached terminal state {terminal_status} before the question was answered: {terminal_message}"
+                )
+            };
+            self.state.prepare_run_terminal_transition(
+                &run.id,
+                terminal_status,
+                &terminal_message,
+                &progress_message,
+                &question_interruption_reason,
+            )?;
+            let transition = self
+                .state
+                .terminal_transition(&run.id)?
+                .ok_or_else(|| anyhow!("run {:?} lost its durable terminal intent", run.id))?;
+            self.terminalize_or_reconcile(&run, &transition)
+        })();
+        if let Err(err) = terminalization {
+            eprintln!(
+                "khazad-doom: terminalization for run {} requires recovery: {err:#}",
+                run.id
+            );
         }
     }
 
@@ -9782,6 +10024,334 @@ mod tests {
     }
 
     #[test]
+    fn terminalization_recovery_preserves_prepared_terminal_intent() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-prepared-cancel".to_string();
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id,
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-prepared-cancel/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run_id.clone(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Running,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        state.prepare_run_terminal_transition(
+            &run_id,
+            RunStatus::Cancelled,
+            "operator cancelled before summary publication",
+            "operator cancelled before summary publication",
+            "run cancelled before question answer",
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        manager.recover_interrupted_runs()?;
+
+        let recovered = state.get_run(&run_id)?.expect("run exists");
+        assert_eq!(recovered.status, RunStatus::Cancelled);
+        assert_eq!(
+            state
+                .get_progress(&run_id)?
+                .expect("terminal progress")
+                .phase,
+            "cancelled"
+        );
+        assert!(
+            state
+                .get_events(&run_id, 100)?
+                .iter()
+                .all(|event| event.typ != "daemon_recovery_completed"),
+            "reconciliation must not replace a prepared terminal outcome with restart interruption"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminalization_resume_reconciles_incomplete_intent_before_new_work() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run_id = "kd-resume-terminal-intent".to_string();
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id: crate::paths::repo_id(repo.path()),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-resume-terminal-intent/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        state.prepare_run_terminal_transition(
+            &run_id,
+            RunStatus::Cancelled,
+            "operator cancelled before resume",
+            "operator cancelled before resume",
+            "run cancelled before question answer",
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        let reconciled = manager.resume_run(ResumeOptions {
+            run_id: run_id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+        })?;
+
+        assert_eq!(reconciled.status, RunStatus::Cancelled);
+        assert_eq!(reconciled.error, "operator cancelled before resume");
+        let events = state.get_events(&run_id, 100)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.typ == super::workflow_events::RUN_CANCELLED)
+                .count(),
+            1
+        );
+        assert!(events.iter().all(|event| event.typ != "run_resumed"));
+        assert!(
+            artifact::Store::new(repo.path())
+                .output_path(&run_id, "run-summary.json")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminalization_summary_failure_keeps_intent_retryable_and_nonterminal() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-summary-failure".to_string();
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id: repo_id.clone(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-summary-failure/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        let worktree_root = paths.repo_worktree_dir(&repo_id, &run_id);
+        fs::create_dir_all(&worktree_root)?;
+        fs::write(worktree_root.join("retry-evidence.txt"), "retain me\n")?;
+        state.prepare_run_terminal_transition(
+            &run_id,
+            RunStatus::Failed,
+            "gate persistence failed",
+            "gate persistence failed",
+            "run failed before question answer",
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        super::inject_terminalization_fault(super::TerminalizationFaultStage::SummaryWrite);
+        assert!(manager.recover_interrupted_runs().is_err());
+        let pending = state.get_run(&run_id)?.expect("run persists");
+        assert_eq!(pending.status, RunStatus::Running);
+        assert!(
+            worktree_root.exists(),
+            "cleanup must not run before summary durability"
+        );
+        let transition = state
+            .terminal_transition(&run_id)?
+            .expect("durable retry intent");
+        assert_eq!(transition.status, RunStatus::Failed);
+        assert_eq!(transition.error, "gate persistence failed");
+        assert!(!transition.summary_written);
+        assert!(!transition.committed);
+        assert!(
+            state
+                .get_events(&run_id, 100)?
+                .iter()
+                .all(|event| event.typ != "run_error")
+        );
+
+        assert_eq!(manager.recover_interrupted_runs()?, 1);
+        assert_eq!(
+            state.get_run(&run_id)?.expect("terminal run").status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            state
+                .get_events(&run_id, 100)?
+                .iter()
+                .filter(|event| event.typ == "run_error")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminalization_notification_failure_is_non_authoritative_after_commit() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-notification-failure".to_string();
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id: repo_id.clone(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-notification-failure/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        fs::create_dir_all(paths.repo_worktree_dir(&repo_id, &run_id))?;
+        state.prepare_run_terminal_transition(
+            &run_id,
+            RunStatus::Cancelled,
+            "operator cancelled",
+            "operator cancelled",
+            "run cancelled before question answer",
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        super::inject_terminalization_fault(super::TerminalizationFaultStage::Notification);
+        assert_eq!(manager.recover_interrupted_runs()?, 1);
+
+        let terminal = state.get_run(&run_id)?.expect("terminal run");
+        assert_eq!(terminal.status, RunStatus::Cancelled);
+        assert_eq!(terminal.error, "operator cancelled");
+        assert!(state.terminal_notification_bookkept(&run_id)?);
+        assert!(state.get_events(&run_id, 100)?.iter().any(|event| {
+            event.typ == "run_incident"
+                && event.payload["kind"] == "terminal_notification_bookkeeping_failed"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn terminalization_cleanup_failure_is_non_authoritative_and_not_replayed() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let repo_id = crate::paths::repo_id(repo.path());
+        let run_id = "kd-cleanup-failure".to_string();
+        let now = Utc::now();
+        let run = Run {
+            id: run_id.clone(),
+            repo_id: repo_id.clone(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "master".to_string(),
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/kd-cleanup-failure/integration".to_string(),
+            selected_slice_id: "slice-001".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        let worktree_root = paths.repo_worktree_dir(&repo_id, &run_id);
+        fs::create_dir_all(&worktree_root)?;
+        fs::write(worktree_root.join("must-not-be-cleaned.txt"), "retain me\n")?;
+        state.prepare_run_terminal_transition(
+            &run_id,
+            RunStatus::Failed,
+            "gate failed",
+            "gate failed",
+            "run failed before question answer",
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        super::inject_terminalization_fault(super::TerminalizationFaultStage::Cleanup);
+        assert_eq!(manager.recover_interrupted_runs()?, 1);
+        let terminal = state.get_run(&run_id)?.expect("terminal run");
+        assert_eq!(terminal.status, RunStatus::Failed);
+        assert_eq!(terminal.error, "gate failed");
+        assert!(
+            worktree_root.exists(),
+            "failed cleanup must retain recovery evidence"
+        );
+        assert_eq!(
+            state
+                .get_events(&run_id, 100)?
+                .iter()
+                .filter(|event| event.typ == "worktree_cleanup_error")
+                .count(),
+            1
+        );
+
+        assert_eq!(manager.recover_interrupted_runs()?, 0);
+        assert!(worktree_root.exists());
+        assert_eq!(
+            state
+                .get_events(&run_id, 100)?
+                .iter()
+                .filter(|event| event.typ == "worktree_cleanup_error")
+                .count(),
+            1,
+            "a claimed cleanup must not be replayed after process loss uncertainty"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fake_runner_parallelizes_independent_slices() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -12601,7 +13171,8 @@ mod tests {
                     | RunStatus::Blocked
                     | RunStatus::Cancelled
                     | RunStatus::Interrupted
-            ) {
+            ) && !state.terminal_transition_needs_reconciliation(run_id)?
+            {
                 return Ok(run);
             }
             assert!(Instant::now() < deadline, "run did not finish: {run:?}");

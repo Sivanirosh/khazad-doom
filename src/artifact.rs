@@ -9,8 +9,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsStr;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DIR_NAME: &str = ".workflow";
 pub const AREA_CONTRACT_FILE: &str = "AREA_CONTRACT.md";
@@ -1454,14 +1457,189 @@ pub fn read_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> {
     Ok(serde_json::from_str(&data)?)
 }
 
-pub fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<()> {
-    if let Some(parent) = path.as_ref().parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonWriteFaultStage {
+    BeforeTempWrite,
+    BeforeRename,
+    AfterRenameBeforeParentSync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static JSON_WRITE_FAULT: std::cell::RefCell<Option<JsonWriteFaultStage>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_json_write_fault(stage: JsonWriteFaultStage) {
+    JSON_WRITE_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_json_write_fault(stage: JsonWriteFaultStage) -> bool {
+    JSON_WRITE_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+static JSON_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_json_temp(parent: &Path, file_name: &OsStr) -> Result<(PathBuf, fs::File)> {
+    for _ in 0..128 {
+        let sequence = JSON_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsStr::new(".").to_os_string();
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let temporary_path = parent.join(temporary_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("create JSON temporary file {}", temporary_path.display())
+                });
+            }
+        }
     }
+    bail!(
+        "could not allocate a unique same-directory temporary JSON file under {}",
+        parent.display()
+    )
+}
+
+#[cfg(unix)]
+fn ensure_json_write_durability_supported() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_json_write_durability_supported() -> Result<()> {
+    bail!(
+        "crash-durable authoritative JSON replacement requires Unix directory synchronization; this runtime is unsupported"
+    )
+}
+
+#[cfg(unix)]
+fn sync_json_parent(parent: &Path) -> Result<()> {
+    fs::File::open(parent)
+        .with_context(|| format!("open JSON parent directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync JSON parent directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_json_parent(_parent: &Path) -> Result<()> {
+    bail!(
+        "crash-durable authoritative JSON replacement requires Unix directory synchronization; this runtime is unsupported"
+    )
+}
+
+pub(crate) const ATOMIC_JSON_WRITER_ARG: &str = "__khazad_atomic_json_write_v1";
+
+pub(crate) fn write_json_from_stdin(path: impl AsRef<Path>) -> Result<()> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .context("read JSON replacement input")?;
+    let value: Value = serde_json::from_slice(&bytes).context("parse JSON replacement input")?;
+    write_json(path, &value)
+}
+
+pub fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<()> {
+    ensure_json_write_durability_supported()?;
+    let path = path.as_ref();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("JSON artifact path has no file name: {}", path.display())
+    })?;
     let mut data = serde_json::to_vec_pretty(value)?;
     data.push(b'\n');
-    fs::write(path.as_ref(), data).with_context(|| format!("write {}", path.as_ref().display()))?;
-    Ok(())
+
+    let (temporary_path, temporary_file) = create_json_temp(parent, file_name)?;
+    let mut temporary = Some(temporary_file);
+    let mut installed = false;
+    let result = (|| -> Result<()> {
+        #[cfg(test)]
+        if take_json_write_fault(JsonWriteFaultStage::BeforeTempWrite) {
+            bail!("injected JSON write fault before temporary-file write");
+        }
+        {
+            let temporary = temporary
+                .as_mut()
+                .expect("temporary JSON file remains open before replacement");
+            temporary.write_all(&data).with_context(|| {
+                format!("write JSON temporary file {}", temporary_path.display())
+            })?;
+            temporary.flush().with_context(|| {
+                format!("flush JSON temporary file {}", temporary_path.display())
+            })?;
+            match fs::metadata(path) {
+                Ok(metadata) => temporary
+                    .set_permissions(metadata.permissions())
+                    .with_context(|| {
+                        format!("preserve JSON artifact permissions for {}", path.display())
+                    })?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("inspect JSON artifact permissions for {}", path.display())
+                    });
+                }
+            }
+            temporary.sync_all().with_context(|| {
+                format!("sync JSON temporary file {}", temporary_path.display())
+            })?;
+        }
+        drop(temporary.take());
+        #[cfg(test)]
+        if take_json_write_fault(JsonWriteFaultStage::BeforeRename) {
+            bail!("injected JSON write fault before rename");
+        }
+        fs::rename(&temporary_path, path).with_context(|| {
+            format!(
+                "atomically replace JSON artifact {} from {}",
+                path.display(),
+                temporary_path.display()
+            )
+        })?;
+        installed = true;
+        #[cfg(test)]
+        if take_json_write_fault(JsonWriteFaultStage::AfterRenameBeforeParentSync) {
+            bail!("injected JSON write fault after rename before parent sync");
+        }
+        sync_json_parent(parent)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if installed {
+                return Err(err.context(format!(
+                    "JSON artifact {} was atomically replaced with complete new bytes, but its crash durability is uncertain because post-rename parent synchronization did not complete",
+                    path.display()
+                )));
+            }
+            drop(temporary.take());
+            if let Err(cleanup_err) = fs::remove_file(&temporary_path) {
+                return Err(err.context(format!(
+                    "remove failed JSON temporary file {}: {cleanup_err}",
+                    temporary_path.display()
+                )));
+            }
+            Err(err)
+        }
+    }
 }
 
 pub fn default_agent_profiles_toml() -> &'static str {
@@ -2017,6 +2195,93 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.worker_question_timeout_seconds, 60);
+    }
+
+    #[test]
+    fn atomic_json_replacement_preserves_previous_artifact_when_rename_is_not_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/run-summary.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = b"{\"version\":\"old\"}\n";
+        fs::write(&path, old).unwrap();
+
+        super::inject_json_write_fault(super::JsonWriteFaultStage::BeforeRename);
+        let err = super::write_json(&path, &serde_json::json!({ "version": "new" }))
+            .expect_err("injected pre-rename failure must abort replacement");
+
+        assert!(format!("{err:#}").contains("injected"), "{err:#}");
+        assert_eq!(fs::read(&path).unwrap(), old);
+        let restored: serde_json::Value = super::read_json(&path).unwrap();
+        assert_eq!(restored["version"], "old");
+    }
+
+    #[test]
+    fn atomic_json_replacement_preserves_previous_artifact_when_temp_write_is_not_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/run-summary.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = b"{\"version\":\"old\"}\n";
+        fs::write(&path, old).unwrap();
+
+        super::inject_json_write_fault(super::JsonWriteFaultStage::BeforeTempWrite);
+        let err = super::write_json(&path, &serde_json::json!({ "version": "new" }))
+            .expect_err("injected pre-write failure must abort replacement");
+
+        assert!(format!("{err:#}").contains("injected"), "{err:#}");
+        assert_eq!(fs::read(&path).unwrap(), old);
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .count(),
+            0,
+            "failed replacement must clean up its temporary sibling"
+        );
+    }
+
+    #[test]
+    fn atomic_json_replacement_keeps_new_complete_artifact_when_parent_sync_is_not_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/run-summary.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{\"version\":\"old\"}\n").unwrap();
+
+        super::inject_json_write_fault(super::JsonWriteFaultStage::AfterRenameBeforeParentSync);
+        let err = super::write_json(&path, &serde_json::json!({ "version": "new" }))
+            .expect_err("injected post-rename failure must report uncertain durability");
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("injected"), "{rendered}");
+        assert!(
+            rendered.contains("was atomically replaced with complete new bytes")
+                && rendered.contains("crash durability is uncertain"),
+            "post-rename failure must describe the installed-but-not-durably-linked outcome: {rendered}"
+        );
+        let replaced: serde_json::Value = super::read_json(&path).unwrap();
+        assert_eq!(replaced["version"], "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_json_replacement_writes_before_preserving_read_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run-summary.json");
+        fs::write(&path, b"{\"version\":\"old\"}\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        super::write_json(&path, &serde_json::json!({ "version": "new" })).unwrap();
+
+        let replaced: serde_json::Value = super::read_json(&path).unwrap();
+        assert_eq!(replaced["version"], "new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
     }
 
     #[test]

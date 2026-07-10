@@ -604,6 +604,10 @@ pub(crate) fn prepare_pi_wrapper_artifacts(
         let _ = fs::remove_file(path);
     }
 
+    // A daemon can outlive an in-place binary upgrade. Resolve the reusable
+    // replacement binary rather than embedding Linux's non-executable
+    // `/path/khazad-doom (deleted)` current-exe display path in a wrapper.
+    let atomic_json_writer = crate::paths::khazad_child_binary();
     write_private(
         &artifacts.prompt_path,
         build_prompt(&job.prompt, &job.json_schema),
@@ -621,13 +625,14 @@ pub(crate) fn prepare_pi_wrapper_artifacts(
             "exit_path": artifacts.exit_path,
             "status_path": artifacts.status_path,
             "result_path": artifacts.result_path,
+            "atomic_json_writer": &atomic_json_writer,
             "env_keys": effective_env(&job.env).keys().cloned().collect::<Vec<_>>(),
             "contract": "khazad-owned-herdr-pi-wrapper-v1",
         }),
     )?;
     write_private(
         &artifacts.wrapper_path,
-        wrapper_script(spec, job, artifacts),
+        wrapper_script(spec, job, artifacts, &atomic_json_writer),
     )?;
     make_executable_private(&artifacts.wrapper_path)?;
     Ok(format!(
@@ -935,7 +940,12 @@ fn terminate_wrapped_process(pid: u32, exit_path: &Path, grace: Duration) {
     request_child_kill(pid);
 }
 
-fn wrapper_script(spec: &PiCommandSpec, job: &Job, artifacts: &PiWrapperArtifacts) -> String {
+fn wrapper_script(
+    spec: &PiCommandSpec,
+    job: &Job,
+    artifacts: &PiWrapperArtifacts,
+    atomic_json_writer: &Path,
+) -> String {
     let command = std::iter::once(shell_quote(&spec.bin))
         .chain(spec.args.iter().map(|arg| shell_quote(arg)))
         .collect::<Vec<_>>()
@@ -951,28 +961,45 @@ STDERR={stderr}
 PROMPT={prompt}
 ENV_FILE={env_file}
 CWD={cwd}
-printf '{{"state":"starting"}}\n' > "$STATUS"
+ATOMIC_JSON_WRITER={atomic_json_writer}
+write_json() {{
+  path=$1
+  payload=$2
+  printf '%s\n' "$payload" | "$ATOMIC_JSON_WRITER" {atomic_json_writer_arg} "$path"
+}}
+if ! write_json "$STATUS" '{{"state":"starting"}}'; then
+  exit 125
+fi
 . "$ENV_FILE"
 code=$?
 if [ "$code" -ne 0 ]; then
-  printf '{{"state":"handoff_failed","exit_code":%s}}\n' "$code" > "$STATUS"
+  write_json "$STATUS" "{{\"state\":\"handoff_failed\",\"exit_code\":$code}}" || exit 125
   exit "$code"
 fi
 cd "$CWD"
 code=$?
 if [ "$code" -ne 0 ]; then
-  printf '{{"state":"handoff_failed","exit_code":%s}}\n' "$code" > "$STATUS"
+  write_json "$STATUS" "{{\"state\":\"handoff_failed\",\"exit_code\":$code}}" || exit 125
   exit "$code"
 fi
 : > "$STDOUT"
 : > "$STDERR"
 env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
 pid=$!
-printf '{{"state":"launched","pid":%s}}\n' "$pid" > "$STATUS"
+if ! write_json "$STATUS" "{{\"state\":\"launched\",\"pid\":$pid}}"; then
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" || true
+  exit 125
+fi
 wait "$pid"
 code=$?
-printf '{{"exit_code":%s}}\n' "$code" > "$EXIT"
-printf '{{"state":"finished","pid":%s,"exit_code":%s}}\n' "$pid" "$code" > "$STATUS"
+exit_written=0
+if write_json "$EXIT" "{{\"exit_code\":$code}}"; then
+  exit_written=1
+fi
+if ! write_json "$STATUS" "{{\"state\":\"finished\",\"pid\":$pid,\"exit_code\":$code}}"; then
+  [ "$exit_written" -eq 1 ] || exit 125
+fi
 exit "$code"
 "#,
         status = shell_quote_path(&artifacts.status_path),
@@ -982,6 +1009,8 @@ exit "$code"
         prompt = shell_quote_path(&artifacts.prompt_path),
         env_file = shell_quote_path(&artifacts.env_path),
         cwd = shell_quote_path(&job.cwd),
+        atomic_json_writer = shell_quote_path(atomic_json_writer),
+        atomic_json_writer_arg = artifact::ATOMIC_JSON_WRITER_ARG,
         command = command,
     )
 }
@@ -1243,7 +1272,7 @@ mod tests {
     use super::{
         AGENT_AUTH_REQUIRED_FAILURE_KIND, Job, PiCommandSpec, RunnerError, RunnerMetadata,
         RunnerSpec, RunnerTranscript, extract_json_object, parse_pi_tui_worker_result_artifact,
-        prepare_pi_tui_worker_artifacts,
+        prepare_pi_tui_worker_artifacts, prepare_pi_wrapper_artifacts,
     };
     use crate::artifact;
     use serde_json::json;
@@ -1371,6 +1400,37 @@ mod tests {
                 .unwrap()
                 .contains("submit_worker_result")
         );
+    }
+
+    #[test]
+    fn legacy_wrapper_uses_daemon_atomic_json_writer_for_coordination() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&temp.path().join("slice.worker.attempt-1.json"))
+            .unwrap();
+        let spec = PiCommandSpec {
+            bin: "pi".to_string(),
+            args: vec!["--provider".to_string(), "openai-codex".to_string()],
+        };
+        let job = Job {
+            kind: "slice-worker".to_string(),
+            prompt: "Implement the slice.".to_string(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{\"type\":\"object\"}".to_string(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+        };
+
+        prepare_pi_wrapper_artifacts(&spec, &job, &artifacts).unwrap();
+
+        let script = std::fs::read_to_string(&artifacts.wrapper_path).unwrap();
+        assert!(script.contains("ATOMIC_JSON_WRITER="));
+        assert!(script.contains(crate::artifact::ATOMIC_JSON_WRITER_ARG));
+        assert!(!script.contains("> \"$STATUS\""));
+        assert!(!script.contains("> \"$EXIT\""));
+        let command: serde_json::Value = artifact::read_json(&artifacts.command_path).unwrap();
+        assert!(command["atomic_json_writer"].is_string());
     }
 
     #[test]
