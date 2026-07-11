@@ -1,9 +1,9 @@
 use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
 use crate::domain::{
-    AutonomyLevel, BranchHandoff, MissionEnvelope, ReplanEvidenceLink, ReplanProposalSource,
-    ReplanProposalState, ReplanProposedChange, RunDetails, RunInspection, RunStatus,
-    SliceValidationReport, SliceWriteResult, StatusFeed, StatusFeedRole,
+    AutonomyLevel, BranchHandoff, DecisionCommandOutcome, MissionEnvelope, ReplanEvidenceLink,
+    ReplanProposalSource, ReplanProposalState, ReplanProposedChange, RunDetails, RunInspection,
+    RunStatus, SliceValidationReport, SliceWriteResult, StatusFeed, StatusFeedRole,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -1056,7 +1056,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             let question = pending
                 .get(index.saturating_sub(1))
                 .ok_or_else(|| anyhow::anyhow!("pending question {index} not found"))?;
-            let _: AnswerQuestionResult = client.call(
+            let result: AnswerQuestionResult = client.call(
                 "answerQuestion",
                 &AnswerQuestionParams {
                     run_id: details.run.id.clone(),
@@ -1064,6 +1064,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
                     answer,
                 },
             )?;
+            require_decision_command_success("answer question", result.effective_outcome())?;
         }
         "answer" => {
             let question_id = parts
@@ -1073,7 +1074,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             if answer.trim().is_empty() {
                 bail!("usage: answer <question-id> <answer>");
             }
-            let _: AnswerQuestionResult = client.call(
+            let result: AnswerQuestionResult = client.call(
                 "answerQuestion",
                 &AnswerQuestionParams {
                     run_id: details.run.id.clone(),
@@ -1081,6 +1082,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
                     answer,
                 },
             )?;
+            require_decision_command_success("answer question", result.effective_outcome())?;
         }
         "accept" | "reject" => {
             let proposal_id = parts
@@ -1095,7 +1097,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             } else {
                 "rejected"
             };
-            let _: DecideReplanProposalResult = client.call(
+            let result: DecideReplanProposalResult = client.call(
                 "decideReplanProposal",
                 &DecideReplanProposalParams {
                     run_id: details.run.id.clone(),
@@ -1108,6 +1110,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
                     revisit_condition: String::new(),
                 },
             )?;
+            require_decision_command_success("decide replan proposal", result.outcome)?;
         }
         "defer" => {
             let proposal_id = parts
@@ -1115,7 +1118,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
                 .context("usage: defer <proposal-id> <condition> --reason <reason>")?;
             let rest = parts.collect::<Vec<_>>().join(" ");
             let (condition, reason) = split_defer_condition_reason(&rest)?;
-            let _: DecideReplanProposalResult = client.call(
+            let result: DecideReplanProposalResult = client.call(
                 "decideReplanProposal",
                 &DecideReplanProposalParams {
                     run_id: details.run.id.clone(),
@@ -1128,6 +1131,7 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
                     revisit_condition: condition,
                 },
             )?;
+            require_decision_command_success("decide replan proposal", result.outcome)?;
         }
         "resume" => {
             let _: StartRunResult = client.call(
@@ -1494,7 +1498,8 @@ fn run_answer(paths: Paths, run_id: String, question_id: String, answer: String)
             answer,
         },
     )?;
-    print_json(&result)
+    print_json(&result)?;
+    require_decision_command_success("answer question", result.effective_outcome())
 }
 
 fn run_replan(paths: Paths, command: ReplanCommand) -> Result<()> {
@@ -1640,7 +1645,16 @@ fn decide_replan(client: &Client, request: ReplanDecisionRequest) -> Result<()> 
             revisit_condition: request.revisit_condition,
         },
     )?;
-    print_json(&result)
+    print_json(&result)?;
+    require_decision_command_success("replan decision", result.outcome)
+}
+
+fn require_decision_command_success(command: &str, outcome: DecisionCommandOutcome) -> Result<()> {
+    if outcome.command_succeeded() {
+        Ok(())
+    } else {
+        bail!("{command} command returned {}", outcome.as_str())
+    }
 }
 
 fn parse_replan_evidence(values: &[String]) -> Result<Vec<ReplanEvidenceLink>> {

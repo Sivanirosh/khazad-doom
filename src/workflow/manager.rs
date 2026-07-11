@@ -685,19 +685,19 @@ impl Manager {
                     )?;
                     continue;
                 };
-                let proposal = self.state.replace_replan_frontier_classification(
-                    &run.id,
-                    &proposal.id,
-                    &classification,
-                )?;
-                self.record_frontier_classification_event(
-                    run,
-                    checkpoint,
-                    &proposal,
-                    &classification,
-                    false,
-                )?;
                 if !frontier_auto_accept_gate_allows(&envelope, &classification) {
+                    let proposal = self.state.replace_replan_frontier_classification(
+                        &run.id,
+                        &proposal.id,
+                        &classification,
+                    )?;
+                    self.record_frontier_classification_event(
+                        run,
+                        checkpoint,
+                        &proposal,
+                        &classification,
+                        false,
+                    )?;
                     self.record_frontier_auto_accept_skip(
                         run,
                         checkpoint,
@@ -712,6 +712,7 @@ impl Manager {
                 let rationale = format!(
                     "frontier policy auto-accepted Tier-1 add_followup_slice proposal within mission envelope at {checkpoint}"
                 );
+                let apply_mode = followup_apply_mode_for_autonomy(envelope.autonomy_level);
                 let proposal = self.state.auto_accept_replan_proposal_with_budget(
                     &run.id,
                     &proposal.id,
@@ -719,23 +720,8 @@ impl Manager {
                     &classification,
                     &budget_before,
                     &budget_after,
-                )?;
-                self.state.record_event(
-                    &run.id,
-                    "frontier_auto_accept_recorded",
-                    &json!({
-                        "proposal_id": proposal.id,
-                        "checkpoint": checkpoint,
-                        "authorizer": proposal.operator_decision.as_ref().map(|decision| decision.authorizer.as_str()).unwrap_or(""),
-                        "source": proposal.operator_decision.as_ref().map(|decision| decision.source.as_str()).unwrap_or(""),
-                        "rationale": rationale,
-                        "tier": classification.tier,
-                        "reason_codes": classification.reason_codes,
-                        "budget_before": budget_before,
-                        "budget_after": budget_after,
-                        "af00_evidence_gate": "satisfied",
-                        "apply_mode": followup_apply_mode_for_autonomy(envelope.autonomy_level).as_str(),
-                    }),
+                    checkpoint,
+                    apply_mode.as_str(),
                 )?;
                 self.apply_followup_proposal_at_checkpoint(
                     run,
@@ -744,7 +730,7 @@ impl Manager {
                     worker_layers,
                     gate_slices,
                     &proposal,
-                    followup_apply_mode_for_autonomy(envelope.autonomy_level),
+                    apply_mode,
                 )?;
                 accepted += 1;
                 accepted_one = true;
@@ -807,21 +793,14 @@ impl Manager {
     ) -> Result<()> {
         self.state.record_event(
             &run.id,
-            "frontier_classified",
-            &json!({
-                "proposal_id": proposal.id,
-                "checkpoint": checkpoint,
-                "tier": &classification.tier,
-                "reason_codes": &classification.reason_codes,
-                "classified_at": classification.classified_at,
-                "envelope_hash": &classification.envelope_hash,
-                "budget_snapshot": &classification.budget_snapshot,
-                "autonomy_level": classification.autonomy_level,
-                "record_only": record_only,
-                "queue_mutated": false,
-                "slice_mutated": false,
-                "decision_recorded": false,
-            }),
+            workflow_events::FRONTIER_CLASSIFIED,
+            &workflow_events::FrontierClassifiedPayload::new(
+                &proposal.id,
+                checkpoint,
+                classification,
+                record_only,
+                false,
+            ),
         )
     }
 
@@ -8568,7 +8547,8 @@ mod tests {
     };
     use crate::gitutil;
     use crate::paths::Paths;
-    use crate::state::Store as StateStore;
+    use crate::state::{Store as StateStore, WorkerQuestionDecisionCommand};
+    use crate::workflow::events as workflow_events;
     use anyhow::Result;
     use chrono::Utc;
     use serde_json::{Value, json};
@@ -9648,6 +9628,82 @@ mod tests {
     }
 
     #[test]
+    fn frontier_auto_accept_failure_leaves_no_classification_or_audit_evidence() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let parent = slice("slice-001");
+        store.write_slice(&parent, true)?;
+        gitutil::commit_all(repo.path(), "workflow fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let mut run = test_run("kd-auto-accept-rollback", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let mut envelope = mission_envelope();
+        envelope.autonomy_level = AutonomyLevel::Promote;
+        state.set_frontier_state(
+            &run.id,
+            Some(&envelope),
+            Some(&FrontierBudgetState::default()),
+        )?;
+        let proposal = create_followup_replan_proposal(
+            &state,
+            &run.id,
+            "slice-001",
+            followup_draft("slice-001-followup"),
+        )?;
+        let mut worker_layers = VecDeque::new();
+        let mut gate_slices = vec![parent];
+
+        crate::state::inject_decision_transaction_fault(
+            crate::state::DecisionTransactionFaultStage::BeforeEventAppend,
+        );
+        assert!(
+            manager
+                .auto_accept_frontier_proposals_at_replan_checkpoint(
+                    &mut run,
+                    "test",
+                    repo.path(),
+                    &mut worker_layers,
+                    &mut gate_slices,
+                )
+                .is_err()
+        );
+
+        let proposal = state
+            .get_replan_proposal(&run.id, &proposal.id)?
+            .expect("proposal remains durable");
+        assert_eq!(proposal.state, ReplanProposalState::Pending);
+        assert!(proposal.frontier_classification.is_none());
+        let (_, budget) = state.get_frontier_state(&run.id)?;
+        assert_eq!(budget, Some(FrontierBudgetState::default()));
+        let events = state.get_events(&run.id, 50)?;
+        for event_type in [
+            workflow_events::FRONTIER_CLASSIFIED,
+            workflow_events::REPLAN_PROPOSAL_DECIDED,
+            workflow_events::FRONTIER_AUTO_ACCEPT_RECORDED,
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.typ == event_type)
+                    .count(),
+                0,
+                "{event_type} must roll back with the failed auto-accept"
+            );
+        }
+        assert!(!store.slice_path("slice-001-followup").exists());
+        Ok(())
+    }
+
+    #[test]
     fn frontier_auto_accept_promote_generates_slice_without_running_it() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -9739,6 +9795,12 @@ mod tests {
                 .iter()
                 .any(|event| event.typ == "frontier_auto_accept_recorded")
         );
+        let classification_event = events
+            .iter()
+            .find(|event| event.typ == workflow_events::FRONTIER_CLASSIFIED)
+            .expect("classification audit committed with auto-accept");
+        assert_eq!(classification_event.payload["checkpoint"], "test");
+        assert_eq!(classification_event.payload["decision_recorded"], true);
         Ok(())
     }
 
@@ -10121,6 +10183,8 @@ mod tests {
             &classification,
             &budget_before,
             &budget_after,
+            "before-crash",
+            "append_and_run",
         )?;
         let mut worker_layers = VecDeque::new();
         let mut gate_slices = vec![parent];
@@ -12630,18 +12694,14 @@ mod tests {
             |question| Ok(json!({ "question_id": question.id })),
             "awaiting operator answer",
         )?;
-        state.answer_worker_question_cas(
+        state.decide_worker_question_command(
             &run.id,
             "q-report-operator",
-            "B",
-            WorkerQuestionAnswerSource::Operator,
-            "worker_question_answered",
-            &json!({
-                "question_id": "q-report-operator",
-                "answer": "B",
-                "answer_source": "operator"
-            }),
-            "operator answered; worker resuming",
+            WorkerQuestionDecisionCommand::answer(
+                "B",
+                WorkerQuestionAnswerSource::Operator,
+                "operator answered; worker resuming",
+            ),
         )?;
         state.open_active_worker_question_with_recommendation(
             "q-report-fallback",
@@ -12657,18 +12717,14 @@ mod tests {
             "awaiting operator answer",
         )?;
         thread::sleep(Duration::from_millis(1_100));
-        state.answer_worker_question_cas(
+        state.decide_worker_question_command(
             &run.id,
             "q-report-fallback",
-            "A",
-            WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-            "worker_question_answered",
-            &json!({
-                "question_id": "q-report-fallback",
-                "answer": "A",
-                "answer_source": "llm_recommendation_timeout"
-            }),
-            "recommendation applied; worker resuming",
+            WorkerQuestionDecisionCommand::answer(
+                "A",
+                WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+                "recommendation applied; worker resuming",
+            ),
         )?;
         state.update_slice_status(&run.id, "slice-001", SliceStatus::Merged, "")?;
         state.update_run(

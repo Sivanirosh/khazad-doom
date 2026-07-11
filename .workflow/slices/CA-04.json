@@ -10,6 +10,7 @@
     "src/domain.rs",
     "src/state.rs",
     "src/daemon.rs",
+    "src/cli.rs",
     "src/ipc.rs",
     "src/workflow/events.rs",
     "src/workflow/manager.rs",

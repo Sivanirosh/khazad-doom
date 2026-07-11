@@ -13,7 +13,7 @@ use crate::ipc::{
     WorkerQuestionTimeoutParams,
 };
 use crate::paths::Paths;
-use crate::state::Store as StateStore;
+use crate::state::{ReplanDecisionCommand, Store as StateStore, WorkerQuestionDecisionCommand};
 use crate::workflow::attention::worker_question_deadline;
 use crate::workflow::events as workflow_events;
 use crate::workflow::read_model::{enrich_replan_proposal, replan_status_from_proposals};
@@ -299,12 +299,12 @@ impl Server {
                 .as_ref()
                 .is_some_and(|run| run.status != RunStatus::Running)
             {
-                let transition = self.store.interrupt_worker_question_if_inactive_cas(
+                let question = self.store.interrupt_worker_question_if_inactive_cas(
                     &params.run_id,
                     &question_id,
                     "run reached a terminal state before the question was answered",
                 )?;
-                return completed_worker_ask_result(&transition.question);
+                return completed_worker_ask_result(&question);
             }
             if current
                 .deadline_at
@@ -317,6 +317,7 @@ impl Server {
         let question = self.resolve_worker_question_deadline(
             &params.run_id,
             &question_id,
+            params.launch_id,
             "worker_question_timed_out",
             "operator question timed out",
         )?;
@@ -410,141 +411,55 @@ impl Server {
                 params.launch_id
             );
         }
-        let current = self
-            .store
-            .get_worker_question(&params.question_id)?
-            .ok_or_else(|| anyhow!("question {:?} not found", params.question_id))?;
-        if current.run_id != params.run_id {
-            bail!(
-                "question {:?} belongs to run {}, not {}",
-                params.question_id,
-                current.run_id,
-                params.run_id
-            );
-        }
-        if current.launch_id != params.launch_id {
-            bail!(
-                "question {:?} belongs to launch {:?}, not {:?}",
-                params.question_id,
-                current.launch_id,
-                params.launch_id
-            );
-        }
-        if current.state != "pending" {
-            return Ok(worker_ask_result(&current));
-        }
-        if !self.worker_question_is_currently_awaited(&current)? {
-            bail!(
-                "question {} is not attached to the active worker attempt",
-                current.id
-            );
-        }
-        let question = if current
-            .deadline_at
-            .is_some_and(|deadline| Utc::now() >= deadline)
-        {
-            self.resolve_worker_question_deadline(
-                &params.run_id,
-                &params.question_id,
-                "worker_question_timed_out",
-                "operator question timed out",
-            )?
-        } else {
-            self.timeout_worker_question(
-                &params.run_id,
-                &params.question_id,
+        let transition = self.store.decide_worker_question_command(
+            &params.run_id,
+            &params.question_id,
+            WorkerQuestionDecisionCommand::resolve_timeout(
+                params.launch_id,
                 "worker_question_cancelled",
                 "operator question closed without an answer",
-            )?
+                format!(
+                    "operator answer unavailable for {}; worker applying blocked contract",
+                    params.question_id
+                ),
+            ),
+        )?;
+        let Some(question) = transition.question else {
+            return Ok(WorkerAskResult {
+                question_id: params.question_id,
+                state: "not_found".to_string(),
+                outcome: Some(transition.outcome),
+                ..WorkerAskResult::default()
+            });
         };
-        Ok(worker_ask_result(&question))
+        let mut result = worker_ask_result(&question);
+        result.outcome = Some(transition.outcome);
+        Ok(result)
     }
 
     fn resolve_worker_question_deadline(
         &self,
         run_id: &str,
         question_id: &str,
+        launch_id: Option<i64>,
         incident_code: &str,
         message_prefix: &str,
     ) -> Result<WorkerQuestion> {
-        let question = self
-            .store
-            .get_worker_question(question_id)?
-            .ok_or_else(|| anyhow!("question {question_id:?} disappeared"))?;
-        if question.run_id != run_id {
-            bail!(
-                "question {question_id:?} belongs to run {}, not {run_id}",
-                question.run_id
-            );
-        }
-        if question.state != "pending" {
-            return Ok(question);
-        }
-        if !self.worker_question_is_currently_awaited(&question)? {
-            return Ok(self
-                .store
-                .interrupt_worker_question_if_inactive_cas(
-                    run_id,
-                    question_id,
-                    "worker attempt became inactive before question resolution",
-                )?
-                .question);
-        }
-        let recommendation = question.recommendation();
-        if question.fallback_eligible && recommendation.is_eligible(&question.options) {
-            let answer = question.recommended_answer.clone();
-            let source = WorkerQuestionAnswerSource::LlmRecommendationTimeout;
-            let payload = workflow_events::WorkerQuestionAnsweredPayload::from_question(
-                &question, &answer, source,
-            );
-            let transition = self.store.answer_worker_question_cas(
-                run_id,
-                question_id,
-                &answer,
-                source,
-                workflow_events::WORKER_QUESTION_ANSWERED,
-                &payload,
-                &format!(
-                    "LLM recommendation applied at deadline for {}; worker resuming",
-                    question.id
-                ),
-            )?;
-            return Ok(transition.question);
-        }
-        self.timeout_worker_question(run_id, question_id, incident_code, message_prefix)
-    }
-
-    fn timeout_worker_question(
-        &self,
-        run_id: &str,
-        question_id: &str,
-        incident_code: &str,
-        message_prefix: &str,
-    ) -> Result<WorkerQuestion> {
-        let current = self
-            .store
-            .get_worker_question(question_id)?
-            .ok_or_else(|| anyhow!("question {question_id:?} disappeared"))?;
-        if current.state != "pending" {
-            return Ok(current);
-        }
-        let incident = workflow_events::RunIncidentPayload::warning(
-            incident_code,
-            format!("{message_prefix}: {}", current.question),
-        )
-        .with_extra("question_id", &current.id)
-        .with_extra("slice_id", &current.slice_id);
-        let transition = self.store.timeout_worker_question_cas(
+        let transition = self.store.decide_worker_question_command(
             run_id,
             question_id,
-            workflow_events::RUN_INCIDENT,
-            &incident,
-            &format!(
-                "operator answer unavailable for {}; worker applying blocked contract",
-                current.id
+            WorkerQuestionDecisionCommand::resolve_timeout(
+                launch_id,
+                incident_code,
+                message_prefix,
+                format!(
+                    "operator answer unavailable for {question_id}; worker applying blocked contract"
+                ),
             ),
         )?;
-        Ok(transition.question)
+        transition
+            .question
+            .ok_or_else(|| anyhow!("question {question_id:?} disappeared"))
     }
 
     fn schedule_worker_question_timeout(&self, question: WorkerQuestion) {
@@ -558,6 +473,7 @@ impl Server {
             if let Err(error) = server.resolve_worker_question_deadline(
                 &question.run_id,
                 &question.id,
+                question.launch_id,
                 "worker_question_timed_out",
                 "operator question timed out",
             ) {
@@ -614,15 +530,6 @@ impl Server {
 
     fn notify_attention_for_worker_question(&self, question: &WorkerQuestion) {
         self.manager.notify_worker_question_attention(question);
-    }
-
-    fn worker_question_is_currently_awaited(&self, question: &WorkerQuestion) -> Result<bool> {
-        self.store.worker_attempt_is_active_with_launch_id(
-            &question.run_id,
-            &question.slice_id,
-            question.attempt,
-            question.launch_id,
-        )
     }
 
     fn handle(&self, method: &str, raw: Option<serde_json::Value>) -> Result<HandleOutcome> {
@@ -778,66 +685,19 @@ impl Server {
             }
             "answerQuestion" => {
                 let params: AnswerQuestionParams = decode_params(raw)?;
-                let current = self
-                    .store
-                    .get_worker_question(&params.question_id)?
-                    .ok_or_else(|| anyhow!("question {:?} not found", params.question_id))?;
-                if current.run_id != params.run_id {
-                    bail!(
-                        "question {:?} belongs to run {}, not {}",
-                        params.question_id,
-                        current.run_id,
-                        params.run_id
-                    );
-                }
-                if current.state == "answered" {
-                    return HandleOutcome::result(AnswerQuestionResult {
-                        question: current,
-                        applied: false,
-                    });
-                }
-                let run = self
-                    .store
-                    .get_run(&params.run_id)?
-                    .ok_or_else(|| anyhow!("run {:?} not found", params.run_id))?;
-                if run.status != RunStatus::Running {
-                    bail!(
-                        "run {} is {}; resume first before answering",
-                        run.id,
-                        run.status
-                    );
-                }
-                if current.state != "pending" {
-                    bail!(
-                        "question {:?} is {}; it has no durable answer to return",
-                        params.question_id,
-                        current.state
-                    );
-                }
-                if !self.worker_question_is_currently_awaited(&current)? {
-                    bail!(
-                        "question {} is not attached to the active worker attempt; resume the run and answer the fresh pending question shown by status/watch/monitor",
-                        current.id
-                    );
-                }
-                let source = WorkerQuestionAnswerSource::Operator;
-                let payload = workflow_events::WorkerQuestionAnsweredPayload::from_question(
-                    &current,
-                    &params.answer,
-                    source,
-                );
-                let transition = self.store.answer_worker_question_cas(
+                let transition = self.store.decide_worker_question_command(
                     &params.run_id,
                     &params.question_id,
-                    &params.answer,
-                    source,
-                    workflow_events::WORKER_QUESTION_ANSWERED,
-                    &payload,
-                    &format!("operator answered {}; worker resuming", current.id),
+                    WorkerQuestionDecisionCommand::answer(
+                        params.answer,
+                        WorkerQuestionAnswerSource::Operator,
+                        format!("operator answered {}; worker resuming", params.question_id),
+                    ),
                 )?;
                 Ok(HandleOutcome::result(AnswerQuestionResult {
                     question: transition.question,
-                    applied: transition.applied,
+                    applied: transition.outcome == crate::domain::DecisionCommandOutcome::Applied,
+                    outcome: Some(transition.outcome),
                 })?)
             }
             "workerQuestionTimeout" => {
@@ -891,28 +751,26 @@ impl Server {
             }
             "decideReplanProposal" => {
                 let params: DecideReplanProposalParams = decode_params(raw)?;
-                let state = replan_decision_state(&params.decision)?;
-                let proposal = self.store.decide_replan_proposal(
+                let command = if matches!(params.decision.as_str(), "timeout" | "timed_out") {
+                    ReplanDecisionCommand::timeout(params.rationale, params.revisit_condition)
+                } else {
+                    ReplanDecisionCommand::operator(
+                        replan_decision_state(&params.decision)?,
+                        params.rationale,
+                        params.authorizer,
+                        params.source,
+                        params.replacement_id,
+                        params.revisit_condition,
+                    )
+                };
+                let transition = self.store.decide_replan_proposal_command(
                     &params.run_id,
                     &params.proposal_id,
-                    state,
-                    &params.rationale,
-                    &params.authorizer,
-                    &params.source,
-                    &params.replacement_id,
-                    &params.revisit_condition,
-                )?;
-                self.store.record_event(
-                    &params.run_id,
-                    "replan_proposal_decided",
-                    &json!({
-                        "proposal_id": proposal.id,
-                        "state": proposal.state,
-                        "decision": proposal.operator_decision,
-                    }),
+                    command,
                 )?;
                 Ok(HandleOutcome::result(DecideReplanProposalResult {
-                    proposal,
+                    proposal: transition.proposal,
+                    outcome: transition.outcome,
                 })?)
             }
             "inspectRun" => {
@@ -964,6 +822,7 @@ fn worker_ask_result(question: &WorkerQuestion) -> WorkerAskResult {
     WorkerAskResult {
         question_id: question.id.clone(),
         state: question.state.clone(),
+        outcome: None,
         answer: question.answer.clone(),
         answer_source: question.answer_source,
         timed_out: question.state == "timed_out",
@@ -1010,6 +869,7 @@ fn method_allows_concurrent_handling(method: &str) -> bool {
             | "workerAskOpen"
             | "workerQuestionTimeout"
             | "answerQuestion"
+            | "decideReplanProposal"
             | "listQuestions"
             | "listReplanProposals"
     )
@@ -1068,9 +928,183 @@ fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Event, SliceRun, SliceStatus};
+    use crate::domain::{Event, ReplanProposalSource, ReplanProposedChange, SliceRun, SliceStatus};
     use crate::workflow::read_model::primary_terminal_reason;
     use chrono::Utc;
+
+    #[test]
+    fn replan_timeout_rpc_uses_the_transactional_decision_command() -> Result<()> {
+        let (_dir, server, store) = worker_question_test_server(60)?;
+        store.create_replan_proposal(
+            "run-fallback",
+            "rp-timeout",
+            ReplanProposalSource {
+                kind: "worker".to_string(),
+                ..ReplanProposalSource::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange {
+                kind: "mark_duplicate".to_string(),
+                target: "slice-1-followup".to_string(),
+                summary: "timeout fixture".to_string(),
+            }],
+            "operator_review",
+        )?;
+        let timeout_params = json!({
+            "run_id": "run-fallback",
+            "proposal_id": "rp-timeout",
+            "decision": "timeout",
+            "rationale": "operator decision window elapsed",
+            "authorizer": "",
+            "source": "",
+            "replacement_id": "",
+            "revisit_condition": ""
+        });
+
+        let applied = server.handle("decideReplanProposal", Some(timeout_params.clone()))?;
+        assert_eq!(applied.result["outcome"], "applied");
+        assert_eq!(applied.result["proposal"]["state"], "deferred");
+        assert_eq!(
+            applied.result["proposal"]["operator_decision"]["source"],
+            "decision_timeout"
+        );
+        assert_eq!(
+            applied.result["proposal"]["operator_decision"]["authorizer"],
+            "daemon"
+        );
+
+        let duplicate = server.handle("decideReplanProposal", Some(timeout_params))?;
+        assert_eq!(duplicate.result["outcome"], "already_applied_idempotently");
+        let conflict = server.handle(
+            "decideReplanProposal",
+            Some(json!({
+                "run_id": "run-fallback",
+                "proposal_id": "rp-timeout",
+                "decision": "deferred",
+                "rationale": "operator decision window elapsed",
+                "authorizer": "operator",
+                "source": "daemon_ipc",
+                "replacement_id": "",
+                "revisit_condition": "operator explicitly revisits the timed-out proposal"
+            })),
+        )?;
+        assert_eq!(conflict.result["outcome"], "conflict");
+        assert_eq!(
+            store
+                .get_events("run-fallback", 100)?
+                .iter()
+                .filter(|event| event.typ == workflow_events::REPLAN_PROPOSAL_DECIDED)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_question_rpc_handlers_return_one_durable_winner() -> Result<()> {
+        let (_dir, server, store) = worker_question_test_server(60)?;
+        let params: WorkerAskParams =
+            serde_json::from_value(eligible_worker_ask_params("run-fallback", "q rpc race"))?;
+        let question = server.open_worker_question(&params)?;
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let answer_server = server.clone();
+        let answer_barrier = barrier.clone();
+        let answer_question_id = question.id.clone();
+        let answer = thread::spawn(move || {
+            answer_barrier.wait();
+            answer_server.handle(
+                "answerQuestion",
+                Some(json!({
+                    "run_id": "run-fallback",
+                    "question_id": answer_question_id,
+                    "answer": "B"
+                })),
+            )
+        });
+        let timeout_server = server.clone();
+        let timeout_barrier = barrier.clone();
+        let timeout_question_id = question.id.clone();
+        let timeout = thread::spawn(move || {
+            timeout_barrier.wait();
+            timeout_server.handle(
+                "workerQuestionTimeout",
+                Some(json!({
+                    "run_id": "run-fallback",
+                    "question_id": timeout_question_id,
+                    "token": "secret-token"
+                })),
+            )
+        });
+        barrier.wait();
+        let outcomes = [
+            answer.join().expect("answer RPC")?.result["outcome"]
+                .as_str()
+                .expect("answer outcome")
+                .to_string(),
+            timeout.join().expect("timeout RPC")?.result["outcome"]
+                .as_str()
+                .expect("timeout outcome")
+                .to_string(),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| *outcome == "applied")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| *outcome == "conflict")
+                .count(),
+            1
+        );
+        let winner = store
+            .get_worker_question(&question.id)?
+            .expect("durable RPC winner");
+        assert!(matches!(winner.state.as_str(), "answered" | "timed_out"));
+        let authoritative_events = store
+            .get_events("run-fallback", 100)?
+            .into_iter()
+            .filter(|event| {
+                event.payload["question_id"] == question.id
+                    && matches!(
+                        event.typ.as_str(),
+                        workflow_events::WORKER_QUESTION_ANSWERED | workflow_events::RUN_INCIDENT
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authoritative_events.len(), 1);
+        assert_eq!(
+            authoritative_events[0].typ,
+            if winner.state == "answered" {
+                workflow_events::WORKER_QUESTION_ANSWERED
+            } else {
+                workflow_events::RUN_INCIDENT
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_question_timeout_rpc_preserves_typed_not_found() -> Result<()> {
+        let (_dir, server, _store) = worker_question_test_server(60)?;
+        let missing = server.handle(
+            "workerQuestionTimeout",
+            Some(json!({
+                "run_id": "run-fallback",
+                "question_id": "q-missing",
+                "token": "secret-token"
+            })),
+        )?;
+        assert_eq!(missing.result["outcome"], "not_found");
+        assert_eq!(missing.result["state"], "not_found");
+        assert_eq!(missing.result["question_id"], "q-missing");
+        Ok(())
+    }
 
     #[test]
     fn worker_question_rpc_timeout_fallback_wins_before_a_late_operator_answer() -> Result<()> {
@@ -1097,6 +1131,7 @@ mod tests {
         )?;
 
         assert_eq!(late_answer.result["applied"], false);
+        assert_eq!(late_answer.result["outcome"], "conflict");
         assert_eq!(late_answer.result["question"]["state"], "answered");
         assert_eq!(late_answer.result["question"]["answer"], "A");
         assert_eq!(
@@ -1112,6 +1147,7 @@ mod tests {
             })),
         )?;
         assert_eq!(cancel_after_fallback.result["timed_out"], false);
+        assert_eq!(cancel_after_fallback.result["outcome"], "conflict");
         assert_eq!(cancel_after_fallback.result["answer"], "A");
         assert_eq!(
             cancel_after_fallback.result["answer_source"],
@@ -1234,8 +1270,7 @@ mod tests {
             &old_question_id,
             "superseded by resume",
         )?;
-        assert!(interrupted.applied);
-        assert_eq!(interrupted.question.state, "interrupted");
+        assert_eq!(interrupted.state, "interrupted");
 
         let second = store.allocate_worker_attempt(
             "run-fallback",
@@ -1266,8 +1301,20 @@ mod tests {
                 "token": "fresh-token",
                 "launch_id": second.launch_id
             })),
-        );
-        assert!(mismatched_close.is_err());
+        )?;
+        assert_eq!(mismatched_close.result["outcome"], "stale_token");
+        assert_eq!(mismatched_close.result["state"], "interrupted");
+        let repeated_close = server.handle(
+            "workerQuestionTimeout",
+            Some(json!({
+                "run_id": "run-fallback",
+                "question_id": old_question_id,
+                "token": "fresh-token",
+                "launch_id": second.launch_id
+            })),
+        )?;
+        assert_eq!(repeated_close.result["outcome"], "stale_token");
+        assert_eq!(repeated_close.result["state"], "interrupted");
 
         let mut fresh = eligible_worker_ask_params("run-fallback", "fresh launch");
         fresh["launch_id"] = json!(second.launch_id);
@@ -1487,6 +1534,7 @@ mod tests {
         let resolved = server.resolve_worker_question_deadline(
             "run-fallback",
             &question_id,
+            None,
             "worker_question_timed_out",
             "operator question timed out",
         )?;

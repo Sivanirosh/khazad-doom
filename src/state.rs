@@ -1,6 +1,6 @@
 use crate::domain::{
-    Event, FrontierBudgetState, FrontierClassification, MissionEnvelope, ReplanDecision,
-    ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
+    DecisionCommandOutcome, Event, FrontierBudgetState, FrontierClassification, MissionEnvelope,
+    ReplanDecision, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
     ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptLedger,
     WorkerAttemptProgress, WorkerQuestion, WorkerQuestionAnswerSource,
     WorkerQuestionRecommendation,
@@ -27,9 +27,320 @@ pub struct Store {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorkerQuestionAnswerTransition {
-    pub question: WorkerQuestion,
-    pub applied: bool,
+pub(crate) enum WorkerQuestionDecisionCommand {
+    Answer {
+        answer: String,
+        answer_source: WorkerQuestionAnswerSource,
+        progress_message: String,
+    },
+    Timeout {
+        expected_launch_id: Option<i64>,
+        apply_recommendation_at_deadline: bool,
+        incident_code: String,
+        message_prefix: String,
+        progress_message: String,
+    },
+}
+
+impl WorkerQuestionDecisionCommand {
+    pub(crate) fn answer(
+        answer: impl Into<String>,
+        answer_source: WorkerQuestionAnswerSource,
+        progress_message: impl Into<String>,
+    ) -> Self {
+        Self::Answer {
+            answer: answer.into(),
+            answer_source,
+            progress_message: progress_message.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeout(
+        incident_code: impl Into<String>,
+        message_prefix: impl Into<String>,
+        progress_message: impl Into<String>,
+    ) -> Self {
+        Self::Timeout {
+            expected_launch_id: None,
+            apply_recommendation_at_deadline: false,
+            incident_code: incident_code.into(),
+            message_prefix: message_prefix.into(),
+            progress_message: progress_message.into(),
+        }
+    }
+
+    pub(crate) fn resolve_timeout(
+        expected_launch_id: Option<i64>,
+        incident_code: impl Into<String>,
+        message_prefix: impl Into<String>,
+        progress_message: impl Into<String>,
+    ) -> Self {
+        Self::Timeout {
+            expected_launch_id,
+            apply_recommendation_at_deadline: true,
+            incident_code: incident_code.into(),
+            message_prefix: message_prefix.into(),
+            progress_message: progress_message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerQuestionDecisionTransition {
+    pub outcome: DecisionCommandOutcome,
+    pub question: Option<WorkerQuestion>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplanAutoAcceptCommand {
+    classification: FrontierClassification,
+    budget_before: FrontierBudgetState,
+    budget_after: FrontierBudgetState,
+    record: Option<FrontierAutoAcceptRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct FrontierAutoAcceptRecord {
+    checkpoint: String,
+    apply_mode: String,
+}
+
+impl FrontierAutoAcceptRecord {
+    fn classification_payload(
+        &self,
+        proposal: &ReplanProposal,
+        classification: &FrontierClassification,
+    ) -> crate::workflow::events::FrontierClassifiedPayload {
+        crate::workflow::events::FrontierClassifiedPayload::new(
+            &proposal.id,
+            &self.checkpoint,
+            classification,
+            false,
+            true,
+        )
+    }
+
+    fn payload(
+        &self,
+        proposal: &ReplanProposal,
+        decision: &ReplanDecision,
+        auto_accept: &ReplanAutoAcceptCommand,
+    ) -> crate::workflow::events::FrontierAutoAcceptRecordedPayload {
+        crate::workflow::events::FrontierAutoAcceptRecordedPayload {
+            proposal_id: proposal.id.clone(),
+            checkpoint: self.checkpoint.clone(),
+            authorizer: decision.authorizer.clone(),
+            source: decision.source.clone(),
+            rationale: decision.rationale.clone(),
+            tier: auto_accept.classification.tier.clone(),
+            reason_codes: auto_accept.classification.reason_codes.clone(),
+            budget_before: auto_accept.budget_before.clone(),
+            budget_after: auto_accept.budget_after.clone(),
+            af00_evidence_gate: "satisfied".to_string(),
+            apply_mode: self.apply_mode.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplanDecisionCommand {
+    state: ReplanProposalState,
+    rationale: String,
+    authorizer: String,
+    source: String,
+    replacement_id: String,
+    revisit_condition: String,
+    auto_accept: Option<ReplanAutoAcceptCommand>,
+}
+
+impl ReplanDecisionCommand {
+    pub(crate) fn operator(
+        state: ReplanProposalState,
+        rationale: impl Into<String>,
+        authorizer: impl Into<String>,
+        source: impl Into<String>,
+        replacement_id: impl Into<String>,
+        revisit_condition: impl Into<String>,
+    ) -> Self {
+        Self {
+            state,
+            rationale: rationale.into(),
+            authorizer: authorizer.into(),
+            source: source.into(),
+            replacement_id: replacement_id.into(),
+            revisit_condition: revisit_condition.into(),
+            auto_accept: None,
+        }
+    }
+
+    pub(crate) fn timeout(
+        rationale: impl Into<String>,
+        revisit_condition: impl Into<String>,
+    ) -> Self {
+        let rationale = rationale.into();
+        let revisit_condition = revisit_condition.into();
+        Self::operator(
+            ReplanProposalState::Deferred,
+            if rationale.trim().is_empty() {
+                "replan decision timed out".to_string()
+            } else {
+                rationale
+            },
+            "daemon",
+            "decision_timeout",
+            "",
+            if revisit_condition.trim().is_empty() {
+                "operator explicitly revisits the timed-out proposal".to_string()
+            } else {
+                revisit_condition
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auto_accept(
+        rationale: impl Into<String>,
+        classification: FrontierClassification,
+        budget_before: FrontierBudgetState,
+        budget_after: FrontierBudgetState,
+    ) -> Self {
+        Self {
+            state: ReplanProposalState::Accepted,
+            rationale: rationale.into(),
+            authorizer: String::new(),
+            source: "frontier_policy".to_string(),
+            replacement_id: String::new(),
+            revisit_condition: String::new(),
+            auto_accept: Some(ReplanAutoAcceptCommand {
+                classification,
+                budget_before,
+                budget_after,
+                record: None,
+            }),
+        }
+    }
+
+    fn auto_accept_recorded(
+        rationale: impl Into<String>,
+        classification: FrontierClassification,
+        budget_before: FrontierBudgetState,
+        budget_after: FrontierBudgetState,
+        checkpoint: impl Into<String>,
+        apply_mode: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: ReplanProposalState::Accepted,
+            rationale: rationale.into(),
+            authorizer: String::new(),
+            source: "frontier_policy".to_string(),
+            replacement_id: String::new(),
+            revisit_condition: String::new(),
+            auto_accept: Some(ReplanAutoAcceptCommand {
+                classification,
+                budget_before,
+                budget_after,
+                record: Some(FrontierAutoAcceptRecord {
+                    checkpoint: checkpoint.into(),
+                    apply_mode: apply_mode.into(),
+                }),
+            }),
+        }
+    }
+
+    fn matches(&self, proposal: &ReplanProposal) -> bool {
+        let authorizer = if self.authorizer.trim().is_empty() {
+            "operator"
+        } else {
+            self.authorizer.trim()
+        };
+        let source = if self.source.trim().is_empty() {
+            "daemon_ipc"
+        } else {
+            self.source.trim()
+        };
+        proposal.state == self.state
+            && proposal.operator_decision.as_ref().is_some_and(|decision| {
+                let base_matches = decision.decision == self.state.as_str()
+                    && decision.rationale == self.rationale.trim()
+                    && decision.source == source
+                    && decision.replacement_id == self.replacement_id.trim()
+                    && decision.revisit_condition == self.revisit_condition.trim();
+                if let Some(auto_accept) = &self.auto_accept {
+                    base_matches
+                        && decision.authorizer == format!("envelope:{}", proposal.run_id)
+                        && proposal.frontier_classification.as_ref()
+                            == Some(&auto_accept.classification)
+                        && decision.frontier_tier == auto_accept.classification.tier
+                        && decision.frontier_reason_codes == auto_accept.classification.reason_codes
+                        && decision.frontier_budget_before.as_ref()
+                            == Some(&auto_accept.budget_before)
+                        && decision.frontier_budget_after.as_ref()
+                            == Some(&auto_accept.budget_after)
+                } else {
+                    base_matches && decision.authorizer == authorizer
+                }
+            })
+    }
+
+    fn supplemental_record_matches(
+        &self,
+        conn: &Connection,
+        proposal: &ReplanProposal,
+    ) -> Result<bool> {
+        let Some((auto_accept, record)) = self.auto_accept.as_ref().and_then(|auto_accept| {
+            auto_accept
+                .record
+                .as_ref()
+                .map(|record| (auto_accept, record))
+        }) else {
+            return Ok(true);
+        };
+        let Some(decision) = proposal.operator_decision.as_ref() else {
+            return Ok(false);
+        };
+        let expected_classification =
+            record.classification_payload(proposal, &auto_accept.classification);
+        let expected_record = record.payload(proposal, decision, auto_accept);
+        Ok(exact_event_payload_exists(
+            conn,
+            &proposal.run_id,
+            crate::workflow::events::FRONTIER_CLASSIFIED,
+            &expected_classification,
+        )? && exact_event_payload_exists(
+            conn,
+            &proposal.run_id,
+            crate::workflow::events::FRONTIER_AUTO_ACCEPT_RECORDED,
+            &expected_record,
+        )?)
+    }
+}
+
+fn exact_event_payload_exists<T: Serialize>(
+    conn: &Connection,
+    run_id: &str,
+    event_type: &str,
+    expected: &T,
+) -> Result<bool> {
+    let expected = serde_json::to_value(expected)?;
+    let mut statement = conn
+        .prepare("SELECT payload_json FROM events WHERE run_id=?1 AND type=?2 ORDER BY id ASC")?;
+    let mut rows = statement.query(params![run_id, event_type])?;
+    while let Some(row) = rows.next()? {
+        let payload_json: String = row.get(0)?;
+        if serde_json::from_str::<serde_json::Value>(&payload_json)
+            .is_ok_and(|payload| payload == expected)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplanDecisionTransition {
+    pub outcome: DecisionCommandOutcome,
+    pub proposal: Option<ReplanProposal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +351,38 @@ pub(crate) struct TerminalTransition {
     pub question_interruption_reason: String,
     pub summary_written: bool,
     pub committed: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionTransactionFaultStage {
+    BeforeEventAppend,
+    BeforeSupplementalEventAppend,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DECISION_TRANSACTION_FAULT:
+        std::cell::RefCell<Option<DecisionTransactionFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_decision_transaction_fault(stage: DecisionTransactionFaultStage) {
+    DECISION_TRANSACTION_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_decision_transaction_fault(stage: DecisionTransactionFaultStage) -> bool {
+    DECISION_TRANSACTION_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 #[cfg(test)]
@@ -159,8 +502,9 @@ impl Store {
     fn conn(&self) -> Result<Connection> {
         let conn = Connection::open(&self.path)
             .with_context(|| format!("open sqlite state {}", self.path.display()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok(conn)
     }
 
@@ -284,7 +628,8 @@ impl Store {
                 asked_at TEXT NOT NULL,
                 answered_at TEXT NOT NULL DEFAULT '',
                 answer TEXT NOT NULL DEFAULT '',
-                answer_source TEXT NOT NULL DEFAULT ''
+                answer_source TEXT NOT NULL DEFAULT '',
+                resolution_command_json TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_worker_questions_run_state
                 ON worker_questions(run_id, state);
@@ -469,6 +814,12 @@ impl Store {
             "worker_questions",
             "answer_source",
             "answer_source TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_questions",
+            "resolution_command_json",
+            "resolution_command_json TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(
             &conn,
@@ -1902,7 +2253,7 @@ impl Store {
         run_id: &str,
         question_id: &str,
         reason: &str,
-    ) -> Result<WorkerQuestionAnswerTransition> {
+    ) -> Result<WorkerQuestion> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = worker_question_by_id(&tx, question_id, Some(run_id))?.ok_or_else(|| {
@@ -1918,10 +2269,7 @@ impl Store {
             )?
         {
             tx.commit()?;
-            return Ok(WorkerQuestionAnswerTransition {
-                question: existing,
-                applied: false,
-            });
+            return Ok(existing);
         }
         let now = Utc::now().to_rfc3339();
         let updated = tx.execute(
@@ -1946,210 +2294,353 @@ impl Store {
         let question = worker_question_by_id(&tx, question_id, Some(run_id))?
             .ok_or_else(|| anyhow::anyhow!("question disappeared during interruption"))?;
         tx.commit()?;
-        Ok(WorkerQuestionAnswerTransition {
-            question,
-            applied: updated == 1,
-        })
+        Ok(question)
     }
 
-    #[allow(dead_code)] // Compatibility path for callers that still expect strict double-answer errors.
-    pub fn answer_worker_question(
+    pub(crate) fn decide_worker_question_command(
         &self,
         run_id: &str,
         question_id: &str,
-        answer: &str,
-    ) -> Result<WorkerQuestion> {
-        let conn = self.conn()?;
-        let existing = worker_question_by_id(&conn, question_id, Some(run_id))?;
-        let Some(existing) = existing else {
-            anyhow::bail!("question {question_id:?} for run {run_id:?} not found");
+        command: WorkerQuestionDecisionCommand,
+    ) -> Result<WorkerQuestionDecisionTransition> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(existing) = worker_question_by_id(&tx, question_id, Some(run_id))? else {
+            tx.commit()?;
+            return Ok(WorkerQuestionDecisionTransition {
+                outcome: DecisionCommandOutcome::NotFound,
+                question: None,
+            });
         };
-        if existing.state != "pending" {
-            anyhow::bail!("question {question_id:?} is already {}", existing.state);
-        }
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE worker_questions SET state='answered', answered_at=?1, answer=?2, answer_source='operator' WHERE id=?3",
-            params![now, answer, question_id],
-        )?;
-        self.get_worker_question(question_id)?
-            .ok_or_else(|| anyhow::anyhow!("question disappeared after answer"))
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn answer_worker_question_cas(
-        &self,
-        run_id: &str,
-        question_id: &str,
-        answer: &str,
-        answer_source: WorkerQuestionAnswerSource,
-        event_type: &str,
-        event_payload: &impl Serialize,
-        progress_message: &str,
-    ) -> Result<WorkerQuestionAnswerTransition> {
-        let payload_json = serde_json::to_string(event_payload)?;
-        let mut conn = self.conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = worker_question_by_id(&tx, question_id, Some(run_id))?.ok_or_else(|| {
-            anyhow::anyhow!("question {question_id:?} for run {run_id:?} not found")
-        })?;
-        if existing.state != "pending" {
-            tx.commit()?;
-            return Ok(WorkerQuestionAnswerTransition {
-                question: existing,
-                applied: false,
-            });
-        }
-        if !active_worker_attempt_with_launch_id(
-            &tx,
-            run_id,
-            &existing.slice_id,
-            existing.attempt,
-            existing.launch_id,
-        )? {
-            anyhow::bail!("question {question_id:?} is not attached to the active worker launch");
-        }
-
-        let now = Utc::now();
-        if answer_source == WorkerQuestionAnswerSource::LlmRecommendationTimeout {
-            let recommendation = existing.recommendation();
-            if !existing.fallback_eligible || !recommendation.is_eligible(&existing.options) {
-                anyhow::bail!(
-                    "question {question_id:?} does not have an eligible durable recommendation"
-                );
-            }
-            if answer != existing.recommended_answer {
-                anyhow::bail!(
-                    "question {question_id:?} timeout fallback must apply the exact durable recommendation"
-                );
-            }
-            let deadline_at = existing.deadline_at.ok_or_else(|| {
-                anyhow::anyhow!("question {question_id:?} has no fallback deadline")
-            })?;
-            if now < deadline_at {
-                anyhow::bail!(
-                    "question {question_id:?} fallback cannot commit before its absolute deadline"
-                );
-            }
-        }
-        let now_text = now.to_rfc3339();
-        let updated = tx.execute(
-            r#"UPDATE worker_questions
-               SET state='answered', answered_at=?1, answer=?2, answer_source=?3
-               WHERE id=?4 AND run_id=?5 AND state='pending'"#,
-            params![
-                &now_text,
+        match command {
+            WorkerQuestionDecisionCommand::Answer {
                 answer,
-                answer_source.as_str(),
-                question_id,
-                run_id
-            ],
-        )?;
-        if updated == 0 {
-            let question = worker_question_by_id(&tx, question_id, Some(run_id))?
-                .ok_or_else(|| anyhow::anyhow!("question disappeared during answer race"))?;
-            tx.commit()?;
-            return Ok(WorkerQuestionAnswerTransition {
-                question,
-                applied: false,
-            });
-        }
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, event_type, payload_json, &now_text],
-        )?;
-        Self::transition_progress_after_worker_question_resolution(
-            &tx,
-            run_id,
-            &existing,
-            progress_message,
-            &now_text,
-        )?;
-        let question = worker_question_by_id(&tx, question_id, Some(run_id))?
-            .ok_or_else(|| anyhow::anyhow!("question disappeared after answer"))?;
-        tx.commit()?;
-        Ok(WorkerQuestionAnswerTransition {
-            question,
-            applied: true,
-        })
-    }
+                answer_source,
+                progress_message,
+            } => {
+                let resolution_command =
+                    worker_question_answer_command_json(&answer, answer_source, &progress_message)?;
+                if existing.state != "pending" {
+                    let idempotent = existing.state == "answered"
+                        && existing.answer == answer
+                        && existing.answer_source == Some(answer_source)
+                        && worker_question_resolution_command(&tx, question_id)?
+                            == resolution_command;
+                    tx.commit()?;
+                    return Ok(WorkerQuestionDecisionTransition {
+                        outcome: if idempotent {
+                            DecisionCommandOutcome::AlreadyAppliedIdempotently
+                        } else {
+                            DecisionCommandOutcome::Conflict
+                        },
+                        question: Some(existing),
+                    });
+                }
+                if !active_worker_attempt_with_launch_id(
+                    &tx,
+                    run_id,
+                    &existing.slice_id,
+                    existing.attempt,
+                    existing.launch_id,
+                )? {
+                    tx.commit()?;
+                    return Ok(WorkerQuestionDecisionTransition {
+                        outcome: DecisionCommandOutcome::StaleToken,
+                        question: Some(existing),
+                    });
+                }
 
-    #[allow(dead_code)] // Compatibility path for callers that only need the durable row.
-    pub fn timeout_worker_question(&self, question_id: &str) -> Result<Option<WorkerQuestion>> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE worker_questions SET state='timed_out', answered_at=?1 WHERE id=?2 AND state='pending'",
-            params![Utc::now().to_rfc3339(), question_id],
-        )?;
-        self.get_worker_question(question_id)
-    }
+                let now = Utc::now();
+                if answer_source == WorkerQuestionAnswerSource::LlmRecommendationTimeout {
+                    let recommendation = existing.recommendation();
+                    if !existing.fallback_eligible || !recommendation.is_eligible(&existing.options)
+                    {
+                        anyhow::bail!(
+                            "question {question_id:?} does not have an eligible durable recommendation"
+                        );
+                    }
+                    if answer != existing.recommended_answer {
+                        anyhow::bail!(
+                            "question {question_id:?} timeout fallback must apply the exact durable recommendation"
+                        );
+                    }
+                    let deadline_at = existing.deadline_at.ok_or_else(|| {
+                        anyhow::anyhow!("question {question_id:?} has no fallback deadline")
+                    })?;
+                    if now < deadline_at {
+                        anyhow::bail!(
+                            "question {question_id:?} fallback cannot commit before its absolute deadline"
+                        );
+                    }
+                }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn timeout_worker_question_cas(
-        &self,
-        run_id: &str,
-        question_id: &str,
-        event_type: &str,
-        event_payload: &impl Serialize,
-        progress_message: &str,
-    ) -> Result<WorkerQuestionAnswerTransition> {
-        let payload_json = serde_json::to_string(event_payload)?;
-        let mut conn = self.conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = worker_question_by_id(&tx, question_id, Some(run_id))?.ok_or_else(|| {
-            anyhow::anyhow!("question {question_id:?} for run {run_id:?} not found")
-        })?;
-        if existing.state != "pending" {
-            tx.commit()?;
-            return Ok(WorkerQuestionAnswerTransition {
-                question: existing,
-                applied: false,
-            });
-        }
-        if !active_worker_attempt_with_launch_id(
-            &tx,
-            run_id,
-            &existing.slice_id,
-            existing.attempt,
-            existing.launch_id,
-        )? {
-            anyhow::bail!("question {question_id:?} is not attached to the active worker launch");
-        }
+                let now_text = now.to_rfc3339();
+                let updated = tx.execute(
+                    r#"UPDATE worker_questions
+                       SET state='answered', answered_at=?1, answer=?2, answer_source=?3,
+                           resolution_command_json=?4
+                       WHERE id=?5 AND run_id=?6 AND state='pending'"#,
+                    params![
+                        &now_text,
+                        &answer,
+                        answer_source.as_str(),
+                        &resolution_command,
+                        question_id,
+                        run_id
+                    ],
+                )?;
+                if updated != 1 {
+                    anyhow::bail!(
+                        "question {question_id:?} changed before the answer could commit"
+                    );
+                }
+                Self::transition_progress_after_worker_question_resolution(
+                    &tx,
+                    run_id,
+                    &existing,
+                    &progress_message,
+                    &now_text,
+                )?;
+                let payload = crate::workflow::events::WorkerQuestionAnsweredPayload::from_question(
+                    &existing,
+                    &answer,
+                    answer_source,
+                );
+                #[cfg(test)]
+                if take_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend)
+                {
+                    anyhow::bail!("injected decision event append failure");
+                }
+                tx.execute(
+                    "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        run_id,
+                        crate::workflow::events::WORKER_QUESTION_ANSWERED,
+                        serde_json::to_string(&payload)?,
+                        &now_text,
+                    ],
+                )?;
+                let question = worker_question_by_id(&tx, question_id, Some(run_id))?
+                    .ok_or_else(|| anyhow::anyhow!("question disappeared after answer"))?;
+                tx.commit()?;
+                Ok(WorkerQuestionDecisionTransition {
+                    outcome: DecisionCommandOutcome::Applied,
+                    question: Some(question),
+                })
+            }
+            WorkerQuestionDecisionCommand::Timeout {
+                expected_launch_id,
+                apply_recommendation_at_deadline,
+                incident_code,
+                message_prefix,
+                progress_message,
+            } => {
+                if existing.launch_id != expected_launch_id {
+                    tx.commit()?;
+                    return Ok(WorkerQuestionDecisionTransition {
+                        outcome: DecisionCommandOutcome::StaleToken,
+                        question: Some(existing),
+                    });
+                }
+                if existing.state != "pending" {
+                    if existing.state == "interrupted" {
+                        tx.commit()?;
+                        return Ok(WorkerQuestionDecisionTransition {
+                            outcome: DecisionCommandOutcome::StaleToken,
+                            question: Some(existing),
+                        });
+                    }
+                    let resolution_command = worker_question_timeout_command_json(
+                        expected_launch_id,
+                        apply_recommendation_at_deadline,
+                        &incident_code,
+                        &message_prefix,
+                        &progress_message,
+                    )?;
+                    let same_terminal_outcome = existing.state == "timed_out"
+                        || (apply_recommendation_at_deadline
+                            && existing.state == "answered"
+                            && existing.answer_source
+                                == Some(WorkerQuestionAnswerSource::LlmRecommendationTimeout));
+                    let idempotent = same_terminal_outcome
+                        && worker_question_resolution_command(&tx, question_id)?
+                            == resolution_command;
+                    tx.commit()?;
+                    return Ok(WorkerQuestionDecisionTransition {
+                        outcome: if idempotent {
+                            DecisionCommandOutcome::AlreadyAppliedIdempotently
+                        } else {
+                            DecisionCommandOutcome::Conflict
+                        },
+                        question: Some(existing),
+                    });
+                }
+                if !active_worker_attempt_with_launch_id(
+                    &tx,
+                    run_id,
+                    &existing.slice_id,
+                    existing.attempt,
+                    existing.launch_id,
+                )? {
+                    let now_text = Utc::now().to_rfc3339();
+                    let reason = "worker attempt became inactive before question resolution";
+                    tx.execute(
+                        r#"UPDATE worker_questions
+                           SET state='interrupted', answered_at=?1, answer=?2
+                           WHERE id=?3 AND run_id=?4 AND state='pending'"#,
+                        params![&now_text, reason, question_id, run_id],
+                    )?;
+                    let payload = serde_json::json!({
+                        "question_id": existing.id,
+                        "slice_id": existing.slice_id,
+                        "attempt": existing.attempt,
+                        "launch_id": existing.launch_id,
+                        "reason": reason,
+                    });
+                    #[cfg(test)]
+                    if take_decision_transaction_fault(
+                        DecisionTransactionFaultStage::BeforeEventAppend,
+                    ) {
+                        anyhow::bail!("injected decision event append failure");
+                    }
+                    tx.execute(
+                        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_question_interrupted', ?2, ?3)",
+                        params![run_id, serde_json::to_string(&payload)?, &now_text],
+                    )?;
+                    let question = worker_question_by_id(&tx, question_id, Some(run_id))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("question disappeared after interruption")
+                        })?;
+                    tx.commit()?;
+                    return Ok(WorkerQuestionDecisionTransition {
+                        outcome: DecisionCommandOutcome::StaleToken,
+                        question: Some(question),
+                    });
+                }
 
-        let now_text = Utc::now().to_rfc3339();
-        let updated = tx.execute(
-            r#"UPDATE worker_questions
-               SET state='timed_out', answered_at=?1
-               WHERE id=?2 AND run_id=?3 AND state='pending'"#,
-            params![&now_text, question_id, run_id],
-        )?;
-        if updated == 0 {
-            let question = worker_question_by_id(&tx, question_id, Some(run_id))?
-                .ok_or_else(|| anyhow::anyhow!("question disappeared during timeout race"))?;
-            tx.commit()?;
-            return Ok(WorkerQuestionAnswerTransition {
-                question,
-                applied: false,
-            });
+                let now = Utc::now();
+                let now_text = now.to_rfc3339();
+                let recommendation = existing.recommendation();
+                let apply_recommendation = apply_recommendation_at_deadline
+                    && existing.deadline_at.is_some_and(|deadline| now >= deadline)
+                    && existing.fallback_eligible
+                    && recommendation.is_eligible(&existing.options);
+                if apply_recommendation {
+                    let answer = existing.recommended_answer.clone();
+                    let source = WorkerQuestionAnswerSource::LlmRecommendationTimeout;
+                    let resolution_command = worker_question_timeout_command_json(
+                        expected_launch_id,
+                        apply_recommendation_at_deadline,
+                        &incident_code,
+                        &message_prefix,
+                        &progress_message,
+                    )?;
+                    let updated = tx.execute(
+                        r#"UPDATE worker_questions
+                           SET state='answered', answered_at=?1, answer=?2, answer_source=?3,
+                               resolution_command_json=?4
+                           WHERE id=?5 AND run_id=?6 AND state='pending'"#,
+                        params![
+                            &now_text,
+                            &answer,
+                            source.as_str(),
+                            &resolution_command,
+                            question_id,
+                            run_id
+                        ],
+                    )?;
+                    if updated != 1 {
+                        anyhow::bail!(
+                            "question {question_id:?} changed before the recommendation could commit"
+                        );
+                    }
+                    Self::transition_progress_after_worker_question_resolution(
+                        &tx,
+                        run_id,
+                        &existing,
+                        &format!(
+                            "LLM recommendation applied at deadline for {}; worker resuming",
+                            existing.id
+                        ),
+                        &now_text,
+                    )?;
+                    let payload =
+                        crate::workflow::events::WorkerQuestionAnsweredPayload::from_question(
+                            &existing, &answer, source,
+                        );
+                    #[cfg(test)]
+                    if take_decision_transaction_fault(
+                        DecisionTransactionFaultStage::BeforeEventAppend,
+                    ) {
+                        anyhow::bail!("injected decision event append failure");
+                    }
+                    tx.execute(
+                        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            run_id,
+                            crate::workflow::events::WORKER_QUESTION_ANSWERED,
+                            serde_json::to_string(&payload)?,
+                            &now_text,
+                        ],
+                    )?;
+                } else {
+                    let resolution_command = worker_question_timeout_command_json(
+                        expected_launch_id,
+                        apply_recommendation_at_deadline,
+                        &incident_code,
+                        &message_prefix,
+                        &progress_message,
+                    )?;
+                    let updated = tx.execute(
+                        r#"UPDATE worker_questions
+                           SET state='timed_out', answered_at=?1, resolution_command_json=?2
+                           WHERE id=?3 AND run_id=?4 AND state='pending'"#,
+                        params![&now_text, &resolution_command, question_id, run_id],
+                    )?;
+                    if updated != 1 {
+                        anyhow::bail!(
+                            "question {question_id:?} changed before the timeout could commit"
+                        );
+                    }
+                    Self::transition_progress_after_worker_question_resolution(
+                        &tx,
+                        run_id,
+                        &existing,
+                        &progress_message,
+                        &now_text,
+                    )?;
+                    let incident = crate::workflow::events::RunIncidentPayload::warning(
+                        incident_code,
+                        format!("{message_prefix}: {}", existing.question),
+                    )
+                    .with_extra("question_id", &existing.id)
+                    .with_extra("slice_id", &existing.slice_id);
+                    #[cfg(test)]
+                    if take_decision_transaction_fault(
+                        DecisionTransactionFaultStage::BeforeEventAppend,
+                    ) {
+                        anyhow::bail!("injected decision event append failure");
+                    }
+                    tx.execute(
+                        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            run_id,
+                            crate::workflow::events::RUN_INCIDENT,
+                            serde_json::to_string(&incident)?,
+                            &now_text,
+                        ],
+                    )?;
+                }
+                let question = worker_question_by_id(&tx, question_id, Some(run_id))?
+                    .ok_or_else(|| anyhow::anyhow!("question disappeared after resolution"))?;
+                tx.commit()?;
+                Ok(WorkerQuestionDecisionTransition {
+                    outcome: DecisionCommandOutcome::Applied,
+                    question: Some(question),
+                })
+            }
         }
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, event_type, payload_json, &now_text],
-        )?;
-        Self::transition_progress_after_worker_question_resolution(
-            &tx,
-            run_id,
-            &existing,
-            progress_message,
-            &now_text,
-        )?;
-        let question = worker_question_by_id(&tx, question_id, Some(run_id))?
-            .ok_or_else(|| anyhow::anyhow!("question disappeared after timeout"))?;
-        tx.commit()?;
-        Ok(WorkerQuestionAnswerTransition {
-            question,
-            applied: true,
-        })
     }
 
     fn transition_progress_after_worker_question_resolution(
@@ -2277,17 +2768,7 @@ impl Store {
         proposal_id: &str,
     ) -> Result<Option<ReplanProposal>> {
         let conn = self.conn()?;
-        let row = conn
-            .query_row(
-                r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
-                          evidence_json, proposed_changes_json, risk, decision_json,
-                          frontier_classification_json, created_at, updated_at
-                   FROM replan_proposals WHERE run_id=?1 AND id=?2"#,
-                params![run_id, proposal_id],
-                replan_proposal_tuple_from_row,
-            )
-            .optional()?;
-        row.map(replan_proposal_from_tuple).transpose()
+        replan_proposal_by_id(&conn, run_id, proposal_id)
     }
 
     pub fn list_replan_proposals(&self, run_id: &str) -> Result<Vec<ReplanProposal>> {
@@ -2314,6 +2795,275 @@ impl Store {
             .collect())
     }
 
+    pub(crate) fn decide_replan_proposal_command(
+        &self,
+        run_id: &str,
+        proposal_id: &str,
+        command: ReplanDecisionCommand,
+    ) -> Result<ReplanDecisionTransition> {
+        if command.state == ReplanProposalState::Pending {
+            anyhow::bail!("replan decision cannot leave proposal pending");
+        }
+        if command.rationale.trim().is_empty() {
+            anyhow::bail!("replan decision rationale is required");
+        }
+        if command.state == ReplanProposalState::Deferred
+            && command.revisit_condition.trim().is_empty()
+        {
+            anyhow::bail!("replan defer requires --until <condition>");
+        }
+        if command.state == ReplanProposalState::Superseded
+            && command.replacement_id.trim().is_empty()
+        {
+            anyhow::bail!("replan supersede requires a replacement proposal id");
+        }
+        if let Some(auto_accept) = &command.auto_accept {
+            if auto_accept.classification.tier != "tier_1" {
+                anyhow::bail!("frontier auto-accept requires a Tier-1 classification");
+            }
+            if !auto_accept
+                .classification
+                .reason_codes
+                .iter()
+                .any(|code| code == "add_followup_slice_only")
+            {
+                anyhow::bail!("frontier auto-accept requires add_followup_slice_only evidence");
+            }
+            if auto_accept.budget_after.auto_promotions_used
+                != auto_accept
+                    .budget_before
+                    .auto_promotions_used
+                    .saturating_add(1)
+                || auto_accept.budget_after.generated_slices
+                    != auto_accept.budget_before.generated_slices.saturating_add(1)
+            {
+                anyhow::bail!(
+                    "frontier auto-accept must consume exactly one promotion and one generated-slice budget unit"
+                );
+            }
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(existing) = replan_proposal_by_id(&tx, run_id, proposal_id)? else {
+            tx.commit()?;
+            return Ok(ReplanDecisionTransition {
+                outcome: DecisionCommandOutcome::NotFound,
+                proposal: None,
+            });
+        };
+        if existing.state != ReplanProposalState::Pending {
+            let idempotent = command.matches(&existing)
+                && command.supplemental_record_matches(&tx, &existing)?;
+            tx.commit()?;
+            return Ok(ReplanDecisionTransition {
+                outcome: if idempotent {
+                    DecisionCommandOutcome::AlreadyAppliedIdempotently
+                } else {
+                    DecisionCommandOutcome::Conflict
+                },
+                proposal: Some(existing),
+            });
+        }
+
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let run_for_apply = run_by_id(&tx, run_id)?;
+        let (authorizer, source, frontier_tier, frontier_reason_codes, budget_before, budget_after) =
+            if let Some(auto_accept) = &command.auto_accept {
+                let followup_only = matches!(existing.proposed_changes.as_slice(), [change]
+                    if change.kind == "add_followup_slice" && change.followup_slice_draft().is_some());
+                if !followup_only {
+                    anyhow::bail!(
+                        "frontier auto-accept is only valid for one typed add_followup_slice proposal"
+                    );
+                }
+                let durable_budget_json: String = tx.query_row(
+                    "SELECT frontier_budget_json FROM runs WHERE id=?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )?;
+                let durable_budget = if durable_budget_json.trim().is_empty() {
+                    FrontierBudgetState::default()
+                } else {
+                    serde_json::from_str(&durable_budget_json)
+                        .with_context(|| format!("parse frontier budget for run {run_id}"))?
+                };
+                if durable_budget != auto_accept.budget_before {
+                    tx.commit()?;
+                    return Ok(ReplanDecisionTransition {
+                        outcome: DecisionCommandOutcome::Conflict,
+                        proposal: Some(existing),
+                    });
+                }
+                tx.execute(
+                    "UPDATE runs SET frontier_budget_json=?1, updated_at=?2 WHERE id=?3",
+                    params![
+                        serde_json::to_string(&auto_accept.budget_after)?,
+                        &now_text,
+                        run_id,
+                    ],
+                )?;
+                (
+                    format!("envelope:{run_id}"),
+                    "frontier_policy".to_string(),
+                    auto_accept.classification.tier.clone(),
+                    auto_accept.classification.reason_codes.clone(),
+                    Some(auto_accept.budget_before.clone()),
+                    Some(auto_accept.budget_after.clone()),
+                )
+            } else {
+                (
+                    if command.authorizer.trim().is_empty() {
+                        "operator".to_string()
+                    } else {
+                        command.authorizer.trim().to_string()
+                    },
+                    if command.source.trim().is_empty() {
+                        "daemon_ipc".to_string()
+                    } else {
+                        command.source.trim().to_string()
+                    },
+                    String::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+            };
+        let decision = ReplanDecision {
+            decision: command.state.as_str().to_string(),
+            rationale: command.rationale.trim().to_string(),
+            authorizer,
+            source,
+            decided_at: now,
+            frontier_tier,
+            frontier_reason_codes,
+            frontier_budget_before: budget_before,
+            frontier_budget_after: budget_after,
+            applied: false,
+            applied_at: None,
+            apply_status: initial_replan_apply_status(
+                &existing,
+                command.state,
+                run_for_apply.as_ref(),
+            ),
+            apply_reason: initial_replan_apply_reason(
+                &existing,
+                command.state,
+                run_for_apply.as_ref(),
+            ),
+            generated_slice_id: initial_replan_generated_slice_id(&existing, command.state),
+            generated_slice_commit: String::new(),
+            apply_before_checkpoint_id: String::new(),
+            apply_after_checkpoint_id: String::new(),
+            queue_before: Vec::new(),
+            queue_after: Vec::new(),
+            queue_before_hash: String::new(),
+            queue_after_hash: String::new(),
+            replacement_id: command.replacement_id.trim().to_string(),
+            revisit_condition: command.revisit_condition.trim().to_string(),
+        };
+        let updated = if let Some(auto_accept) = &command.auto_accept {
+            tx.execute(
+                r#"UPDATE replan_proposals
+                   SET state=?1, decision_json=?2, frontier_classification_json=?3, updated_at=?4
+                   WHERE run_id=?5 AND id=?6 AND state='pending'"#,
+                params![
+                    command.state.as_str(),
+                    serde_json::to_string(&decision)?,
+                    serde_json::to_string(&auto_accept.classification)?,
+                    &now_text,
+                    run_id,
+                    proposal_id,
+                ],
+            )?
+        } else {
+            tx.execute(
+                r#"UPDATE replan_proposals
+                   SET state=?1, decision_json=?2, updated_at=?3
+                   WHERE run_id=?4 AND id=?5 AND state='pending'"#,
+                params![
+                    command.state.as_str(),
+                    serde_json::to_string(&decision)?,
+                    &now_text,
+                    run_id,
+                    proposal_id,
+                ],
+            )?
+        };
+        if updated != 1 {
+            anyhow::bail!(
+                "replan proposal {proposal_id:?} changed before the decision could commit"
+            );
+        }
+        let proposal = replan_proposal_by_id(&tx, run_id, proposal_id)?
+            .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision"))?;
+        let payload = crate::workflow::events::ReplanProposalDecidedPayload {
+            proposal_id: proposal.id.clone(),
+            state: proposal.state,
+            decision: proposal.operator_decision.clone().ok_or_else(|| {
+                anyhow::anyhow!("replan decision disappeared before event append")
+            })?,
+        };
+        #[cfg(test)]
+        if take_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend) {
+            anyhow::bail!("injected decision event append failure");
+        }
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                run_id,
+                crate::workflow::events::REPLAN_PROPOSAL_DECIDED,
+                serde_json::to_string(&payload)?,
+                &now_text,
+            ],
+        )?;
+        if let Some((auto_accept, record)) = command.auto_accept.as_ref().and_then(|auto_accept| {
+            auto_accept
+                .record
+                .as_ref()
+                .map(|record| (auto_accept, record))
+        }) {
+            let decision = proposal
+                .operator_decision
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("replan decision disappeared before audit event"))?;
+            let classification_record =
+                record.classification_payload(&proposal, &auto_accept.classification);
+            let auto_accept_record = record.payload(&proposal, decision, auto_accept);
+            #[cfg(test)]
+            if take_decision_transaction_fault(
+                DecisionTransactionFaultStage::BeforeSupplementalEventAppend,
+            ) {
+                anyhow::bail!("injected supplemental decision event append failure");
+            }
+            tx.execute(
+                "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    run_id,
+                    crate::workflow::events::FRONTIER_CLASSIFIED,
+                    serde_json::to_string(&classification_record)?,
+                    &now_text,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    run_id,
+                    crate::workflow::events::FRONTIER_AUTO_ACCEPT_RECORDED,
+                    serde_json::to_string(&auto_accept_record)?,
+                    &now_text,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ReplanDecisionTransition {
+            outcome: DecisionCommandOutcome::Applied,
+            proposal: Some(proposal),
+        })
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn decide_replan_proposal(
         &self,
@@ -2326,81 +3076,34 @@ impl Store {
         replacement_id: &str,
         revisit_condition: &str,
     ) -> Result<ReplanProposal> {
-        if state == ReplanProposalState::Pending {
-            anyhow::bail!("replan decision cannot leave proposal pending");
-        }
-        if rationale.trim().is_empty() {
-            anyhow::bail!("replan decision rationale is required");
-        }
-        if state == ReplanProposalState::Deferred && revisit_condition.trim().is_empty() {
-            anyhow::bail!("replan defer requires --until <condition>");
-        }
-        if state == ReplanProposalState::Superseded && replacement_id.trim().is_empty() {
-            anyhow::bail!("replan supersede requires a replacement proposal id");
-        }
-        let existing = self
-            .get_replan_proposal(run_id, proposal_id)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("replan proposal {proposal_id:?} for run {run_id:?} not found")
-            })?;
-        if existing.state != ReplanProposalState::Pending {
-            anyhow::bail!(
-                "replan proposal {proposal_id:?} is already {}",
-                existing.state
-            );
-        }
-        let now = Utc::now();
-        let run_for_apply = self.get_run(run_id)?;
-        let decision = ReplanDecision {
-            decision: state.as_str().to_string(),
-            rationale: rationale.trim().to_string(),
-            authorizer: if authorizer.trim().is_empty() {
-                "operator".to_string()
-            } else {
-                authorizer.trim().to_string()
-            },
-            source: if source.trim().is_empty() {
-                "daemon_ipc".to_string()
-            } else {
-                source.trim().to_string()
-            },
-            decided_at: now,
-            frontier_tier: String::new(),
-            frontier_reason_codes: Vec::new(),
-            frontier_budget_before: None,
-            frontier_budget_after: None,
-            applied: false,
-            applied_at: None,
-            apply_status: initial_replan_apply_status(&existing, state, run_for_apply.as_ref()),
-            apply_reason: initial_replan_apply_reason(&existing, state, run_for_apply.as_ref()),
-            generated_slice_id: initial_replan_generated_slice_id(&existing, state),
-            generated_slice_commit: String::new(),
-            apply_before_checkpoint_id: String::new(),
-            apply_after_checkpoint_id: String::new(),
-            queue_before: Vec::new(),
-            queue_after: Vec::new(),
-            queue_before_hash: String::new(),
-            queue_after_hash: String::new(),
-            replacement_id: replacement_id.trim().to_string(),
-            revisit_condition: revisit_condition.trim().to_string(),
-        };
-        let conn = self.conn()?;
-        conn.execute(
-            r#"UPDATE replan_proposals
-               SET state=?1, decision_json=?2, updated_at=?3
-               WHERE run_id=?4 AND id=?5"#,
-            params![
-                state.as_str(),
-                serde_json::to_string(&decision)?,
-                now.to_rfc3339(),
-                run_id,
-                proposal_id,
-            ],
+        let transition = self.decide_replan_proposal_command(
+            run_id,
+            proposal_id,
+            ReplanDecisionCommand::operator(
+                state,
+                rationale,
+                authorizer,
+                source,
+                replacement_id,
+                revisit_condition,
+            ),
         )?;
-        self.get_replan_proposal(run_id, proposal_id)?
-            .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision"))
+        match transition.outcome {
+            DecisionCommandOutcome::Applied
+            | DecisionCommandOutcome::AlreadyAppliedIdempotently => transition
+                .proposal
+                .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after decision")),
+            DecisionCommandOutcome::NotFound => {
+                anyhow::bail!("replan proposal {proposal_id:?} for run {run_id:?} not found")
+            }
+            outcome => anyhow::bail!(
+                "replan decision for {proposal_id:?} returned {}",
+                outcome.as_str()
+            ),
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn auto_accept_replan_proposal_with_budget(
         &self,
         run_id: &str,
@@ -2409,109 +3112,31 @@ impl Store {
         classification: &FrontierClassification,
         budget_before: &FrontierBudgetState,
         budget_after: &FrontierBudgetState,
+        checkpoint: &str,
+        apply_mode: &str,
     ) -> Result<ReplanProposal> {
-        if rationale.trim().is_empty() {
-            anyhow::bail!("frontier auto-accept rationale is required");
-        }
-        if classification.tier != "tier_1" {
-            anyhow::bail!("frontier auto-accept requires a Tier-1 classification");
-        }
-        if !classification
-            .reason_codes
-            .iter()
-            .any(|code| code == "add_followup_slice_only")
-        {
-            anyhow::bail!("frontier auto-accept requires add_followup_slice_only evidence");
-        }
-        if budget_after.auto_promotions_used != budget_before.auto_promotions_used.saturating_add(1)
-            || budget_after.generated_slices != budget_before.generated_slices.saturating_add(1)
-        {
-            anyhow::bail!(
-                "frontier auto-accept must consume exactly one promotion and one generated-slice budget unit"
-            );
-        }
-        let existing = self
-            .get_replan_proposal(run_id, proposal_id)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("replan proposal {proposal_id:?} for run {run_id:?} not found")
-            })?;
-        if existing.state != ReplanProposalState::Pending {
-            anyhow::bail!(
-                "replan proposal {proposal_id:?} is already {}",
-                existing.state
-            );
-        }
-        let followup_only = matches!(existing.proposed_changes.as_slice(), [change]
-            if change.kind == "add_followup_slice" && change.followup_slice_draft().is_some());
-        if !followup_only {
-            anyhow::bail!(
-                "frontier auto-accept is only valid for one typed add_followup_slice proposal"
-            );
-        }
-        let now = Utc::now();
-        let run_for_apply = self.get_run(run_id)?;
-        let decision = ReplanDecision {
-            decision: ReplanProposalState::Accepted.as_str().to_string(),
-            rationale: rationale.trim().to_string(),
-            authorizer: format!("envelope:{run_id}"),
-            source: "frontier_policy".to_string(),
-            decided_at: now,
-            frontier_tier: classification.tier.clone(),
-            frontier_reason_codes: classification.reason_codes.clone(),
-            frontier_budget_before: Some(budget_before.clone()),
-            frontier_budget_after: Some(budget_after.clone()),
-            applied: false,
-            applied_at: None,
-            apply_status: initial_replan_apply_status(
-                &existing,
-                ReplanProposalState::Accepted,
-                run_for_apply.as_ref(),
+        let transition = self.decide_replan_proposal_command(
+            run_id,
+            proposal_id,
+            ReplanDecisionCommand::auto_accept_recorded(
+                rationale,
+                classification.clone(),
+                budget_before.clone(),
+                budget_after.clone(),
+                checkpoint,
+                apply_mode,
             ),
-            apply_reason: initial_replan_apply_reason(
-                &existing,
-                ReplanProposalState::Accepted,
-                run_for_apply.as_ref(),
-            ),
-            generated_slice_id: initial_replan_generated_slice_id(
-                &existing,
-                ReplanProposalState::Accepted,
-            ),
-            generated_slice_commit: String::new(),
-            apply_before_checkpoint_id: String::new(),
-            apply_after_checkpoint_id: String::new(),
-            queue_before: Vec::new(),
-            queue_after: Vec::new(),
-            queue_before_hash: String::new(),
-            queue_after_hash: String::new(),
-            replacement_id: String::new(),
-            revisit_condition: String::new(),
-        };
-        let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE runs SET frontier_budget_json=?1, updated_at=?2 WHERE id=?3",
-            params![
-                serde_json::to_string(budget_after)?,
-                now.to_rfc3339(),
-                run_id,
-            ],
         )?;
-        tx.execute(
-            r#"UPDATE replan_proposals
-               SET state=?1, decision_json=?2, frontier_classification_json=?3, updated_at=?4
-               WHERE run_id=?5 AND id=?6"#,
-            params![
-                ReplanProposalState::Accepted.as_str(),
-                serde_json::to_string(&decision)?,
-                serde_json::to_string(classification)?,
-                now.to_rfc3339(),
-                run_id,
-                proposal_id,
-            ],
-        )?;
-        tx.commit()?;
-        self.get_replan_proposal(run_id, proposal_id)?
-            .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after auto-accept"))
+        match transition.outcome {
+            DecisionCommandOutcome::Applied
+            | DecisionCommandOutcome::AlreadyAppliedIdempotently => transition
+                .proposal
+                .ok_or_else(|| anyhow::anyhow!("replan proposal disappeared after auto-accept")),
+            outcome => anyhow::bail!(
+                "frontier auto-accept for {proposal_id:?} returned {}",
+                outcome.as_str()
+            ),
+        }
     }
 
     pub fn replace_replan_decision(
@@ -2920,16 +3545,7 @@ impl Store {
 
     pub fn get_run(&self, id: &str) -> Result<Option<Run>> {
         let conn = self.conn()?;
-        let row = conn
-            .query_row(
-                r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
-                          selected_slice_id, error, started_at, updated_at
-                   FROM runs WHERE id=?1"#,
-                params![id],
-                run_tuple_from_row,
-            )
-            .optional()?;
-        row.map(run_from_tuple).transpose()
+        run_by_id(&conn, id)
     }
 
     pub fn get_slice_runs(&self, run_id: &str) -> Result<Vec<SliceRun>> {
@@ -3291,6 +3907,19 @@ fn run_progress_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunP
     ))
 }
 
+fn run_by_id(conn: &Connection, id: &str) -> Result<Option<Run>> {
+    conn.query_row(
+        r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                  selected_slice_id, error, started_at, updated_at
+           FROM runs WHERE id=?1"#,
+        params![id],
+        run_tuple_from_row,
+    )
+    .optional()?
+    .map(run_from_tuple)
+    .transpose()
+}
+
 fn run_from_tuple(row: RunTuple) -> Result<Run> {
     let (
         id,
@@ -3362,6 +3991,24 @@ fn event_from_tuple(row: EventTuple) -> Result<Event> {
             .with_context(|| format!("parse event payload {payload_json:?}"))?,
         created_at: parse_time("created_at", &created_at)?,
     })
+}
+
+fn replan_proposal_by_id(
+    conn: &Connection,
+    run_id: &str,
+    proposal_id: &str,
+) -> Result<Option<ReplanProposal>> {
+    conn.query_row(
+        r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
+                  evidence_json, proposed_changes_json, risk, decision_json,
+                  frontier_classification_json, created_at, updated_at
+           FROM replan_proposals WHERE run_id=?1 AND id=?2"#,
+        params![run_id, proposal_id],
+        replan_proposal_tuple_from_row,
+    )
+    .optional()?
+    .map(replan_proposal_from_tuple)
+    .transpose()
 }
 
 fn replan_proposal_from_tuple(row: ReplanProposalTuple) -> Result<ReplanProposal> {
@@ -3700,6 +4347,45 @@ fn insert_worker_question_row(
     })
 }
 
+fn worker_question_resolution_command(conn: &Connection, question_id: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT resolution_command_json FROM worker_questions WHERE id=?1",
+        params![question_id],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("read resolution command for worker question {question_id:?}"))
+}
+
+fn worker_question_answer_command_json(
+    answer: &str,
+    answer_source: WorkerQuestionAnswerSource,
+    progress_message: &str,
+) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "kind": "answer",
+        "answer": answer,
+        "answer_source": answer_source.as_str(),
+        "progress_message": progress_message,
+    }))?)
+}
+
+fn worker_question_timeout_command_json(
+    expected_launch_id: Option<i64>,
+    apply_recommendation_at_deadline: bool,
+    incident_code: &str,
+    message_prefix: &str,
+    progress_message: &str,
+) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "kind": "timeout",
+        "expected_launch_id": expected_launch_id,
+        "apply_recommendation_at_deadline": apply_recommendation_at_deadline,
+        "incident_code": incident_code,
+        "message_prefix": message_prefix,
+        "progress_message": progress_message,
+    }))?)
+}
+
 fn worker_question_by_id(
     conn: &Connection,
     question_id: &str,
@@ -3977,6 +4663,25 @@ mod tests {
     }
 
     #[test]
+    fn every_store_connection_uses_the_sqlite_concurrency_contract() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+
+        for _ in 0..2 {
+            let conn = store.conn()?;
+            let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+            let journal_mode: String =
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            let busy_timeout_ms: i64 =
+                conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+            assert_eq!(foreign_keys, 1);
+            assert_eq!(journal_mode, "wal");
+            assert_eq!(busy_timeout_ms, 5_000);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn semantic_progress_from_wrapper_stdout_path_updates_worker_progress() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(dir.path().join("state.sqlite"))?;
@@ -4230,6 +4935,554 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_identical_replan_decision_is_idempotent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-idempotent-replan",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        let proposal = store.create_replan_proposal(
+            "run-idempotent-replan",
+            "rp-idempotent",
+            ReplanProposalSource {
+                kind: "operator".to_string(),
+                ..ReplanProposalSource::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange {
+                kind: "add_followup_slice".to_string(),
+                target: "slice-followup".to_string(),
+                summary: "capture follow-up".to_string(),
+            }],
+            "operator_review",
+        )?;
+
+        for _ in 0..2 {
+            let decided = store.decide_replan_proposal(
+                "run-idempotent-replan",
+                &proposal.id,
+                ReplanProposalState::Accepted,
+                "approved",
+                "test-operator",
+                "daemon_ipc",
+                "",
+                "",
+            )?;
+            assert_eq!(decided.state, ReplanProposalState::Accepted);
+        }
+
+        assert_eq!(
+            store
+                .get_events("run-idempotent-replan", 100)?
+                .into_iter()
+                .filter(|event| event.typ == "replan_proposal_decided")
+                .count(),
+            1,
+            "an idempotent duplicate must not append a second authoritative event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replan_decision_command_returns_typed_idempotent_and_conflict_outcomes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-typed-replan",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        let proposal = store.create_replan_proposal(
+            "run-typed-replan",
+            "rp-typed",
+            ReplanProposalSource {
+                kind: "operator".to_string(),
+                ..ReplanProposalSource::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange {
+                kind: "add_followup_slice".to_string(),
+                target: "slice-followup".to_string(),
+                summary: "capture follow-up".to_string(),
+            }],
+            "operator_review",
+        )?;
+        let accepted = ReplanDecisionCommand::operator(
+            ReplanProposalState::Accepted,
+            "approved",
+            "test-operator",
+            "daemon_ipc",
+            "",
+            "",
+        );
+
+        let applied = store.decide_replan_proposal_command(
+            "run-typed-replan",
+            &proposal.id,
+            accepted.clone(),
+        )?;
+        assert_eq!(applied.outcome, DecisionCommandOutcome::Applied);
+
+        let duplicate =
+            store.decide_replan_proposal_command("run-typed-replan", &proposal.id, accepted)?;
+        assert_eq!(
+            duplicate.outcome,
+            DecisionCommandOutcome::AlreadyAppliedIdempotently
+        );
+
+        let conflict = store.decide_replan_proposal_command(
+            "run-typed-replan",
+            &proposal.id,
+            ReplanDecisionCommand::operator(
+                ReplanProposalState::Rejected,
+                "rejected instead",
+                "test-operator",
+                "daemon_ipc",
+                "",
+                "",
+            ),
+        )?;
+        assert_eq!(conflict.outcome, DecisionCommandOutcome::Conflict);
+        assert_eq!(
+            conflict.proposal.expect("conflict winner").state,
+            ReplanProposalState::Accepted
+        );
+        assert_eq!(
+            store
+                .get_events("run-typed-replan", 100)?
+                .into_iter()
+                .filter(|event| event.typ == "replan_proposal_decided")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_auto_accepts_cannot_double_spend_one_budget_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-auto-budget-race",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        let budget_before = FrontierBudgetState::default();
+        let budget_after = FrontierBudgetState {
+            auto_promotions_used: 1,
+            generated_slices: 1,
+            ..FrontierBudgetState::default()
+        };
+        store.set_frontier_state("run-auto-budget-race", None, Some(&budget_before))?;
+        let classification = FrontierClassification {
+            tier: "tier_1".to_string(),
+            reason_codes: vec!["add_followup_slice_only".to_string()],
+            classified_at: now,
+            envelope_hash: "envelope".to_string(),
+            budget_snapshot: budget_before.clone(),
+            autonomy_level: crate::domain::AutonomyLevel::Run,
+        };
+        for proposal_id in ["rp-auto-a", "rp-auto-b"] {
+            let draft = crate::domain::FollowupSliceDraft {
+                id: format!("{proposal_id}-slice"),
+                title: "Follow-up".to_string(),
+                goal: "Capture the bounded follow-up".to_string(),
+                areas: vec!["src/state.rs".to_string()],
+                acceptance: vec!["follow-up accepted".to_string()],
+                verify: vec!["cargo test".to_string()],
+                ..crate::domain::FollowupSliceDraft::default()
+            };
+            store.create_replan_proposal(
+                "run-auto-budget-race",
+                proposal_id,
+                ReplanProposalSource {
+                    kind: "worker".to_string(),
+                    ..ReplanProposalSource::default()
+                },
+                Vec::new(),
+                Vec::new(),
+                vec![ReplanProposedChange::with_followup_slice_draft(
+                    "add_followup_slice".to_string(),
+                    draft.id.clone(),
+                    "bounded follow-up".to_string(),
+                    draft,
+                )],
+                "auto_approvable",
+            )?;
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for proposal_id in ["rp-auto-a", "rp-auto-b"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let classification = classification.clone();
+            let budget_before = budget_before.clone();
+            let budget_after = budget_after.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.decide_replan_proposal_command(
+                    "run-auto-budget-race",
+                    proposal_id,
+                    ReplanDecisionCommand::auto_accept(
+                        "frontier policy accepted",
+                        classification,
+                        budget_before,
+                        budget_after,
+                    ),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("auto-accept command")
+                    .map(|result| result.outcome)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Conflict)
+                .count(),
+            1
+        );
+        let (_, budget) = store.get_frontier_state("run-auto-budget-race")?;
+        assert_eq!(budget, Some(budget_after.clone()));
+        let proposals = store.list_replan_proposals("run-auto-budget-race")?;
+        assert_eq!(
+            proposals
+                .iter()
+                .filter(|proposal| proposal.state == ReplanProposalState::Accepted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            proposals
+                .iter()
+                .filter(|proposal| proposal.state == ReplanProposalState::Pending)
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_events("run-auto-budget-race", 100)?
+                .iter()
+                .filter(|event| event.typ == "replan_proposal_decided")
+                .count(),
+            1
+        );
+        let accepted_id = proposals
+            .iter()
+            .find(|proposal| proposal.state == ReplanProposalState::Accepted)
+            .expect("accepted proposal")
+            .id
+            .clone();
+        let exact_duplicate = store.decide_replan_proposal_command(
+            "run-auto-budget-race",
+            &accepted_id,
+            ReplanDecisionCommand::auto_accept(
+                "frontier policy accepted",
+                classification.clone(),
+                budget_before.clone(),
+                budget_after.clone(),
+            ),
+        )?;
+        assert_eq!(
+            exact_duplicate.outcome,
+            DecisionCommandOutcome::AlreadyAppliedIdempotently
+        );
+        let mut conflicting_classification = classification.clone();
+        conflicting_classification.envelope_hash = "different-envelope".to_string();
+        let conflicting_duplicate = store.decide_replan_proposal_command(
+            "run-auto-budget-race",
+            &accepted_id,
+            ReplanDecisionCommand::auto_accept(
+                "frontier policy accepted",
+                conflicting_classification,
+                budget_before.clone(),
+                budget_after.clone(),
+            ),
+        )?;
+        assert_eq!(
+            conflicting_duplicate.outcome,
+            DecisionCommandOutcome::Conflict
+        );
+
+        let rollback_draft = crate::domain::FollowupSliceDraft {
+            id: "rp-auto-rollback-slice".to_string(),
+            title: "Rollback follow-up".to_string(),
+            goal: "Prove budget rollback".to_string(),
+            areas: vec!["src/state.rs".to_string()],
+            acceptance: vec!["rollback proven".to_string()],
+            verify: vec!["cargo test".to_string()],
+            ..crate::domain::FollowupSliceDraft::default()
+        };
+        store.create_replan_proposal(
+            "run-auto-budget-race",
+            "rp-auto-rollback",
+            ReplanProposalSource {
+                kind: "worker".to_string(),
+                ..ReplanProposalSource::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange::with_followup_slice_draft(
+                "add_followup_slice".to_string(),
+                rollback_draft.id.clone(),
+                "rollback follow-up".to_string(),
+                rollback_draft,
+            )],
+            "auto_approvable",
+        )?;
+        let next_budget = FrontierBudgetState {
+            auto_promotions_used: 2,
+            generated_slices: 2,
+            ..FrontierBudgetState::default()
+        };
+        inject_decision_transaction_fault(
+            DecisionTransactionFaultStage::BeforeSupplementalEventAppend,
+        );
+        assert!(
+            store
+                .auto_accept_replan_proposal_with_budget(
+                    "run-auto-budget-race",
+                    "rp-auto-rollback",
+                    "frontier policy rollback",
+                    &classification,
+                    &budget_after,
+                    &next_budget,
+                    "rollback-checkpoint",
+                    "append_and_run",
+                )
+                .is_err()
+        );
+        let (_, durable_budget) = store.get_frontier_state("run-auto-budget-race")?;
+        assert_eq!(durable_budget, Some(budget_after.clone()));
+        assert_eq!(
+            store
+                .get_replan_proposal("run-auto-budget-race", "rp-auto-rollback")?
+                .expect("rolled back proposal")
+                .state,
+            ReplanProposalState::Pending
+        );
+        assert_eq!(
+            store
+                .get_events("run-auto-budget-race", 100)?
+                .iter()
+                .filter(|event| event.typ == "replan_proposal_decided")
+                .count(),
+            1,
+            "a failed supplemental event append must roll back proposal state and budget"
+        );
+        assert_eq!(
+            store
+                .get_events("run-auto-budget-race", 100)?
+                .iter()
+                .filter(|event| event.typ == "frontier_auto_accept_recorded")
+                .count(),
+            0
+        );
+        assert_eq!(
+            store
+                .get_events("run-auto-budget-race", 100)?
+                .iter()
+                .filter(|event| event.typ == "frontier_classified")
+                .count(),
+            0,
+            "a failed supplemental event append must roll back classification audit evidence"
+        );
+
+        let recorded = store.decide_replan_proposal_command(
+            "run-auto-budget-race",
+            "rp-auto-rollback",
+            ReplanDecisionCommand::auto_accept_recorded(
+                "frontier policy rollback",
+                classification.clone(),
+                budget_after.clone(),
+                next_budget.clone(),
+                "rollback-checkpoint",
+                "append_and_run",
+            ),
+        )?;
+        assert_eq!(recorded.outcome, DecisionCommandOutcome::Applied);
+        let exact_recorded_duplicate = store.decide_replan_proposal_command(
+            "run-auto-budget-race",
+            "rp-auto-rollback",
+            ReplanDecisionCommand::auto_accept_recorded(
+                "frontier policy rollback",
+                classification.clone(),
+                budget_after.clone(),
+                next_budget.clone(),
+                "rollback-checkpoint",
+                "append_and_run",
+            ),
+        )?;
+        assert_eq!(
+            exact_recorded_duplicate.outcome,
+            DecisionCommandOutcome::AlreadyAppliedIdempotently
+        );
+        for (checkpoint, apply_mode) in [
+            ("different-checkpoint", "append_and_run"),
+            ("rollback-checkpoint", "append_only"),
+        ] {
+            let conflict = store.decide_replan_proposal_command(
+                "run-auto-budget-race",
+                "rp-auto-rollback",
+                ReplanDecisionCommand::auto_accept_recorded(
+                    "frontier policy rollback",
+                    classification.clone(),
+                    budget_after.clone(),
+                    next_budget.clone(),
+                    checkpoint,
+                    apply_mode,
+                ),
+            )?;
+            assert_eq!(conflict.outcome, DecisionCommandOutcome::Conflict);
+        }
+        assert_eq!(
+            store
+                .get_events("run-auto-budget-race", 100)?
+                .iter()
+                .filter(|event| event.typ == "frontier_auto_accept_recorded")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_events("run-auto-budget-race", 100)?
+                .iter()
+                .filter(|event| event.typ == "frontier_classified")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_conflicting_replan_decisions_have_one_winner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.sqlite");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-concurrent-replan",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        let proposal = store.create_replan_proposal(
+            "run-concurrent-replan",
+            "rp-race",
+            ReplanProposalSource {
+                kind: "worker".to_string(),
+                slice_id: "slice-001".to_string(),
+                phase: "worker_running".to_string(),
+                attempt: 1,
+                summary: "concurrent operator decision".to_string(),
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![ReplanProposedChange {
+                kind: "add_followup_slice".to_string(),
+                target: "slice-001-followup".to_string(),
+                summary: "capture follow-up work".to_string(),
+            }],
+            "operator_review",
+        )?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for (state, rationale) in [
+            (ReplanProposalState::Accepted, "accept"),
+            (ReplanProposalState::Rejected, "reject"),
+        ] {
+            let store = Store::open(&path)?;
+            let barrier = barrier.clone();
+            let proposal_id = proposal.id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.decide_replan_proposal_command(
+                    "run-concurrent-replan",
+                    &proposal_id,
+                    ReplanDecisionCommand::operator(
+                        state,
+                        rationale,
+                        "test-operator",
+                        "concurrent-test",
+                        "",
+                        "",
+                    ),
+                )
+            }));
+        }
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("decision thread"))
+            .collect::<Vec<_>>();
+
+        let outcomes = results
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|result| result.outcome)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Conflict)
+                .count(),
+            1
+        );
+        let final_proposal = store
+            .get_replan_proposal("run-concurrent-replan", &proposal.id)?
+            .expect("durable proposal");
+        let decision_events = store
+            .get_events("run-concurrent-replan", 100)?
+            .into_iter()
+            .filter(|event| event.typ == "replan_proposal_decided")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decision_events.len(),
+            1,
+            "the winning state change and its authoritative event must commit together"
+        );
+        assert_eq!(decision_events[0].payload["proposal_id"], final_proposal.id);
+        assert_eq!(
+            decision_events[0].payload["state"],
+            final_proposal.state.as_str()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_question_recommendation_eligibility_is_exact_and_bounded() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(dir.path().join("state.sqlite"))?;
@@ -4421,19 +5674,16 @@ mod tests {
             &recommendation,
         )?;
         store.update_run("run-guard", RunStatus::Completed, "")?;
-        assert!(
-            store
-                .answer_worker_question_cas(
-                    "run-guard",
-                    "q-terminal",
-                    "A",
-                    WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-                    "worker_question_answered",
-                    &serde_json::json!({"question_id": "q-terminal"}),
-                    "recommendation applied",
-                )
-                .is_err()
-        );
+        let terminal = store.decide_worker_question_command(
+            "run-guard",
+            "q-terminal",
+            WorkerQuestionDecisionCommand::answer(
+                "A",
+                WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+                "recommendation applied",
+            ),
+        )?;
+        assert_eq!(terminal.outcome, DecisionCommandOutcome::StaleToken);
         assert_eq!(
             store
                 .get_worker_question("q-terminal")?
@@ -4453,17 +5703,20 @@ mod tests {
             "new attempt awaiting answer",
             "",
         )?;
-        let stale = store.answer_worker_question_cas(
+        let stale = store.decide_worker_question_command(
             "run-guard",
             "q-terminal",
-            "A",
-            WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-            "worker_question_answered",
-            &serde_json::json!({"question_id": "q-terminal"}),
-            "recommendation applied",
+            WorkerQuestionDecisionCommand::answer(
+                "A",
+                WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+                "recommendation applied",
+            ),
         )?;
-        assert!(!stale.applied);
-        assert_eq!(stale.question.state, "interrupted");
+        assert_eq!(stale.outcome, DecisionCommandOutcome::Conflict);
+        assert_eq!(
+            stale.question.expect("interrupted question").state,
+            "interrupted"
+        );
         assert_eq!(
             store
                 .get_events("run-guard", 100)?
@@ -4476,13 +5729,113 @@ mod tests {
     }
 
     #[test]
-    fn worker_question_compare_and_set_keeps_the_first_answer_and_one_event() -> Result<()> {
+    fn stale_launch_interruption_rolls_back_when_event_append_fails() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(dir.path().join("state.sqlite"))?;
         let now = Utc::now();
-        store.insert_run(&run("run-race", "/tmp/repo", RunStatus::Running, now))?;
+        store.insert_run(&run(
+            "run-stale-launch",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        let launch = store.allocate_worker_attempt(
+            "run-stale-launch",
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        store.mark_worker_attempt_launched(launch.launch_id)?;
+        store.open_active_worker_question_with_launch_id_and_recommendation(
+            "q-stale-launch",
+            "run-stale-launch",
+            "slice-001",
+            1,
+            Some(launch.launch_id),
+            "Choose?",
+            &["A".to_string(), "B".to_string()],
+            60,
+            &WorkerQuestionRecommendation::default(),
+            "worker_question_asked",
+            |question| Ok(serde_json::json!({ "question_id": question.id })),
+            "awaiting operator answer",
+        )?;
+        store.finish_worker_attempt(launch.launch_id, "interrupted", "worker exited")?;
+
+        inject_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend);
+        assert!(
+            store
+                .decide_worker_question_command(
+                    "run-stale-launch",
+                    "q-stale-launch",
+                    WorkerQuestionDecisionCommand::resolve_timeout(
+                        Some(launch.launch_id),
+                        "worker_question_cancelled",
+                        "operator question closed",
+                        "worker remains blocked",
+                    ),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_worker_question("q-stale-launch")?
+                .expect("rolled back stale question")
+                .state,
+            "pending"
+        );
+        assert_eq!(
+            store
+                .get_events("run-stale-launch", 100)?
+                .iter()
+                .filter(|event| event.typ == "worker_question_interrupted")
+                .count(),
+            0
+        );
+
+        let applied = store.decide_worker_question_command(
+            "run-stale-launch",
+            "q-stale-launch",
+            WorkerQuestionDecisionCommand::resolve_timeout(
+                Some(launch.launch_id),
+                "worker_question_cancelled",
+                "operator question closed",
+                "worker remains blocked",
+            ),
+        )?;
+        assert_eq!(applied.outcome, DecisionCommandOutcome::StaleToken);
+        assert_eq!(
+            applied.question.expect("stale question").state,
+            "interrupted"
+        );
+        assert_eq!(
+            store
+                .get_events("run-stale-launch", 100)?
+                .iter()
+                .filter(|event| event.typ == "worker_question_interrupted")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_question_command_returns_typed_answer_outcomes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-question-command",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
         store.upsert_slice_run(&SliceRun {
-            run_id: "run-race".to_string(),
+            run_id: "run-question-command".to_string(),
             slice_id: "slice-001".to_string(),
             status: SliceStatus::Running,
             branch: String::new(),
@@ -4491,7 +5844,7 @@ mod tests {
             last_error: String::new(),
         })?;
         store.update_progress(
-            "run-race",
+            "run-question-command",
             "awaiting_operator",
             "slice-001",
             1,
@@ -4501,13 +5854,13 @@ mod tests {
         )?;
         let recommendation = WorkerQuestionRecommendation {
             recommended_answer: "A".to_string(),
-            rationale: "A is the smallest reversible choice".to_string(),
+            rationale: "A is reversible".to_string(),
             bounded_within_current_slice_or_mission_authority: true,
             reversible: true,
         };
         store.insert_worker_question_with_recommendation(
-            "q-operator-first",
-            "run-race",
+            "q-command",
+            "run-question-command",
             "slice-001",
             1,
             "Which path?",
@@ -4516,53 +5869,159 @@ mod tests {
             &recommendation,
         )?;
 
-        let operator = store.answer_worker_question_cas(
-            "run-race",
-            "q-operator-first",
-            "B",
-            WorkerQuestionAnswerSource::Operator,
-            "worker_question_answered",
-            &serde_json::json!({"question_id": "q-operator-first", "answer": "B", "answer_source": "operator"}),
-            "operator answered; worker resuming",
+        let applied = store.decide_worker_question_command(
+            "run-question-command",
+            "q-command",
+            WorkerQuestionDecisionCommand::answer(
+                "B",
+                WorkerQuestionAnswerSource::Operator,
+                "operator answered; worker resuming",
+            ),
         )?;
-        let fallback_lost = store.answer_worker_question_cas(
-            "run-race",
-            "q-operator-first",
-            "A",
-            WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-            "worker_question_answered",
-            &serde_json::json!({"question_id": "q-operator-first", "answer": "A", "answer_source": "llm_recommendation_timeout"}),
-            "recommendation applied; worker resuming",
-        )?;
+        assert_eq!(applied.outcome, DecisionCommandOutcome::Applied);
+        assert_eq!(applied.question.as_ref().expect("answer").answer, "B");
 
-        assert!(operator.applied);
-        assert!(!fallback_lost.applied);
-        assert_eq!(fallback_lost.question.answer, "B");
+        let duplicate = store.decide_worker_question_command(
+            "run-question-command",
+            "q-command",
+            WorkerQuestionDecisionCommand::answer(
+                "B",
+                WorkerQuestionAnswerSource::Operator,
+                "operator answered; worker resuming",
+            ),
+        )?;
         assert_eq!(
-            fallback_lost.question.answer_source,
-            Some(WorkerQuestionAnswerSource::Operator)
+            duplicate.outcome,
+            DecisionCommandOutcome::AlreadyAppliedIdempotently
         );
-        assert_eq!(
-            store
-                .get_events("run-race", 100)?
-                .iter()
-                .filter(|event| event.typ == "worker_question_answered")
-                .count(),
-            1
-        );
+        let changed_progress = store.decide_worker_question_command(
+            "run-question-command",
+            "q-command",
+            WorkerQuestionDecisionCommand::answer(
+                "B",
+                WorkerQuestionAnswerSource::Operator,
+                "different durable progress evidence",
+            ),
+        )?;
+        assert_eq!(changed_progress.outcome, DecisionCommandOutcome::Conflict);
+
+        let conflict = store.decide_worker_question_command(
+            "run-question-command",
+            "q-command",
+            WorkerQuestionDecisionCommand::answer(
+                "A",
+                WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+                "recommendation applied; worker resuming",
+            ),
+        )?;
+        assert_eq!(conflict.outcome, DecisionCommandOutcome::Conflict);
+        let events = store.get_events("run-question-command", 100)?;
+        let answered = events
+            .iter()
+            .filter(|event| event.typ == "worker_question_answered")
+            .collect::<Vec<_>>();
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].payload["answer"], "B");
+        assert_eq!(answered[0].payload["answer_source"], "operator");
 
         store.update_progress(
-            "run-race",
+            "run-question-command",
             "awaiting_operator",
             "slice-001",
             1,
             "ask_operator",
-            "awaiting another answer",
+            "awaiting rollback answer",
             "",
         )?;
         store.insert_worker_question_with_recommendation(
-            "q-fallback-first",
-            "run-race",
+            "q-command-rollback",
+            "run-question-command",
+            "slice-001",
+            1,
+            "Rollback this answer?",
+            &["A".to_string(), "B".to_string()],
+            60,
+            &recommendation,
+        )?;
+        inject_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend);
+        assert!(
+            store
+                .decide_worker_question_command(
+                    "run-question-command",
+                    "q-command-rollback",
+                    WorkerQuestionDecisionCommand::answer(
+                        "B",
+                        WorkerQuestionAnswerSource::Operator,
+                        "operator answered; worker resuming",
+                    ),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_worker_question("q-command-rollback")?
+                .expect("rolled back question")
+                .state,
+            "pending"
+        );
+        assert_eq!(
+            store
+                .get_events("run-question-command", 100)?
+                .iter()
+                .filter(|event| event.typ == "worker_question_answered")
+                .count(),
+            1,
+            "a failed event append must roll back the answer"
+        );
+        assert_eq!(
+            store
+                .get_progress("run-question-command")?
+                .expect("rolled back progress")
+                .phase,
+            "awaiting_operator"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simultaneous_operator_fallback_and_legacy_timeout_commands_each_commit_one_outcome()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-question-race",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: "run-question-race".to_string(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Running,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        store.update_progress(
+            "run-question-race",
+            "awaiting_operator",
+            "slice-001",
+            1,
+            "ask_operator",
+            "awaiting answer",
+            "",
+        )?;
+        let recommendation = WorkerQuestionRecommendation {
+            recommended_answer: "A".to_string(),
+            rationale: "A is reversible".to_string(),
+            bounded_within_current_slice_or_mission_authority: true,
+            reversible: true,
+        };
+        store.insert_worker_question_with_recommendation(
+            "q-race-command",
+            "run-question-race",
             "slice-001",
             1,
             "Which path?",
@@ -4571,66 +6030,172 @@ mod tests {
             &recommendation,
         )?;
         store.conn()?.execute(
-            "UPDATE worker_questions SET deadline_at=?1 WHERE id='q-fallback-first'",
+            "UPDATE worker_questions SET deadline_at=?1 WHERE id='q-race-command'",
             params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()],
         )?;
-        assert!(
-            store
-                .answer_worker_question_cas(
-                    "run-race",
-                    "q-fallback-first",
-                    "B",
-                    WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-                    "worker_question_answered",
-                    &serde_json::json!({"question_id": "q-fallback-first", "answer": "B", "answer_source": "llm_recommendation_timeout"}),
-                    "recommendation applied; worker resuming",
-                )
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .get_worker_question("q-fallback-first")?
-                .expect("question after rejected substitute")
-                .state,
-            "pending"
-        );
-        let fallback = store.answer_worker_question_cas(
-            "run-race",
-            "q-fallback-first",
-            "A",
-            WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-            "worker_question_answered",
-            &serde_json::json!({"question_id": "q-fallback-first", "answer": "A", "answer_source": "llm_recommendation_timeout"}),
-            "recommendation applied; worker resuming",
-        )?;
-        let operator_lost = store.answer_worker_question_cas(
-            "run-race",
-            "q-fallback-first",
-            "B",
-            WorkerQuestionAnswerSource::Operator,
-            "worker_question_answered",
-            &serde_json::json!({"question_id": "q-fallback-first", "answer": "B", "answer_source": "operator"}),
-            "operator answered; worker resuming",
-        )?;
 
-        assert!(fallback.applied);
-        assert!(!operator_lost.applied);
-        assert_eq!(operator_lost.question.answer, "A");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let operator_store = store.clone();
+        let operator_barrier = barrier.clone();
+        let operator = std::thread::spawn(move || {
+            operator_barrier.wait();
+            operator_store.decide_worker_question_command(
+                "run-question-race",
+                "q-race-command",
+                WorkerQuestionDecisionCommand::answer(
+                    "B",
+                    WorkerQuestionAnswerSource::Operator,
+                    "operator answered; worker resuming",
+                ),
+            )
+        });
+        let fallback_store = store.clone();
+        let fallback_barrier = barrier.clone();
+        let fallback = std::thread::spawn(move || {
+            fallback_barrier.wait();
+            fallback_store.decide_worker_question_command(
+                "run-question-race",
+                "q-race-command",
+                WorkerQuestionDecisionCommand::resolve_timeout(
+                    None,
+                    "worker_question_timed_out",
+                    "operator question timed out",
+                    "worker applying blocked contract",
+                ),
+            )
+        });
+        barrier.wait();
+        let outcomes = [
+            operator.join().expect("operator command")?.outcome,
+            fallback.join().expect("fallback command")?.outcome,
+        ];
         assert_eq!(
-            operator_lost.question.answer_source,
-            Some(WorkerQuestionAnswerSource::LlmRecommendationTimeout)
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Applied)
+                .count(),
+            1
         );
         assert_eq!(
-            store.get_progress("run-race")?.expect("progress").phase,
-            "worker_running"
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Conflict)
+                .count(),
+            1
+        );
+
+        let question = store
+            .get_worker_question("q-race-command")?
+            .expect("durable winner");
+        let answered_events = store
+            .get_events("run-question-race", 100)?
+            .into_iter()
+            .filter(|event| event.typ == "worker_question_answered")
+            .collect::<Vec<_>>();
+        assert_eq!(answered_events.len(), 1);
+        assert_eq!(answered_events[0].payload["answer"], question.answer);
+        assert_eq!(
+            answered_events[0].payload["answer_source"],
+            question.answer_source.expect("winner source").as_str()
+        );
+
+        store.update_progress(
+            "run-question-race",
+            "awaiting_operator",
+            "slice-001",
+            1,
+            "ask_operator",
+            "awaiting legacy answer",
+            "",
+        )?;
+        store.insert_worker_question(
+            "q-race-legacy-timeout",
+            "run-question-race",
+            "slice-001",
+            1,
+            "Legacy question?",
+            &[],
+            60,
+        )?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let operator_store = store.clone();
+        let operator_barrier = barrier.clone();
+        let operator = std::thread::spawn(move || {
+            operator_barrier.wait();
+            operator_store.decide_worker_question_command(
+                "run-question-race",
+                "q-race-legacy-timeout",
+                WorkerQuestionDecisionCommand::answer(
+                    "legacy answer",
+                    WorkerQuestionAnswerSource::Operator,
+                    "operator answered; worker resuming",
+                ),
+            )
+        });
+        let timeout_store = store.clone();
+        let timeout_barrier = barrier.clone();
+        let timeout = std::thread::spawn(move || {
+            timeout_barrier.wait();
+            timeout_store.decide_worker_question_command(
+                "run-question-race",
+                "q-race-legacy-timeout",
+                WorkerQuestionDecisionCommand::resolve_timeout(
+                    None,
+                    "worker_question_timed_out",
+                    "operator question timed out",
+                    "worker applying blocked contract",
+                ),
+            )
+        });
+        barrier.wait();
+        let outcomes = [
+            operator.join().expect("operator command")?.outcome,
+            timeout.join().expect("timeout command")?.outcome,
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == DecisionCommandOutcome::Conflict)
+                .count(),
+            1
+        );
+        let question = store
+            .get_worker_question("q-race-legacy-timeout")?
+            .expect("legacy timeout winner");
+        assert!(matches!(question.state.as_str(), "answered" | "timed_out"));
+        let authoritative_events = store
+            .get_events("run-question-race", 100)?
+            .into_iter()
+            .filter(|event| {
+                event.payload["question_id"] == "q-race-legacy-timeout"
+                    && matches!(
+                        event.typ.as_str(),
+                        "worker_question_answered" | "run_incident"
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authoritative_events.len(), 1);
+        assert_eq!(
+            authoritative_events[0].typ,
+            if question.state == "answered" {
+                "worker_question_answered"
+            } else {
+                "run_incident"
+            }
         );
         assert_eq!(
             store
-                .get_events("run-race", 100)?
-                .iter()
-                .filter(|event| event.typ == "worker_question_answered")
-                .count(),
-            2
+                .get_progress("run-question-race")?
+                .expect("legacy resolution progress")
+                .phase,
+            "worker_running"
         );
         Ok(())
     }
@@ -4826,27 +6391,35 @@ mod tests {
         assert_eq!(question_a.state, "pending");
         assert_eq!(question_b.state, "pending");
 
-        let incident = serde_json::json!({
-            "kind": "worker_question_timed_out",
-            "question_id": "q-b"
-        });
-        let first = store.timeout_worker_question_cas(
+        let timeout = WorkerQuestionDecisionCommand::timeout(
+            "worker_question_timed_out",
+            "operator question timed out",
+            "worker applying blocked contract",
+        );
+        let first = store.decide_worker_question_command("run-parallel", "q-b", timeout.clone())?;
+        let duplicate = store.decide_worker_question_command("run-parallel", "q-b", timeout)?;
+        assert_eq!(first.outcome, DecisionCommandOutcome::Applied);
+        assert_eq!(
+            duplicate.outcome,
+            DecisionCommandOutcome::AlreadyAppliedIdempotently
+        );
+        assert_eq!(
+            duplicate.question.expect("timed out question").state,
+            "timed_out"
+        );
+        let conflicting_timeout = store.decide_worker_question_command(
             "run-parallel",
             "q-b",
-            "run_incident",
-            &incident,
-            "worker applying blocked contract",
+            WorkerQuestionDecisionCommand::timeout(
+                "different_incident_code",
+                "different timeout attribution",
+                "different progress evidence",
+            ),
         )?;
-        let duplicate = store.timeout_worker_question_cas(
-            "run-parallel",
-            "q-b",
-            "run_incident",
-            &incident,
-            "worker applying blocked contract",
-        )?;
-        assert!(first.applied);
-        assert!(!duplicate.applied);
-        assert_eq!(duplicate.question.state, "timed_out");
+        assert_eq!(
+            conflicting_timeout.outcome,
+            DecisionCommandOutcome::Conflict
+        );
         assert_eq!(
             store
                 .get_events("run-parallel", 100)?
@@ -4918,14 +6491,16 @@ mod tests {
         assert_eq!(awaiting.slice_id, "slice-a");
         assert_eq!(awaiting.attempt, 1);
 
-        let transition = store.timeout_worker_question_cas(
+        let transition = store.decide_worker_question_command(
             "run-progress-race",
             "q-a",
-            "run_incident",
-            &serde_json::json!({"question_id": "q-a"}),
-            "worker resuming after blocked contract",
+            WorkerQuestionDecisionCommand::timeout(
+                "worker_question_timed_out",
+                "operator question timed out",
+                "worker resuming after blocked contract",
+            ),
         )?;
-        assert!(transition.applied);
+        assert_eq!(transition.outcome, DecisionCommandOutcome::Applied);
         let resumed = store.get_progress("run-progress-race")?.expect("progress");
         assert_eq!(resumed.phase, "worker_running");
         assert_eq!(resumed.slice_id, "slice-a");
@@ -5061,18 +6636,19 @@ mod tests {
             last_error: String::new(),
         })?;
         store.activate_slice_attempt("run-terminal-question", "slice-001", 1)?;
-        let stale = store.answer_worker_question_cas(
+        let stale = store.decide_worker_question_command(
             "run-terminal-question",
             "q-terminal-question",
-            "A",
-            WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-            "worker_question_answered",
-            &serde_json::json!({"question_id": "q-terminal-question"}),
-            "recommendation applied",
+            WorkerQuestionDecisionCommand::answer(
+                "A",
+                WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+                "recommendation applied",
+            ),
         )?;
-        assert!(!stale.applied);
-        assert_eq!(stale.question.state, "interrupted");
-        assert_eq!(stale.question.answer_source, None);
+        assert_eq!(stale.outcome, DecisionCommandOutcome::Conflict);
+        let stale = stale.question.expect("interrupted question");
+        assert_eq!(stale.state, "interrupted");
+        assert_eq!(stale.answer_source, None);
         assert_eq!(
             store
                 .get_events("run-terminal-question", 100)?
@@ -5265,6 +6841,101 @@ mod tests {
     }
 
     #[test]
+    fn fallback_timeout_duplicates_require_exact_command_evidence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-fallback-exact",
+            "/tmp/repo",
+            RunStatus::Running,
+            now,
+        ))?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: "run-fallback-exact".to_string(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Running,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        open_active_test_question(
+            &store,
+            "q-fallback-exact",
+            "run-fallback-exact",
+            "slice-001",
+            1,
+            "Choose?",
+            &["A".to_string(), "B".to_string()],
+            60,
+            &WorkerQuestionRecommendation {
+                recommended_answer: "A".to_string(),
+                rationale: "A is reversible".to_string(),
+                bounded_within_current_slice_or_mission_authority: true,
+                reversible: true,
+            },
+        )?;
+        store.conn()?.execute(
+            "UPDATE worker_questions SET deadline_at='2020-01-01T00:00:00Z' WHERE id='q-fallback-exact'",
+            [],
+        )?;
+
+        let command = || {
+            WorkerQuestionDecisionCommand::resolve_timeout(
+                None,
+                "worker_question_timed_out",
+                "operator question timed out",
+                "worker applying durable fallback",
+            )
+        };
+        assert_eq!(
+            store
+                .decide_worker_question_command(
+                    "run-fallback-exact",
+                    "q-fallback-exact",
+                    command(),
+                )?
+                .outcome,
+            DecisionCommandOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .decide_worker_question_command(
+                    "run-fallback-exact",
+                    "q-fallback-exact",
+                    command(),
+                )?
+                .outcome,
+            DecisionCommandOutcome::AlreadyAppliedIdempotently
+        );
+        assert_eq!(
+            store
+                .decide_worker_question_command(
+                    "run-fallback-exact",
+                    "q-fallback-exact",
+                    WorkerQuestionDecisionCommand::resolve_timeout(
+                        None,
+                        "different_incident_attribution",
+                        "operator question timed out",
+                        "worker applying durable fallback",
+                    ),
+                )?
+                .outcome,
+            DecisionCommandOutcome::Conflict
+        );
+        assert_eq!(
+            store
+                .get_events("run-fallback-exact", 100)?
+                .iter()
+                .filter(|event| event.typ == "worker_question_answered")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_question_fallback_cannot_commit_before_durable_deadline() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(dir.path().join("state.sqlite"))?;
@@ -5298,14 +6969,14 @@ mod tests {
         )?;
         assert!(
             store
-                .answer_worker_question_cas(
+                .decide_worker_question_command(
                     "run-early",
                     "q-early",
-                    "A",
-                    WorkerQuestionAnswerSource::LlmRecommendationTimeout,
-                    "worker_question_answered",
-                    &serde_json::json!({"question_id": "q-early"}),
-                    "worker resuming",
+                    WorkerQuestionDecisionCommand::answer(
+                        "A",
+                        WorkerQuestionAnswerSource::LlmRecommendationTimeout,
+                        "worker resuming",
+                    ),
                 )
                 .is_err()
         );
@@ -5790,6 +7461,24 @@ mod tests {
         let now = Utc::now();
         store.insert_run(&run("run-1", "/tmp/repo", RunStatus::Running, now))?;
         store.store_worker_token("run-1", "secret-token")?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: "run-1".to_string(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Running,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 2,
+            last_error: String::new(),
+        })?;
+        store.update_progress(
+            "run-1",
+            "awaiting_operator",
+            "slice-001",
+            2,
+            "ask_operator",
+            "awaiting answer",
+            "",
+        )?;
 
         assert!(store.validate_worker_token("run-1", "secret-token")?);
         assert!(!store.validate_worker_token("run-1", "wrong-token")?);
@@ -5807,10 +7496,29 @@ mod tests {
         assert_eq!(question.state, "pending");
         assert_eq!(store.list_worker_questions("run-1")?.len(), 1);
 
-        let answered = store.answer_worker_question("run-1", "q-1", "A")?;
+        let answered = store.decide_worker_question_command(
+            "run-1",
+            "q-1",
+            WorkerQuestionDecisionCommand::answer(
+                "A",
+                WorkerQuestionAnswerSource::Operator,
+                "operator answered; worker resuming",
+            ),
+        )?;
+        assert_eq!(answered.outcome, DecisionCommandOutcome::Applied);
+        let answered = answered.question.expect("answered question");
         assert_eq!(answered.state, "answered");
         assert_eq!(answered.answer, "A");
-        assert!(store.answer_worker_question("run-1", "q-1", "B").is_err());
+        let conflict = store.decide_worker_question_command(
+            "run-1",
+            "q-1",
+            WorkerQuestionDecisionCommand::answer(
+                "B",
+                WorkerQuestionAnswerSource::Operator,
+                "operator answered; worker resuming",
+            ),
+        )?;
+        assert_eq!(conflict.outcome, DecisionCommandOutcome::Conflict);
         Ok(())
     }
 }

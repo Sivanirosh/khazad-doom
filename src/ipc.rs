@@ -1,6 +1,6 @@
 use crate::domain::{
-    MissionEnvelope, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
-    ReplanProposedChange, SliceSummary, SliceValidationIssue, WorkerQuestion,
+    DecisionCommandOutcome, MissionEnvelope, ReplanEvidenceLink, ReplanProposal,
+    ReplanProposalSource, ReplanProposedChange, SliceSummary, SliceValidationIssue, WorkerQuestion,
     WorkerQuestionAnswerSource,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -130,10 +130,12 @@ pub struct WorkerAskParams {
     pub reversible: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerAskResult {
     pub question_id: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<DecisionCommandOutcome>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,9 +176,22 @@ pub struct AnswerQuestionParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerQuestionResult {
-    pub question: WorkerQuestion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<WorkerQuestion>,
     #[serde(default)]
     pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<DecisionCommandOutcome>,
+}
+
+impl AnswerQuestionResult {
+    pub fn effective_outcome(&self) -> DecisionCommandOutcome {
+        self.outcome.unwrap_or(if self.applied {
+            DecisionCommandOutcome::Applied
+        } else {
+            DecisionCommandOutcome::Conflict
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,7 +252,14 @@ pub struct DecideReplanProposalParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecideReplanProposalResult {
-    pub proposal: ReplanProposal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ReplanProposal>,
+    #[serde(default = "legacy_success_outcome")]
+    pub outcome: DecisionCommandOutcome,
+}
+
+fn legacy_success_outcome() -> DecisionCommandOutcome {
+    DecisionCommandOutcome::Applied
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -366,6 +388,28 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn legacy_decision_results_preserve_success_without_failing_open() {
+        let rejected: AnswerQuestionResult = serde_json::from_value(json!({
+            "applied": false
+        }))
+        .expect("legacy answer result decodes");
+        assert_eq!(
+            rejected.effective_outcome(),
+            DecisionCommandOutcome::Conflict
+        );
+
+        let applied: AnswerQuestionResult = serde_json::from_value(json!({
+            "applied": true
+        }))
+        .expect("legacy answer result decodes");
+        assert_eq!(applied.effective_outcome(), DecisionCommandOutcome::Applied);
+
+        let replan: DecideReplanProposalResult =
+            serde_json::from_value(json!({})).expect("legacy replan result decodes");
+        assert_eq!(replan.outcome, DecisionCommandOutcome::Applied);
+    }
 
     #[test]
     fn native_pi_tui_worker_accepts_legacy_ipc_field() {

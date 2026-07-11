@@ -2,7 +2,7 @@ mod daemon;
 
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -829,7 +829,11 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
         &["answer", &restart_run_id, &old_question_id, "alpha"],
     )?;
     assert!(!stale_answer.status.success());
-    assert!(String::from_utf8(stale_answer.stderr)?.contains("resume first before answering"));
+    assert_eq!(json_stdout(&stale_answer)?["outcome"], "conflict");
+    assert!(
+        String::from_utf8(stale_answer.stderr)?
+            .contains("answer question command returned conflict")
+    );
     kd_ok_with_env(
         &bin,
         home_restart.path(),
@@ -861,6 +865,186 @@ fn ask_operator_answer_timeout_unavailable_and_restart_black_box() -> TestResult
     wait_for_status(&bin, home_restart.path(), &restart_run_id, "completed")?;
     guard_restart.stop();
 
+    Ok(())
+}
+
+#[test]
+fn concurrent_question_socket_rpcs_commit_one_fallback_or_legacy_timeout_winner() -> TestResult {
+    let bin = binary_path();
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_operator_question_fake_pi(fake_bin.path())?;
+    let fake_pi_string = path(&fake_pi).to_string();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-ask-same-pane-rpc-race",
+            "title": "Question RPC race",
+            "goal": "Exercise concurrent answer and timeout RPCs.",
+            "acceptance": ["one durable question resolution wins"]
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(
+        repo.path(),
+        &["commit", "-m", "add question RPC race slice"],
+    )?;
+
+    let started = kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[
+            ("KHAZAD_PI_BIN", fake_pi_string.as_str()),
+            ("KHAZAD_FAKE_PI_OPERATOR_MODE", "same_pane"),
+        ],
+        &[
+            "run",
+            "--repo",
+            path(repo.path()),
+            "--agent",
+            "pi",
+            "--cockpit",
+            "direct",
+            "--all",
+        ],
+    )?;
+    let run_id = json_stdout(&started)?["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let awaiting = wait_for_pending_question(&bin, home.path(), &run_id)?;
+    let first_question = awaiting["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["state"] == "pending")
+        })
+        .expect("eligible pending question");
+    let first_question_id = first_question["id"]
+        .as_str()
+        .expect("question id")
+        .to_string();
+    let first_launch_id = first_question["launch_id"]
+        .as_i64()
+        .expect("launch-scoped question");
+    let first_token = live_worker_token(home.path(), &awaiting, first_launch_id)?;
+    force_question_deadline(home.path(), &first_question_id, true)?;
+    let first_outcomes = race_question_socket_rpcs(
+        home.path(),
+        &run_id,
+        &first_question_id,
+        first_launch_id,
+        &first_token,
+    )?;
+    assert_one_applied_one_conflict(&first_outcomes);
+    let first_status = json_stdout(&kd_ok(&bin, home.path(), &["status", "--run", &run_id])?)?;
+    let first_winner = first_status["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["id"] == first_question_id)
+        })
+        .expect("eligible durable winner");
+    assert_eq!(first_winner["state"], "answered");
+    assert!(matches!(
+        first_winner["answer_source"].as_str(),
+        Some("operator" | "llm_recommendation_timeout")
+    ));
+    assert_eq!(
+        question_resolution_event_count(&first_status, &first_question_id),
+        1
+    );
+
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &run_id,
+            "--reason",
+            "prepare legacy timeout RPC race",
+        ],
+    )?;
+    wait_for_terminal_status(&bin, home.path(), &run_id, "cancelled")?;
+    kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_FAKE_PI_OPERATOR_MODE", "same_pane")],
+        &[
+            "resume",
+            "--run",
+            &run_id,
+            "--agent",
+            "pi",
+            "--pi-bin",
+            fake_pi_string.as_str(),
+        ],
+    )?;
+    let awaiting = wait_for_pending_question(&bin, home.path(), &run_id)?;
+    let second_question = awaiting["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["state"] == "pending")
+        })
+        .expect("legacy pending question");
+    let second_question_id = second_question["id"]
+        .as_str()
+        .expect("question id")
+        .to_string();
+    assert_ne!(second_question_id, first_question_id);
+    let second_launch_id = second_question["launch_id"]
+        .as_i64()
+        .expect("launch-scoped question");
+    let second_token = live_worker_token(home.path(), &awaiting, second_launch_id)?;
+    force_question_deadline(home.path(), &second_question_id, false)?;
+    let second_outcomes = race_question_socket_rpcs(
+        home.path(),
+        &run_id,
+        &second_question_id,
+        second_launch_id,
+        &second_token,
+    )?;
+    assert_one_applied_one_conflict(&second_outcomes);
+    let second_status = json_stdout(&kd_ok(&bin, home.path(), &["status", "--run", &run_id])?)?;
+    let second_winner = second_status["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["id"] == second_question_id)
+        })
+        .expect("legacy durable winner");
+    assert!(matches!(
+        second_winner["state"].as_str(),
+        Some("answered" | "timed_out")
+    ));
+    assert_eq!(
+        question_resolution_event_count(&second_status, &second_question_id),
+        1
+    );
+
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &run_id,
+            "--reason",
+            "question RPC races complete",
+        ],
+    )?;
+    wait_for_terminal_status(&bin, home.path(), &run_id, "cancelled")?;
+    guard.stop();
     Ok(())
 }
 
@@ -3496,7 +3680,7 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
         ],
     )?;
     assert_eq!(json_stdout(&accepted)?["proposal"]["state"], "pending");
-    kd_ok(
+    let accepted_decision = kd_ok(
         &bin,
         home.path(),
         &[
@@ -3508,6 +3692,97 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
             "recorded but not applied in v1",
         ],
     )?;
+    assert_eq!(json_stdout(&accepted_decision)?["outcome"], "applied");
+    let duplicate_decision = kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "replan",
+            "accept",
+            &run_id,
+            "rp-accepted",
+            "--reason",
+            "recorded but not applied in v1",
+        ],
+    )?;
+    assert_eq!(
+        json_stdout(&duplicate_decision)?["outcome"],
+        "already_applied_idempotently"
+    );
+
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "replan",
+            "propose",
+            &run_id,
+            "--id",
+            "rp-race",
+            "--source-kind",
+            "worker",
+            "--source-slice",
+            "slice-001",
+            "--change",
+            "mark_duplicate:slice-race:exercise concurrent decisions",
+            "--risk",
+            "operator_review",
+        ],
+    )?;
+    let (accepted_race, rejected_race) = thread::scope(|scope| {
+        let accept = scope.spawn(|| {
+            kd(
+                &bin,
+                home.path(),
+                &[
+                    "replan",
+                    "accept",
+                    &run_id,
+                    "rp-race",
+                    "--reason",
+                    "accept concurrently",
+                ],
+            )
+            .expect("run concurrent accept command")
+        });
+        let reject = scope.spawn(|| {
+            kd(
+                &bin,
+                home.path(),
+                &[
+                    "replan",
+                    "reject",
+                    &run_id,
+                    "rp-race",
+                    "--reason",
+                    "reject concurrently",
+                ],
+            )
+            .expect("run concurrent reject command")
+        });
+        (
+            accept.join().expect("accept command thread"),
+            reject.join().expect("reject command thread"),
+        )
+    });
+    let race_outputs = [accepted_race, rejected_race];
+    assert_eq!(
+        race_outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1,
+        "exactly one conflicting daemon command may succeed"
+    );
+    let mut race_outcomes = race_outputs
+        .iter()
+        .map(json_stdout)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|result| result["outcome"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    race_outcomes.sort();
+    assert_eq!(race_outcomes, vec!["applied", "conflict"]);
 
     let pending = kd_ok(
         &bin,
@@ -5439,6 +5714,8 @@ if mode == "answer" and "timeout" in slice_id:
     mode = "timeout"
 if mode == "answer" and "unavailable" in slice_id:
     mode = "unavailable"
+if mode == "answer" and "same-pane" in slice_id:
+    mode = "same_pane"
 attempt = int(os.environ.get("KHAZAD_ATTEMPT", "0") or "0")
 question_text = f"Which operator answer should {slice_id} use on attempt {attempt}?"
 
@@ -5538,6 +5815,153 @@ emit({
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms)?;
     Ok(path)
+}
+
+fn live_worker_token(home: &Path, status: &Value, launch_id: i64) -> TestResult<String> {
+    let pid = if let Some(pid) = status["progress"]["worker"]["pid"].as_i64() {
+        pid
+    } else {
+        let conn = rusqlite::Connection::open(home.join("state.sqlite"))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.query_row(
+            "SELECT worker_pid FROM worker_attempt_ledger WHERE launch_id=?1",
+            rusqlite::params![launch_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .ok_or("pending question launch has no live worker pid")?
+    };
+    let environ = fs::read(format!("/proc/{pid}/environ"))?;
+    let token = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| {
+            entry
+                .strip_prefix(b"KHAZAD_WORKER_TOKEN=")
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or("live worker environment has no token")?;
+    Ok(token)
+}
+
+fn force_question_deadline(home: &Path, question_id: &str, fallback_eligible: bool) -> TestResult {
+    let conn = rusqlite::Connection::open(home.join("state.sqlite"))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let updated = conn.execute(
+        "UPDATE worker_questions SET deadline_at='2000-01-01T00:00:00+00:00', fallback_eligible=?1 WHERE id=?2",
+        rusqlite::params![fallback_eligible, question_id],
+    )?;
+    if updated != 1 {
+        return Err(format!("question {question_id:?} was not updated").into());
+    }
+    Ok(())
+}
+
+fn race_question_socket_rpcs(
+    home: &Path,
+    run_id: &str,
+    question_id: &str,
+    launch_id: i64,
+    token: &str,
+) -> TestResult<[Value; 2]> {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let answer_home = home.to_path_buf();
+    let answer_run_id = run_id.to_string();
+    let answer_question_id = question_id.to_string();
+    let answer_barrier = barrier.clone();
+    let answer = thread::spawn(move || {
+        answer_barrier.wait();
+        daemon_rpc(
+            &answer_home,
+            "answerQuestion",
+            json!({
+                "run_id": answer_run_id,
+                "question_id": answer_question_id,
+                "answer": "bravo"
+            }),
+        )
+        .map_err(|error| error.to_string())
+    });
+    let timeout_home = home.to_path_buf();
+    let timeout_run_id = run_id.to_string();
+    let timeout_question_id = question_id.to_string();
+    let timeout_token = token.to_string();
+    let timeout_barrier = barrier.clone();
+    let timeout = thread::spawn(move || {
+        timeout_barrier.wait();
+        daemon_rpc(
+            &timeout_home,
+            "workerQuestionTimeout",
+            json!({
+                "run_id": timeout_run_id,
+                "question_id": timeout_question_id,
+                "token": timeout_token,
+                "launch_id": launch_id
+            }),
+        )
+        .map_err(|error| error.to_string())
+    });
+    barrier.wait();
+    let answer = answer
+        .join()
+        .map_err(|_| "answer RPC thread panicked")?
+        .map_err(|error| format!("answer RPC failed: {error}"))?;
+    let timeout = timeout
+        .join()
+        .map_err(|_| "timeout RPC thread panicked")?
+        .map_err(|error| format!("timeout RPC failed: {error}"))?;
+    Ok([answer, timeout])
+}
+
+fn daemon_rpc(home: &Path, method: &str, params: Value) -> TestResult<Value> {
+    let mut stream = UnixStream::connect(home.join("socket"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let request = json!({
+        "id": format!("integration-{method}"),
+        "method": method,
+        "params": params,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    let response: Value = serde_json::from_str(&response)?;
+    if let Some(error) = response["error"].as_str() {
+        return Err(format!("daemon {method} error: {error}").into());
+    }
+    Ok(response["result"].clone())
+}
+
+fn assert_one_applied_one_conflict(outcomes: &[Value; 2]) {
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome["outcome"] == "applied")
+            .count(),
+        1,
+        "RPC outcomes: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome["outcome"] == "conflict")
+            .count(),
+        1,
+        "RPC outcomes: {outcomes:?}"
+    );
+}
+
+fn question_resolution_event_count(status: &Value, question_id: &str) -> usize {
+    status["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("worker_question_answered" | "run_incident")
+            ) && event["payload"]["question_id"] == question_id
+        })
+        .count()
 }
 
 fn prepend_path(dir: &Path) -> String {

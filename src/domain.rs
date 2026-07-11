@@ -1905,6 +1905,32 @@ impl WorkerQuestion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DecisionCommandOutcome {
+    Applied,
+    AlreadyAppliedIdempotently,
+    Conflict,
+    StaleToken,
+    NotFound,
+}
+
+impl DecisionCommandOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::AlreadyAppliedIdempotently => "already_applied_idempotently",
+            Self::Conflict => "conflict",
+            Self::StaleToken => "stale_token",
+            Self::NotFound => "not_found",
+        }
+    }
+
+    pub fn command_succeeded(self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadyAppliedIdempotently)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplanProposalState {
     Pending,
     Accepted,

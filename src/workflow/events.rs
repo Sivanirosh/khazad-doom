@@ -1,5 +1,6 @@
 use crate::domain::{
-    GateResult, RepairResult, ReplanProposalSource, ReplanProposedChange, Run,
+    AutonomyLevel, FrontierBudgetState, FrontierClassification, GateResult, RepairResult,
+    ReplanDecision, ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run,
     WorkerProfileEvidence, WorkerQuestion, WorkflowExitStates,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -12,6 +13,8 @@ pub(crate) const ATTENTION_NOTIFICATION_SENT: &str = "attention_notification_sen
 pub(crate) const CHECKPOINT_WRITTEN: &str = "checkpoint_written";
 pub(crate) const COCKPIT_READY: &str = "cockpit_ready";
 pub(crate) const COCKPIT_WORKER_READY: &str = "cockpit_worker_ready";
+pub(crate) const FRONTIER_AUTO_ACCEPT_RECORDED: &str = "frontier_auto_accept_recorded";
+pub(crate) const FRONTIER_CLASSIFIED: &str = "frontier_classified";
 pub(crate) const IMPLEMENTATION_SUMMARY: &str = "implementation_summary";
 pub(crate) const INTEGRATION_REPAIR_COMPLETED: &str = "integration_repair_completed";
 pub(crate) const PARALLEL_LAYER_COMPLETED: &str = "parallel_layer_completed";
@@ -23,6 +26,7 @@ pub(crate) const RUN_COMPLETED: &str = "run_completed";
 pub(crate) const RUN_ERROR: &str = "run_error";
 pub(crate) const RUN_INCIDENT: &str = "run_incident";
 pub(crate) const RUN_STARTED: &str = "run_started";
+pub(crate) const REPLAN_PROPOSAL_DECIDED: &str = "replan_proposal_decided";
 pub(crate) const SLICE_MERGED: &str = "slice_merged";
 pub(crate) const SLICE_STARTED: &str = "slice_started";
 pub(crate) const TERMINAL_NOTIFICATION_SENT: &str = "terminal_notification_sent";
@@ -720,6 +724,69 @@ impl ImplementationSummaryPayload {
             final_sha: text_field(value, &["final_sha"]).unwrap_or_default(),
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct FrontierClassifiedPayload {
+    pub proposal_id: String,
+    pub checkpoint: String,
+    pub tier: String,
+    pub reason_codes: Vec<String>,
+    pub classified_at: chrono::DateTime<chrono::Utc>,
+    pub envelope_hash: String,
+    pub budget_snapshot: FrontierBudgetState,
+    pub autonomy_level: AutonomyLevel,
+    pub record_only: bool,
+    pub queue_mutated: bool,
+    pub slice_mutated: bool,
+    pub decision_recorded: bool,
+}
+
+impl FrontierClassifiedPayload {
+    pub(crate) fn new(
+        proposal_id: impl Into<String>,
+        checkpoint: impl Into<String>,
+        classification: &FrontierClassification,
+        record_only: bool,
+        decision_recorded: bool,
+    ) -> Self {
+        Self {
+            proposal_id: proposal_id.into(),
+            checkpoint: checkpoint.into(),
+            tier: classification.tier.clone(),
+            reason_codes: classification.reason_codes.clone(),
+            classified_at: classification.classified_at,
+            envelope_hash: classification.envelope_hash.clone(),
+            budget_snapshot: classification.budget_snapshot.clone(),
+            autonomy_level: classification.autonomy_level,
+            record_only,
+            queue_mutated: false,
+            slice_mutated: false,
+            decision_recorded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct FrontierAutoAcceptRecordedPayload {
+    pub proposal_id: String,
+    pub checkpoint: String,
+    pub authorizer: String,
+    pub source: String,
+    pub rationale: String,
+    pub tier: String,
+    pub reason_codes: Vec<String>,
+    pub budget_before: FrontierBudgetState,
+    pub budget_after: FrontierBudgetState,
+    pub af00_evidence_gate: String,
+    pub apply_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReplanProposalDecidedPayload {
+    pub proposal_id: String,
+    pub state: ReplanProposalState,
+    pub decision: ReplanDecision,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
