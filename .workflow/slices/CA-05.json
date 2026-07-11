@@ -2,7 +2,9 @@
   "id": "CA-05",
   "title": "Launch admission and merge reconciliation",
   "goal": "Make run admission and serial integration merge recoverable daemon-owned protocols with durable intent, compensation, and restart reconciliation.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-05",
+  "closed_at": "2026-07-11T10:50:58.150916089Z",
   "depends_on": [
     "CA-04"
   ],
