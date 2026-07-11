@@ -52,11 +52,13 @@ function khazadWorkerExtension(pi) {
 					answer: '',
 				});
 			}
+			const launchId = Number.parseInt(process.env.KHAZAD_LAUNCH_ID || '', 10);
 			const params = {
 				run_id: runId,
 				slice_id: sliceId,
 				token,
 				attempt: Number(process.env.KHAZAD_ATTEMPT || '0'),
+				...(Number.isSafeInteger(launchId) && launchId > 0 ? { launch_id: launchId } : {}),
 				question: String(input.question || ''),
 				options: Array.isArray(input.options) ? input.options.map(String) : [],
 				timeout_seconds: Number(input.timeout_seconds || 0),
@@ -189,6 +191,7 @@ async function closeWorkerQuestionWithoutAnswer(socket, params, questionId, mess
 			run_id: params.run_id,
 			question_id: questionId,
 			token: params.token,
+			...(params.launch_id ? { launch_id: params.launch_id } : {}),
 		});
 	} catch (error) {
 		closeError = String(error?.message || error);

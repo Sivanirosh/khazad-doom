@@ -446,11 +446,21 @@ impl Store {
         Ok(slices)
     }
 
+    #[allow(dead_code)] // retained for legacy handoff producers/readers.
     pub fn write_handoff(&self, run_id: &str, handoff: &Handoff) -> Result<PathBuf> {
+        self.write_handoff_named(run_id, handoff, &handoff.slice.id)
+    }
+
+    /// Writes a handoff under a daemon-owned immutable attempt name. The legacy
+    /// slice-id-only API remains for reading and producing old run artifacts.
+    pub fn write_handoff_named(
+        &self,
+        run_id: &str,
+        handoff: &Handoff,
+        name: &str,
+    ) -> Result<PathBuf> {
         self.ensure_run_dirs(run_id)?;
-        let path = self
-            .handoff_dir(run_id)
-            .join(format!("{}.json", handoff.slice.id));
+        let path = self.handoff_dir(run_id).join(format!("{name}.json"));
         write_json(&path, handoff)?;
         Ok(path)
     }
@@ -2084,6 +2094,7 @@ mod tests {
             economics: crate::domain::RunEconomics::default(),
             plan_revisions: crate::domain::PlanRevisions::default(),
             worker_questions: Vec::new(),
+            worker_attempts: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         store.write_implementation_summary(&summary).unwrap();

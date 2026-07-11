@@ -2998,6 +2998,7 @@ mod tests {
             },
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
+            worker_attempts: Vec::new(),
             generated_slices: Vec::new(),
             progress: options.progress,
             incidents: Vec::new(),

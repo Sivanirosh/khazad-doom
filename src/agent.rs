@@ -10,7 +10,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -418,6 +418,18 @@ impl Runner for PiRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Pi and any children inherit this group, making cancellation cover the
+        // whole normal worker tree rather than only the immediate Pi process.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
 
         let mut child = cmd.spawn().with_context(|| format!("start {}", spec.bin))?;
         let pid = child.id();
@@ -472,6 +484,33 @@ impl Runner for PiRunner {
             thread::sleep(Duration::from_millis(50));
         };
 
+        // Cancellation can race with the immediate Pi parent exiting between
+        // the loop's cancellation check and `try_wait`. Linearize that race
+        // before normal post-exit cleanup so surviving descendants still get
+        // TERM, the configured grace, and then KILL.
+        if cancel.is_cancelled() {
+            terminate_child(
+                &mut child,
+                Duration::from_secs(job.termination_grace_seconds),
+            );
+            let parser = join_parser(parser_thread)?;
+            let stderr = stderr_thread.join().unwrap_or_default();
+            return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
+        }
+        // A successfully exited Pi parent can leave descendants holding the
+        // process group and output pipes. Clean that group with the same
+        // TERM/grace/KILL protocol used by cancellation. This also closes the
+        // race where cancellation arrives just after the post-exit check.
+        #[cfg(unix)]
+        terminate_child(
+            &mut child,
+            Duration::from_secs(job.termination_grace_seconds),
+        );
+        if cancel.is_cancelled() {
+            let parser = join_parser(parser_thread)?;
+            let stderr = stderr_thread.join().unwrap_or_default();
+            return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
+        }
         let parser = join_parser(parser_thread)?;
         let stderr = stderr_thread.join().unwrap_or_default();
         if !status.success() {
@@ -538,11 +577,41 @@ fn join_parser(parser_thread: thread::JoinHandle<Result<PiParser>>) -> Result<Pi
 }
 
 fn terminate_child(child: &mut std::process::Child, grace: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        let mut child_exited = matches!(child.try_wait(), Ok(Some(_)));
+        if !child_process_group_exists(pid) {
+            if !child_exited {
+                let _ = child.wait();
+            }
+            return;
+        }
+        request_child_terminate(pid);
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if !child_exited {
+                child_exited = matches!(child.try_wait(), Ok(Some(_)));
+            }
+            if !child_process_group_exists(pid) {
+                if !child_exited {
+                    let _ = child.wait();
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        request_child_kill(pid);
+        if !child_exited {
+            let _ = child.wait();
+        }
     }
-    if grace.as_millis() > 0 {
-        request_child_terminate(child.id());
+    #[cfg(not(unix))]
+    {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        request_child_terminate(pid);
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if matches!(child.try_wait(), Ok(Some(_))) {
@@ -550,30 +619,48 @@ fn terminate_child(child: &mut std::process::Child, grace: Duration) {
             }
             thread::sleep(Duration::from_millis(50));
         }
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(unix)]
 fn request_child_terminate(pid: u32) {
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
     }
 }
-
 #[cfg(not(unix))]
 fn request_child_terminate(_pid: u32) {}
-
 #[cfg(unix)]
 fn request_child_kill(pid: u32) {
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+#[cfg(not(unix))]
+fn request_child_kill(_pid: u32) {}
+#[cfg(unix)]
+fn child_process_group_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PiWrapperLaunchError {
+    BeforePi(String),
+    LaunchUncertain(String),
+}
+
+impl std::fmt::Display for PiWrapperLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforePi(message) | Self::LaunchUncertain(message) => f.write_str(message),
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn request_child_kill(_pid: u32) {}
+impl std::error::Error for PiWrapperLaunchError {}
 
 #[derive(Debug, Clone, Deserialize)]
 struct PiWrapperStatus {
@@ -719,10 +806,15 @@ pub(crate) fn wait_for_pi_wrapper_launch(
     artifacts: &PiWrapperArtifacts,
     timeout: Duration,
     events: &Option<RunnerEventSink>,
-) -> Result<u32> {
+) -> std::result::Result<u32, PiWrapperLaunchError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = read_wrapper_status(&artifacts.status_path)? {
+        let status = read_wrapper_status(&artifacts.status_path).map_err(|err| {
+            PiWrapperLaunchError::LaunchUncertain(format!(
+                "could not read Herdr worker launch status; Pi launch is uncertain: {err}"
+            ))
+        })?;
+        if let Some(status) = status {
             if let Some(pid) = status.pid
                 && matches!(status.state.as_str(), "launched" | "finished")
             {
@@ -730,23 +822,23 @@ pub(crate) fn wait_for_pi_wrapper_launch(
                 return Ok(pid);
             }
             if matches!(status.state.as_str(), "handoff_failed" | "setup_failed") {
-                bail!(
+                return Err(PiWrapperLaunchError::BeforePi(format!(
                     "Herdr worker wrapper failed before launching Pi: {}",
                     status.state
-                );
+                )));
             }
         }
         if artifacts.exit_path.exists() {
-            bail!(
-                "Herdr worker wrapper exited before reporting a launched Pi process: {}",
+            return Err(PiWrapperLaunchError::LaunchUncertain(format!(
+                "Herdr worker wrapper exited without a readable launch record; Pi launch is uncertain: {}",
                 bounded_file_text(&artifacts.stderr_path, 2000)
-            );
+            )));
         }
         if Instant::now() >= deadline {
-            bail!(
-                "Herdr worker wrapper did not report a launched Pi process within {}s",
+            return Err(PiWrapperLaunchError::LaunchUncertain(format!(
+                "Herdr worker wrapper did not report a launched Pi process within {}s; Pi launch is uncertain",
                 timeout.as_secs()
-            );
+            )));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1270,13 +1362,16 @@ fn is_zero(value: &usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_AUTH_REQUIRED_FAILURE_KIND, Job, PiCommandSpec, RunnerError, RunnerMetadata,
-        RunnerSpec, RunnerTranscript, extract_json_object, parse_pi_tui_worker_result_artifact,
-        prepare_pi_tui_worker_artifacts, prepare_pi_wrapper_artifacts,
+        AGENT_AUTH_REQUIRED_FAILURE_KIND, CancellationToken, Job, PiCommandSpec, PiRunner,
+        PiWrapperLaunchError, Runner, RunnerError, RunnerMetadata, RunnerSpec, RunnerTranscript,
+        extract_json_object, parse_pi_tui_worker_result_artifact, prepare_pi_tui_worker_artifacts,
+        prepare_pi_wrapper_artifacts, wait_for_pi_wrapper_launch,
     };
     use crate::artifact;
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn classifies_pi_auth_failure_only_without_assistant_output() {
@@ -1431,6 +1526,175 @@ mod tests {
         assert!(!script.contains("> \"$EXIT\""));
         let command: serde_json::Value = artifact::read_json(&artifacts.command_path).unwrap();
         assert!(command["atomic_json_writer"].is_string());
+    }
+
+    #[test]
+    fn wrapper_launch_fallback_requires_durable_prelaunch_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&temp.path().join("worker.json"))
+            .unwrap();
+
+        let uncertain = wait_for_pi_wrapper_launch(&artifacts, Duration::ZERO, &None)
+            .expect_err("a missing launch record is uncertain, not proof Pi never started");
+        assert!(matches!(
+            uncertain,
+            PiWrapperLaunchError::LaunchUncertain(_)
+        ));
+
+        artifact::write_json(&artifacts.status_path, &json!({"state": "handoff_failed"})).unwrap();
+        let before_pi = wait_for_pi_wrapper_launch(&artifacts, Duration::ZERO, &None)
+            .expect_err("an explicit handoff failure should remain a prelaunch fallback");
+        assert!(matches!(before_pi, PiWrapperLaunchError::BeforePi(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_reaps_term_ignoring_pi_grandchild_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi");
+        let ready = temp.path().join("ready");
+        let marker = temp.path().join("grandchild-marker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n(trap '' TERM; sleep 3; : > \"$MARKER\") &\n: > \"$READY\"\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert("READY".to_string(), ready.to_string_lossy().into_owned());
+        env.insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
+        let job = Job {
+            kind: "test".to_string(),
+            prompt: "test".to_string(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{}".to_string(),
+            env,
+            termination_grace_seconds: 1,
+        };
+        let result = thread::spawn(move || runner.run(job, cancelled, None));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "fake Pi did not create its ready signal");
+        cancel.cancel();
+        assert!(result.join().unwrap().is_err());
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            !marker.exists(),
+            "a TERM-ignoring Pi grandchild survived cancellation and wrote its marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_parent_exit_cleanup_honors_descendant_grace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi");
+        let ready = temp.path().join("ready-after-parent-exit");
+        let marker = temp.path().join("descendant-grace-marker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n(trap 'sleep 0.3; : > \"$MARKER\"; exit 0' TERM; : > \"$READY\"; while :; do sleep 0.05; done) &\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert("READY".to_string(), ready.to_string_lossy().into_owned());
+        env.insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let job = Job {
+            kind: "test".to_string(),
+            prompt: "test".to_string(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{}".to_string(),
+            env,
+            termination_grace_seconds: 1,
+        };
+        let result = thread::spawn(move || runner.run(job, CancellationToken::new(), None));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "fake Pi descendant did not start");
+        let _ = result.join().unwrap();
+        assert!(
+            marker.exists(),
+            "post-parent-exit cleanup killed the descendant without the configured TERM grace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_honors_descendant_grace_after_pi_parent_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi");
+        let ready = temp.path().join("ready");
+        let marker = temp.path().join("grandchild-grace-marker");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n(trap 'sleep 0.3; : > \"$MARKER\"; exit 0' TERM; while :; do sleep 0.05; done) &\n: > \"$READY\"\nwait\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert("READY".to_string(), ready.to_string_lossy().into_owned());
+        env.insert("MARKER".to_string(), marker.to_string_lossy().into_owned());
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
+        let job = Job {
+            kind: "test".to_string(),
+            prompt: "test".to_string(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{}".to_string(),
+            env,
+            termination_grace_seconds: 1,
+        };
+        let result = thread::spawn(move || runner.run(job, cancelled, None));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "fake Pi did not create its ready signal");
+        cancel.cancel();
+        assert!(result.join().unwrap().is_err());
+        assert!(
+            marker.exists(),
+            "Pi descendant did not receive its configured graceful shutdown window"
+        );
     }
 
     #[test]

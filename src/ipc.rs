@@ -96,6 +96,9 @@ pub struct WorkerAskParams {
     pub token: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attempt: usize,
+    /// Immutable daemon launch identity. Absent for legacy workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
     pub question: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -181,6 +184,9 @@ pub struct WorkerQuestionTimeoutParams {
     pub run_id: String,
     pub question_id: String,
     pub token: String,
+    /// Immutable daemon launch identity. Absent for legacy workers/questions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

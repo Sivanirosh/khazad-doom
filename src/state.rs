@@ -1,14 +1,14 @@
 use crate::domain::{
     Event, FrontierBudgetState, FrontierClassification, MissionEnvelope, ReplanDecision,
     ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
-    ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus,
+    ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptLedger,
     WorkerAttemptProgress, WorkerQuestion, WorkerQuestionAnswerSource,
     WorkerQuestionRecommendation,
 };
 use crate::pi_contract;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -183,6 +183,7 @@ impl Store {
                 integration_branch TEXT NOT NULL,
                 selected_slice_id TEXT NOT NULL,
                 error TEXT NOT NULL DEFAULT '',
+                execution_epoch INTEGER NOT NULL DEFAULT 1,
                 started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -196,6 +197,38 @@ impl Store {
                 last_error TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (run_id, slice_id)
             );
+            CREATE TABLE IF NOT EXISTS worker_attempt_ledger (
+                launch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                slice_id TEXT NOT NULL,
+                launch_ordinal INTEGER NOT NULL,
+                execution_epoch INTEGER NOT NULL,
+                worker_retry_ordinal INTEGER NOT NULL,
+                repair_ordinal INTEGER NOT NULL,
+                envelope_retry_ordinal INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                worktree TEXT NOT NULL,
+                output_stem TEXT NOT NULL,
+                worker_token_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                launched_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '',
+                failure_cause TEXT NOT NULL DEFAULT '',
+                worker_pid INTEGER,
+                worker_process_observed_at TEXT NOT NULL DEFAULT '',
+                worker_last_event_at TEXT NOT NULL DEFAULT '',
+                worker_last_event_kind TEXT NOT NULL DEFAULT '',
+                worker_last_semantic_progress_at TEXT NOT NULL DEFAULT '',
+                worker_last_semantic_progress_summary TEXT NOT NULL DEFAULT '',
+                worker_attempt_timeout_seconds INTEGER NOT NULL DEFAULT 0,
+                worker_no_output_warning_seconds INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (run_id, slice_id, launch_ordinal),
+                UNIQUE (run_id, output_stem)
+            );
+            CREATE INDEX IF NOT EXISTS worker_attempt_ledger_run_slice_idx
+                ON worker_attempt_ledger (run_id, slice_id, launch_ordinal);
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
@@ -237,6 +270,7 @@ impl Store {
                 run_id TEXT NOT NULL,
                 slice_id TEXT NOT NULL,
                 attempt INTEGER NOT NULL DEFAULT 0,
+                launch_id INTEGER,
                 question TEXT NOT NULL,
                 options_json TEXT NOT NULL,
                 timeout_seconds INTEGER NOT NULL DEFAULT 0,
@@ -271,6 +305,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_replan_proposals_run_state
                 ON replan_proposals(run_id, state, created_at);
             "#,
+        )?;
+        ensure_column(
+            &conn,
+            "runs",
+            "execution_epoch",
+            "execution_epoch INTEGER NOT NULL DEFAULT 1",
         )?;
         ensure_column(
             &conn,
@@ -326,6 +366,61 @@ impl Store {
             "worker_questions",
             "attempt",
             "attempt INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "worker_questions", "launch_id", "launch_id INTEGER")?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_token_hash",
+            "worker_token_hash TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_pid",
+            "worker_pid INTEGER",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_process_observed_at",
+            "worker_process_observed_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_last_event_at",
+            "worker_last_event_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_last_event_kind",
+            "worker_last_event_kind TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_last_semantic_progress_at",
+            "worker_last_semantic_progress_at TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_last_semantic_progress_summary",
+            "worker_last_semantic_progress_summary TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_attempt_timeout_seconds",
+            "worker_attempt_timeout_seconds INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "worker_attempt_ledger",
+            "worker_no_output_warning_seconds",
+            "worker_no_output_warning_seconds INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
             &conn,
@@ -560,6 +655,12 @@ impl Store {
                     existing_intent.status
                 );
             }
+            interrupt_active_worker_attempts(
+                &tx,
+                run_id,
+                &existing_intent.question_interruption_reason,
+                existing_intent.status,
+            )?;
             tx.commit()?;
             return Ok(0);
         }
@@ -648,6 +749,7 @@ impl Store {
                  AND status IN ('running', 'repair_needed', 'ready_to_merge')"#,
             params![interrupted_slice_status.as_str(), slice_error, run_id],
         )?;
+        interrupt_active_worker_attempts(&tx, run_id, question_interruption_reason, status)?;
         tx.execute(
             r#"INSERT INTO run_progress
                (run_id, phase, slice_id, attempt, command, message, output_tail, phase_started_at,
@@ -767,6 +869,12 @@ impl Store {
                 "run {run_id:?} cannot publish terminal state before its terminal summary is durable"
             );
         }
+        interrupt_active_worker_attempts(
+            &tx,
+            run_id,
+            &transition.question_interruption_reason,
+            transition.status,
+        )?;
         let (current_status, current_error) = tx
             .query_row(
                 "SELECT status, error FROM runs WHERE id=?1",
@@ -819,7 +927,20 @@ impl Store {
         Ok(true)
     }
 
-    pub(crate) fn reopen_run_for_resume(&self, run_id: &str) -> Result<()> {
+    pub(crate) fn current_run_execution_epoch(&self, run_id: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let epoch = conn
+            .query_row(
+                "SELECT execution_epoch FROM runs WHERE id=?1",
+                params![run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .context("run disappeared while reading execution epoch")?;
+        Ok(epoch.max(1) as usize)
+    }
+
+    pub(crate) fn reopen_run_for_resume(&self, run_id: &str) -> Result<usize> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let transition = tx
@@ -842,7 +963,7 @@ impl Store {
             );
         }
         let changed = tx.execute(
-            "UPDATE runs SET status=?1, error='', updated_at=?2 WHERE id=?3",
+            "UPDATE runs SET status=?1, error='', execution_epoch=execution_epoch+1, updated_at=?2 WHERE id=?3",
             params![RunStatus::Running.as_str(), Utc::now().to_rfc3339(), run_id],
         )?;
         if changed != 1 {
@@ -852,8 +973,13 @@ impl Store {
             "DELETE FROM terminal_transitions WHERE run_id=?1",
             params![run_id],
         )?;
+        let epoch = tx.query_row(
+            "SELECT execution_epoch FROM runs WHERE id=?1",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )?;
         tx.commit()?;
-        Ok(())
+        Ok(epoch.max(1) as usize)
     }
 
     pub(crate) fn terminal_transition_needs_reconciliation(&self, run_id: &str) -> Result<bool> {
@@ -1018,6 +1144,296 @@ impl Store {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_worker_attempt(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+        execution_epoch: usize,
+        worker_retry_ordinal: usize,
+        repair_ordinal: usize,
+        envelope_retry_ordinal: usize,
+        kind: &str,
+        worktree_root: &Path,
+    ) -> Result<WorkerAttemptLedger> {
+        self.allocate_worker_attempt_with_projection(
+            run_id,
+            slice_id,
+            execution_epoch,
+            worker_retry_ordinal,
+            repair_ordinal,
+            envelope_retry_ordinal,
+            kind,
+            worktree_root,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_run_worker_attempt(
+        &self,
+        run_id: &str,
+        scope_id: &str,
+        execution_epoch: usize,
+        worker_retry_ordinal: usize,
+        repair_ordinal: usize,
+        envelope_retry_ordinal: usize,
+        kind: &str,
+        worktree_root: &Path,
+    ) -> Result<WorkerAttemptLedger> {
+        self.allocate_worker_attempt_with_projection(
+            run_id,
+            scope_id,
+            execution_epoch,
+            worker_retry_ordinal,
+            repair_ordinal,
+            envelope_retry_ordinal,
+            kind,
+            worktree_root,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_worker_attempt_with_projection(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+        execution_epoch: usize,
+        worker_retry_ordinal: usize,
+        repair_ordinal: usize,
+        envelope_retry_ordinal: usize,
+        kind: &str,
+        worktree_root: &Path,
+        project_slice_run: bool,
+    ) -> Result<WorkerAttemptLedger> {
+        if execution_epoch == 0
+            || (project_slice_run && worker_retry_ordinal == 0)
+            || kind.trim().is_empty()
+        {
+            anyhow::bail!(
+                "worker-attempt allocation requires a nonzero execution epoch, a kind, and a nonzero slice retry ordinal"
+            );
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active_run = tx
+            .query_row(
+                "SELECT status FROM runs WHERE id=?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if active_run.as_deref() != Some("running") {
+            anyhow::bail!("cannot allocate worker attempt for non-running or missing run {run_id}");
+        }
+        let next_ordinal = tx.query_row(
+            "SELECT COALESCE(MAX(launch_ordinal), 0) + 1 FROM worker_attempt_ledger WHERE run_id=?1 AND slice_id=?2",
+            params![run_id, slice_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let now = Utc::now();
+        let created_at = now.to_rfc3339();
+        tx.execute(
+            r#"INSERT INTO worker_attempt_ledger
+               (run_id, slice_id, launch_ordinal, execution_epoch, worker_retry_ordinal,
+                repair_ordinal, envelope_retry_ordinal, kind, state, branch, worktree,
+                output_stem, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'allocated', '', '', '', ?9)"#,
+            params![
+                run_id,
+                slice_id,
+                next_ordinal,
+                execution_epoch as i64,
+                worker_retry_ordinal as i64,
+                repair_ordinal as i64,
+                envelope_retry_ordinal as i64,
+                kind,
+                created_at,
+            ],
+        )?;
+        let launch_id = tx.last_insert_rowid();
+        let branch = format!("khazad/{run_id}/{slice_id}/launch-{launch_id}");
+        let worktree = worktree_root
+            .join(slice_id)
+            .join(format!("launch-{launch_id}"))
+            .to_string_lossy()
+            .to_string();
+        let output_stem = format!("{slice_id}.worker.launch-{launch_id}");
+        tx.execute(
+            "UPDATE worker_attempt_ledger SET branch=?1, worktree=?2, output_stem=?3 WHERE launch_id=?4",
+            params![branch, worktree, output_stem, launch_id],
+        )?;
+        if project_slice_run {
+            tx.execute(
+                r#"INSERT INTO slice_runs (run_id, slice_id, status, branch, attempts)
+                   VALUES (?1, ?2, 'running', ?3, ?4)
+                   ON CONFLICT(run_id, slice_id) DO UPDATE SET
+                     status='running', branch=excluded.branch, attempts=excluded.attempts"#,
+                params![run_id, slice_id, branch, worker_retry_ordinal as i64],
+            )?;
+        }
+        let payload = serde_json::json!({
+            "launch_id": launch_id,
+            "slice_id": slice_id,
+            "launch_ordinal": next_ordinal,
+            "execution_epoch": execution_epoch,
+            "worker_retry_ordinal": worker_retry_ordinal,
+            "repair_ordinal": repair_ordinal,
+            "envelope_retry_ordinal": envelope_retry_ordinal,
+            "kind": kind,
+            "state": "allocated",
+            "output_stem": &output_stem,
+        });
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_allocated', ?2, ?3)",
+            params![run_id, serde_json::to_string(&payload)?, now.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(WorkerAttemptLedger {
+            run_id: run_id.to_string(),
+            slice_id: slice_id.to_string(),
+            launch_id,
+            launch_ordinal: next_ordinal as usize,
+            execution_epoch,
+            worker_retry_ordinal,
+            repair_ordinal,
+            envelope_retry_ordinal,
+            kind: kind.to_string(),
+            state: "allocated".to_string(),
+            branch,
+            worktree,
+            output_stem,
+            created_at: now,
+            launched_at: None,
+            finished_at: None,
+            failure_cause: String::new(),
+            activity: None,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_worker_attempt_launched(&self, launch_id: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (run_id, slice_id): (String, String) = tx.query_row(
+            "SELECT run_id, slice_id FROM worker_attempt_ledger WHERE launch_id=?1 AND state='allocated'",
+            params![launch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.context("cannot mark non-allocated worker attempt launched")?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE worker_attempt_ledger SET state='running', launched_at=?1 WHERE launch_id=?2 AND state='allocated'",
+            params![now, launch_id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_launched', ?2, ?3)",
+            params![run_id, serde_json::to_string(&serde_json::json!({"launch_id": launch_id, "slice_id": slice_id}))?, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn finish_worker_attempt(
+        &self,
+        launch_id: i64,
+        state: &str,
+        failure_cause: &str,
+    ) -> Result<()> {
+        if !matches!(state, "succeeded" | "failed" | "interrupted") {
+            anyhow::bail!(
+                "worker attempt terminal state must be succeeded, failed, or interrupted"
+            );
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (run_id, slice_id, prior_state): (String, String, String) = tx
+            .query_row(
+                "SELECT run_id, slice_id, state FROM worker_attempt_ledger WHERE launch_id=?1",
+                params![launch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .context("cannot finish missing worker attempt")?;
+        if !matches!(prior_state.as_str(), "allocated" | "running")
+            || (state == "succeeded" && prior_state != "running")
+        {
+            anyhow::bail!("cannot finish worker attempt {launch_id} from {prior_state} as {state}");
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE worker_attempt_ledger SET state=?1, finished_at=?2, failure_cause=?3 WHERE launch_id=?4",
+            params![state, now, failure_cause, launch_id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_finished', ?2, ?3)",
+            params![run_id, serde_json::to_string(&serde_json::json!({"launch_id": launch_id, "slice_id": slice_id, "state": state, "failure_cause": failure_cause}))?, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn list_worker_attempt_ledger(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+    ) -> Result<Vec<WorkerAttemptLedger>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id, slice_id, launch_id, launch_ordinal, execution_epoch,
+                      worker_retry_ordinal, repair_ordinal, envelope_retry_ordinal, kind,
+                      state, branch, worktree, output_stem, created_at, launched_at,
+                      finished_at, failure_cause, worker_pid, worker_process_observed_at,
+                      worker_last_event_at, worker_last_event_kind,
+                      worker_last_semantic_progress_at, worker_last_semantic_progress_summary,
+                      worker_attempt_timeout_seconds, worker_no_output_warning_seconds
+               FROM worker_attempt_ledger
+               WHERE run_id=?1 AND slice_id=?2
+               ORDER BY launch_ordinal ASC, launch_id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![run_id, slice_id], worker_attempt_ledger_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_worker_attempt_ledger_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<WorkerAttemptLedger>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT run_id, slice_id, launch_id, launch_ordinal, execution_epoch,
+                      worker_retry_ordinal, repair_ordinal, envelope_retry_ordinal, kind,
+                      state, branch, worktree, output_stem, created_at, launched_at,
+                      finished_at, failure_cause, worker_pid, worker_process_observed_at,
+                      worker_last_event_at, worker_last_event_kind,
+                      worker_last_semantic_progress_at, worker_last_semantic_progress_summary,
+                      worker_attempt_timeout_seconds, worker_no_output_warning_seconds
+               FROM worker_attempt_ledger
+               WHERE run_id=?1
+               ORDER BY launch_id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![run_id], worker_attempt_ledger_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Retains a durable allocation after a crash but marks it unrecoverable;
+    /// resume must allocate a fresh identity rather than reviving this row.
+    #[allow(dead_code)]
+    pub fn reconcile_unlaunched_worker_attempts(
+        &self,
+        run_id: &str,
+        reason: &str,
+    ) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let interrupted =
+            interrupt_active_worker_attempts(&tx, run_id, reason, RunStatus::Interrupted)?;
+        tx.commit()?;
+        Ok(interrupted)
+    }
+
     pub fn upsert_slice_run(&self, slice_run: &SliceRun) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -1116,29 +1532,54 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)] // legacy ordinal-only compatibility API
     pub fn worker_attempt_is_active(
         &self,
         run_id: &str,
         slice_id: &str,
         attempt: usize,
     ) -> Result<bool> {
-        let conn = self.conn()?;
-        active_worker_attempt(&conn, run_id, slice_id, attempt)
+        self.worker_attempt_is_active_with_launch_id(run_id, slice_id, attempt, None)
     }
 
+    /// A launch-scoped question may only be serviced by its exact running ledger row.
+    /// Legacy questions retain ordinal-only compatibility.
+    pub fn worker_attempt_is_active_with_launch_id(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+        attempt: usize,
+        launch_id: Option<i64>,
+    ) -> Result<bool> {
+        let conn = self.conn()?;
+        active_worker_attempt_with_launch_id(&conn, run_id, slice_id, attempt, launch_id)
+    }
+
+    #[allow(dead_code)] // Legacy ordinal-only worker-question compatibility.
     pub fn has_pending_worker_question(
         &self,
         run_id: &str,
         slice_id: &str,
         attempt: usize,
     ) -> Result<bool> {
+        self.has_pending_worker_question_with_launch_id(run_id, slice_id, attempt, None)
+    }
+
+    pub fn has_pending_worker_question_with_launch_id(
+        &self,
+        run_id: &str,
+        slice_id: &str,
+        attempt: usize,
+        launch_id: Option<i64>,
+    ) -> Result<bool> {
         let conn = self.conn()?;
         let pending = conn
             .query_row(
                 r#"SELECT 1 FROM worker_questions
-                   WHERE run_id=?1 AND slice_id=?2 AND attempt=?3 AND state='pending'
-                   LIMIT 1"#,
-                params![run_id, slice_id, attempt as i64],
+               WHERE run_id=?1 AND slice_id=?2 AND attempt=?3 AND state='pending'
+                 AND (launch_id IS NULL OR launch_id=?4)
+               LIMIT 1"#,
+                params![run_id, slice_id, attempt as i64, launch_id],
                 |_| Ok(()),
             )
             .optional()?;
@@ -1155,6 +1596,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)] // Legacy ordinal-only worker-question compatibility.
     pub fn store_worker_token(&self, run_id: &str, token: &str) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -1176,6 +1618,62 @@ impl Store {
             )
             .optional()?;
         Ok(hash.is_some_and(|hash| hash == token_hash(token)))
+    }
+
+    pub fn store_worker_launch_token(
+        &self,
+        run_id: &str,
+        launch_id: i64,
+        token: &str,
+    ) -> Result<()> {
+        if launch_id <= 0 || token.is_empty() {
+            anyhow::bail!("worker launch token requires a positive launch id and non-empty token");
+        }
+        let conn = self.conn()?;
+        let updated = conn.execute(
+            r#"UPDATE worker_attempt_ledger
+               SET worker_token_hash=?1
+               WHERE launch_id=?2 AND run_id=?3 AND state='allocated'
+                 AND worker_token_hash=''"#,
+            params![token_hash(token), launch_id, run_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!(
+                "cannot bind worker token to missing, launched, or already-authorized launch {launch_id} for run {run_id}"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_worker_launch_token(
+        &self,
+        run_id: &str,
+        launch_id: i64,
+        token: &str,
+    ) -> Result<bool> {
+        if launch_id <= 0 {
+            return Ok(false);
+        }
+        let conn = self.conn()?;
+        let hash: Option<String> = conn
+            .query_row(
+                r#"SELECT l.worker_token_hash
+                   FROM worker_attempt_ledger l
+                   JOIN runs r ON r.id=l.run_id
+                   LEFT JOIN slice_runs s ON s.run_id=l.run_id AND s.slice_id=l.slice_id
+                   WHERE l.launch_id=?1 AND l.run_id=?2 AND l.state='running'
+                     AND r.status='running'
+                     AND (
+                       (l.kind='integration-repair' AND l.repair_ordinal>0)
+                       OR (s.status IN ('running', 'repair_needed')
+                           AND s.attempts=l.worker_retry_ordinal)
+                     )
+                   LIMIT 1"#,
+                params![launch_id, run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hash.is_some_and(|hash| !hash.is_empty() && hash == token_hash(token)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1221,6 +1719,7 @@ impl Store {
             run_id,
             slice_id,
             attempt,
+            None,
             question,
             options,
             timeout_seconds,
@@ -1228,7 +1727,35 @@ impl Store {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn insert_worker_question_with_launch_id_and_recommendation(
+        &self,
+        id: &str,
+        run_id: &str,
+        slice_id: &str,
+        attempt: usize,
+        launch_id: Option<i64>,
+        question: &str,
+        options: &[String],
+        timeout_seconds: u64,
+        recommendation: &WorkerQuestionRecommendation,
+    ) -> Result<WorkerQuestion> {
+        let conn = self.conn()?;
+        insert_worker_question_row(
+            &conn,
+            id,
+            run_id,
+            slice_id,
+            attempt,
+            launch_id,
+            question,
+            options,
+            timeout_seconds,
+            recommendation,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn open_active_worker_question_with_recommendation<T, F>(
         &self,
         id: &str,
@@ -1247,11 +1774,47 @@ impl Store {
         T: Serialize,
         F: FnOnce(&WorkerQuestion) -> Result<T>,
     {
+        self.open_active_worker_question_with_launch_id_and_recommendation(
+            id,
+            run_id,
+            slice_id,
+            attempt,
+            None,
+            question,
+            options,
+            timeout_seconds,
+            recommendation,
+            asked_event_type,
+            asked_event,
+            progress_message,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_active_worker_question_with_launch_id_and_recommendation<T, F>(
+        &self,
+        id: &str,
+        run_id: &str,
+        slice_id: &str,
+        attempt: usize,
+        launch_id: Option<i64>,
+        question: &str,
+        options: &[String],
+        timeout_seconds: u64,
+        recommendation: &WorkerQuestionRecommendation,
+        asked_event_type: &str,
+        asked_event: F,
+        progress_message: &str,
+    ) -> Result<WorkerQuestion>
+    where
+        T: Serialize,
+        F: FnOnce(&WorkerQuestion) -> Result<T>,
+    {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !active_worker_attempt(&tx, run_id, slice_id, attempt)? {
+        if !active_worker_attempt_with_launch_id(&tx, run_id, slice_id, attempt, launch_id)? {
             anyhow::bail!(
-                "worker question rejected for stale or inactive attempt {slice_id} attempt {attempt} in run {run_id}"
+                "worker question rejected for stale or inactive launch {launch_id:?} ({slice_id} attempt {attempt}) in run {run_id}"
             );
         }
         let pending = tx
@@ -1274,6 +1837,7 @@ impl Store {
             run_id,
             slice_id,
             attempt,
+            launch_id,
             question,
             options,
             timeout_seconds,
@@ -1298,7 +1862,7 @@ impl Store {
     pub fn list_worker_questions(&self, run_id: &str) -> Result<Vec<WorkerQuestion>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            r#"SELECT id, run_id, slice_id, attempt, question, options_json, timeout_seconds,
+            r#"SELECT id, run_id, slice_id, attempt, launch_id, question, options_json, timeout_seconds,
                       state, asked_at, answered_at, answer, recommended_answer,
                       recommendation_rationale, bounded_within_current_slice_or_mission_authority,
                       reversible, fallback_eligible, deadline_at, answer_source
@@ -1315,9 +1879,9 @@ impl Store {
     pub fn list_worker_questions_for_repo(&self, repo_path: &str) -> Result<Vec<WorkerQuestion>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            r#"SELECT q.id, q.run_id, q.slice_id, q.attempt, q.question, q.options_json,
-                      q.timeout_seconds, q.state, q.asked_at, q.answered_at, q.answer,
-                      q.recommended_answer, q.recommendation_rationale,
+            r#"SELECT q.id, q.run_id, q.slice_id, q.attempt, q.launch_id, q.question,
+                      q.options_json, q.timeout_seconds, q.state, q.asked_at, q.answered_at,
+                      q.answer, q.recommended_answer, q.recommendation_rationale,
                       q.bounded_within_current_slice_or_mission_authority, q.reversible,
                       q.fallback_eligible, q.deadline_at, q.answer_source
                FROM worker_questions q
@@ -1345,7 +1909,13 @@ impl Store {
             anyhow::anyhow!("question {question_id:?} for run {run_id:?} not found")
         })?;
         if existing.state != "pending"
-            || active_worker_attempt(&tx, run_id, &existing.slice_id, existing.attempt)?
+            || active_worker_attempt_with_launch_id(
+                &tx,
+                run_id,
+                &existing.slice_id,
+                existing.attempt,
+                existing.launch_id,
+            )?
         {
             tx.commit()?;
             return Ok(WorkerQuestionAnswerTransition {
@@ -1365,6 +1935,7 @@ impl Store {
                 "question_id": existing.id,
                 "slice_id": existing.slice_id,
                 "attempt": existing.attempt,
+                "launch_id": existing.launch_id,
                 "reason": reason
             }))?;
             tx.execute(
@@ -1429,8 +2000,14 @@ impl Store {
                 applied: false,
             });
         }
-        if !active_worker_attempt(&tx, run_id, &existing.slice_id, existing.attempt)? {
-            anyhow::bail!("question {question_id:?} is not attached to the active worker attempt");
+        if !active_worker_attempt_with_launch_id(
+            &tx,
+            run_id,
+            &existing.slice_id,
+            existing.attempt,
+            existing.launch_id,
+        )? {
+            anyhow::bail!("question {question_id:?} is not attached to the active worker launch");
         }
 
         let now = Utc::now();
@@ -1529,8 +2106,14 @@ impl Store {
                 applied: false,
             });
         }
-        if !active_worker_attempt(&tx, run_id, &existing.slice_id, existing.attempt)? {
-            anyhow::bail!("question {question_id:?} is not attached to the active worker attempt");
+        if !active_worker_attempt_with_launch_id(
+            &tx,
+            run_id,
+            &existing.slice_id,
+            existing.attempt,
+            existing.launch_id,
+        )? {
+            anyhow::bail!("question {question_id:?} is not attached to the active worker launch");
         }
 
         let now_text = Utc::now().to_rfc3339();
@@ -2177,6 +2760,7 @@ impl Store {
         phase: &str,
         slice_id: &str,
         attempt: usize,
+        launch_id: Option<i64>,
         pid: Option<u32>,
         event_kind: &str,
         event_text: &str,
@@ -2184,6 +2768,11 @@ impl Store {
         no_output_warning_seconds: u64,
     ) -> Result<Option<RunProgress>> {
         let conn = self.conn()?;
+        if launch_id.is_some()
+            && !active_worker_attempt_with_launch_id(&conn, run_id, slice_id, attempt, launch_id)?
+        {
+            return self.get_progress(run_id);
+        }
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let is_process_observation = matches!(event_kind, "started" | "process_observed");
@@ -2198,6 +2787,52 @@ impl Store {
             .as_ref()
             .map(|progress| progress.summary.as_str())
             .unwrap_or_default();
+        if let Some(launch_id) = launch_id {
+            let updated = conn.execute(
+                r#"UPDATE worker_attempt_ledger SET
+                     worker_pid=COALESCE(?1, worker_pid),
+                     worker_process_observed_at=CASE
+                       WHEN ?2 THEN ?3
+                       ELSE worker_process_observed_at
+                     END,
+                     worker_last_event_at=CASE
+                       WHEN ?4 THEN ?3
+                       ELSE worker_last_event_at
+                     END,
+                     worker_last_event_kind=CASE
+                       WHEN ?4 THEN ?5
+                       ELSE worker_last_event_kind
+                     END,
+                     worker_last_semantic_progress_at=CASE
+                       WHEN ?6 THEN ?3
+                       ELSE worker_last_semantic_progress_at
+                     END,
+                     worker_last_semantic_progress_summary=CASE
+                       WHEN ?6 THEN ?7
+                       ELSE worker_last_semantic_progress_summary
+                     END,
+                     worker_attempt_timeout_seconds=?8,
+                     worker_no_output_warning_seconds=?9
+                   WHERE launch_id=?10 AND run_id=?11 AND slice_id=?12 AND state='running'"#,
+                params![
+                    pid.map(|pid| pid as i64),
+                    is_process_observation,
+                    &now_text,
+                    is_worker_event,
+                    event_kind,
+                    has_semantic_progress,
+                    semantic_progress_summary,
+                    attempt_timeout_seconds as i64,
+                    no_output_warning_seconds as i64,
+                    launch_id,
+                    run_id,
+                    slice_id,
+                ],
+            )?;
+            if updated != 1 {
+                return self.get_progress(run_id);
+            }
+        }
         conn.execute(
             r#"UPDATE run_progress SET
                  updated_at=?1,
@@ -2262,7 +2897,25 @@ impl Store {
                 run_progress_tuple_from_row,
             )
             .optional()?;
-        row.map(run_progress_from_tuple).transpose()
+        let mut progress = row.map(run_progress_from_tuple).transpose()?;
+        if let Some(progress) = progress.as_mut()
+            && let Some(worker) = progress.worker.as_mut()
+        {
+            worker.launch_id = conn
+                .query_row(
+                    r#"SELECT launch_id FROM worker_attempt_ledger
+                       WHERE run_id=?1 AND slice_id=?2 AND state='running'
+                         AND (
+                           (kind='integration-repair' AND repair_ordinal=?3)
+                           OR (kind<>'integration-repair' AND worker_retry_ordinal=?3)
+                         )
+                       ORDER BY launch_id DESC LIMIT 1"#,
+                    params![run_id, &progress.slice_id, progress.attempt as i64],
+                    |row| row.get(0),
+                )
+                .optional()?;
+        }
+        Ok(progress)
     }
 
     pub fn get_run(&self, id: &str) -> Result<Option<Run>> {
@@ -2431,6 +3084,54 @@ impl Store {
         }
         Ok(runs)
     }
+}
+
+fn interrupt_active_worker_attempts(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    reason: &str,
+    terminal_status: RunStatus,
+) -> Result<usize> {
+    let active_attempts = {
+        let mut statement = tx.prepare(
+            r#"SELECT launch_id, slice_id, state
+               FROM worker_attempt_ledger
+               WHERE run_id=?1 AND state IN ('allocated', 'running')
+               ORDER BY launch_id ASC"#,
+        )?;
+        let rows = statement.query_map(params![run_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if active_attempts.is_empty() {
+        return Ok(0);
+    }
+    let now = Utc::now().to_rfc3339();
+    for (launch_id, slice_id, prior_state) in &active_attempts {
+        tx.execute(
+            r#"UPDATE worker_attempt_ledger
+               SET state='interrupted', finished_at=?1, failure_cause=?2
+               WHERE launch_id=?3 AND state IN ('allocated', 'running')"#,
+            params![now, reason, launch_id],
+        )?;
+        let payload = serde_json::json!({
+            "launch_id": launch_id,
+            "slice_id": slice_id,
+            "reason": reason,
+            "prior_state": prior_state,
+            "terminal_status": terminal_status,
+        });
+        tx.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_interrupted', ?2, ?3)",
+            params![run_id, serde_json::to_string(&payload)?, now],
+        )?;
+    }
+    Ok(active_attempts.len())
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -2800,14 +3501,116 @@ fn project_awaiting_operator_progress(
     Ok(())
 }
 
-fn active_worker_attempt(
+fn worker_attempt_ledger_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkerAttemptLedger> {
+    let created_at: String = row.get(13)?;
+    let launched_at_text: String = row.get(14)?;
+    let finished_at_text: String = row.get(15)?;
+    let worker_pid = row.get::<_, Option<i64>>(17)?.map(|pid| pid.max(0) as u32);
+    let process_observed_at: String = row.get(18)?;
+    let last_event_at: String = row.get(19)?;
+    let last_event_kind: String = row.get(20)?;
+    let last_semantic_progress_at: String = row.get(21)?;
+    let last_semantic_progress_summary: String = row.get(22)?;
+    let attempt_timeout_seconds = row.get::<_, i64>(23)?.max(0) as u64;
+    let no_output_warning_seconds = row.get::<_, i64>(24)?.max(0) as u64;
+    let parse_time = |value: String| {
+        DateTime::parse_from_rfc3339(&value)
+            .map(|time| time.with_timezone(&Utc))
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })
+    };
+    let parse_optional_time = |value: String| {
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            parse_time(value).map(Some)
+        }
+    };
+    let launched_at = parse_optional_time(launched_at_text)?;
+    let has_activity = worker_pid.is_some()
+        || !process_observed_at.is_empty()
+        || !last_event_at.is_empty()
+        || !last_event_kind.is_empty()
+        || !last_semantic_progress_at.is_empty()
+        || !last_semantic_progress_summary.is_empty()
+        || attempt_timeout_seconds > 0
+        || no_output_warning_seconds > 0;
+    let activity = if has_activity {
+        launched_at.as_ref().map(|attempt_started_at| {
+            Ok::<WorkerAttemptProgress, rusqlite::Error>(WorkerAttemptProgress {
+                launch_id: Some(row.get(2)?),
+                attempt_started_at: *attempt_started_at,
+                pid: worker_pid,
+                process_observed_at: parse_optional_time(process_observed_at)?,
+                last_event_at: parse_optional_time(last_event_at)?,
+                last_event_kind,
+                last_semantic_progress_at: parse_optional_time(last_semantic_progress_at)?,
+                last_semantic_progress_summary,
+                attempt_timeout_seconds,
+                no_output_warning_seconds,
+            })
+        })
+    } else {
+        None
+    };
+    Ok(WorkerAttemptLedger {
+        run_id: row.get(0)?,
+        slice_id: row.get(1)?,
+        launch_id: row.get(2)?,
+        launch_ordinal: row.get::<_, i64>(3)?.max(0) as usize,
+        execution_epoch: row.get::<_, i64>(4)?.max(0) as usize,
+        worker_retry_ordinal: row.get::<_, i64>(5)?.max(0) as usize,
+        repair_ordinal: row.get::<_, i64>(6)?.max(0) as usize,
+        envelope_retry_ordinal: row.get::<_, i64>(7)?.max(0) as usize,
+        kind: row.get(8)?,
+        state: row.get(9)?,
+        branch: row.get(10)?,
+        worktree: row.get(11)?,
+        output_stem: row.get(12)?,
+        created_at: parse_time(created_at)?,
+        launched_at,
+        finished_at: parse_optional_time(finished_at_text)?,
+        failure_cause: row.get(16)?,
+        activity: activity.transpose()?,
+    })
+}
+
+fn active_worker_attempt_with_launch_id(
     conn: &Connection,
     run_id: &str,
     slice_id: &str,
     attempt: usize,
+    launch_id: Option<i64>,
 ) -> Result<bool> {
-    let active = conn
-        .query_row(
+    let active = if let Some(launch_id) = launch_id {
+        conn.query_row(
+            r#"SELECT 1
+               FROM runs r
+               JOIN worker_attempt_ledger l ON l.run_id=r.id
+               LEFT JOIN slice_runs s ON s.run_id=l.run_id AND s.slice_id=l.slice_id
+               WHERE r.id=?1 AND r.status='running'
+                 AND l.slice_id=?2 AND l.launch_id=?4 AND l.state='running'
+                 AND (
+                   (l.kind='integration-repair' AND l.repair_ordinal=?3)
+                   OR (
+                     l.kind<>'integration-repair' AND l.worker_retry_ordinal=?3
+                     AND s.status IN ('running', 'repair_needed') AND s.attempts=?3
+                   )
+                 )
+               LIMIT 1"#,
+            params![run_id, slice_id, attempt as i64, launch_id],
+            |_| Ok(()),
+        )
+        .optional()?
+    } else {
+        conn.query_row(
             r#"SELECT 1
                FROM runs r
                JOIN slice_runs s ON s.run_id=r.id
@@ -2818,7 +3621,8 @@ fn active_worker_attempt(
             params![run_id, slice_id, attempt as i64],
             |_| Ok(()),
         )
-        .optional()?;
+        .optional()?
+    };
     Ok(active.is_some())
 }
 
@@ -2829,6 +3633,7 @@ fn insert_worker_question_row(
     run_id: &str,
     slice_id: &str,
     attempt: usize,
+    launch_id: Option<i64>,
     question: &str,
     options: &[String],
     timeout_seconds: u64,
@@ -2844,18 +3649,19 @@ fn insert_worker_question_row(
     let fallback_eligible = recommendation.is_eligible(options);
     conn.execute(
         r#"INSERT INTO worker_questions
-           (id, run_id, slice_id, attempt, question, options_json, timeout_seconds,
+           (id, run_id, slice_id, attempt, launch_id, question, options_json, timeout_seconds,
             recommended_answer, recommendation_rationale,
             bounded_within_current_slice_or_mission_authority, reversible,
             fallback_eligible, deadline_at, state, asked_at, answered_at, answer,
             answer_source)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   'pending', ?14, '', '', '')"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   'pending', ?15, '', '', '')"#,
         params![
             id,
             run_id,
             slice_id,
             attempt as i64,
+            launch_id,
             question,
             serde_json::to_string(options)?,
             timeout_seconds.min(i64::MAX as u64) as i64,
@@ -2875,6 +3681,7 @@ fn insert_worker_question_row(
         run_id: run_id.to_string(),
         slice_id: slice_id.to_string(),
         attempt,
+        launch_id,
         question: question.to_string(),
         options: options.to_vec(),
         timeout_seconds,
@@ -2898,7 +3705,7 @@ fn worker_question_by_id(
     question_id: &str,
     run_id: Option<&str>,
 ) -> Result<Option<WorkerQuestion>> {
-    let columns = r#"SELECT id, run_id, slice_id, attempt, question, options_json,
+    let columns = r#"SELECT id, run_id, slice_id, attempt, launch_id, question, options_json,
                             timeout_seconds, state, asked_at, answered_at, answer,
                             recommended_answer, recommendation_rationale,
                             bounded_within_current_slice_or_mission_authority, reversible,
@@ -2923,12 +3730,12 @@ fn worker_question_by_id(
 }
 
 fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQuestion> {
-    let options_json: String = row.get(5)?;
-    let timeout_seconds: i64 = row.get(6)?;
-    let asked_at_text: String = row.get(8)?;
-    let answered_at: String = row.get(9)?;
-    let deadline_at: String = row.get(16)?;
-    let answer_source: String = row.get(17)?;
+    let options_json: String = row.get(6)?;
+    let timeout_seconds: i64 = row.get(7)?;
+    let asked_at_text: String = row.get(9)?;
+    let answered_at: String = row.get(10)?;
+    let deadline_at: String = row.get(17)?;
+    let answer_source: String = row.get(18)?;
     let options = serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default();
     let attempt: i64 = row.get(3)?;
     let asked_at = DateTime::parse_from_rfc3339(&asked_at_text)
@@ -2953,16 +3760,17 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
         run_id: row.get(1)?,
         slice_id: row.get(2)?,
         attempt: attempt.max(0) as usize,
-        question: row.get(4)?,
+        launch_id: row.get(4)?,
+        question: row.get(5)?,
         options,
         timeout_seconds,
-        recommended_answer: row.get(11)?,
-        recommendation_rationale: row.get(12)?,
-        bounded_within_current_slice_or_mission_authority: row.get(13)?,
-        reversible: row.get(14)?,
-        fallback_eligible: row.get(15)?,
+        recommended_answer: row.get(12)?,
+        recommendation_rationale: row.get(13)?,
+        bounded_within_current_slice_or_mission_authority: row.get(14)?,
+        reversible: row.get(15)?,
+        fallback_eligible: row.get(16)?,
         deadline_at,
-        state: row.get(7)?,
+        state: row.get(8)?,
         asked_at,
         answered_at: if answered_at.trim().is_empty() {
             None
@@ -2971,7 +3779,7 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
                 .map(|time| time.with_timezone(&Utc))
                 .ok()
         },
-        answer: row.get(10)?,
+        answer: row.get(11)?,
         answer_source: WorkerQuestionAnswerSource::parse(&answer_source),
     })
 }
@@ -3069,6 +3877,7 @@ fn run_progress_from_tuple(row: RunProgressTuple) -> Result<RunProgress> {
         None
     } else {
         Some(WorkerAttemptProgress {
+            launch_id: None,
             attempt_started_at: parse_time(
                 "worker_attempt_started_at",
                 &worker_attempt_started_at,
@@ -3198,6 +4007,7 @@ mod tests {
             "worker_running",
             "slice-001",
             1,
+            None,
             Some(123),
             "stdout",
             line,
@@ -4291,6 +5101,27 @@ mod tests {
             RunStatus::Running,
             now,
         ))?;
+        let allocated = store.allocate_worker_attempt(
+            "run-terminal-first-commit-wins",
+            "slice-allocated",
+            1,
+            1,
+            0,
+            0,
+            "slice-worker",
+            dir.path(),
+        )?;
+        let running = store.allocate_worker_attempt(
+            "run-terminal-first-commit-wins",
+            "slice-running",
+            1,
+            1,
+            0,
+            0,
+            "slice-worker",
+            dir.path(),
+        )?;
+        store.mark_worker_attempt_launched(running.launch_id)?;
 
         assert_eq!(
             store.prepare_run_terminal_transition(
@@ -4302,6 +5133,16 @@ mod tests {
             )?,
             0
         );
+        for launch in [allocated, running] {
+            let ledger = store
+                .list_worker_attempt_ledger("run-terminal-first-commit-wins", &launch.slice_id)?;
+            assert_eq!(ledger[0].state, "interrupted");
+            assert!(ledger[0].finished_at.is_some());
+            assert_eq!(
+                ledger[0].failure_cause,
+                "run cancelled before question answer"
+            );
+        }
         assert_eq!(
             store.prepare_run_terminal_transition(
                 "run-terminal-first-commit-wins",
@@ -4328,6 +5169,15 @@ mod tests {
                 .filter(|event| event.typ == "terminal_transition_intended")
                 .count(),
             1
+        );
+        assert_eq!(
+            store
+                .get_events("run-terminal-first-commit-wins", 100)?
+                .iter()
+                .filter(|event| event.typ == "worker_attempt_interrupted")
+                .count(),
+            2,
+            "retrying the same terminal intent must not duplicate launch transitions"
         );
         assert_eq!(
             store
@@ -4518,6 +5368,418 @@ mod tests {
         assert_eq!(question.deadline_at, None);
         assert_eq!(question.answer_source, None);
         assert_eq!(question.state, "pending");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_attempt_ledger_allocates_monotonic_immutable_launches_across_epochs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        store.insert_run(&run("run-ledger", "/tmp/repo", RunStatus::Running, now))?;
+
+        let first = store.allocate_worker_attempt(
+            "run-ledger",
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        let second = store.allocate_worker_attempt(
+            "run-ledger",
+            "slice-001",
+            2,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+
+        assert!(second.launch_id > first.launch_id);
+        assert_eq!(first.launch_ordinal, 1);
+        assert_eq!(second.launch_ordinal, 2);
+        assert_eq!(first.execution_epoch, 1);
+        assert_eq!(second.execution_epoch, 2);
+        assert_eq!(
+            first.output_stem,
+            format!("slice-001.worker.launch-{}", first.launch_id)
+        );
+        assert_eq!(
+            first.branch,
+            format!("khazad/run-ledger/slice-001/launch-{}", first.launch_id)
+        );
+        assert_eq!(
+            first.worktree,
+            format!("/tmp/worktrees/slice-001/launch-{}", first.launch_id)
+        );
+        let projection = store.get_slice_runs("run-ledger")?;
+        assert_eq!(projection[0].status, SliceStatus::Running);
+        assert_eq!(projection[0].branch, second.branch);
+        let history = store.list_worker_attempt_ledger("run-ledger", "slice-001")?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], first);
+        assert_eq!(history[1], second);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_attempt_ledger_preserves_allocated_but_not_launched_evidence_for_reconciliation()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.sqlite");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        store.insert_run(&run("run-unlaunched", "/tmp/repo", RunStatus::Running, now))?;
+        let allocated = store.allocate_worker_attempt(
+            "run-unlaunched",
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        drop(store);
+
+        let reopened = Store::open(&path)?;
+        let before = reopened.list_worker_attempt_ledger("run-unlaunched", "slice-001")?;
+        assert_eq!(before, vec![allocated.clone()]);
+        assert_eq!(before[0].state, "allocated");
+        assert_eq!(
+            reopened.reconcile_unlaunched_worker_attempts(
+                "run-unlaunched",
+                "daemon restarted before worker launch",
+            )?,
+            1
+        );
+        let after = reopened.list_worker_attempt_ledger("run-unlaunched", "slice-001")?;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].launch_id, allocated.launch_id);
+        assert_eq!(after[0].state, "interrupted");
+        assert_eq!(
+            after[0].failure_cause,
+            "daemon restarted before worker launch"
+        );
+        assert!(after[0].finished_at.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_attempt_ledger_transitions_are_legal_and_append_events() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        store.insert_run(&run(
+            "run-transitions",
+            "/tmp/repo",
+            RunStatus::Running,
+            Utc::now(),
+        ))?;
+        let attempt = store.allocate_worker_attempt(
+            "run-transitions",
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        assert!(
+            store
+                .finish_worker_attempt(attempt.launch_id, "succeeded", "")
+                .is_err()
+        );
+        store.mark_worker_attempt_launched(attempt.launch_id)?;
+        assert!(
+            store
+                .mark_worker_attempt_launched(attempt.launch_id)
+                .is_err()
+        );
+        store.finish_worker_attempt(attempt.launch_id, "succeeded", "")?;
+        assert!(
+            store
+                .finish_worker_attempt(attempt.launch_id, "failed", "late")
+                .is_err()
+        );
+        let history = store.list_worker_attempt_ledger("run-transitions", "slice-001")?;
+        assert_eq!(history[0].state, "succeeded");
+        assert!(history[0].launched_at.is_some());
+        assert!(history[0].finished_at.is_some());
+        let events = store.get_events("run-transitions", 20)?;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.typ == "worker_attempt_launched")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.typ == "worker_attempt_finished")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_a_run_transactionally_advances_execution_epoch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        store.insert_run(&run(
+            "run-epoch",
+            "/tmp/repo",
+            RunStatus::Failed,
+            Utc::now(),
+        ))?;
+
+        assert_eq!(store.current_run_execution_epoch("run-epoch")?, 1);
+        assert_eq!(store.reopen_run_for_resume("run-epoch")?, 2);
+        assert_eq!(store.current_run_execution_epoch("run-epoch")?, 2);
+        assert_eq!(store.reopen_run_for_resume("run-epoch")?, 3);
+        assert_eq!(store.current_run_execution_epoch("run-epoch")?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_launch_tokens_are_bound_to_the_exact_active_launch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        store.insert_run(&run(
+            "run-launch-token",
+            "/tmp/repo",
+            RunStatus::Running,
+            Utc::now(),
+        ))?;
+
+        let first = store.allocate_worker_attempt(
+            "run-launch-token",
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        store.store_worker_launch_token("run-launch-token", first.launch_id, "first-token")?;
+        assert!(
+            store
+                .store_worker_launch_token("run-launch-token", first.launch_id, "replacement")
+                .is_err()
+        );
+        store.mark_worker_attempt_launched(first.launch_id)?;
+        assert!(store.validate_worker_launch_token(
+            "run-launch-token",
+            first.launch_id,
+            "first-token"
+        )?);
+        store.finish_worker_attempt(first.launch_id, "interrupted", "resume")?;
+        assert!(!store.validate_worker_launch_token(
+            "run-launch-token",
+            first.launch_id,
+            "first-token"
+        )?);
+
+        let second = store.allocate_worker_attempt(
+            "run-launch-token",
+            "slice-001",
+            2,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        store.store_worker_launch_token("run-launch-token", second.launch_id, "second-token")?;
+        store.mark_worker_attempt_launched(second.launch_id)?;
+        assert!(store.validate_worker_launch_token(
+            "run-launch-token",
+            second.launch_id,
+            "second-token"
+        )?);
+        assert!(!store.validate_worker_launch_token(
+            "run-launch-token",
+            second.launch_id,
+            "first-token"
+        )?);
+        assert!(!store.validate_worker_launch_token(
+            "run-launch-token",
+            first.launch_id,
+            "second-token"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_authority_uses_its_repair_ordinal_not_a_retry_ordinal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        store.insert_run(&run(
+            "run-integration-repair-launch",
+            "/tmp/repo",
+            RunStatus::Running,
+            Utc::now(),
+        ))?;
+        let launch = store.allocate_run_worker_attempt(
+            "run-integration-repair-launch",
+            "integration-repair",
+            1,
+            0,
+            1,
+            0,
+            "integration-repair",
+            Path::new("/tmp/worktrees"),
+        )?;
+        store.store_worker_launch_token(
+            "run-integration-repair-launch",
+            launch.launch_id,
+            "repair-token",
+        )?;
+        store.mark_worker_attempt_launched(launch.launch_id)?;
+
+        assert!(store.validate_worker_launch_token(
+            "run-integration-repair-launch",
+            launch.launch_id,
+            "repair-token"
+        )?);
+        assert!(store.worker_attempt_is_active_with_launch_id(
+            "run-integration-repair-launch",
+            "integration-repair",
+            1,
+            Some(launch.launch_id),
+        )?);
+        assert!(!store.worker_attempt_is_active_with_launch_id(
+            "run-integration-repair-launch",
+            "integration-repair",
+            0,
+            Some(launch.launch_id),
+        )?);
+        store.update_progress(
+            "run-integration-repair-launch",
+            "integration_repair",
+            "integration-repair",
+            1,
+            "pi",
+            "repair running",
+            "",
+        )?;
+        store.observe_worker_attempt(
+            "run-integration-repair-launch",
+            "integration_repair",
+            "integration-repair",
+            1,
+            Some(launch.launch_id),
+            Some(42),
+            "tool",
+            "repair progress",
+            30,
+            10,
+        )?;
+        assert_eq!(
+            store
+                .get_progress("run-integration-repair-launch")?
+                .and_then(|progress| progress.worker)
+                .and_then(|worker| worker.launch_id),
+            Some(launch.launch_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_activity_is_bound_to_the_exact_running_launch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        store.insert_run(&run(
+            "run-launch-activity",
+            "/tmp/repo",
+            RunStatus::Running,
+            Utc::now(),
+        ))?;
+        let first = store.allocate_worker_attempt(
+            "run-launch-activity",
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        store.mark_worker_attempt_launched(first.launch_id)?;
+        store.finish_worker_attempt(first.launch_id, "interrupted", "superseded")?;
+        let second = store.allocate_worker_attempt(
+            "run-launch-activity",
+            "slice-001",
+            2,
+            1,
+            0,
+            0,
+            "worker",
+            Path::new("/tmp/worktrees"),
+        )?;
+        store.mark_worker_attempt_launched(second.launch_id)?;
+        store.update_progress(
+            "run-launch-activity",
+            "worker_running",
+            "slice-001",
+            1,
+            "pi",
+            "worker running",
+            "",
+        )?;
+
+        store.observe_worker_attempt(
+            "run-launch-activity",
+            "worker_running",
+            "slice-001",
+            1,
+            Some(first.launch_id),
+            Some(111),
+            "stderr",
+            "stale launch output",
+            30,
+            10,
+        )?;
+        assert!(
+            store
+                .get_progress("run-launch-activity")?
+                .expect("progress")
+                .worker
+                .is_none(),
+            "a finished launch must not mutate current worker activity"
+        );
+
+        store.observe_worker_attempt(
+            "run-launch-activity",
+            "worker_running",
+            "slice-001",
+            1,
+            Some(second.launch_id),
+            Some(222),
+            "stderr",
+            "current launch output",
+            30,
+            10,
+        )?;
+        let worker = store
+            .get_progress("run-launch-activity")?
+            .expect("progress")
+            .worker
+            .expect("current worker activity");
+        assert_eq!(worker.launch_id, Some(second.launch_id));
+        assert_eq!(worker.pid, Some(222));
+        assert_eq!(worker.last_event_kind, "stderr");
+        let history = store.list_worker_attempt_ledger("run-launch-activity", "slice-001")?;
+        assert!(history[0].activity.is_none());
+        let activity = history[1].activity.as_ref().expect("launch activity");
+        assert_eq!(activity.launch_id, Some(second.launch_id));
+        assert_eq!(activity.pid, Some(222));
+        assert_eq!(activity.last_event_kind, "stderr");
+        assert_eq!(activity.attempt_timeout_seconds, 30);
+        assert_eq!(activity.no_output_warning_seconds, 10);
         Ok(())
     }
 

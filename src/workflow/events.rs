@@ -323,6 +323,10 @@ pub(crate) struct CockpitWorkerReadyPayload {
     pub slice_id: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub launch_stem: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_of_truth: String,
 }
@@ -337,6 +341,8 @@ impl CockpitWorkerReadyPayload {
             pane_id: text_field(value, &["pane_id"]).unwrap_or_default(),
             slice_id: text_field(value, &["slice_id"]).unwrap_or_else(|| "slice".to_string()),
             attempt: usize_field(value, "attempt"),
+            launch_id: value.get("launch_id").and_then(Value::as_i64),
+            launch_stem: text_field(value, &["launch_stem"]).unwrap_or_default(),
             source_of_truth: text_field(value, &["source_of_truth"]).unwrap_or_default(),
         });
         if payload.adapter.trim().is_empty() {
@@ -382,13 +388,20 @@ impl SliceMergedPayload {
 pub(crate) struct IntegrationRepairCompletedPayload {
     pub status: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
 }
 
 impl IntegrationRepairCompletedPayload {
-    pub(crate) fn new(status: impl Into<String>, summary: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        status: impl Into<String>,
+        summary: impl Into<String>,
+        launch_id: i64,
+    ) -> Self {
         Self {
             status: status.into(),
             summary: summary.into(),
+            launch_id: Some(launch_id),
         }
     }
 }
@@ -466,6 +479,8 @@ pub(crate) struct WorkerAttemptTimeoutPayload {
     pub slice_id: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub timeout_seconds: u64,
     pub message: String,
@@ -476,6 +491,7 @@ impl WorkerAttemptTimeoutPayload {
         phase: impl Into<String>,
         slice_id: impl Into<String>,
         attempt: usize,
+        launch_id: Option<i64>,
         timeout_seconds: u64,
         message: impl Into<String>,
     ) -> Self {
@@ -483,6 +499,7 @@ impl WorkerAttemptTimeoutPayload {
             phase: phase.into(),
             slice_id: slice_id.into(),
             attempt,
+            launch_id,
             timeout_seconds,
             message: message.into(),
         }
@@ -533,6 +550,8 @@ pub(crate) struct WorkerQuestionAskedPayload {
     pub slice_id: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
     pub question: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -559,6 +578,7 @@ impl WorkerQuestionAskedPayload {
             question_id: question.id.clone(),
             slice_id: question.slice_id.clone(),
             attempt: question.attempt,
+            launch_id: question.launch_id,
             question: question.question.clone(),
             options: question.options.clone(),
             timeout_seconds: question.timeout_seconds,
@@ -581,6 +601,8 @@ impl WorkerQuestionAskedPayload {
 pub(crate) struct WorkerQuestionAnsweredPayload {
     pub question_id: String,
     pub slice_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -600,6 +622,7 @@ impl WorkerQuestionAnsweredPayload {
         Self {
             question_id: question.id.clone(),
             slice_id: question.slice_id.clone(),
+            launch_id: question.launch_id,
             answer: answer.into(),
             answer_source: answer_source.as_str().to_string(),
             recommended_answer: question.recommended_answer.clone(),

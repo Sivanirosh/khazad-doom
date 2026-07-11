@@ -7,7 +7,7 @@ use crate::domain::{
     MissionEnvelope, PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions,
     ReplanProposal, ReplanProposalState, ReplanStatus, Run, RunDetails, RunEconomics, RunIncident,
     RunProgress, RunStatus, Slice, SliceProvenance, SliceRun, SliceStatus, TerminalReason,
-    WorkerProfileEvidence, WorkerQuestion, frontier_classification_annotation,
+    WorkerAttemptLedger, WorkerProfileEvidence, WorkerQuestion, frontier_classification_annotation,
     frontier_classification_would_auto_promote, replan_decision_commands,
 };
 use crate::gitutil;
@@ -85,6 +85,7 @@ impl<'a> RunReadModelBuilder<'a> {
         let run = apply_terminal_override(run, &options);
         let run_id = run.id.clone();
         let slice_runs = self.state.get_slice_runs(&run_id)?;
+        let worker_attempts = worker_attempt_history(self.state, &run, &slice_runs)?;
         let mut progress = self.state.get_progress(&run_id)?;
         let events = self.state.get_events(&run_id, options.events_limit())?;
         if let Some(progress) = progress.as_mut() {
@@ -121,6 +122,7 @@ impl<'a> RunReadModelBuilder<'a> {
         let mut details = RunDetails {
             worker_profile,
             slice_runs,
+            worker_attempts,
             generated_slices,
             progress,
             incidents,
@@ -155,6 +157,65 @@ impl<'a> RunReadModelBuilder<'a> {
             &generated_slices,
         )
     }
+}
+
+fn worker_attempt_history(
+    state: &StateStore,
+    run: &Run,
+    slice_runs: &[SliceRun],
+) -> Result<Vec<WorkerAttemptLedger>> {
+    let mut attempts = state.list_worker_attempt_ledger_for_run(&run.id)?;
+    for slice_run in slice_runs {
+        for ordinal in 1..=slice_run.attempts {
+            let has_durable_worker_launch = attempts.iter().any(|attempt| {
+                attempt.slice_id == slice_run.slice_id
+                    && attempt.kind == "slice-worker"
+                    && attempt.worker_retry_ordinal == ordinal
+            });
+            if !has_durable_worker_launch {
+                let is_latest = ordinal == slice_run.attempts;
+                attempts.push(WorkerAttemptLedger {
+                    run_id: slice_run.run_id.clone(),
+                    slice_id: slice_run.slice_id.clone(),
+                    launch_id: 0,
+                    launch_ordinal: ordinal,
+                    execution_epoch: 0,
+                    worker_retry_ordinal: ordinal,
+                    repair_ordinal: 0,
+                    envelope_retry_ordinal: 0,
+                    kind: "legacy-slice-run".to_string(),
+                    state: if is_latest {
+                        slice_run.status.as_str().to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    branch: if is_latest {
+                        slice_run.branch.clone()
+                    } else {
+                        String::new()
+                    },
+                    worktree: String::new(),
+                    output_stem: String::new(),
+                    created_at: run.started_at,
+                    launched_at: None,
+                    finished_at: None,
+                    failure_cause: if is_latest {
+                        slice_run.last_error.clone()
+                    } else {
+                        "legacy attempt details unavailable".to_string()
+                    },
+                    activity: None,
+                });
+            }
+        }
+    }
+    attempts.sort_by(|left, right| {
+        left.launch_id
+            .cmp(&right.launch_id)
+            .then_with(|| left.slice_id.cmp(&right.slice_id))
+            .then_with(|| left.launch_ordinal.cmp(&right.launch_ordinal))
+    });
+    Ok(attempts)
 }
 
 fn apply_terminal_override(run: &Run, options: &RunReadModelOptions) -> Run {
@@ -1567,4 +1628,215 @@ fn proposed_change_summary(changes: &[crate::domain::ReplanProposedChange]) -> S
 fn display_or_dash(value: &str) -> &str {
     let trimmed = value.trim();
     if trimmed.is_empty() { "-" } else { trimmed }
+}
+
+#[cfg(test)]
+mod worker_attempt_history_tests {
+    use super::*;
+    use crate::domain::{Run, RunStatus, SliceRun, SliceStatus};
+    use chrono::Utc;
+
+    #[test]
+    fn snapshot_exposes_legacy_marked_attempt_history_when_no_ledger_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-history".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: "slice-a".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .upsert_slice_run(&SliceRun {
+                run_id: run.id.clone(),
+                slice_id: "slice-a".to_string(),
+                status: SliceStatus::Blocked,
+                branch: "legacy-branch".to_string(),
+                commit_sha: String::new(),
+                attempts: 2,
+                last_error: "legacy failure".to_string(),
+            })
+            .unwrap();
+
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&run, RunReadModelOptions::status(10))
+            .unwrap();
+        assert_eq!(model.details.worker_attempts.len(), 2);
+        let first = &model.details.worker_attempts[0];
+        assert_eq!(first.kind, "legacy-slice-run");
+        assert_eq!(first.worker_retry_ordinal, 1);
+        assert_eq!(first.state, "failed");
+        assert!(first.branch.is_empty());
+        assert_eq!(first.failure_cause, "legacy attempt details unavailable");
+        let latest = &model.details.worker_attempts[1];
+        assert_eq!(latest.kind, "legacy-slice-run");
+        assert_eq!(latest.worker_retry_ordinal, 2);
+        assert_eq!(latest.branch, "legacy-branch");
+        assert_eq!(latest.created_at, run.started_at);
+        let repeated = RunReadModelBuilder::new(&state)
+            .snapshot(&run, RunReadModelOptions::status(10))
+            .unwrap();
+        assert_eq!(
+            repeated.details.worker_attempts,
+            model.details.worker_attempts
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_legacy_retries_before_a_new_ledger_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-mixed-history".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: "slice-a".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .upsert_slice_run(&SliceRun {
+                run_id: run.id.clone(),
+                slice_id: "slice-a".to_string(),
+                status: SliceStatus::Failed,
+                branch: "legacy-branch".to_string(),
+                commit_sha: String::new(),
+                attempts: 2,
+                last_error: "legacy retry failed".to_string(),
+            })
+            .unwrap();
+        let modern = state
+            .allocate_worker_attempt(
+                &run.id,
+                "slice-a",
+                2,
+                3,
+                0,
+                0,
+                "slice-worker",
+                directory.path(),
+            )
+            .unwrap();
+        state
+            .mark_worker_attempt_launched(modern.launch_id)
+            .unwrap();
+        state
+            .finish_worker_attempt(modern.launch_id, "succeeded", "")
+            .unwrap();
+
+        let first = RunReadModelBuilder::new(&state)
+            .snapshot(&run, RunReadModelOptions::status(10))
+            .unwrap();
+        let repeated = RunReadModelBuilder::new(&state)
+            .snapshot(&run, RunReadModelOptions::status(10))
+            .unwrap();
+
+        assert_eq!(
+            first.details.worker_attempts,
+            repeated.details.worker_attempts
+        );
+        assert_eq!(first.details.worker_attempts.len(), 3);
+        for ordinal in 1..=2 {
+            let legacy = first
+                .details
+                .worker_attempts
+                .iter()
+                .find(|attempt| {
+                    attempt.kind == "legacy-slice-run" && attempt.worker_retry_ordinal == ordinal
+                })
+                .expect("missing legacy retry evidence");
+            assert_eq!(legacy.launch_id, 0);
+            assert_eq!(legacy.state, "failed");
+        }
+        let retained = first
+            .details
+            .worker_attempts
+            .iter()
+            .find(|attempt| attempt.launch_id == modern.launch_id)
+            .expect("missing immutable ledger launch");
+        assert_eq!(retained.worker_retry_ordinal, 3);
+        assert_eq!(retained.state, "succeeded");
+    }
+
+    #[test]
+    fn snapshot_orders_durable_ledger_history_by_launch_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-ledger-history".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: "slice-a".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        for slice_id in ["slice-z", "slice-a"] {
+            state
+                .upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: slice_id.to_string(),
+                    status: SliceStatus::Running,
+                    branch: String::new(),
+                    commit_sha: String::new(),
+                    attempts: 0,
+                    last_error: String::new(),
+                })
+                .unwrap();
+            state
+                .allocate_worker_attempt(
+                    &run.id,
+                    slice_id,
+                    1,
+                    1,
+                    0,
+                    0,
+                    "slice-worker",
+                    directory.path(),
+                )
+                .unwrap();
+        }
+
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&run, RunReadModelOptions::status(10))
+            .unwrap();
+        assert_eq!(
+            model
+                .details
+                .worker_attempts
+                .iter()
+                .map(|row| row.slice_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["slice-z", "slice-a"]
+        );
+        assert!(
+            model
+                .details
+                .worker_attempts
+                .iter()
+                .all(|row| row.kind == "slice-worker")
+        );
+    }
 }

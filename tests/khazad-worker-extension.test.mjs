@@ -177,6 +177,12 @@ test('ask_operator same-pane cancellation preserves an auto-applied recommendati
 				};
 			}
 			if (request.method === 'workerQuestionTimeout') {
+				assert.deepEqual(request.params, {
+					run_id: 'kd-run',
+					question_id: 'q-auto',
+					token: 'secret-token',
+					launch_id: 73,
+				});
 				return {
 					question_id: 'q-auto',
 					state: 'answered',
@@ -193,6 +199,7 @@ test('ask_operator same-pane cancellation preserves an auto-applied recommendati
 					KHAZAD_RUN_ID: 'kd-run',
 					KHAZAD_SLICE_ID: 'slice-001',
 					KHAZAD_WORKER_TOKEN: 'secret-token',
+					KHAZAD_LAUNCH_ID: '73',
 				},
 				() =>
 					tool.execute(

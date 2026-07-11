@@ -328,11 +328,11 @@ fn daemon_fake_run_handoff_and_inspect_black_box() -> TestResult {
             artifact["kind"] == "output" && artifact["name"] == "economics.json"
         })
     );
-    assert!(
-        artifacts.iter().any(|artifact| {
-            artifact["kind"] == "handoff" && artifact["name"] == "slice-001.json"
-        })
-    );
+    let slice_one_stem = worker_attempt_output_stem(&status, "slice-001", "slice-worker", 1, 0)?;
+    assert!(artifacts.iter().any(|artifact| {
+        artifact["kind"] == "handoff"
+            && artifact["name"].as_str() == Some(&format!("{slice_one_stem}.json"))
+    }));
 
     let env_started = kd_ok_with_env(
         &bin,
@@ -404,8 +404,10 @@ fn profile_and_fake_evidence_are_consistent_everywhere_black_box() -> TestResult
     let run_dir = repo.path().join(".workflow/runs").join(&run_id);
     let preflight: Value =
         serde_json::from_str(&fs::read_to_string(run_dir.join("outputs/preflight.json"))?)?;
+    let worker_stem =
+        worker_attempt_output_stem(&status, "slice-fake-proof", "slice-worker", 1, 0)?;
     let handoff_slice: Value = serde_json::from_str(&fs::read_to_string(
-        run_dir.join("handoffs/slice-fake-proof.json"),
+        run_dir.join("handoffs").join(format!("{worker_stem}.json")),
     )?)?;
     let final_report: Value = serde_json::from_str(&fs::read_to_string(
         run_dir.join("outputs/final-report.json"),
@@ -975,6 +977,47 @@ fn ask_operator_terminal_same_pane_question_cannot_revive_on_resume() -> TestRes
     assert_eq!(summary["progress"]["phase"], "cancelled");
     assert_eq!(summary["questions"][0]["state"], "interrupted");
 
+    // A first resume creates a distinct, still-interrupted launch; the second
+    // resume must retain both abandoned launch identities and their handoffs.
+    kd_ok_with_env(
+        &bin,
+        home.path(),
+        &[("KHAZAD_FAKE_PI_OPERATOR_MODE", "same_pane")],
+        &[
+            "resume",
+            "--run",
+            &run_id,
+            "--agent",
+            "pi",
+            "--pi-bin",
+            fake_pi_string.as_str(),
+        ],
+    )?;
+    let second_awaiting = wait_for_pending_question(&bin, home.path(), &run_id)?;
+    let second_question_id = second_awaiting["questions"]
+        .as_array()
+        .and_then(|questions| {
+            questions
+                .iter()
+                .find(|question| question["state"] == "pending")
+        })
+        .and_then(|question| question["id"].as_str())
+        .expect("second resume pending question")
+        .to_string();
+    assert_ne!(second_question_id, old_question_id);
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &run_id,
+            "--reason",
+            "cancel second same-pane question",
+        ],
+    )?;
+    wait_for_terminal_status(&bin, home.path(), &run_id, "cancelled")?;
+
     kd_ok(
         &bin,
         home.path(),
@@ -1006,6 +1049,35 @@ fn ask_operator_terminal_same_pane_question_cannot_revive_on_resume() -> TestRes
                 || event["payload"]["question_id"] != old_question_id
         })
     }));
+    let attempts = completed["worker_attempts"]
+        .as_array()
+        .expect("public immutable worker attempt history");
+    assert!(attempts.len() >= 3, "initial launch plus two resumes");
+    let launch_ids: std::collections::BTreeSet<_> = attempts
+        .iter()
+        .filter_map(|attempt| attempt["launch_id"].as_i64())
+        .collect();
+    let stems: std::collections::BTreeSet<_> = attempts
+        .iter()
+        .filter_map(|attempt| attempt["output_stem"].as_str())
+        .collect();
+    let epochs: std::collections::BTreeSet<_> = attempts
+        .iter()
+        .filter_map(|attempt| attempt["execution_epoch"].as_u64())
+        .collect();
+    assert_eq!(launch_ids.len(), attempts.len());
+    assert_eq!(stems.len(), attempts.len());
+    assert!(epochs.is_superset(&std::collections::BTreeSet::from([1, 2, 3])));
+    let run_dir = repo.path().join(".workflow/runs").join(&run_id);
+    for stem in stems {
+        assert!(
+            run_dir
+                .join("handoffs")
+                .join(format!("{stem}.json"))
+                .exists(),
+            "preserved handoff for {stem}"
+        );
+    }
 
     guard.stop();
     Ok(())
@@ -1475,26 +1547,46 @@ fn herdr_worker_wrapper_real() -> TestResult {
     let workspace_label = format!("Khazad-Doom {run_id}");
     let workspace_id = wait_for_herdr_workspace(&workspace_label)?;
     let _workspace_guard = HerdrWorkspaceGuard::new(workspace_id.clone());
-    let worker_label = format!("Worker {run_id}/HERDR-WRAP attempt 1");
+    let launch_deadline = Instant::now() + Duration::from_secs(10);
+    let launch_id = loop {
+        let status = json_stdout(&kd_ok(&bin, home.path(), &["status", "--run", &run_id])?)?;
+        if let Some(launch_id) = status["worker_attempts"].as_array().and_then(|attempts| {
+            attempts.iter().find_map(|attempt| {
+                (attempt["slice_id"].as_str() == Some("HERDR-WRAP"))
+                    .then(|| attempt["launch_id"].as_i64())
+                    .flatten()
+            })
+        }) {
+            break launch_id;
+        }
+        assert!(
+            Instant::now() < launch_deadline,
+            "worker launch identity was not published"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let worker_label = format!("Worker {run_id}/HERDR-WRAP attempt 1 launch {launch_id}");
     wait_for_herdr_pane_label(&workspace_id, &worker_label)?;
 
     let completed = wait_for_status(&bin, home.path(), &run_id, "completed")?;
     assert!(completed["events"].as_array().unwrap().iter().any(|event| {
         event["type"].as_str() == Some("cockpit_worker_ready")
             && event["payload"]["pane"].as_str() == Some(worker_label.as_str())
+            && event["payload"]["launch_id"].as_i64() == Some(launch_id)
             && event["payload"]["source_of_truth"].as_str() == Some("kd_artifact_files")
     }));
 
     let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
     let inspected = json_stdout(&inspected)?;
-    for artifact in [
-        "HERDR-WRAP.worker.attempt-1.herdr.stdout.ndjson",
-        "HERDR-WRAP.worker.attempt-1.herdr.stderr.log",
-        "HERDR-WRAP.worker.attempt-1.herdr.exit.json",
-        "HERDR-WRAP.worker.attempt-1.herdr.result.json",
-        "HERDR-WRAP.worker.attempt-1.json",
+    let worker_stem = worker_attempt_output_stem(&completed, "HERDR-WRAP", "slice-worker", 1, 0)?;
+    for suffix in [
+        ".herdr.stdout.ndjson",
+        ".herdr.stderr.log",
+        ".herdr.exit.json",
+        ".herdr.result.json",
+        ".json",
     ] {
-        artifact_path(&inspected, artifact)?;
+        artifact_path(&inspected, &format!("{worker_stem}{suffix}"))?;
     }
 
     guard.stop();
@@ -2013,7 +2105,8 @@ fn verification_mutation_blocks_without_repair_publication_or_final_sha() -> Tes
 
     let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
     let inspected = json_stdout(&inspected)?;
-    let check_path = artifact_path(&inspected, "PURITY-01.check.attempt-1.json")?;
+    let worker_stem = worker_attempt_output_stem(&blocked, "PURITY-01", "slice-worker", 1, 0)?;
+    let check_path = artifact_path(&inspected, &format!("{worker_stem}.check.json"))?;
     let check: Value = serde_json::from_str(&fs::read_to_string(check_path)?)?;
     assert_eq!(check["failure_kind"], "verification_mutated_worktree");
     assert_eq!(
@@ -2227,12 +2320,14 @@ fn verifier_exit_125_and_stderr_cannot_forge_supervision_failure() -> TestResult
         .as_str()
         .expect("run_id")
         .to_string();
-    wait_for_terminal_status(&bin, home.path(), &run_id, "failed")?;
+    let failed = wait_for_terminal_status(&bin, home.path(), &run_id, "failed")?;
 
     let inspected = json_stdout(&kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?)?;
+    let worker_stem =
+        worker_attempt_output_stem(&failed, "PURITY-SUPERVISOR-FORGE-01", "slice-worker", 1, 0)?;
     let check: Value = serde_json::from_str(&fs::read_to_string(artifact_path(
         &inspected,
-        "PURITY-SUPERVISOR-FORGE-01.check.attempt-1.json",
+        &format!("{worker_stem}.check.json"),
     )?)?)?;
     assert_eq!(check["failure_kind"], "command_failed", "{check:#}");
     assert_eq!(
@@ -2408,9 +2503,11 @@ fn filter_equivalent_raw_verification_mutation_blocks_and_restores() -> TestResu
     );
 
     let inspected = json_stdout(&kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?)?;
+    let worker_stem =
+        worker_attempt_output_stem(&blocked, "PURITY-FILTER-01", "slice-worker", 1, 0)?;
     let check: Value = serde_json::from_str(&fs::read_to_string(artifact_path(
         &inspected,
-        "PURITY-FILTER-01.check.attempt-1.json",
+        &format!("{worker_stem}.check.json"),
     )?)?)?;
     assert_eq!(check["failure_kind"], "verification_mutated_worktree");
     assert_eq!(
@@ -2497,7 +2594,9 @@ fn cancelled_slice_verification_persists_restored_mutation_evidence() -> TestRes
     );
 
     let inspected = json_stdout(&kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?)?;
-    let check_path = artifact_path(&inspected, "PURITY-CANCEL-01.check.attempt-1.json")?;
+    let worker_stem =
+        worker_attempt_output_stem(&cancelled, "PURITY-CANCEL-01", "slice-worker", 1, 0)?;
+    let check_path = artifact_path(&inspected, &format!("{worker_stem}.check.json"))?;
     let check: Value = serde_json::from_str(&fs::read_to_string(check_path)?)?;
     assert_eq!(check["verification_cancelled"], true);
     assert_eq!(check["failure_kind"], "verification_mutated_worktree");
@@ -3553,7 +3652,8 @@ fn invalid_worker_output_pi_attempt_is_preserved_and_counted_black_box() -> Test
 
     let inspected = kd_ok(&bin, home.path(), &["inspect", "--run", &run_id])?;
     let inspected = json_stdout(&inspected)?;
-    let invalid_path = artifact_path(&inspected, "slice-001.worker.attempt-1.invalid-output.json")?;
+    let worker_stem = worker_attempt_output_stem(&completed, "slice-001", "slice-worker", 1, 0)?;
+    let invalid_path = artifact_path(&inspected, &format!("{worker_stem}.invalid-output.json"))?;
     let invalid: Value = serde_json::from_str(&fs::read_to_string(invalid_path)?)?;
     assert_eq!(invalid["slice_id"], "slice-001");
     assert_eq!(invalid["attempt"], 1);
@@ -3575,9 +3675,11 @@ fn invalid_worker_output_pi_attempt_is_preserved_and_counted_black_box() -> Test
             .unwrap_or_default()
             .contains("invalid worker stderr tail")
     );
+    let first_envelope_stem =
+        worker_attempt_output_stem(&completed, "slice-001", "slice-envelope-retry", 1, 1)?;
     let invalid_schema_path = artifact_path(
         &inspected,
-        "slice-001.worker.attempt-1.envelope-1.invalid-output.json",
+        &format!("{first_envelope_stem}.envelope-1.invalid-output.json"),
     )?;
     let invalid_schema: Value = serde_json::from_str(&fs::read_to_string(invalid_schema_path)?)?;
     let invalid_schema_error = invalid_schema["parse_error"].as_str().unwrap_or_default();
@@ -3699,10 +3801,9 @@ fn af_worker_envelope_failures_are_corrected_in_same_attempt_black_box() -> Test
             .expect("slice run");
         assert_eq!(slice_run["attempts"], 1, "{slice_id}");
 
-        let invalid_path = artifact_path(
-            &inspected,
-            &format!("{slice_id}.worker.attempt-1.invalid-output.json"),
-        )?;
+        let worker_stem = worker_attempt_output_stem(&completed, slice_id, "slice-worker", 1, 0)?;
+        let invalid_path =
+            artifact_path(&inspected, &format!("{worker_stem}.invalid-output.json"))?;
         let invalid: Value = serde_json::from_str(&fs::read_to_string(invalid_path)?)?;
         assert_eq!(invalid["attempt"], 1);
         assert_eq!(invalid["envelope_retry"], 0);
@@ -3727,10 +3828,9 @@ fn af_worker_envelope_failures_are_corrected_in_same_attempt_black_box() -> Test
                 .contains(&format!("{slice_id}.txt")),
             "initial implementation commit should be preserved: {invalid:#}"
         );
-        let envelope_path = artifact_path(
-            &inspected,
-            &format!("{slice_id}.worker.attempt-1.envelope-1.json"),
-        )?;
+        let envelope_stem =
+            worker_attempt_output_stem(&completed, slice_id, "slice-envelope-retry", 1, 1)?;
+        let envelope_path = artifact_path(&inspected, &format!("{envelope_stem}.json"))?;
         assert!(Path::new(envelope_path).exists());
         assert!(events.iter().any(|event| {
             event["type"].as_str() == Some("worker_envelope_retry_succeeded")
@@ -3956,7 +4056,8 @@ fn cancelled_pi_worker_retains_terminal_and_attempt_artifacts_black_box() -> Tes
     assert_eq!(run_summary["cancel_reason"], reason);
     assert_eq!(run_summary["primary_failure"], reason);
 
-    let failure_path = artifact_path(&inspected, "slice-001.worker.attempt-1.failure.json")?;
+    let worker_stem = worker_attempt_output_stem(&cancelled, "slice-001", "slice-worker", 1, 0)?;
+    let failure_path = artifact_path(&inspected, &format!("{worker_stem}.failure.json"))?;
     let failure: Value = serde_json::from_str(&fs::read_to_string(failure_path)?)?;
     assert!(
         failure["stdout_tail"]
@@ -4986,6 +5087,10 @@ state_path = Path(__file__).with_name(f"{slice_id}.attempt")
 attempt = int(state_path.read_text(encoding="utf-8")) + 1 if state_path.exists() else 1
 state_path.write_text(str(attempt), encoding="utf-8")
 if attempt == 1:
+    with open(f"{slice_id}.txt", "w", encoding="utf-8") as fh:
+        fh.write(f"implementation preserved across invalid output for {slice_id}\n")
+    subprocess.run(["git", "add", "."], check=True)
+    subprocess.run(["git", "commit", "-m", f"fake pi implement {slice_id}"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print("invalid worker stdout tail", flush=True)
     print("invalid worker stderr tail", file=sys.stderr, flush=True)
     event = {
@@ -5002,10 +5107,6 @@ if attempt == 2:
     }
     print(json.dumps(event), flush=True)
     sys.exit(0)
-with open(f"{slice_id}.txt", "w", encoding="utf-8") as fh:
-    fh.write(f"valid implementation after invalid output for {slice_id}\n")
-subprocess.run(["git", "add", "."], check=True)
-subprocess.run(["git", "commit", "-m", f"fake pi implement {slice_id}"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 result = {
     "slice_id": slice_id,
@@ -5363,6 +5464,9 @@ params = {
     "options": ["alpha", "bravo"],
     "timeout_seconds": 1 if mode == "timeout" else int(os.environ.get("KHAZAD_FAKE_PI_OPERATOR_TIMEOUT", "30")),
 }
+launch_id = int(os.environ.get("KHAZAD_LAUNCH_ID", "0") or "0")
+if launch_id > 0:
+    params["launch_id"] = launch_id
 if mode == "same_pane":
     params.update({
         "recommended_answer": "alpha",
@@ -5612,6 +5716,37 @@ fn artifact_path<'a>(inspection: &'a Value, name: &str) -> TestResult<&'a str> {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("artifact {name:?} not found in inspection: {inspection:#}"),
+            )
+            .into()
+        })
+}
+
+fn worker_attempt_output_stem<'a>(
+    status: &'a Value,
+    slice_id: &str,
+    kind: &str,
+    worker_retry_ordinal: u64,
+    envelope_retry_ordinal: u64,
+) -> TestResult<&'a str> {
+    status["worker_attempts"]
+        .as_array()
+        .and_then(|attempts| {
+            attempts.iter().find_map(|attempt| {
+                (attempt["slice_id"].as_str() == Some(slice_id)
+                    && attempt["kind"].as_str() == Some(kind)
+                    && attempt["worker_retry_ordinal"].as_u64() == Some(worker_retry_ordinal)
+                    && attempt["envelope_retry_ordinal"].as_u64()
+                        == Some(envelope_retry_ordinal))
+                .then(|| attempt["output_stem"].as_str())
+                .flatten()
+            })
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "worker attempt {slice_id}/{kind}/retry-{worker_retry_ordinal}/envelope-{envelope_retry_ordinal} not found in status: {status:#}"
+                ),
             )
             .into()
         })

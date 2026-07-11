@@ -25,11 +25,11 @@ use super::{
     worker_envelope_retry_prompt, worker_prompt,
 };
 use crate::agent::{
-    CancellationToken, Job, PiCommandSpec, Runner, RunnerError, RunnerEvent, RunnerEventSink,
-    RunnerLaunchFailure, RunnerMetadata, RunnerTranscript, collect_pi_wrapper_result,
-    parse_pi_tui_worker_result_artifact, prepare_pi_tui_worker_artifacts,
-    prepare_pi_wrapper_artifacts, runner_from_spec, wait_for_pi_wrapper_launch,
-    worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
+    CancellationToken, Job, PiCommandSpec, PiWrapperLaunchError, Runner, RunnerError, RunnerEvent,
+    RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, RunnerTranscript,
+    collect_pi_wrapper_result, parse_pi_tui_worker_result_artifact,
+    prepare_pi_tui_worker_artifacts, prepare_pi_wrapper_artifacts, runner_from_spec,
+    wait_for_pi_wrapper_launch, worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
 };
 use crate::agent_profile::{ProfileResolveInput, resolve_effective_worker_profile};
 use crate::artifact;
@@ -41,8 +41,8 @@ use crate::domain::{
     PlanRevisions, RepairResult, ReplanDecision, ReplanEvidenceLink, ReplanProposal,
     ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus,
     Slice, SliceExitState, SliceProvenance, SliceRun, SliceStatus, SliceValidationReport,
-    SliceWriteResult, WorkerProfileEvidence, WorkerQuestion, WorkerResult, WorkflowConfig,
-    WorkflowExitStates, is_open_status, replan_decision_commands,
+    SliceWriteResult, WorkerAttemptLedger, WorkerProfileEvidence, WorkerQuestion, WorkerResult,
+    WorkflowConfig, WorkflowExitStates, is_open_status, replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
@@ -73,6 +73,7 @@ pub const MAX_WORKER_ATTEMPTS: usize = 3;
 pub const DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS: usize = 2;
 pub const DEFAULT_SLICE_REPAIR_ATTEMPTS: usize = 1;
 pub const DEFAULT_REPAIR_ATTEMPTS: usize = 1;
+const INTEGRATION_REPAIR_SCOPE_ID: &str = "integration-repair";
 static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
 const WORKTREE_REMOVE_ATTEMPTS: usize = 3;
 const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -244,6 +245,7 @@ struct IntegrationRepairContext<'a> {
     runner: Arc<dyn Runner>,
     config: &'a WorkflowConfig,
     economics: RunEconomicsRecorder,
+    verification_cache: &'a VerificationCommandCache,
 }
 
 struct SupervisedWorkerJobOutcome {
@@ -254,6 +256,7 @@ struct SupervisedWorkerJobOutcome {
 #[derive(Clone)]
 struct WorkerExecutionContext {
     run: Run,
+    execution_epoch: usize,
     root_worktree: PathBuf,
     slice_base_sha: String,
     dependency_summary: BTreeMap<String, String>,
@@ -263,30 +266,46 @@ struct WorkerExecutionContext {
     cockpit_mode: CockpitMode,
     economics: RunEconomicsRecorder,
     verification_cache: VerificationCommandCache,
-    worker_token: String,
     native_pi_tui_worker: bool,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // CA-03 identity propagation is completed at the downstream sinks.
 struct WorkerAttemptContext {
     run_id: String,
     phase: String,
     slice_id: String,
+    // Display retry budget remains distinct from immutable daemon launch identity.
     attempt: usize,
+    launch_id: Option<i64>,
+    launch_stem: Option<String>,
     timeout_seconds: u64,
     no_output_warning_seconds: u64,
     termination_grace_seconds: u64,
     native_pi_tui_worker: bool,
 }
 
+#[allow(dead_code)] // CA-03 identity propagation is completed at the downstream sinks.
 struct AgentCallContext<'a> {
     phase: &'a str,
     slice_id: &'a str,
     attempt: usize,
+    launch_id: Option<i64>,
+    launch_stem: Option<&'a str>,
+}
+
+struct ValidWorkerAttempt {
+    result: WorkerResult,
+    launch_id: i64,
+    launch_stem: String,
+    branch: String,
+    worktree: PathBuf,
+    output_path: PathBuf,
+    _terminal_guard: Option<WorkerAttemptTerminalGuard>,
 }
 
 enum WorkerAttemptRunResult {
-    Valid(Box<WorkerResult>),
+    Valid(Box<ValidWorkerAttempt>),
     Continue,
 }
 
@@ -294,9 +313,10 @@ struct WorkerAttemptRunRequest<'a> {
     run: &'a Run,
     slice: &'a Slice,
     attempt: usize,
+    launch_id: i64,
+    launch_stem: &'a str,
     runner: Arc<dyn Runner>,
     runner_metadata: &'a RunnerMetadata,
-    handoff_path: &'a Path,
     handoff: &'a Handoff,
     prompt: String,
     worker_worktree: &'a Path,
@@ -333,10 +353,8 @@ struct TargetedSliceRepairRequest<'a> {
     slice: &'a Slice,
     attempt: usize,
     runner: Arc<dyn Runner>,
-    handoff_path: &'a Path,
     handoff: &'a Handoff,
     worker_worktree: &'a Path,
-    worker_branch: &'a str,
     slice_base_sha: &'a str,
     check_path: &'a Path,
     check: &'a CheckResult,
@@ -344,10 +362,47 @@ struct TargetedSliceRepairRequest<'a> {
     economics: &'a RunEconomicsRecorder,
     verification_cache: &'a VerificationCommandCache,
     cancel: &'a CancellationToken,
-    worker_token: &'a str,
     cockpit_mode: CockpitMode,
     native_pi_tui_worker: bool,
     all_checks: &'a mut Vec<CheckResult>,
+}
+
+struct PreparedWorkerLaunch {
+    ledger: WorkerAttemptLedger,
+    token: String,
+    handoff: Handoff,
+    handoff_path: PathBuf,
+    output_path: PathBuf,
+}
+
+struct PreparedRunWorkerLaunch {
+    ledger: WorkerAttemptLedger,
+    token: String,
+    output_path: PathBuf,
+}
+
+struct WorkerAttemptTerminalGuard {
+    state: StateStore,
+    launch_id: i64,
+}
+
+impl WorkerAttemptTerminalGuard {
+    fn new(state: &StateStore, launch_id: i64) -> Self {
+        Self {
+            state: state.clone(),
+            launch_id,
+        }
+    }
+}
+
+impl Drop for WorkerAttemptTerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.state.finish_worker_attempt(
+            self.launch_id,
+            "failed",
+            "worker launch exited without an explicit terminal transition",
+        );
+    }
 }
 
 struct AgentLaunchIncidentContext<'a> {
@@ -365,11 +420,25 @@ enum CockpitWorkerJobError {
 }
 
 impl WorkerAttemptContext {
+    fn wire_attempt(&self) -> usize {
+        self.attempt
+    }
+
+    fn cockpit_launch_identity(&self) -> usize {
+        self.launch_id
+            .filter(|launch_id| *launch_id > 0)
+            .and_then(|launch_id| usize::try_from(launch_id).ok())
+            .unwrap_or(self.attempt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         run_id: &str,
         phase: &str,
         slice_id: &str,
         attempt: usize,
+        launch_id: Option<i64>,
+        launch_stem: Option<&str>,
         config: &WorkflowConfig,
         native_pi_tui_worker: bool,
     ) -> Self {
@@ -378,6 +447,8 @@ impl WorkerAttemptContext {
             phase: phase.to_string(),
             slice_id: slice_id.to_string(),
             attempt,
+            launch_id,
+            launch_stem: launch_stem.map(str::to_string),
             timeout_seconds: config.worker_attempt_timeout_seconds,
             no_output_warning_seconds: config.worker_no_output_warning_seconds,
             termination_grace_seconds: config.worker_termination_grace_seconds,
@@ -872,8 +943,9 @@ impl Manager {
         store: &artifact::Store,
         run: &Run,
         handoff: &Handoff,
+        name: &str,
     ) -> Result<PathBuf> {
-        let path = store.write_handoff(&run.id, handoff)?;
+        let path = store.write_handoff_named(&run.id, handoff, name)?;
         let mut value = serde_json::to_value(handoff)?;
         if let serde_json::Value::Object(fields) = &mut value {
             fields.insert(
@@ -885,35 +957,168 @@ impl Manager {
         Ok(path)
     }
 
-    fn record_cockpit_launch(&self, run: &Run, mode: CockpitMode) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_followup_worker_launch(
+        &self,
+        run: &Run,
+        slice: &Slice,
+        worker_retry_ordinal: usize,
+        repair_ordinal: usize,
+        envelope_retry_ordinal: usize,
+        kind: &str,
+        role: &str,
+        base_ref: &str,
+        source_handoff: &Handoff,
+    ) -> Result<PreparedWorkerLaunch> {
+        let root_worktree = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let ledger = self.state.allocate_worker_attempt(
+            &run.id,
+            &slice.id,
+            self.state.current_run_execution_epoch(&run.id)?,
+            worker_retry_ordinal,
+            repair_ordinal,
+            envelope_retry_ordinal,
+            kind,
+            &root_worktree,
+        )?;
+        let token = new_worker_token();
+        if let Err(err) = self
+            .state
+            .store_worker_launch_token(&run.id, ledger.launch_id, &token)
+        {
+            let _ = self
+                .state
+                .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+            return Err(err);
+        }
+        let worktree = PathBuf::from(&ledger.worktree);
+        let worktree_result = {
+            let _git_lock = WORKTREE_ADD_LOCK
+                .lock()
+                .expect("worktree add mutex poisoned");
+            gitutil::worktree_add(&run.repo_path, &worktree, &ledger.branch, base_ref)
+        };
+        if let Err(err) = worktree_result {
+            let _ = self
+                .state
+                .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+            return Err(err).context("create follow-up worker worktree");
+        }
+        let store = artifact::Store::new(&run.repo_path);
+        let output_path = store.output_path(&run.id, &format!("{}.json", ledger.output_stem));
+        let mut handoff = source_handoff.clone();
+        handoff.role = role.to_string();
+        handoff.worktree_path = ledger.worktree.clone();
+        handoff.branch = ledger.branch.clone();
+        handoff.output_path = output_path.to_string_lossy().to_string();
+        let handoff_path = match self.write_worker_handoff_with_plan_revisions(
+            &store,
+            run,
+            &handoff,
+            &ledger.output_stem,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let _ =
+                    self.state
+                        .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+                return Err(err);
+            }
+        };
+        Ok(PreparedWorkerLaunch {
+            ledger,
+            token,
+            handoff,
+            handoff_path,
+            output_path,
+        })
+    }
+
+    fn prepare_integration_repair_launch(
+        &self,
+        run: &Run,
+        repair_ordinal: usize,
+        base_ref: &str,
+    ) -> Result<PreparedRunWorkerLaunch> {
+        let root_worktree = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let ledger = self.state.allocate_run_worker_attempt(
+            &run.id,
+            INTEGRATION_REPAIR_SCOPE_ID,
+            self.state.current_run_execution_epoch(&run.id)?,
+            0,
+            repair_ordinal,
+            0,
+            "integration-repair",
+            &root_worktree,
+        )?;
+        let token = new_worker_token();
+        if let Err(err) = self
+            .state
+            .store_worker_launch_token(&run.id, ledger.launch_id, &token)
+        {
+            let _ = self
+                .state
+                .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+            return Err(err);
+        }
+        let worktree = PathBuf::from(&ledger.worktree);
+        let worktree_result = {
+            let _git_lock = WORKTREE_ADD_LOCK
+                .lock()
+                .expect("worktree add mutex poisoned");
+            gitutil::worktree_add(&run.repo_path, &worktree, &ledger.branch, base_ref)
+        };
+        if let Err(err) = worktree_result {
+            let _ = self
+                .state
+                .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+            return Err(err).context("create integration repair worker worktree");
+        }
+        let output_path = artifact::Store::new(&run.repo_path)
+            .output_path(&run.id, &format!("{}.json", ledger.output_stem));
+        Ok(PreparedRunWorkerLaunch {
+            ledger,
+            token,
+            output_path,
+        })
+    }
+
+    fn record_cockpit_launch(&self, run: &Run, mode: CockpitMode) -> Result<CockpitMode> {
         match open_default_run_cockpit(run, mode, &self.paths.root) {
-            Ok(CockpitLaunch::Opened(opened)) => self.state.record_event(
-                &run.id,
-                workflow_events::COCKPIT_READY,
-                &workflow_events::CockpitReadyPayload {
-                    adapter: opened.adapter,
-                    mode: opened.mode.as_str().to_string(),
-                    workspace: opened.workspace_label,
-                    panes: opened.pane_labels,
-                    source_of_truth: "daemon_state".to_string(),
-                    planner: "cockpit_layout_v2_observability_only".to_string(),
-                },
-            ),
-            Ok(CockpitLaunch::SkippedDirect) => Ok(()),
-            Err(unavailable) => self.state.record_event(
-                &run.id,
-                workflow_events::RUN_INCIDENT,
-                &workflow_events::RunIncidentPayload::warning(
-                    "cockpit_unavailable",
-                    unavailable.message,
-                )
-                .with_extra("adapter", unavailable.adapter)
-                .with_extra("mode", unavailable.mode.as_str())
-                .with_extra("remediation", unavailable.remediation)
-                .with_extra("fallback", "direct")
-                .with_extra("layout", "cockpit_layout_v2_observability_only")
-                .with_extra("source_of_truth", "daemon_state"),
-            ),
+            Ok(CockpitLaunch::Opened(opened)) => {
+                let effective_mode = opened.mode;
+                self.state.record_event(
+                    &run.id,
+                    workflow_events::COCKPIT_READY,
+                    &workflow_events::CockpitReadyPayload {
+                        adapter: opened.adapter,
+                        mode: effective_mode.as_str().to_string(),
+                        workspace: opened.workspace_label,
+                        panes: opened.pane_labels,
+                        source_of_truth: "daemon_state".to_string(),
+                        planner: "cockpit_layout_v2_observability_only".to_string(),
+                    },
+                )?;
+                Ok(effective_mode)
+            }
+            Ok(CockpitLaunch::SkippedDirect) => Ok(CockpitMode::Direct),
+            Err(unavailable) => {
+                self.state.record_event(
+                    &run.id,
+                    workflow_events::RUN_INCIDENT,
+                    &workflow_events::RunIncidentPayload::warning(
+                        "cockpit_unavailable",
+                        unavailable.message,
+                    )
+                    .with_extra("adapter", unavailable.adapter)
+                    .with_extra("mode", unavailable.mode.as_str())
+                    .with_extra("remediation", unavailable.remediation)
+                    .with_extra("fallback", "direct")
+                    .with_extra("layout", "cockpit_layout_v2_observability_only")
+                    .with_extra("source_of_truth", "daemon_state"),
+                )?;
+                Ok(CockpitMode::Direct)
+            }
         }
     }
 
@@ -925,7 +1130,8 @@ impl Manager {
                 &context.run_id,
                 &context.phase,
                 &context.slice_id,
-                context.attempt,
+                context.wire_attempt(),
+                context.launch_id,
                 event.pid,
                 event.kind.as_str(),
                 &event.text,
@@ -984,10 +1190,11 @@ impl Manager {
                 let delta = now.saturating_duration_since(last_tick);
                 last_tick = now;
                 let paused = state
-                    .has_pending_worker_question(
+                    .has_pending_worker_question_with_launch_id(
                         &supervisor_context.run_id,
                         &supervisor_context.slice_id,
-                        supervisor_context.attempt,
+                        supervisor_context.wire_attempt(),
+                        supervisor_context.launch_id,
                     )
                     .unwrap_or(false);
                 if paused {
@@ -1032,6 +1239,7 @@ impl Manager {
                         &context.phase,
                         &context.slice_id,
                         context.attempt,
+                        context.launch_id,
                         context.timeout_seconds,
                         &message,
                     ),
@@ -1265,6 +1473,7 @@ impl Manager {
             run_id: run.id.clone(),
             slice_id: context.slice_id.clone(),
             attempt: context.attempt,
+            launch_id: context.launch_id,
             command,
             cwd: job.cwd.clone(),
             env: vec![
@@ -1275,18 +1484,25 @@ impl Manager {
                 ),
             ],
         };
-        let opened =
-            match open_default_worker_pane(run, cockpit_mode, &self.paths.root, &worker_request) {
-                Ok(CockpitWorkerLaunch::Opened(opened)) => opened,
-                Ok(CockpitWorkerLaunch::SkippedDirect) => {
-                    return Err(CockpitWorkerJobError::Fallback(
-                        "cockpit mode resolved to direct before worker pane launch".to_string(),
-                    ));
-                }
-                Err(unavailable) => {
-                    return Err(CockpitWorkerJobError::Fallback(unavailable.message));
-                }
-            };
+        let opened = match open_default_worker_pane(
+            run,
+            cockpit_mode,
+            &self.paths.root,
+            &worker_request,
+        ) {
+            Ok(CockpitWorkerLaunch::Opened(opened)) => opened,
+            Ok(CockpitWorkerLaunch::SkippedDirect) => {
+                return Err(CockpitWorkerJobError::Fallback(
+                    "cockpit mode resolved to direct before worker pane launch".to_string(),
+                ));
+            }
+            Err(unavailable) => {
+                return Err(CockpitWorkerJobError::Worker(anyhow!(
+                    "Herdr worker pane launch is uncertain; refusing direct fallback under the same launch identity: {}",
+                    unavailable.message
+                )));
+            }
+        };
         self.state
             .record_event(
                 &run.id,
@@ -1299,6 +1515,9 @@ impl Manager {
                     "pane_id": opened.pane_id,
                     "slice_id": context.slice_id.clone(),
                     "attempt": context.attempt,
+                    "launch_id": context.launch_id,
+                    "launch_stem": context.launch_stem,
+                    "launch_identity": context.cockpit_launch_identity(),
                     "source_of_truth": "kd_artifact_files",
                     "layout_planner": "cockpit_layout_v2",
                     "worker_slot_name": opened.slot_name,
@@ -1309,8 +1528,15 @@ impl Manager {
             .map_err(CockpitWorkerJobError::Worker)?;
         let pid = match wait_for_pi_wrapper_launch(&artifacts, Duration::from_secs(5), &events) {
             Ok(pid) => pid,
-            Err(err) if cancel.is_cancelled() => return Err(CockpitWorkerJobError::Worker(err)),
-            Err(err) => return Err(CockpitWorkerJobError::Fallback(err.to_string())),
+            Err(err) if cancel.is_cancelled() => {
+                return Err(CockpitWorkerJobError::Worker(err.into()));
+            }
+            Err(PiWrapperLaunchError::BeforePi(message)) => {
+                return Err(CockpitWorkerJobError::Fallback(message));
+            }
+            Err(err @ PiWrapperLaunchError::LaunchUncertain(_)) => {
+                return Err(CockpitWorkerJobError::Worker(err.into()));
+            }
         };
         collect_pi_wrapper_result(job, &artifacts, cancel, events, pid)
             .map_err(CockpitWorkerJobError::Worker)
@@ -1334,7 +1560,11 @@ impl Manager {
         let artifacts = artifact::Store::new(&run.repo_path)
             .pi_tui_worker_artifacts_for_output_path(output_path)
             .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
-        let session_name = tui_worker_session_name(&run.id, &context.slice_id, context.attempt);
+        let session_name = tui_worker_session_name(
+            &run.id,
+            &context.slice_id,
+            context.cockpit_launch_identity(),
+        );
         let argv = prepare_pi_tui_worker_artifacts(spec, job, &artifacts, &session_name)
             .map_err(|err| CockpitWorkerJobError::Fallback(err.to_string()))?;
         let mut env = job
@@ -1355,6 +1585,7 @@ impl Manager {
             run_id: run.id.clone(),
             slice_id: context.slice_id.clone(),
             attempt: context.attempt,
+            launch_id: context.launch_id,
             name: session_name,
             argv,
             cwd: job.cwd.clone(),
@@ -1372,7 +1603,12 @@ impl Manager {
                     "cockpit mode resolved to direct before TUI worker launch".to_string(),
                 ));
             }
-            Err(unavailable) => return Err(CockpitWorkerJobError::Fallback(unavailable.message)),
+            Err(unavailable) => {
+                return Err(CockpitWorkerJobError::Worker(anyhow!(
+                    "Herdr TUI worker launch is uncertain; refusing direct fallback under the same launch identity: {}",
+                    unavailable.message
+                )));
+            }
         };
         self.state
             .record_event(
@@ -1388,6 +1624,9 @@ impl Manager {
                     "agent_name": opened.agent_name.clone(),
                     "slice_id": context.slice_id.clone(),
                     "attempt": context.attempt,
+                    "launch_id": context.launch_id,
+                    "launch_stem": context.launch_stem,
+                    "launch_identity": context.cockpit_launch_identity(),
                     "source_of_truth": "kd_tui_result_artifact",
                     "layout_planner": "cockpit_layout_v2",
                     "worker_slot_name": opened.slot_name.clone(),
@@ -1418,6 +1657,9 @@ impl Manager {
                 .with_extra("mode", mode.as_str())
                 .with_extra("slice_id", &context.slice_id)
                 .with_extra("attempt", context.attempt)
+                .with_extra("launch_id", context.launch_id)
+                .with_extra("launch_stem", &context.launch_stem)
+                .with_extra("launch_identity", context.cockpit_launch_identity())
                 .with_extra("fallback", "direct")
                 .with_extra("layout", "cockpit_layout_v2_observability_only")
                 .with_extra("source_of_truth", "kd_artifact_files"),
@@ -1438,6 +1680,8 @@ impl Manager {
                     .with_extra("phase", &context.phase)
                     .with_extra("slice_id", &context.slice_id)
                     .with_extra("attempt", context.attempt)
+                    .with_extra("launch_id", context.launch_id)
+                    .with_extra("launch_stem", &context.launch_stem)
                     .with_extra("agent", runner_name),
             );
         }
@@ -1833,11 +2077,9 @@ impl Manager {
                 }),
             )?;
         }
-        self.record_cockpit_launch(&run, cockpit_mode)?;
+        let cockpit_mode = self.record_cockpit_launch(&run, cockpit_mode)?;
         self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
 
-        let worker_token = new_worker_token();
-        self.state.store_worker_token(&run.id, &worker_token)?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
         let manager = self.clone();
@@ -1856,7 +2098,6 @@ impl Manager {
                 parallelism,
                 IntegrationMode::Fresh,
                 cockpit_mode,
-                worker_token,
                 native_pi_tui_worker,
             );
         });
@@ -1903,6 +2144,16 @@ impl Manager {
             .state
             .get_run(&opts.run_id)?
             .ok_or_else(|| anyhow!("run {:?} not found", opts.run_id))?;
+        let inactive_deadline = Instant::now() + Duration::from_secs(5);
+        while self.active.contains(&run.id) {
+            if Instant::now() >= inactive_deadline {
+                bail!(
+                    "run {:?} is still finishing its prior execution; retry resume after cleanup",
+                    run.id
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         if self
             .state
             .terminal_transition_needs_reconciliation(&run.id)?
@@ -1978,6 +2229,13 @@ impl Manager {
             }
             selected_slices.push(slice);
         }
+        // An allocation may have been persisted immediately before a daemon crash.
+        // Preserve that immutable evidence; a resumed worker receives a fresh launch
+        // identity rather than reviving or overwriting the abandoned allocation.
+        self.state.reconcile_unlaunched_worker_attempts(
+            &run.id,
+            "resume began before the allocated worker process was launched",
+        )?;
         let slice_runs = self.state.get_slice_runs(&run.id)?;
         let merged: BTreeSet<_> = slice_runs
             .iter()
@@ -1990,14 +2248,19 @@ impl Manager {
             .cloned()
             .collect();
         for slice in &remaining {
+            // `slice_runs` is a mutable current-summary compatibility projection.
+            // Do not reset its retry budget or discard its last branch/error merely
+            // because the run is being resumed; historical launch evidence lives in
+            // the append-only worker_attempt_ledger.
+            let prior = slice_runs.iter().find(|row| row.slice_id == slice.id);
             self.state.upsert_slice_run(&SliceRun {
                 run_id: run.id.clone(),
                 slice_id: slice.id.clone(),
                 status: SliceStatus::Pending,
-                branch: String::new(),
-                commit_sha: String::new(),
-                attempts: 0,
-                last_error: String::new(),
+                branch: prior.map(|row| row.branch.clone()).unwrap_or_default(),
+                commit_sha: prior.map(|row| row.commit_sha.clone()).unwrap_or_default(),
+                attempts: prior.map(|row| row.attempts).unwrap_or_default(),
+                last_error: prior.map(|row| row.last_error.clone()).unwrap_or_default(),
             })?;
         }
         self.state.reopen_run_for_resume(&run.id)?;
@@ -2017,9 +2280,7 @@ impl Manager {
         )?;
         self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
-        self.record_cockpit_launch(&run, cockpit_mode)?;
-        let worker_token = new_worker_token();
-        self.state.store_worker_token(&run.id, &worker_token)?;
+        let cockpit_mode = self.record_cockpit_launch(&run, cockpit_mode)?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
         let manager = self.clone();
@@ -2039,7 +2300,6 @@ impl Manager {
                 parallelism,
                 IntegrationMode::Existing,
                 cockpit_mode,
-                worker_token,
                 native_pi_tui_worker,
             );
         });
@@ -2639,13 +2899,9 @@ impl Manager {
 
     fn run_worktree_snapshots(&self, run: &Run) -> Vec<serde_json::Value> {
         let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
+        discover_run_worktrees(&root)
+            .unwrap_or_default()
+            .into_iter()
             .map(|path| {
                 json!({
                     "path": path.to_string_lossy(),
@@ -2668,7 +2924,6 @@ impl Manager {
         parallelism: usize,
         integration_mode: IntegrationMode,
         cockpit_mode: CockpitMode,
-        worker_token: String,
         native_pi_tui_worker: bool,
     ) {
         let outcome = self.run_slices(
@@ -2680,7 +2935,6 @@ impl Manager {
             parallelism,
             integration_mode,
             cockpit_mode,
-            worker_token,
             native_pi_tui_worker,
         );
         let terminalization = (|| -> Result<()> {
@@ -2749,7 +3003,6 @@ impl Manager {
         parallelism: usize,
         integration_mode: IntegrationMode,
         cockpit_mode: CockpitMode,
-        worker_token: String,
         native_pi_tui_worker: bool,
     ) -> Result<ImplementationSummary> {
         check_cancelled(cancel)?;
@@ -2845,6 +3098,7 @@ impl Manager {
                 let worker_phase = economics.start_phase(format!("worker_layer:{batch_ids}"));
                 let worker_context = WorkerExecutionContext {
                     run: run.clone(),
+                    execution_epoch: self.state.current_run_execution_epoch(&run.id)?,
                     root_worktree: root_worktree.clone(),
                     slice_base_sha,
                     dependency_summary: dependency_summary.clone(),
@@ -2854,7 +3108,6 @@ impl Manager {
                     cockpit_mode,
                     economics: economics.clone(),
                     verification_cache: verification_cache.clone(),
-                    worker_token: worker_token.clone(),
                     native_pi_tui_worker,
                 };
                 let outcomes = self.run_worker_batch(&batch, &worker_context, parallelism)?;
@@ -2940,6 +3193,7 @@ impl Manager {
             &run,
             "",
             0,
+            None,
             &integration_worktree,
             &config,
             economics.clone(),
@@ -2997,6 +3251,7 @@ impl Manager {
                 runner: runner.clone(),
                 config: &config,
                 economics: economics.clone(),
+                verification_cache: &verification_cache,
             })?;
             repair_phase.finish();
 
@@ -3005,6 +3260,7 @@ impl Manager {
                 &run,
                 "",
                 0,
+                None,
                 &integration_worktree,
                 &config,
                 economics.clone(),
@@ -3096,6 +3352,10 @@ impl Manager {
         append_worker_evidence_attestation_basis(&mut evidence_attestation, &worker_profile);
         let plan_revisions = self.plan_revisions_for_run(&run)?;
         let worker_questions = self.state.list_worker_questions(&run.id)?;
+        let worker_attempts = self
+            .run_read_model(&run, RunReadModelOptions::status(0))?
+            .details
+            .worker_attempts;
         let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
         let mut summary = ImplementationSummary {
             run_id: run.id.clone(),
@@ -3116,6 +3376,7 @@ impl Manager {
             economics: economics.snapshot(),
             plan_revisions,
             worker_questions,
+            worker_attempts,
             created_at: Utc::now(),
         };
 
@@ -3230,6 +3491,7 @@ impl Manager {
         run: &Run,
         slice_id: &str,
         attempt: usize,
+        launch_stem: Option<&str>,
         worktree: &Path,
         config: &WorkflowConfig,
         economics: RunEconomicsRecorder,
@@ -3251,6 +3513,8 @@ impl Manager {
             "worktree_setup:integration".to_string()
         } else if attempt == 0 {
             format!("worktree_setup:{slice_id}:initial")
+        } else if let Some(launch_stem) = launch_stem {
+            format!("worktree_setup:{slice_id}:{launch_stem}")
         } else {
             format!("worktree_setup:{slice_id}:attempt-{attempt}")
         };
@@ -3290,6 +3554,8 @@ impl Manager {
             "integration.worktree-setup.json".to_string()
         } else if attempt == 0 {
             format!("{slice_id}.worktree-setup.initial.json")
+        } else if let Some(launch_stem) = launch_stem {
+            format!("{launch_stem}.worktree-setup.json")
         } else {
             format!("{slice_id}.worktree-setup.attempt-{attempt}.json")
         };
@@ -3580,7 +3846,7 @@ impl Manager {
             .map(|slice_run| {
                 previous_results
                     .remove(&slice_run.slice_id)
-                    .or_else(|| read_worker_result(store, &run.id, slice_run))
+                    .or_else(|| read_worker_result(&self.state, store, &run.id, slice_run))
                     .unwrap_or_else(|| WorkerResult {
                         slice_id: slice_run.slice_id.clone(),
                         status: "complete".to_string(),
@@ -4018,77 +4284,114 @@ impl Manager {
         let economics = ctx.economics.clone();
         let verification_cache = ctx.verification_cache.clone();
         let store = artifact::Store::new(&run.repo_path);
-        let worker_worktree = ctx.root_worktree.join(&slice.id);
-        let worker_branch = format!("khazad/{}/{}", run.id, slice.id);
-        {
-            let _git_lock = WORKTREE_ADD_LOCK
-                .lock()
-                .expect("worktree add mutex poisoned");
-            gitutil::worktree_add(
-                &run.repo_path,
-                &worker_worktree,
-                &worker_branch,
-                &ctx.slice_base_sha,
-            )
-            .context("create worker worktree")?;
-        }
-
-        self.state.upsert_slice_run(&SliceRun {
-            run_id: run.id.clone(),
-            slice_id: slice.id.clone(),
-            status: SliceStatus::Running,
-            branch: worker_branch.clone(),
-            commit_sha: String::new(),
-            attempts: 0,
-            last_error: String::new(),
-        })?;
-        self.state.record_event(
-            &run.id,
-            workflow_events::SLICE_STARTED,
-            &workflow_events::SliceStartedPayload::new(&slice.id),
-        )?;
-        self.mark_progress(
-            &run.id,
-            "worker_started",
-            &slice.id,
-            0,
-            "",
-            "slice worker started",
-        );
-        if let Err(err) = self.run_worktree_setup(
-            run,
-            &slice.id,
-            0,
-            &worker_worktree,
-            config,
-            economics.clone(),
-            verification_cache.clone(),
-            cancel,
-        ) {
-            self.state.upsert_slice_run(&SliceRun {
-                run_id: run.id.clone(),
-                slice_id: slice.id.clone(),
-                status: SliceStatus::Blocked,
-                branch: worker_branch.clone(),
-                commit_sha: gitutil::head_sha(&worker_worktree).unwrap_or_default(),
-                attempts: 0,
-                last_error: err.to_string(),
-            })?;
-            return Err(err);
-        }
-
         let mut all_checks = Vec::new();
         let mut last_failure = String::new();
         let mut primary_failure: Option<String> = None;
         let mut secondary_failures: Vec<String> = Vec::new();
-        for attempt in 1..=MAX_WORKER_ATTEMPTS {
+        let consumed_retry_budget = self
+            .state
+            .get_slice_runs(&run.id)?
+            .into_iter()
+            .find(|slice_run| slice_run.slice_id == slice.id)
+            .map(|slice_run| slice_run.attempts)
+            .unwrap_or_default();
+        if consumed_retry_budget >= MAX_WORKER_ATTEMPTS {
+            bail!(
+                "worker retry budget exhausted for slice {} ({consumed_retry_budget}/{MAX_WORKER_ATTEMPTS})",
+                slice.id
+            );
+        }
+        for attempt in consumed_retry_budget + 1..=MAX_WORKER_ATTEMPTS {
             check_cancelled(cancel)?;
+            // The allocation commits immutable identity and current projection before
+            // any worktree, handoff, artifact, or worker side effect.
+            // A durable allocation can exist without a successfully-created Git
+            // branch. Only a resolvable retained branch may seed a retry.
+            let prior_branch = self
+                .state
+                .list_worker_attempt_ledger(&run.id, &slice.id)?
+                .into_iter()
+                .rev()
+                .find_map(|row| {
+                    (!row.branch.is_empty()
+                        && gitutil::run(&run.repo_path, &["rev-parse", "--verify", &row.branch])
+                            .is_ok())
+                    .then_some(row.branch)
+                });
+            let ledger = self.state.allocate_worker_attempt(
+                &run.id,
+                &slice.id,
+                ctx.execution_epoch,
+                attempt,
+                0,
+                0,
+                "slice-worker",
+                &ctx.root_worktree,
+            )?;
+            let _terminal_guard = WorkerAttemptTerminalGuard::new(&self.state, ledger.launch_id);
+            let worker_token = new_worker_token();
+            if let Err(err) =
+                self.state
+                    .store_worker_launch_token(&run.id, ledger.launch_id, &worker_token)
+            {
+                let _ =
+                    self.state
+                        .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+                return Err(err);
+            }
+            self.state.record_event(
+                &run.id,
+                workflow_events::SLICE_STARTED,
+                &workflow_events::SliceStartedPayload::new(&slice.id),
+            )?;
+            let worker_worktree = PathBuf::from(&ledger.worktree);
+            let worker_branch = ledger.branch.clone();
+            let worker_base = prior_branch.unwrap_or_else(|| ctx.slice_base_sha.clone());
+            {
+                let _git_lock = WORKTREE_ADD_LOCK
+                    .lock()
+                    .expect("worktree add mutex poisoned");
+                if let Err(err) = gitutil::worktree_add(
+                    &run.repo_path,
+                    &worker_worktree,
+                    &worker_branch,
+                    &worker_base,
+                ) {
+                    let _ = self.state.finish_worker_attempt(
+                        ledger.launch_id,
+                        "failed",
+                        &err.to_string(),
+                    );
+                    return Err(err).context("create worker worktree");
+                }
+            }
             self.state
                 .activate_slice_attempt(&run.id, &slice.id, attempt)?;
-            let output_path = store.output_path(
+            self.mark_progress(
                 &run.id,
-                &format!("{}.worker.attempt-{attempt}.json", slice.id),
+                "worker_started",
+                &slice.id,
+                attempt,
+                "",
+                "slice worker started",
             );
+            if let Err(err) = self.run_worktree_setup(
+                run,
+                &slice.id,
+                attempt,
+                Some(&ledger.output_stem),
+                &worker_worktree,
+                config,
+                economics.clone(),
+                verification_cache.clone(),
+                cancel,
+            ) {
+                let _ =
+                    self.state
+                        .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
+                return Err(err);
+            }
+            let output_path = store.output_path(&run.id, &format!("{}.json", ledger.output_stem));
             let runner_metadata = runner.metadata();
             let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
             let handoff = Handoff {
@@ -4113,8 +4416,22 @@ impl Manager {
                 contract: "Implement only this slice, commit all intended changes, leave a clean worktree, and return JSON."
                     .to_string(),
             };
-            let handoff_path =
-                self.write_worker_handoff_with_plan_revisions(&store, run, &handoff)?;
+            let handoff_path = match self.write_worker_handoff_with_plan_revisions(
+                &store,
+                run,
+                &handoff,
+                &ledger.output_stem,
+            ) {
+                Ok(path) => path,
+                Err(err) => {
+                    let _ = self.state.finish_worker_attempt(
+                        ledger.launch_id,
+                        "failed",
+                        &err.to_string(),
+                    );
+                    return Err(err);
+                }
+            };
             let prompt = worker_prompt(&handoff_path.to_string_lossy(), &handoff, &last_failure);
             self.mark_progress(
                 &run.id,
@@ -4124,14 +4441,16 @@ impl Manager {
                 runner.name(),
                 "slice worker is running",
             );
-            let mut worker_result =
+            self.state.mark_worker_attempt_launched(ledger.launch_id)?;
+            let worker_attempt =
                 match self.run_worker_attempt_with_envelope(WorkerAttemptRunRequest {
                     run,
                     slice,
                     attempt,
+                    launch_id: ledger.launch_id,
+                    launch_stem: &ledger.output_stem,
                     runner: runner.clone(),
                     runner_metadata: &runner_metadata,
-                    handoff_path: &handoff_path,
                     handoff: &handoff,
                     prompt,
                     worker_worktree: &worker_worktree,
@@ -4140,16 +4459,43 @@ impl Manager {
                     config,
                     economics: &economics,
                     cancel,
-                    worker_token: &ctx.worker_token,
+                    worker_token: &worker_token,
                     cockpit_mode: ctx.cockpit_mode,
                     native_pi_tui_worker: ctx.native_pi_tui_worker,
                     primary_failure: &mut primary_failure,
                     secondary_failures: &mut secondary_failures,
                     last_failure: &mut last_failure,
-                })? {
-                    WorkerAttemptRunResult::Valid(worker_result) => *worker_result,
-                    WorkerAttemptRunResult::Continue => continue,
+                }) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let _ = self.state.finish_worker_attempt(
+                            ledger.launch_id,
+                            "failed",
+                            &err.to_string(),
+                        );
+                        return Err(err);
+                    }
                 };
+            let valid_attempt = match worker_attempt {
+                WorkerAttemptRunResult::Valid(worker_attempt) => *worker_attempt,
+                WorkerAttemptRunResult::Continue => {
+                    let _ = self.state.finish_worker_attempt(
+                        ledger.launch_id,
+                        "failed",
+                        "worker envelope requested retry",
+                    );
+                    continue;
+                }
+            };
+            let ValidWorkerAttempt {
+                result: mut worker_result,
+                launch_id: active_launch_id,
+                launch_stem: active_launch_stem,
+                branch: worker_branch,
+                worktree: worker_worktree,
+                output_path,
+                _terminal_guard: _active_terminal_guard,
+            } = valid_attempt;
             self.create_worker_candidate_followup_slice_proposals(
                 run,
                 slice,
@@ -4169,12 +4515,18 @@ impl Manager {
                 run,
                 &slice.id,
                 attempt,
+                Some(&active_launch_stem),
                 &worker_worktree,
                 config,
                 economics.clone(),
                 verification_cache.clone(),
                 cancel,
             ) {
+                self.state.finish_worker_attempt(
+                    active_launch_id,
+                    "failed",
+                    &format!("post-worker worktree setup failed: {err}"),
+                )?;
                 self.state.upsert_slice_run(&SliceRun {
                     run_id: run.id.clone(),
                     slice_id: slice.id.clone(),
@@ -4187,7 +4539,7 @@ impl Manager {
                 return Err(err);
             }
 
-            let check = self.lightweight_check(
+            let check = match self.lightweight_check(
                 LightweightCheckContext {
                     run_id: &run.id,
                     slice,
@@ -4199,11 +4551,19 @@ impl Manager {
                     verification_cache: verification_cache.clone(),
                 },
                 cancel,
-            )?;
-            let check_path = store.output_path(
-                &run.id,
-                &format!("{}.check.attempt-{attempt}.json", slice.id),
-            );
+            ) {
+                Ok(check) => check,
+                Err(err) => {
+                    self.state.finish_worker_attempt(
+                        active_launch_id,
+                        "failed",
+                        &format!("lightweight check failed: {err}"),
+                    )?;
+                    return Err(err);
+                }
+            };
+            let check_path =
+                store.output_path(&run.id, &format!("{}.check.json", active_launch_stem));
             artifact::write_json(&check_path, &check)?;
             all_checks.push(check.clone());
 
@@ -4228,6 +4588,8 @@ impl Manager {
                     attempts: attempt,
                     last_error: String::new(),
                 })?;
+                self.state
+                    .finish_worker_attempt(active_launch_id, "succeeded", "")?;
                 return Ok(SliceWorkerOutcome {
                     slice: slice.clone(),
                     result: worker_result,
@@ -4267,6 +4629,11 @@ impl Manager {
             if check.verification_cancelled
                 && check.failure_kind != "verification_restoration_failed"
             {
+                self.state.finish_worker_attempt(
+                    active_launch_id,
+                    "interrupted",
+                    "run cancelled",
+                )?;
                 return Err(CancelledError::new("run cancelled").into());
             }
             if check_failure_needs_operator(&check) {
@@ -4285,6 +4652,8 @@ impl Manager {
                     attempts: attempt,
                     last_error: message.clone(),
                 })?;
+                self.state
+                    .finish_worker_attempt(active_launch_id, "failed", &message)?;
                 return Err(BlockedError::new(message).into());
             }
             if worker_result.status == "blocked" {
@@ -4294,23 +4663,22 @@ impl Manager {
                     SliceStatus::Blocked,
                     &worker_result.summary,
                 )?;
-                return Err(BlockedError::new(format!(
-                    "worker reported blocked: {}",
-                    worker_result.summary
-                ))
-                .into());
+                let message = format!("worker reported blocked: {}", worker_result.summary);
+                self.state
+                    .finish_worker_attempt(active_launch_id, "failed", &message)?;
+                return Err(BlockedError::new(message).into());
             }
             if attempt == MAX_WORKER_ATTEMPTS {
+                self.state
+                    .finish_worker_attempt(active_launch_id, "failed", &last_failure)?;
                 if let Some(outcome) =
                     self.run_targeted_slice_repair(TargetedSliceRepairRequest {
                         run,
                         slice,
                         attempt,
                         runner: runner.clone(),
-                        handoff_path: &handoff_path,
                         handoff: &handoff,
                         worker_worktree: &worker_worktree,
-                        worker_branch: &worker_branch,
                         slice_base_sha: &ctx.slice_base_sha,
                         check_path: &check_path,
                         check: &check,
@@ -4318,7 +4686,6 @@ impl Manager {
                         economics: &economics,
                         verification_cache: &verification_cache,
                         cancel,
-                        worker_token: &ctx.worker_token,
                         cockpit_mode: ctx.cockpit_mode,
                         native_pi_tui_worker: ctx.native_pi_tui_worker,
                         all_checks: &mut all_checks,
@@ -4340,6 +4707,8 @@ impl Manager {
                 )?;
                 bail!(message);
             }
+            self.state
+                .finish_worker_attempt(active_launch_id, "failed", &last_failure)?;
             self.state.upsert_slice_run(&SliceRun {
                 run_id: run.id.clone(),
                 slice_id: slice.id.clone(),
@@ -4903,13 +5272,16 @@ impl Manager {
         let store = artifact::Store::new(&run.repo_path);
         store.ensure_run_dirs(&run.id)?;
         let progress = self.state.get_progress(&run.id)?;
+        // The expected result path is ledger-scoped for normal worker launches.
+        // Derive diagnostics from that immutable identity instead of the retry ordinal.
+        let expected_stem = expected_output_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("worker-output");
         let invalid_output_name = if envelope_retry == 0 {
-            format!("{}.worker.attempt-{attempt}.invalid-output.json", slice.id)
+            format!("{expected_stem}.invalid-output.json")
         } else {
-            format!(
-                "{}.worker.attempt-{attempt}.envelope-{envelope_retry}.invalid-output.json",
-                slice.id
-            )
+            format!("{expected_stem}.envelope-{envelope_retry}.invalid-output.json")
         };
         let invalid_output_path = store.output_path(&run.id, &invalid_output_name);
         let raw_payload_text = raw_payload
@@ -5051,11 +5423,12 @@ impl Manager {
             "progress": progress,
             "created_at": Utc::now(),
         });
+        let output_stem = output_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("worker-output");
         artifact::write_json(
-            store.output_path(
-                &run.id,
-                &format!("{}.worker.attempt-{attempt}.failure.json", slice.id),
-            ),
+            store.output_path(&run.id, &format!("{output_stem}.failure.json")),
             &diagnostic,
         )?;
         Ok(())
@@ -5081,8 +5454,16 @@ impl Manager {
                 prompt: request.prompt.clone(),
                 cwd: request.worker_worktree.to_path_buf(),
                 json_schema: WORKER_RESULT_SCHEMA.to_string(),
-                env: worker_job_env(&self.paths, run, &slice.id, attempt, request.worker_token),
-                termination_grace_seconds: 0,
+                env: worker_job_env(
+                    &self.paths,
+                    run,
+                    &slice.id,
+                    attempt,
+                    Some(request.launch_id),
+                    Some(request.launch_stem),
+                    request.worker_token,
+                ),
+                termination_grace_seconds: request.config.worker_termination_grace_seconds,
             },
             request.cancel,
             WorkerAttemptContext::new(
@@ -5090,6 +5471,8 @@ impl Manager {
                 "worker_running",
                 &slice.id,
                 attempt,
+                Some(request.launch_id),
+                Some(request.launch_stem),
                 request.config,
                 request.native_pi_tui_worker,
             ),
@@ -5098,6 +5481,8 @@ impl Manager {
                 phase: "slice_worker",
                 slice_id: &slice.id,
                 attempt,
+                launch_id: Some(request.launch_id),
+                launch_stem: Some(request.launch_stem),
             },
             run,
             request.cockpit_mode,
@@ -5264,7 +5649,17 @@ impl Manager {
             )?;
             return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
         }
-        Ok(WorkerAttemptRunResult::Valid(Box::new(worker_result)))
+        Ok(WorkerAttemptRunResult::Valid(Box::new(
+            ValidWorkerAttempt {
+                result: worker_result,
+                launch_id: request.launch_id,
+                launch_stem: request.launch_stem.to_string(),
+                branch: request.worker_branch.to_string(),
+                worktree: request.worker_worktree.to_path_buf(),
+                output_path: request.output_path.to_path_buf(),
+                _terminal_guard: None,
+            },
+        )))
     }
 
     fn run_targeted_slice_repair(
@@ -5277,13 +5672,39 @@ impl Manager {
         for repair_attempt in 1..=DEFAULT_SLICE_REPAIR_ATTEMPTS {
             check_cancelled(request.cancel)?;
             let store = artifact::Store::new(&request.run.repo_path);
-            let repair_output_path = store.output_path(
-                &request.run.id,
-                &format!(
-                    "{}.worker.attempt-{}.slice-repair-{repair_attempt}.json",
-                    request.slice.id, request.attempt
-                ),
-            );
+            let repair_base = gitutil::head_sha(request.worker_worktree)?;
+            let launch = self.prepare_followup_worker_launch(
+                request.run,
+                request.slice,
+                request.attempt,
+                repair_attempt,
+                0,
+                "slice-repair",
+                "slice-repair",
+                &repair_base,
+                request.handoff,
+            )?;
+            let _terminal_guard =
+                WorkerAttemptTerminalGuard::new(&self.state, launch.ledger.launch_id);
+            let repair_worktree = PathBuf::from(&launch.ledger.worktree);
+            if let Err(err) = self.run_worktree_setup(
+                request.run,
+                &request.slice.id,
+                request.attempt,
+                Some(&launch.ledger.output_stem),
+                &repair_worktree,
+                request.config,
+                request.economics.clone(),
+                request.verification_cache.clone(),
+                request.cancel,
+            ) {
+                let _ = self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    &err.to_string(),
+                );
+                return Err(err);
+            }
             self.mark_progress(
                 &request.run.id,
                 "slice_repair",
@@ -5293,24 +5714,28 @@ impl Manager {
                 "targeted in-scope slice repair is running",
             );
             let prompt = slice_repair_prompt(
-                &request.handoff_path.to_string_lossy(),
-                request.handoff,
+                &launch.handoff_path.to_string_lossy(),
+                &launch.handoff,
                 &request.check.summary,
                 &request.check_path.to_string_lossy(),
             );
+            self.state
+                .mark_worker_attempt_launched(launch.ledger.launch_id)?;
             let agent_result = self.run_recorded_slice_worker_job(
                 request.runner.clone(),
                 Job {
                     kind: "slice-repair".to_string(),
                     prompt,
-                    cwd: request.worker_worktree.to_path_buf(),
+                    cwd: repair_worktree.clone(),
                     json_schema: WORKER_RESULT_SCHEMA.to_string(),
                     env: worker_job_env(
                         &self.paths,
                         request.run,
                         &request.slice.id,
                         request.attempt,
-                        request.worker_token,
+                        Some(launch.ledger.launch_id),
+                        Some(&launch.ledger.output_stem),
+                        &launch.token,
                     ),
                     termination_grace_seconds: request.config.worker_termination_grace_seconds,
                 },
@@ -5320,6 +5745,8 @@ impl Manager {
                     "slice_repair",
                     &request.slice.id,
                     request.attempt,
+                    Some(launch.ledger.launch_id),
+                    Some(&launch.ledger.output_stem),
                     request.config,
                     request.native_pi_tui_worker,
                 ),
@@ -5328,11 +5755,29 @@ impl Manager {
                     phase: "slice_repair",
                     slice_id: &request.slice.id,
                     attempt: request.attempt,
+                    launch_id: Some(launch.ledger.launch_id),
+                    launch_stem: Some(&launch.ledger.output_stem),
                 },
                 request.run,
                 request.cockpit_mode,
-                &repair_output_path,
-            )?;
+                &launch.output_path,
+            );
+            let agent_result = match agent_result {
+                Ok(result) => result,
+                Err(err) => {
+                    let state = if request.cancel.is_cancelled() {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    };
+                    let _ = self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        state,
+                        &err.to_string(),
+                    );
+                    return Err(err);
+                }
+            };
             let Some(output) = agent_result.output else {
                 self.record_invalid_worker_output_attempt(
                     request.run,
@@ -5340,12 +5785,17 @@ impl Manager {
                     request.attempt,
                     repair_attempt,
                     "slice repair returned no JSON output",
-                    request.worker_worktree,
-                    &repair_output_path,
+                    &repair_worktree,
+                    &launch.output_path,
                     "slice_repair_exhausted",
                     "slice_repair_failed",
                     None,
                     RunnerTranscript::default(),
+                )?;
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    "slice repair returned no JSON output",
                 )?;
                 return Ok(None);
             };
@@ -5358,12 +5808,17 @@ impl Manager {
                         request.attempt,
                         repair_attempt,
                         &format!("slice repair JSON did not match result model: {err}"),
-                        request.worker_worktree,
-                        &repair_output_path,
+                        &repair_worktree,
+                        &launch.output_path,
                         "slice_repair_exhausted",
                         "slice_repair_failed",
                         Some(output),
                         RunnerTranscript::default(),
+                    )?;
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        "failed",
+                        &format!("slice repair JSON did not match result model: {err}"),
                     )?;
                     return Ok(None);
                 }
@@ -5375,12 +5830,17 @@ impl Manager {
                     request.attempt,
                     repair_attempt,
                     &format!("slice repair JSON failed validation: {err}"),
-                    request.worker_worktree,
-                    &repair_output_path,
+                    &repair_worktree,
+                    &launch.output_path,
                     "slice_repair_exhausted",
                     "slice_repair_failed",
                     Some(serde_json::to_value(&worker_result).unwrap_or_default()),
                     RunnerTranscript::default(),
+                )?;
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    &format!("slice repair JSON failed validation: {err}"),
                 )?;
                 return Ok(None);
             }
@@ -5388,22 +5848,27 @@ impl Manager {
                 request.run,
                 request.slice,
                 request.attempt,
-                &repair_output_path,
+                &launch.output_path,
                 &mut worker_result,
             )?;
             self.create_worker_finding_replan_proposals(
                 request.run,
                 request.slice,
                 request.attempt,
-                &repair_output_path,
+                &launch.output_path,
                 &mut worker_result,
             )?;
-            artifact::write_json(&repair_output_path, &worker_result)?;
+            artifact::write_json(&launch.output_path, &worker_result)?;
             if worker_result.status == "blocked" {
                 self.state.update_slice_status(
                     &request.run.id,
                     &request.slice.id,
                     SliceStatus::Blocked,
+                    &worker_result.summary,
+                )?;
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
                     &worker_result.summary,
                 )?;
                 return Err(BlockedError::new(format!(
@@ -5413,13 +5878,19 @@ impl Manager {
                 .into());
             }
             if worker_result.status == "failed" {
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    &worker_result.summary,
+                )?;
                 return Ok(None);
             }
             self.run_worktree_setup(
                 request.run,
                 &request.slice.id,
                 request.attempt,
-                request.worker_worktree,
+                Some(&launch.ledger.output_stem),
+                &repair_worktree,
                 request.config,
                 request.economics.clone(),
                 request.verification_cache.clone(),
@@ -5429,7 +5900,7 @@ impl Manager {
                 LightweightCheckContext {
                     run_id: &request.run.id,
                     slice: request.slice,
-                    worker_worktree: request.worker_worktree,
+                    worker_worktree: &repair_worktree,
                     base_sha: request.slice_base_sha,
                     attempt: request.attempt,
                     config: request.config,
@@ -5440,10 +5911,7 @@ impl Manager {
             )?;
             let repair_check_path = store.output_path(
                 &request.run.id,
-                &format!(
-                    "{}.check.attempt-{}.slice-repair-{repair_attempt}.json",
-                    request.slice.id, request.attempt
-                ),
+                &format!("{}.check.json", launch.ledger.output_stem),
             );
             artifact::write_json(&repair_check_path, &repair_check)?;
             request.all_checks.push(repair_check.clone());
@@ -5455,7 +5923,7 @@ impl Manager {
                     run_id: request.run.id.clone(),
                     slice_id: request.slice.id.clone(),
                     status: SliceStatus::ReadyToMerge,
-                    branch: request.worker_branch.to_string(),
+                    branch: launch.ledger.branch.clone(),
                     commit_sha: worker_result.commit_sha.clone(),
                     attempts: request.attempt,
                     last_error: String::new(),
@@ -5469,15 +5937,18 @@ impl Manager {
                         "repair_attempt": repair_attempt,
                         "status": "fixed",
                         "trigger_failure_kind": request.check.failure_kind,
+                        "launch_id": launch.ledger.launch_id,
                         "check_path": repair_check_path,
-                        "output_path": repair_output_path,
+                        "output_path": launch.output_path,
                     }),
                 )?;
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "succeeded", "")?;
                 return Ok(Some(SliceWorkerOutcome {
                     slice: request.slice.clone(),
                     result: worker_result,
                     checks: request.all_checks.clone(),
-                    branch: request.worker_branch.to_string(),
+                    branch: launch.ledger.branch.clone(),
                     attempts: request.attempt,
                 }));
             }
@@ -5495,6 +5966,11 @@ impl Manager {
                 primary_failure: Some(&request.check.summary),
                 secondary_failures: &[],
             })?;
+            self.state.finish_worker_attempt(
+                launch.ledger.launch_id,
+                "failed",
+                &repair_check.summary,
+            )?;
         }
         Ok(None)
     }
@@ -5504,18 +5980,18 @@ impl Manager {
         request: WorkerAttemptRunRequest<'_>,
         invalid_artifact: &Path,
     ) -> Result<WorkerAttemptRunResult> {
-        if let Some(worker_result) = self.retry_worker_envelope_reemission(
+        self.state
+            .finish_worker_attempt(request.launch_id, "failed", request.last_failure)?;
+        if let Some(worker_attempt) = self.retry_worker_envelope_reemission(
             request.run,
             request.slice,
             request.attempt,
             request.runner.clone(),
-            request.handoff_path,
             request.handoff,
             request.worker_worktree,
             request.config,
             request.economics,
             request.cancel,
-            request.worker_token,
             request.cockpit_mode,
             request.native_pi_tui_worker,
             request.last_failure,
@@ -5523,7 +5999,7 @@ impl Manager {
             request.primary_failure,
             request.secondary_failures,
         )? {
-            return Ok(WorkerAttemptRunResult::Valid(Box::new(worker_result)));
+            return Ok(WorkerAttemptRunResult::Valid(Box::new(worker_attempt)));
         }
         self.update_invalid_worker_attempt_status(
             request.run,
@@ -5545,32 +6021,37 @@ impl Manager {
         slice: &Slice,
         attempt: usize,
         runner: Arc<dyn Runner>,
-        handoff_path: &Path,
         handoff: &Handoff,
         worker_worktree: &Path,
         config: &WorkflowConfig,
         economics: &RunEconomicsRecorder,
         cancel: &CancellationToken,
-        worker_token: &str,
         cockpit_mode: CockpitMode,
         native_pi_tui_worker: bool,
         initial_failure: &str,
         initial_invalid_artifact: &Path,
         primary_failure: &mut Option<String>,
         secondary_failures: &mut Vec<String>,
-    ) -> Result<Option<WorkerResult>> {
-        let store = artifact::Store::new(&run.repo_path);
+    ) -> Result<Option<ValidWorkerAttempt>> {
         let mut last_failure = initial_failure.to_string();
         let mut last_artifact = initial_invalid_artifact.to_path_buf();
+        let mut retry_base = gitutil::head_sha(worker_worktree)?;
         for envelope_retry in 1..=DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS {
             check_cancelled(cancel)?;
-            let retry_output_path = store.output_path(
-                &run.id,
-                &format!(
-                    "{}.worker.attempt-{attempt}.envelope-{envelope_retry}.json",
-                    slice.id
-                ),
-            );
+            let launch = self.prepare_followup_worker_launch(
+                run,
+                slice,
+                attempt,
+                0,
+                envelope_retry,
+                "slice-envelope-retry",
+                "slice-envelope-retry",
+                &retry_base,
+                handoff,
+            )?;
+            let terminal_guard =
+                WorkerAttemptTerminalGuard::new(&self.state, launch.ledger.launch_id);
+            let retry_worktree = PathBuf::from(&launch.ledger.worktree);
             self.mark_progress(
                 &run.id,
                 "worker_envelope_retry",
@@ -5580,19 +6061,29 @@ impl Manager {
                 "worker is re-emitting a valid JSON envelope for existing evidence",
             );
             let prompt = worker_envelope_retry_prompt(
-                &handoff_path.to_string_lossy(),
-                handoff,
+                &launch.handoff_path.to_string_lossy(),
+                &launch.handoff,
                 &last_failure,
                 &last_artifact.to_string_lossy(),
             );
+            self.state
+                .mark_worker_attempt_launched(launch.ledger.launch_id)?;
             let result = self.run_recorded_slice_worker_job(
                 runner.clone(),
                 Job {
                     kind: "slice-envelope-retry".to_string(),
                     prompt,
-                    cwd: worker_worktree.to_path_buf(),
+                    cwd: retry_worktree.clone(),
                     json_schema: WORKER_RESULT_SCHEMA.to_string(),
-                    env: worker_job_env(&self.paths, run, &slice.id, attempt, worker_token),
+                    env: worker_job_env(
+                        &self.paths,
+                        run,
+                        &slice.id,
+                        attempt,
+                        Some(launch.ledger.launch_id),
+                        Some(&launch.ledger.output_stem),
+                        &launch.token,
+                    ),
                     termination_grace_seconds: config.worker_termination_grace_seconds,
                 },
                 cancel,
@@ -5601,6 +6092,8 @@ impl Manager {
                     "worker_envelope_retry",
                     &slice.id,
                     attempt,
+                    Some(launch.ledger.launch_id),
+                    Some(&launch.ledger.output_stem),
                     config,
                     native_pi_tui_worker,
                 ),
@@ -5609,16 +6102,19 @@ impl Manager {
                     phase: "slice_worker_envelope_retry",
                     slice_id: &slice.id,
                     attempt,
+                    launch_id: Some(launch.ledger.launch_id),
+                    launch_stem: Some(&launch.ledger.output_stem),
                 },
                 run,
                 cockpit_mode,
-                &retry_output_path,
+                &launch.output_path,
             );
             let retry_disposition = if envelope_retry == DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS {
                 "envelope_retry_exhausted"
             } else {
                 "envelope_retry_pending"
             };
+            retry_base = gitutil::head_sha(&retry_worktree)?;
             let result = match result {
                 Ok(result) => result,
                 Err(err) => {
@@ -5628,14 +6124,24 @@ impl Manager {
                         .downcast_ref::<RunnerError>()
                         .map(|err| err.transcript().clone())
                         .unwrap_or_default();
+                    let state = if cancel.is_cancelled() {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    };
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        state,
+                        &last_failure,
+                    )?;
                     last_artifact = self.record_invalid_worker_output_attempt(
                         run,
                         slice,
                         attempt,
                         envelope_retry,
                         &last_failure,
-                        worker_worktree,
-                        &retry_output_path,
+                        &retry_worktree,
+                        &launch.output_path,
                         retry_disposition,
                         "none",
                         None,
@@ -5647,14 +6153,19 @@ impl Manager {
             let Some(output) = result.output else {
                 last_failure = "worker envelope retry returned no JSON output".to_string();
                 remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    &last_failure,
+                )?;
                 last_artifact = self.record_invalid_worker_output_attempt(
                     run,
                     slice,
                     attempt,
                     envelope_retry,
                     &last_failure,
-                    worker_worktree,
-                    &retry_output_path,
+                    &retry_worktree,
+                    &launch.output_path,
                     retry_disposition,
                     "none",
                     None,
@@ -5668,14 +6179,19 @@ impl Manager {
                     last_failure =
                         format!("worker envelope JSON did not match result model: {err}");
                     remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        "failed",
+                        &last_failure,
+                    )?;
                     last_artifact = self.record_invalid_worker_output_attempt(
                         run,
                         slice,
                         attempt,
                         envelope_retry,
                         &last_failure,
-                        worker_worktree,
-                        &retry_output_path,
+                        &retry_worktree,
+                        &launch.output_path,
                         retry_disposition,
                         "none",
                         Some(output),
@@ -5687,14 +6203,19 @@ impl Manager {
             if let Err(err) = validate_worker_result(&worker_result, slice) {
                 last_failure = format!("worker envelope JSON failed validation: {err}");
                 remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    &last_failure,
+                )?;
                 last_artifact = self.record_invalid_worker_output_attempt(
                     run,
                     slice,
                     attempt,
                     envelope_retry,
                     &last_failure,
-                    worker_worktree,
-                    &retry_output_path,
+                    &retry_worktree,
+                    &launch.output_path,
                     retry_disposition,
                     "none",
                     Some(serde_json::to_value(&worker_result).unwrap_or_default()),
@@ -5702,20 +6223,29 @@ impl Manager {
                 )?;
                 continue;
             }
-            artifact::write_json(&retry_output_path, &worker_result)?;
+            artifact::write_json(&launch.output_path, &worker_result)?;
             self.state.record_event(
                 &run.id,
                 workflow_events::WORKER_ENVELOPE_RETRY_SUCCEEDED,
                 &json!({
                     "slice_id": slice.id,
                     "attempt": attempt,
+                    "launch_id": launch.ledger.launch_id,
                     "envelope_retry": envelope_retry,
-                    "output_path": retry_output_path,
-                    "previous_invalid_output": initial_invalid_artifact,
+                    "output_path": launch.output_path,
+                    "previous_invalid_output": last_artifact,
                     "disposition": "valid_envelope_reemitted_existing_worker_head",
                 }),
             )?;
-            return Ok(Some(worker_result));
+            return Ok(Some(ValidWorkerAttempt {
+                result: worker_result,
+                launch_id: launch.ledger.launch_id,
+                launch_stem: launch.ledger.output_stem,
+                branch: launch.ledger.branch,
+                worktree: retry_worktree,
+                output_path: launch.output_path,
+                _terminal_guard: Some(terminal_guard),
+            }));
         }
         Ok(None)
     }
@@ -5732,20 +6262,80 @@ impl Manager {
             serde_json::to_string_pretty(context.checks).unwrap_or_else(|_| "[]".to_string());
         let gate_summary =
             serde_json::to_string_pretty(context.gate_failure).unwrap_or_else(|_| "{}".to_string());
-        let store = artifact::Store::new(&run.repo_path);
+        let persisted_repair_launches = self
+            .state
+            .list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?
+            .into_iter()
+            .filter(|launch| launch.kind == "integration-repair")
+            .collect::<Vec<_>>();
+        let latest_repair_launch = persisted_repair_launches
+            .iter()
+            .max_by_key(|launch| (launch.repair_ordinal, launch.launch_id));
+        let consumed_repair_budget = latest_repair_launch
+            .map(|launch| launch.repair_ordinal)
+            .unwrap_or_default();
+        economics.set_repair_attempts(consumed_repair_budget);
+        if let Some(launch) = latest_repair_launch.filter(|launch| launch.state == "succeeded") {
+            let output_path = artifact::Store::new(&run.repo_path)
+                .output_path(&run.id, &format!("{}.json", launch.output_stem));
+            let result: RepairResult = artifact::read_json(&output_path).with_context(|| {
+                format!(
+                    "read persisted successful integration repair launch {} from {}",
+                    launch.launch_id,
+                    output_path.display()
+                )
+            })?;
+            validate_repair_result(&result).with_context(|| {
+                format!(
+                    "validate persisted successful integration repair launch {}",
+                    launch.launch_id
+                )
+            })?;
+            return Ok(result);
+        }
+        if consumed_repair_budget >= DEFAULT_REPAIR_ATTEMPTS {
+            bail!(
+                "integration repair budget exhausted for run {} ({consumed_repair_budget}/{DEFAULT_REPAIR_ATTEMPTS})",
+                run.id
+            );
+        }
+        let integration_repair_base = gitutil::head_sha(integration_worktree)?;
+        let mut next_repair_base = integration_repair_base.clone();
         let mut last_error = String::new();
-        for attempt in 1..=DEFAULT_REPAIR_ATTEMPTS {
+        for attempt in consumed_repair_budget + 1..=DEFAULT_REPAIR_ATTEMPTS {
             economics.set_repair_attempts(attempt);
             check_cancelled(cancel)?;
-            let repair_base = gitutil::head_sha(integration_worktree).unwrap_or_default();
-            let output_path = store.output_path(
-                &run.id,
-                &format!("integration-repair.attempt-{attempt}.json"),
-            );
+            let launch = self.prepare_integration_repair_launch(run, attempt, &next_repair_base)?;
+            let _terminal_guard =
+                WorkerAttemptTerminalGuard::new(&self.state, launch.ledger.launch_id);
+            let repair_worktree = PathBuf::from(&launch.ledger.worktree);
+            if let Err(err) = self.run_worktree_setup(
+                run,
+                INTEGRATION_REPAIR_SCOPE_ID,
+                attempt,
+                Some(&launch.ledger.output_stem),
+                &repair_worktree,
+                config,
+                economics.clone(),
+                context.verification_cache.clone(),
+                cancel,
+            ) {
+                let state = if cancel.is_cancelled() {
+                    "interrupted"
+                } else {
+                    "failed"
+                };
+                let _ = self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    state,
+                    &err.to_string(),
+                );
+                return Err(err);
+            }
             self.mark_progress(
                 &run.id,
                 "integration_repair",
-                "",
+                INTEGRATION_REPAIR_SCOPE_ID,
                 attempt,
                 runner.name(),
                 "integration repair worker is running",
@@ -5753,40 +6343,66 @@ impl Manager {
             let runner_metadata = runner.metadata();
             let prompt = integration_repair_prompt(
                 &run.id,
-                &integration_worktree.to_string_lossy(),
+                &repair_worktree.to_string_lossy(),
                 slices,
                 &check_summary,
                 &gate_summary,
                 context.trigger,
             );
+            self.state
+                .mark_worker_attempt_launched(launch.ledger.launch_id)?;
             let agent_result = match self.run_recorded_agent_job(
                 runner.clone(),
                 Job {
                     kind: "integration-repair".to_string(),
                     prompt,
-                    cwd: integration_worktree.to_path_buf(),
+                    cwd: repair_worktree.clone(),
                     json_schema: REPAIR_RESULT_SCHEMA.to_string(),
-                    env: BTreeMap::new(),
-                    termination_grace_seconds: 0,
+                    env: worker_job_env(
+                        &self.paths,
+                        run,
+                        INTEGRATION_REPAIR_SCOPE_ID,
+                        attempt,
+                        Some(launch.ledger.launch_id),
+                        Some(&launch.ledger.output_stem),
+                        &launch.token,
+                    ),
+                    termination_grace_seconds: config.worker_termination_grace_seconds,
                 },
                 cancel,
                 WorkerAttemptContext::new(
                     &run.id,
                     "integration_repair",
-                    "",
+                    INTEGRATION_REPAIR_SCOPE_ID,
                     attempt,
+                    Some(launch.ledger.launch_id),
+                    Some(&launch.ledger.output_stem),
                     config,
                     false,
                 ),
                 &economics,
                 AgentCallContext {
                     phase: "integration_repair",
-                    slice_id: "",
+                    slice_id: INTEGRATION_REPAIR_SCOPE_ID,
                     attempt,
+                    launch_id: Some(launch.ledger.launch_id),
+                    launch_stem: Some(&launch.ledger.output_stem),
                 },
             ) {
                 Ok(result) => result,
                 Err(err) => {
+                    next_repair_base =
+                        gitutil::head_sha(&repair_worktree).unwrap_or(next_repair_base);
+                    let state = if cancel.is_cancelled() {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    };
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        state,
+                        &err.to_string(),
+                    )?;
                     if cancel.is_cancelled() {
                         return Err(CancelledError::new("run cancelled").into());
                     }
@@ -5797,7 +6413,7 @@ impl Manager {
                             AgentLaunchIncidentContext {
                                 run,
                                 phase: "integration_repair",
-                                slice_id: "",
+                                slice_id: INTEGRATION_REPAIR_SCOPE_ID,
                                 attempt,
                                 runner_name: runner.name(),
                                 metadata: &runner_metadata,
@@ -5810,19 +6426,29 @@ impl Manager {
                     continue;
                 }
             };
+            next_repair_base = gitutil::head_sha(&repair_worktree)?;
             let Some(output) = agent_result.output else {
                 last_error = "integration repair returned no JSON output".to_string();
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
                 continue;
             };
             let mut result: RepairResult = match serde_json::from_value(output) {
                 Ok(value) => value,
                 Err(err) => {
                     last_error = err.to_string();
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        "failed",
+                        &last_error,
+                    )?;
                     continue;
                 }
             };
             if let Err(err) = validate_repair_result(&result) {
                 last_error = format!("integration repair JSON failed validation: {err}");
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
                 continue;
             }
             result.trigger = context.trigger.to_string();
@@ -5831,20 +6457,30 @@ impl Manager {
                 .create_repair_candidate_followup_slice_proposals(
                     run,
                     attempt,
-                    &output_path,
+                    &launch.output_path,
                     &mut result,
                 )?;
             let created_finding_proposal = self.create_repair_finding_replan_proposals(
                 run,
                 attempt,
-                &output_path,
+                &launch.output_path,
                 &mut result,
             )?;
-            artifact::write_json(&output_path, &result)?;
+            artifact::write_json(&launch.output_path, &result)?;
             if created_candidate_proposal || created_finding_proposal {
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    "integration repair requires an operator replan decision",
+                )?;
                 self.block_if_pending_replan(run, "integration repair follow-up proposal")?;
             }
             if result.status == "blocked" {
+                self.state.finish_worker_attempt(
+                    launch.ledger.launch_id,
+                    "failed",
+                    &result.summary,
+                )?;
                 return Err(BlockedError::new(format!(
                     "integration repair blocked: {}",
                     result.summary
@@ -5853,30 +6489,42 @@ impl Manager {
             }
             if result.status == "failed" {
                 last_error = result.summary.clone();
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
                 continue;
             }
-            let status = match gitutil::status_porcelain(integration_worktree) {
+            let status = match gitutil::status_porcelain(&repair_worktree) {
                 Ok(status) => status,
                 Err(err) => {
                     last_error = err.to_string();
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        "failed",
+                        &last_error,
+                    )?;
                     continue;
                 }
             };
             if !status.trim().is_empty() {
                 last_error = "integration repair left uncommitted changes".to_string();
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
                 continue;
             }
-            if result.commit_sha.is_empty()
-                && result.status == "fixed"
-                && let Ok(head) = gitutil::head_sha(integration_worktree)
-            {
-                result.commit_sha = head;
+            let repair_head = gitutil::head_sha(&repair_worktree)?;
+            if result.status == "no-op" && repair_head != integration_repair_base {
+                last_error = "integration repair reported no-op after creating commits".to_string();
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
+                continue;
             }
             if result.status == "fixed" {
-                let repair_head = gitutil::head_sha(integration_worktree).unwrap_or_default();
+                if result.commit_sha.is_empty() {
+                    result.commit_sha = repair_head.clone();
+                }
                 let unauthorized = repair_authority_violations(
-                    integration_worktree,
-                    &repair_base,
+                    &repair_worktree,
+                    &integration_repair_base,
                     &repair_head,
                     slices,
                 )?;
@@ -5884,8 +6532,8 @@ impl Manager {
                     let proposal_id = self.create_repair_authority_proposal(
                         run,
                         attempt,
-                        &output_path,
-                        &repair_base,
+                        &launch.output_path,
+                        &integration_repair_base,
                         &repair_head,
                         &unauthorized,
                         &result,
@@ -5911,18 +6559,42 @@ impl Manager {
                             unauthorized.join(", ")
                         ),
                     });
-                    artifact::write_json(&output_path, &result)?;
-                    gitutil::run(integration_worktree, &["reset", "--hard", &repair_base])?;
+                    artifact::write_json(&launch.output_path, &result)?;
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        "failed",
+                        "integration repair exceeded its authorized areas",
+                    )?;
                     self.block_if_pending_replan(run, "integration repair authority proposal")?;
                 }
+                if let Err(err) = gitutil::merge(
+                    integration_worktree,
+                    &launch.ledger.branch,
+                    &format!(
+                        "khazad(integration-repair): merge launch {}",
+                        launch.ledger.launch_id
+                    ),
+                ) {
+                    let _ = gitutil::merge_abort(integration_worktree);
+                    last_error = format!("integration repair merge failed: {err}");
+                    self.state.finish_worker_attempt(
+                        launch.ledger.launch_id,
+                        "failed",
+                        &last_error,
+                    )?;
+                    return Err(BlockedError::new(last_error).into());
+                }
             }
-            artifact::write_json(&output_path, &result)?;
+            artifact::write_json(&launch.output_path, &result)?;
+            self.state
+                .finish_worker_attempt(launch.ledger.launch_id, "succeeded", "")?;
             self.state.record_event(
                 &run.id,
                 workflow_events::INTEGRATION_REPAIR_COMPLETED,
                 &workflow_events::IntegrationRepairCompletedPayload::new(
                     &result.status,
                     &result.summary,
+                    launch.ledger.launch_id,
                 ),
             )?;
             return Ok(result);
@@ -5981,13 +6653,20 @@ impl Manager {
             && gitutil::has_retained_completion_publication_journal(&integration)?
         {
             let mut errors = Vec::new();
+            for path in discover_run_worktrees(&root)? {
+                if path != integration
+                    && let Err(err) = gitutil::worktree_remove(&run.repo_path, &path)
+                {
+                    errors.push(format!("{}: {err:#}", path.display()));
+                }
+            }
             for entry in std::fs::read_dir(&root)? {
                 let path = entry?.path();
                 if path == integration {
                     continue;
                 }
                 let removal = if path.is_dir() {
-                    gitutil::worktree_remove(&run.repo_path, &path)
+                    std::fs::remove_dir_all(&path).map_err(anyhow::Error::from)
                 } else {
                     std::fs::remove_file(&path).map_err(anyhow::Error::from)
                 };
@@ -6041,9 +6720,9 @@ impl Manager {
         if !root.exists() {
             return Ok(());
         }
-        for entry in std::fs::read_dir(&root)? {
-            let path = entry?.path();
-            if path.is_dir() && gitutil::has_retained_completion_publication_journal(&path)? {
+        let worktrees = discover_run_worktrees(&root)?;
+        for path in &worktrees {
+            if gitutil::has_retained_completion_publication_journal(path)? {
                 bail!(
                     "retained completion publication recovery journal prevents worktree cleanup: {}",
                     path.display()
@@ -6051,12 +6730,7 @@ impl Manager {
             }
         }
         let mut errors = Vec::new();
-        for entry in std::fs::read_dir(&root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
+        for path in worktrees {
             if let Err(err) = gitutil::worktree_remove(&run.repo_path, &path) {
                 errors.push(format!("{}: {err}", path.display()));
             }
@@ -6422,6 +7096,30 @@ fn terminal_next_commands(run: &Run, status: RunStatus) -> Vec<String> {
     }
 }
 
+fn discover_run_worktrees(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut worktrees = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if path.join(".git").exists() {
+                worktrees.push(path);
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+    worktrees.sort();
+    Ok(worktrees)
+}
+
 fn git_output_or_empty(worktree: &Path, args: &[&str]) -> String {
     gitutil::run(worktree, args).unwrap_or_default()
 }
@@ -6680,22 +7378,39 @@ fn skipped_repair_result(policy: RepairPolicy, gate: &GateResult) -> RepairResul
     }
 }
 
+/// Reads immutable ledger evidence first. Ordinal-named output is retained only as a
+/// compatibility fallback for runs created before the CA-03 launch ledger existed.
 fn read_worker_result(
+    state: &StateStore,
     store: &artifact::Store,
     run_id: &str,
     slice_run: &SliceRun,
 ) -> Option<WorkerResult> {
-    if slice_run.attempts == 0 {
-        return None;
-    }
-    artifact::read_json(store.output_path(
-        run_id,
-        &format!(
-            "{}.worker.attempt-{}.json",
-            slice_run.slice_id, slice_run.attempts
-        ),
-    ))
-    .ok()
+    let ledger_result = state
+        .list_worker_attempt_ledger(run_id, &slice_run.slice_id)
+        .ok()
+        .and_then(|attempts| {
+            attempts.into_iter().rev().find_map(|attempt| {
+                artifact::read_json(
+                    store.output_path(run_id, &format!("{}.json", attempt.output_stem)),
+                )
+                .ok()
+            })
+        });
+    ledger_result.or_else(|| {
+        (slice_run.attempts > 0)
+            .then(|| {
+                artifact::read_json(store.output_path(
+                    run_id,
+                    &format!(
+                        "{}.worker.attempt-{}.json",
+                        slice_run.slice_id, slice_run.attempts
+                    ),
+                ))
+                .ok()
+            })
+            .flatten()
+    })
 }
 
 fn existing_completion_publication(
@@ -7232,6 +7947,13 @@ impl ActiveRuns {
         self.count.fetch_sub(1, Ordering::SeqCst);
     }
 
+    fn contains(&self, run_id: &str) -> bool {
+        self.tokens
+            .lock()
+            .expect("active runs mutex poisoned")
+            .contains_key(run_id)
+    }
+
     fn cancel(&self, run_id: &str) -> bool {
         let token = self
             .tokens
@@ -7723,8 +8445,8 @@ fn run_preflight_native_pi_tui_worker(run: &Run) -> bool {
         .unwrap_or(false)
 }
 
-fn tui_worker_session_name(run_id: &str, slice_id: &str, attempt: usize) -> String {
-    format!("kd-tui-{run_id}-{slice_id}-attempt-{attempt}")
+fn tui_worker_session_name(run_id: &str, slice_id: &str, launch_identity: usize) -> String {
+    format!("kd-tui-{run_id}-{slice_id}-launch-{launch_identity}")
 }
 
 fn wait_for_pi_tui_worker_result(
@@ -7764,18 +8486,31 @@ fn worker_job_env(
     run: &Run,
     slice_id: &str,
     attempt: usize,
+    launch_id: Option<i64>,
+    launch_stem: Option<&str>,
     token: &str,
 ) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut env = BTreeMap::from([
         (
             "KHAZAD_DAEMON_SOCKET".to_string(),
             paths.socket().to_string_lossy().to_string(),
         ),
         ("KHAZAD_RUN_ID".to_string(), run.id.clone()),
         ("KHAZAD_SLICE_ID".to_string(), slice_id.to_string()),
+        // This is the established worker-wire retry ordinal.  Immutable
+        // daemon launch identity travels separately below, so existing workers
+        // and their ask_operator payloads remain protocol-compatible.
         ("KHAZAD_ATTEMPT".to_string(), attempt.to_string()),
+        ("KHAZAD_RETRY_ORDINAL".to_string(), attempt.to_string()),
         ("KHAZAD_WORKER_TOKEN".to_string(), token.to_string()),
-    ])
+    ]);
+    if let Some(launch_id) = launch_id {
+        env.insert("KHAZAD_LAUNCH_ID".to_string(), launch_id.to_string());
+    }
+    if let Some(launch_stem) = launch_stem {
+        env.insert("KHAZAD_LAUNCH_STEM".to_string(), launch_stem.to_string());
+    }
+    env
 }
 
 fn classify_run_failure(err: &anyhow::Error) -> RunStatus {
@@ -7810,12 +8545,14 @@ impl Error for BlockedError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCallContext, MAX_WORKER_ATTEMPTS, Manager, RepairPolicy, ResumeOptions,
-        RunEconomicsRecorder, RunReadModelBuilder, RunReadModelOptions, StartOptions,
-        WorkerAttemptContext, check_failure_needs_operator, existing_completion_publication,
-        queue_snapshot_hash, repair_authority_violations, selected_slice_ids,
-        should_run_integration_repair, validate_followup_slice_draft, validate_mission_envelope,
-        validate_repair_result, validate_worker_result, worker_attempt_retry_disposition,
+        AgentCallContext, DEFAULT_REPAIR_ATTEMPTS, DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS,
+        INTEGRATION_REPAIR_SCOPE_ID, IntegrationRepairContext, MAX_WORKER_ATTEMPTS, Manager,
+        RepairPolicy, ResumeOptions, RunEconomicsRecorder, RunReadModelBuilder,
+        RunReadModelOptions, StartOptions, VerificationCommandCache, WorkerAttemptContext,
+        check_failure_needs_operator, existing_completion_publication, queue_snapshot_hash,
+        repair_authority_violations, selected_slice_ids, should_run_integration_repair,
+        validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
+        validate_worker_result, worker_attempt_retry_disposition,
     };
     use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
     use crate::artifact::{self, Store as ArtifactStore};
@@ -7899,6 +8636,7 @@ mod tests {
             economics: RunEconomics::default(),
             plan_revisions: crate::domain::PlanRevisions::default(),
             worker_questions: Vec::new(),
+            worker_attempts: Vec::new(),
             created_at: Utc::now(),
         };
         store.write_implementation_summary(&summary)?;
@@ -8009,6 +8747,42 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[derive(Default)]
+    struct BudgetExhaustingRunner {
+        calls: AtomicUsize,
+    }
+
+    impl Runner for BudgetExhaustingRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            fs::write(job.cwd.join("slice-001.txt"), "blocked\n")?;
+            gitutil::run(&job.cwd, &["add", "-A"])?;
+            gitutil::run(&job.cwd, &["commit", "-m", "consume final worker retry"])?;
+            let mut output = valid_worker_output(&handoff, &job.cwd)?;
+            output["status"] = json!("blocked");
+            output["summary"] = json!("operator grant required");
+            Ok(ResultData {
+                output: Some(output),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "retry-budget-test"
+        }
     }
 
     struct OperatorPauseRunner {
@@ -8126,6 +8900,8 @@ mod tests {
             "worker",
             "slice-001",
             1,
+            None,
+            None,
             &WorkflowConfig {
                 worker_attempt_timeout_seconds: 0,
                 ..WorkflowConfig::default()
@@ -8152,6 +8928,8 @@ mod tests {
                 phase: "worker",
                 slice_id: "slice-001",
                 attempt: 1,
+                launch_id: None,
+                launch_stem: None,
             },
         );
         if fail {
@@ -8161,6 +8939,186 @@ mod tests {
             outcome?;
         }
         Ok(economics.snapshot())
+    }
+
+    #[test]
+    fn cockpit_identity_prefers_the_immutable_launch_over_retry_ordinal() {
+        let config = WorkflowConfig::default();
+        let modern = WorkerAttemptContext::new(
+            "run-cockpit-identity",
+            "worker",
+            "slice-001",
+            1,
+            Some(41),
+            Some("slice-001.launch-41"),
+            &config,
+            false,
+        );
+        let legacy = WorkerAttemptContext::new(
+            "run-cockpit-identity",
+            "worker",
+            "slice-001",
+            3,
+            None,
+            None,
+            &config,
+            false,
+        );
+
+        assert_eq!(modern.cockpit_launch_identity(), 41);
+        assert_eq!(legacy.cockpit_launch_identity(), 3);
+    }
+
+    #[test]
+    fn supervised_worker_uses_configured_process_termination_grace() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-worker-grace", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let manager = Manager::new(paths, state);
+        let context = WorkerAttemptContext::new(
+            &run.id,
+            "worker",
+            "slice-001",
+            1,
+            None,
+            None,
+            &WorkflowConfig {
+                worker_attempt_timeout_seconds: 0,
+                worker_termination_grace_seconds: 7,
+                ..WorkflowConfig::default()
+            },
+            false,
+        );
+        let observed_grace = Arc::new(AtomicUsize::new(0));
+        let capture = observed_grace.clone();
+        let outcome = manager.run_supervised_worker_job_with(
+            Job {
+                kind: "worker".to_string(),
+                prompt: String::new(),
+                cwd: repo.path().to_path_buf(),
+                json_schema: String::new(),
+                env: BTreeMap::new(),
+                termination_grace_seconds: 0,
+            },
+            &CancellationToken::new(),
+            context,
+            move |job, _cancel, _events| {
+                capture.store(job.termination_grace_seconds as usize, Ordering::SeqCst);
+                Ok(ResultData {
+                    output: None,
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                })
+            },
+        );
+
+        outcome.result?;
+        assert_eq!(observed_grace.load(Ordering::SeqCst), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_launch_question_does_not_pause_current_launch_economics() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-stale-launch-pause", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let root = paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let first = state.allocate_worker_attempt(
+            &run.id,
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "slice-worker",
+            &root,
+        )?;
+        state.mark_worker_attempt_launched(first.launch_id)?;
+        state.open_active_worker_question_with_launch_id_and_recommendation(
+            "q-stale-launch-pause",
+            &run.id,
+            "slice-001",
+            1,
+            Some(first.launch_id),
+            "Choose?",
+            &["A".to_string(), "B".to_string()],
+            60,
+            &WorkerQuestionRecommendation::default(),
+            "worker_question_asked",
+            |question| Ok(json!({ "question_id": question.id })),
+            "awaiting operator answer",
+        )?;
+        state.finish_worker_attempt(first.launch_id, "interrupted", "superseded")?;
+        let second = state.allocate_worker_attempt(
+            &run.id,
+            "slice-001",
+            2,
+            1,
+            0,
+            0,
+            "slice-worker",
+            &root,
+        )?;
+        state.mark_worker_attempt_launched(second.launch_id)?;
+        let manager = Manager::new(paths, state);
+        let context = WorkerAttemptContext::new(
+            &run.id,
+            "worker",
+            "slice-001",
+            1,
+            Some(second.launch_id),
+            Some(&second.output_stem),
+            &WorkflowConfig {
+                worker_attempt_timeout_seconds: 0,
+                ..WorkflowConfig::default()
+            },
+            false,
+        );
+        let economics = RunEconomicsRecorder::new("test", true, 1, 0);
+        manager.run_recorded_agent_job(
+            Arc::new(OperatorPauseRunner { fail: false }),
+            Job {
+                kind: "worker".to_string(),
+                prompt: String::new(),
+                cwd: repo.path().to_path_buf(),
+                json_schema: String::new(),
+                env: BTreeMap::new(),
+                termination_grace_seconds: 0,
+            },
+            &CancellationToken::new(),
+            context,
+            &economics,
+            AgentCallContext {
+                phase: "worker",
+                slice_id: "slice-001",
+                attempt: 1,
+                launch_id: Some(second.launch_id),
+                launch_stem: Some(&second.output_stem),
+            },
+        )?;
+
+        let snapshot = economics.snapshot();
+        assert_eq!(snapshot.agent_calls.len(), 1);
+        assert!(
+            snapshot.agent_calls[0].operator_pause_ms < 100,
+            "a stale launch question must not pause the current launch: {}ms",
+            snapshot.agent_calls[0].operator_pause_ms
+        );
+        Ok(())
     }
 
     #[test]
@@ -10004,7 +10962,29 @@ mod tests {
             attempts: 0,
             last_error: String::new(),
         })?;
-        fs::create_dir_all(paths.repo_worktree_dir(&repo_id, &run_id))?;
+        let worktree_root = paths.repo_worktree_dir(&repo_id, &run_id);
+        let allocated = state.allocate_worker_attempt(
+            &run_id,
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "slice-worker",
+            &worktree_root,
+        )?;
+        let running = state.allocate_worker_attempt(
+            &run_id,
+            "slice-002",
+            1,
+            1,
+            0,
+            0,
+            "slice-worker",
+            &worktree_root,
+        )?;
+        state.mark_worker_attempt_launched(running.launch_id)?;
+        fs::create_dir_all(&worktree_root)?;
         let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
 
         assert_eq!(manager.recover_interrupted_runs()?, 1);
@@ -10012,9 +10992,19 @@ mod tests {
         let recovered = state.get_run(&run_id)?.expect("run exists");
         assert_eq!(recovered.status, RunStatus::Interrupted);
         let slice_runs = state.get_slice_runs(&run_id)?;
-        assert_eq!(slice_runs[0].status, SliceStatus::Interrupted);
+        assert!(
+            slice_runs
+                .iter()
+                .all(|slice_run| slice_run.status == SliceStatus::Interrupted)
+        );
+        for launch in [allocated, running] {
+            let ledger = state.list_worker_attempt_ledger(&run_id, &launch.slice_id)?;
+            assert_eq!(ledger[0].state, "interrupted");
+            assert!(ledger[0].finished_at.is_some());
+            assert!(ledger[0].failure_cause.contains("daemon restarted"));
+        }
         assert!(!paths.repo_worktree_dir(&repo_id, &run_id).exists());
-        let events = state.get_events(&run_id, 20)?;
+        let events = state.get_events(&run_id, 30)?;
         assert!(
             events
                 .iter()
@@ -11150,6 +12140,10 @@ mod tests {
         let implementation_summary: serde_json::Value =
             artifact::read_json(store.output_path(&run.id, "implementation-summary.json"))?;
         for report in [&final_report, &implementation_summary] {
+            let attempts = report["worker_attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert!(attempts[0]["launch_id"].as_i64().unwrap() > 0);
+            assert_eq!(attempts[0]["kind"], "slice-worker");
             let revisions = &report["plan_revisions"];
             assert_eq!(revisions["source_of_truth"], "daemon_replan_proposals");
             assert_eq!(revisions["unresolved_pending_blocks_handoff"], false);
@@ -11185,8 +12179,12 @@ mod tests {
             );
         }
 
-        let worker_handoff: serde_json::Value =
-            artifact::read_json(store.handoff_dir(&run.id).join("slice-001.json"))?;
+        let worker_launches = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        let worker_handoff: serde_json::Value = artifact::read_json(
+            store
+                .handoff_dir(&run.id)
+                .join(format!("{}.json", worker_launches[0].output_stem)),
+        )?;
         assert_eq!(
             worker_handoff["plan_revisions"]["source_of_truth"],
             "daemon_replan_proposals"
@@ -11757,6 +12755,64 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_and_cleanup_include_nested_launch_worktrees() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("kd-nested-worktrees", repo.path(), "slice-001")?;
+        let root = paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let first = root.join("slice-001/launch-1");
+        let second = root.join("slice-001/launch-2");
+        let integration = root.join("integration");
+        gitutil::worktree_add(
+            repo.path(),
+            &first,
+            "khazad/kd-nested-worktrees/slice-001/launch-1",
+            &run.base_sha,
+        )?;
+        gitutil::worktree_add(
+            repo.path(),
+            &second,
+            "khazad/kd-nested-worktrees/slice-001/launch-2",
+            &run.base_sha,
+        )?;
+        gitutil::worktree_add(
+            repo.path(),
+            &integration,
+            "khazad/kd-nested-worktrees/integration",
+            &run.base_sha,
+        )?;
+        let manager = Manager::new(paths, state);
+
+        let snapshot_paths = manager
+            .run_worktree_snapshots(&run)
+            .into_iter()
+            .filter_map(|snapshot| snapshot["path"].as_str().map(str::to_string))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            snapshot_paths,
+            [
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+                integration.to_string_lossy().to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        manager.cleanup_run_worktrees(&run)?;
+        assert!(!root.exists());
+        let worktree_list = gitutil::run(repo.path(), &["worktree", "list", "--porcelain"])?;
+        assert!(!worktree_list.contains("kd-nested-worktrees"));
+        Ok(())
+    }
+
+    #[test]
     fn terminal_cleanup_preserves_retained_publication_recovery_journal() -> Result<()> {
         let repo = tempfile::tempdir()?;
         init_git_repo(repo.path())?;
@@ -11863,6 +12919,175 @@ mod tests {
         assert!(gitutil::has_retained_completion_publication_journal(
             &integration
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn two_resumes_preserve_launch_evidence_and_do_not_reset_retry_budget() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        store.ensure_run_dirs("kd-two-resumes")?;
+        let mut test_slice = slice("slice-001");
+        test_slice.areas = vec!["slice-001.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &test_slice)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add retry budget slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let mut run = test_run("kd-two-resumes", repo.path(), "slice-001")?;
+        gitutil::run(
+            repo.path(),
+            &["branch", &run.integration_branch, &run.base_sha],
+        )?;
+        state.insert_run(&run)?;
+        let worktree_root = paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let first = state.allocate_worker_attempt(
+            &run.id,
+            "slice-001",
+            1,
+            1,
+            0,
+            0,
+            "slice-worker",
+            &worktree_root,
+        )?;
+        state.mark_worker_attempt_launched(first.launch_id)?;
+        state.observe_worker_attempt(
+            &run.id,
+            "worker_running",
+            "slice-001",
+            1,
+            Some(first.launch_id),
+            Some(101),
+            "stdout",
+            r#"{"type":"tool_execution_end","toolName":"first-immutable-activity"}"#,
+            30,
+            10,
+        )?;
+        state.finish_worker_attempt(first.launch_id, "failed", "first failure")?;
+        let second = state.allocate_worker_attempt(
+            &run.id,
+            "slice-001",
+            1,
+            2,
+            0,
+            0,
+            "slice-worker",
+            &worktree_root,
+        )?;
+        state.mark_worker_attempt_launched(second.launch_id)?;
+        state.observe_worker_attempt(
+            &run.id,
+            "worker_running",
+            "slice-001",
+            2,
+            Some(second.launch_id),
+            Some(202),
+            "stdout",
+            r#"{"type":"tool_execution_end","toolName":"second-immutable-activity"}"#,
+            30,
+            10,
+        )?;
+        state.finish_worker_attempt(second.launch_id, "failed", "second failure")?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Failed,
+            branch: second.branch.clone(),
+            commit_sha: String::new(),
+            attempts: 2,
+            last_error: "second failure".to_string(),
+        })?;
+        state.update_run(&run.id, RunStatus::Failed, "second failure")?;
+        run.status = RunStatus::Failed;
+        let first_evidence = store.output_path(&run.id, &format!("{}.json", first.output_stem));
+        let second_evidence = store.output_path(&run.id, &format!("{}.json", second.output_stem));
+        fs::write(&first_evidence, b"first immutable worker result\n")?;
+        fs::write(&second_evidence, b"second immutable worker result\n")?;
+        let first_raw_output = store
+            .pi_wrapper_artifacts_for_output_path(&first_evidence)?
+            .stdout_path;
+        let second_raw_output = store
+            .pi_wrapper_artifacts_for_output_path(&second_evidence)?
+            .stdout_path;
+        fs::write(&first_raw_output, b"first immutable raw output\n")?;
+        fs::write(&second_raw_output, b"second immutable raw output\n")?;
+        let before_resumes = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        assert_eq!(before_resumes.len(), 2);
+        assert_eq!(
+            before_resumes[0]
+                .activity
+                .as_ref()
+                .map(|activity| activity.last_semantic_progress_summary.as_str()),
+            Some("tool first-immutable-activity finished")
+        );
+        assert_eq!(before_resumes[0].failure_cause, "first failure");
+        assert_eq!(before_resumes[1].failure_cause, "second failure");
+
+        let runner = Arc::new(BudgetExhaustingRunner::default());
+        let manager = Manager::with_runner(paths, state.clone(), runner.clone());
+        manager.resume_run(ResumeOptions {
+            run_id: run.id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+        })?;
+        let first_resume = wait_for_run(&state, &run.id)?;
+        assert_eq!(first_resume.status, RunStatus::Blocked);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+        let after_first_resume = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        assert_eq!(after_first_resume.len(), 3);
+        assert_eq!(&after_first_resume[..2], before_resumes.as_slice());
+        assert_eq!(after_first_resume[2].worker_retry_ordinal, 3);
+
+        manager.resume_run(ResumeOptions {
+            run_id: run.id.clone(),
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+        })?;
+        let second_resume = wait_for_run(&state, &run.id)?;
+        assert_eq!(second_resume.status, RunStatus::Failed);
+        assert!(second_resume.error.contains("retry budget exhausted"));
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+        let after_second_resume = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        assert_eq!(after_second_resume, after_first_resume);
+        assert_eq!(
+            fs::read(&first_evidence)?,
+            b"first immutable worker result\n"
+        );
+        assert_eq!(
+            fs::read(&second_evidence)?,
+            b"second immutable worker result\n"
+        );
+        assert_eq!(
+            fs::read(&first_raw_output)?,
+            b"first immutable raw output\n"
+        );
+        assert_eq!(
+            fs::read(&second_raw_output)?,
+            b"second immutable raw output\n"
+        );
+        assert_eq!(state.current_run_execution_epoch(&run.id)?, 3);
+        assert_eq!(
+            state
+                .get_events(&run.id, 500)?
+                .iter()
+                .filter(|event| event.typ == "run_resumed")
+                .count(),
+            2
+        );
         Ok(())
     }
 
@@ -12054,8 +13279,10 @@ mod tests {
         let slice_runs = state.get_slice_runs(&run.id)?;
         assert_eq!(slice_runs[0].attempts, 1);
         assert_eq!(slice_runs[0].status, SliceStatus::Blocked);
-        let check: CheckResult =
-            artifact::read_json(store.output_path(&run.id, "slice-001.check.attempt-1.json"))?;
+        let launches = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        let check: CheckResult = artifact::read_json(
+            store.output_path(&run.id, &format!("{}.check.json", launches[0].output_stem)),
+        )?;
         assert_eq!(check.failure_kind, "tool_missing");
         assert_eq!(check.findings[0].action, "operator-fix");
         let run_summary: serde_json::Value =
@@ -12482,8 +13709,10 @@ mod tests {
             failed.error
         );
         assert!(failed.error.contains("slice-001.txt"));
-        let check: CheckResult =
-            artifact::read_json(store.output_path(&run.id, "slice-001.check.attempt-1.json"))?;
+        let launches = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        let check: CheckResult = artifact::read_json(
+            store.output_path(&run.id, &format!("{}.check.json", launches[0].output_stem)),
+        )?;
         assert_eq!(check.failure_kind, "scope_violation");
         Ok(())
     }
@@ -12593,6 +13822,247 @@ mod tests {
         assert_eq!(summary.economics.repair_policy, "always");
         assert_eq!(summary.economics.repair_attempts, 1);
         assert!(summary.economics.cache_hits >= 1);
+        let repair_launches =
+            state.list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?;
+        assert_eq!(repair_launches.len(), 1);
+        let repair_launch = &repair_launches[0];
+        assert_eq!(repair_launch.kind, "integration-repair");
+        assert_eq!(repair_launch.worker_retry_ordinal, 0);
+        assert_eq!(repair_launch.repair_ordinal, 1);
+        assert_eq!(repair_launch.envelope_retry_ordinal, 0);
+        assert_eq!(repair_launch.state, "succeeded");
+        assert!(
+            store
+                .output_path(&run.id, &format!("{}.json", repair_launch.output_stem))
+                .is_file()
+        );
+        assert!(!Path::new(&repair_launch.worktree).exists());
+        assert!(summary.worker_attempts.iter().any(|attempt| {
+            attempt.launch_id == repair_launch.launch_id
+                && attempt.slice_id == INTEGRATION_REPAIR_SCOPE_ID
+        }));
+        assert!(
+            state
+                .get_slice_runs(&run.id)?
+                .iter()
+                .all(|slice_run| slice_run.slice_id != INTEGRATION_REPAIR_SCOPE_ID)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_does_not_reset_its_persisted_budget() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-persisted-integration-repair", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let retained = state.allocate_run_worker_attempt(
+            &run.id,
+            INTEGRATION_REPAIR_SCOPE_ID,
+            1,
+            0,
+            DEFAULT_REPAIR_ATTEMPTS,
+            0,
+            "integration-repair",
+            repo.path(),
+        )?;
+        state.mark_worker_attempt_launched(retained.launch_id)?;
+        state.finish_worker_attempt(
+            retained.launch_id,
+            "interrupted",
+            "daemon restarted after repair launch",
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let slices = vec![slice("slice-001")];
+        let gate = GateResult {
+            status: "failed".to_string(),
+            summary: "gate still fails".to_string(),
+            ..GateResult::default()
+        };
+        let config = WorkflowConfig::default();
+        let economics = RunEconomicsRecorder::new("auto", true, 1, DEFAULT_REPAIR_ATTEMPTS);
+        let cache = VerificationCommandCache::default();
+        let cancel = CancellationToken::new();
+
+        let error = manager
+            .integration_repair(IntegrationRepairContext {
+                run: &run,
+                slices: &slices,
+                integration_worktree: repo.path(),
+                checks: &[],
+                gate_failure: &gate,
+                trigger: "gate_failed",
+                cancel: &cancel,
+                runner: Arc::new(FakeRunner),
+                config: &config,
+                economics,
+                verification_cache: &cache,
+            })
+            .expect_err("a persisted repair launch must consume the retry budget");
+
+        assert!(
+            error.to_string().contains("repair budget exhausted"),
+            "unexpected error: {error:#}"
+        );
+        let launches = state.list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?;
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].launch_id, retained.launch_id);
+        assert_eq!(launches[0].repair_ordinal, DEFAULT_REPAIR_ATTEMPTS);
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_reuses_a_persisted_success_before_rerunning_the_gate() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let artifacts = ArtifactStore::new(repo.path());
+        artifacts.ensure_layout()?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-reuse-integration-repair", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let retained = state.allocate_run_worker_attempt(
+            &run.id,
+            INTEGRATION_REPAIR_SCOPE_ID,
+            1,
+            0,
+            1,
+            0,
+            "integration-repair",
+            repo.path(),
+        )?;
+        state.mark_worker_attempt_launched(retained.launch_id)?;
+        let prior_result = RepairResult {
+            status: "no-op".to_string(),
+            summary: "persisted repair already completed".to_string(),
+            trigger: "policy_always_gate_passed".to_string(),
+            attempts: 1,
+            ..RepairResult::default()
+        };
+        artifact::write_json(
+            artifacts.output_path(&run.id, &format!("{}.json", retained.output_stem)),
+            &prior_result,
+        )?;
+        state.finish_worker_attempt(retained.launch_id, "succeeded", "")?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let slices = vec![slice("slice-001")];
+        let gate = GateResult {
+            status: "passed".to_string(),
+            summary: "gate passed before the interrupted rerun".to_string(),
+            ..GateResult::default()
+        };
+        let config = WorkflowConfig::default();
+        let economics = RunEconomicsRecorder::new("always", true, 1, DEFAULT_REPAIR_ATTEMPTS);
+        let cache = VerificationCommandCache::default();
+        let cancel = CancellationToken::new();
+
+        let reused = manager.integration_repair(IntegrationRepairContext {
+            run: &run,
+            slices: &slices,
+            integration_worktree: repo.path(),
+            checks: &[],
+            gate_failure: &gate,
+            trigger: "policy_always_gate_passed",
+            cancel: &cancel,
+            runner: Arc::new(FakeRunner),
+            config: &config,
+            economics: economics.clone(),
+            verification_cache: &cache,
+        })?;
+
+        assert_eq!(reused.status, prior_result.status);
+        assert_eq!(reused.summary, prior_result.summary);
+        assert_eq!(reused.attempts, prior_result.attempts);
+        assert_eq!(economics.snapshot().repair_attempts, 1);
+        let launches = state.list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?;
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].launch_id, retained.launch_id);
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_launch_merges_its_retained_branch_before_gate_rerun() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut config = WorkflowConfig::default();
+        config.verify_profiles.insert(
+            "repair-test".to_string(),
+            VerifyProfile {
+                commands: vec![VerifyCommand {
+                    command: "test \"$(cat integration-fix.txt 2>/dev/null)\" = fixed".to_string(),
+                    ..VerifyCommand::default()
+                }],
+            },
+        );
+        artifact::write_json(store.config_path(), &config)?;
+        let mut first = slice("slice-001");
+        first.areas = vec![
+            "slice-001.txt".to_string(),
+            "integration-fix.txt".to_string(),
+        ];
+        first.verify = vec!["test -f slice-001.txt".to_string()];
+        first.verify_profile = "repair-test".to_string();
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &first)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(
+            repo.path(),
+            &["commit", "-m", "add integration repair fixture"],
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(IntegrationFixRunner));
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+            mission_envelope: None,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(
+            completed.status,
+            RunStatus::Completed,
+            "unexpected failure: {}",
+            completed.error
+        );
+        let launches = state.list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?;
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].state, "succeeded");
+        gitutil::run(
+            repo.path(),
+            &[
+                "show",
+                &format!("{}:integration-fix.txt", completed.integration_branch),
+            ],
+        )?;
+        let summary: ImplementationSummary =
+            artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
+        assert_eq!(summary.integration_repair.status, "fixed");
+        assert_eq!(summary.integration_gate.status, "passed");
         Ok(())
     }
 
@@ -12707,7 +14177,7 @@ mod tests {
         assert_eq!(slice_runs.len(), 1);
         assert_eq!(slice_runs[0].slice_id, "slice-002");
         assert_eq!(slice_runs[0].status, SliceStatus::Merged);
-        let events = state.get_events(&run.id, 20)?;
+        let events = state.get_events(&run.id, 200)?;
         let started = events
             .iter()
             .find(|event| event.typ == "run_started")
@@ -13003,19 +14473,84 @@ mod tests {
         let slice_runs = state.get_slice_runs(&run.id)?;
         assert_eq!(slice_runs[0].status, SliceStatus::Merged);
         assert_eq!(slice_runs[0].attempts, 3);
+        let worker_attempts = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        assert_eq!(worker_attempts.len(), 5);
+        assert_eq!(
+            worker_attempts
+                .iter()
+                .map(|launch| (
+                    launch.worker_retry_ordinal,
+                    launch.repair_ordinal,
+                    launch.envelope_retry_ordinal,
+                    launch.kind.as_str(),
+                    launch.state.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 0, 0, "slice-worker", "failed"),
+                (1, 0, 1, "slice-envelope-retry", "failed"),
+                (2, 0, 0, "slice-worker", "failed"),
+                (3, 0, 0, "slice-worker", "failed"),
+                (3, 1, 0, "slice-repair", "succeeded"),
+            ]
+        );
+        assert_eq!(
+            worker_attempts
+                .iter()
+                .map(|launch| launch.launch_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            worker_attempts.len()
+        );
+        assert_eq!(
+            worker_attempts
+                .iter()
+                .map(|launch| launch.branch.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            worker_attempts.len()
+        );
+        assert_eq!(
+            worker_attempts
+                .iter()
+                .map(|launch| launch.worktree.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            worker_attempts.len()
+        );
+        assert_eq!(
+            worker_attempts
+                .iter()
+                .map(|launch| launch.output_stem.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            worker_attempts.len()
+        );
+        assert!(worker_attempts.iter().all(|launch| {
+            store
+                .handoff_dir(&run.id)
+                .join(format!("{}.json", launch.output_stem))
+                .exists()
+        }));
         assert!(
             store
-                .output_path(&run.id, "slice-001.worker.attempt-1.invalid-output.json")
+                .output_path(
+                    &run.id,
+                    &format!("{}.invalid-output.json", worker_attempts[0].output_stem),
+                )
                 .exists()
         );
         assert!(
             store
-                .output_path(&run.id, "slice-001.worker.attempt-1.envelope-1.json")
+                .output_path(&run.id, &format!("{}.json", worker_attempts[1].output_stem))
                 .exists()
         );
         assert!(
             store
-                .output_path(&run.id, "slice-001.check.attempt-3.slice-repair-1.json")
+                .output_path(
+                    &run.id,
+                    &format!("{}.check.json", worker_attempts[4].output_stem),
+                )
                 .exists()
         );
         let events = state.get_events(&run.id, 500)?;
@@ -13043,6 +14578,93 @@ mod tests {
             event.typ == "slice_repair_completed"
                 && event.payload["status"].as_str() == Some("fixed")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_retries_build_on_the_preceding_retained_retry_branch() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        let mut test_slice = slice("slice-001");
+        test_slice.areas = vec![
+            "initial.txt".to_string(),
+            "retry-1.txt".to_string(),
+            "retry-2.txt".to_string(),
+        ];
+        test_slice.verify =
+            vec!["test -f initial.txt && test -f retry-1.txt && test -f retry-2.txt".to_string()];
+        artifact::write_json(store.slices_dir().join("slice-001.json"), &test_slice)?;
+        gitutil::run(repo.path(), &["add", ".gitignore", ".workflow"])?;
+        gitutil::run(repo.path(), &["commit", "-m", "add iterative retry slice"])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(
+            paths,
+            state.clone(),
+            Arc::new(IterativeEnvelopeRunner::default()),
+        );
+        let run = manager.start_run(StartOptions {
+            repo_path: repo.path().to_path_buf(),
+            slice_ids: vec!["slice-001".to_string()],
+            all: false,
+            agent: "fake".to_string(),
+            pi_bin: String::new(),
+            pi_args: Vec::new(),
+            native_pi_tui_worker: false,
+            parallelism: 1,
+            allow_dirty: false,
+            origin_notification_target: String::new(),
+            mission_envelope: None,
+        })?;
+
+        let completed = wait_for_run(&state, &run.id)?;
+        assert_eq!(
+            completed.status,
+            RunStatus::Completed,
+            "unexpected failure: {}",
+            completed.error
+        );
+        let launches = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        assert_eq!(launches.len(), 3);
+        assert_eq!(launches[1].envelope_retry_ordinal, 1);
+        assert_eq!(launches[2].envelope_retry_ordinal, 2);
+        gitutil::run(
+            repo.path(),
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &launches[1].branch,
+                &launches[2].branch,
+            ],
+        )?;
+        gitutil::run(
+            repo.path(),
+            &["show", &format!("{}:retry-1.txt", launches[2].branch)],
+        )?;
+        gitutil::run(
+            repo.path(),
+            &["show", &format!("{}:retry-2.txt", launches[2].branch)],
+        )?;
+        let success = state
+            .get_events(&run.id, 500)?
+            .into_iter()
+            .find(|event| event.typ == "worker_envelope_retry_succeeded")
+            .expect("successful second envelope retry event");
+        let preceding_invalid_output = store.output_path(
+            &run.id,
+            &format!("{}.envelope-1.invalid-output.json", launches[1].output_stem),
+        );
+        assert_eq!(
+            success.payload["previous_invalid_output"].as_str(),
+            preceding_invalid_output.to_str()
+        );
         Ok(())
     }
 
@@ -13086,11 +14708,33 @@ mod tests {
 
         let failed = wait_for_run(&state, &run.id)?;
         assert_eq!(failed.status, RunStatus::Failed);
+        let worker_attempts = state.list_worker_attempt_ledger(&run.id, "slice-001")?;
+        assert_eq!(
+            worker_attempts.len(),
+            MAX_WORKER_ATTEMPTS * 3,
+            "unexpected failure: {}",
+            failed.error
+        );
+        assert!(
+            worker_attempts
+                .iter()
+                .all(|launch| launch.state == "failed")
+        );
+        let final_launch = worker_attempts
+            .iter()
+            .find(|launch| {
+                launch.worker_retry_ordinal == MAX_WORKER_ATTEMPTS
+                    && launch.envelope_retry_ordinal == DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS
+            })
+            .expect("final envelope retry launch");
         assert!(
             store
                 .output_path(
                     &run.id,
-                    "slice-001.worker.attempt-3.envelope-2.invalid-output.json",
+                    &format!(
+                        "{}.envelope-{}.invalid-output.json",
+                        final_launch.output_stem, DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS
+                    ),
                 )
                 .exists()
         );
@@ -13173,7 +14817,13 @@ mod tests {
                     | RunStatus::Interrupted
             ) && !state.terminal_transition_needs_reconciliation(run_id)?
             {
-                return Ok(run);
+                let cleanup_settled = state.get_events(run_id, 50)?.iter().any(|event| {
+                    event.typ == super::workflow_events::WORKTREES_CLEANED
+                        || event.typ == "worktree_cleanup_error"
+                });
+                if cleanup_settled {
+                    return Ok(run);
+                }
             }
             assert!(Instant::now() < deadline, "run did not finish: {run:?}");
             thread::sleep(Duration::from_millis(50));
@@ -13188,6 +14838,50 @@ mod tests {
         gitutil::run(path, &["add", "README.md"])?;
         gitutil::run(path, &["commit", "-m", "initial"])?;
         Ok(())
+    }
+
+    struct IntegrationFixRunner;
+
+    impl Runner for IntegrationFixRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if job.kind == "integration-repair" {
+                fs::write(job.cwd.join("integration-fix.txt"), "fixed\n")?;
+                gitutil::run(&job.cwd, &["add", "integration-fix.txt"])?;
+                gitutil::run(&job.cwd, &["commit", "-m", "fix integration gate"])?;
+                return Ok(ResultData {
+                    output: Some(json!({
+                        "status": "fixed",
+                        "summary": "added the authorized integration evidence",
+                        "findings": [],
+                        "finding_dispositions": []
+                    })),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            fs::write(job.cwd.join("slice-001.txt"), "implemented\n")?;
+            gitutil::run(&job.cwd, &["add", "slice-001.txt"])?;
+            gitutil::run(&job.cwd, &["commit", "-m", "implement slice"])?;
+            Ok(ResultData {
+                output: Some(valid_worker_output(&handoff, &job.cwd)?),
+                usage: Usage::default(),
+                contract_warnings: Vec::new(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
     }
 
     struct ReadySiblingFailRunner;
@@ -13299,6 +14993,75 @@ mod tests {
                         contract_warnings: Vec::new(),
                     })
                 }
+            }
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[derive(Default)]
+    struct IterativeEnvelopeRunner {
+        envelope_calls: AtomicUsize,
+    }
+
+    impl Runner for IterativeEnvelopeRunner {
+        fn run(
+            &self,
+            job: Job,
+            cancel: CancellationToken,
+            _events: Option<RunnerEventSink>,
+        ) -> Result<ResultData> {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let handoff_path = handoff_path_from_prompt(&job.prompt)?;
+            let handoff: Handoff = artifact::read_json(&handoff_path)?;
+            if job.kind == "slice-worker" {
+                fs::write(job.cwd.join("initial.txt"), "initial\n")?;
+                gitutil::run(&job.cwd, &["add", "-A"])?;
+                gitutil::run(&job.cwd, &["commit", "-m", "initial malformed attempt"])?;
+                return Ok(ResultData {
+                    output: Some(json!({
+                        "slice_id": handoff.slice.id,
+                        "summary": "missing status forces first envelope retry"
+                    })),
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                });
+            }
+            let retry = self.envelope_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            match retry {
+                1 => {
+                    fs::write(job.cwd.join("retry-1.txt"), "first retained retry\n")?;
+                    gitutil::run(&job.cwd, &["add", "-A"])?;
+                    gitutil::run(&job.cwd, &["commit", "-m", "first retained retry"])?;
+                    Ok(ResultData {
+                        output: Some(json!({
+                            "slice_id": handoff.slice.id,
+                            "summary": "still missing status"
+                        })),
+                        usage: Usage::default(),
+                        contract_warnings: Vec::new(),
+                    })
+                }
+                2 => {
+                    if !job.cwd.join("retry-1.txt").is_file() {
+                        anyhow::bail!("second envelope retry lost first retry evidence");
+                    }
+                    fs::write(job.cwd.join("retry-2.txt"), "second iterative retry\n")?;
+                    gitutil::run(&job.cwd, &["add", "-A"])?;
+                    gitutil::run(&job.cwd, &["commit", "-m", "second iterative retry"])?;
+                    let mut output = valid_worker_output(&handoff, &job.cwd)?;
+                    output["changed_files"] = json!(["initial.txt", "retry-1.txt", "retry-2.txt"]);
+                    Ok(ResultData {
+                        output: Some(output),
+                        usage: Usage::default(),
+                        contract_warnings: Vec::new(),
+                    })
+                }
+                _ => anyhow::bail!("unexpected extra envelope retry {retry}"),
             }
         }
 

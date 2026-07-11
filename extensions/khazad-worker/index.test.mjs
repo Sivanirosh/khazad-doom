@@ -248,7 +248,12 @@ test('ask_operator closes the daemon question when the worker-pane prompt is can
 			requests.push(request);
 			if (request.method === 'workerAskOpen') return { question_id: 'q-cancel', state: 'pending' };
 			if (request.method === 'workerQuestionTimeout') {
-				assert.deepEqual(request.params, { run_id: 'kd-run', question_id: 'q-cancel', token: 'secret-token' });
+				assert.deepEqual(request.params, {
+					run_id: 'kd-run',
+					question_id: 'q-cancel',
+					token: 'secret-token',
+					launch_id: 73,
+				});
 				return { question_id: 'q-cancel', state: 'timed_out', timed_out: true };
 			}
 			throw new Error(`unexpected method ${request.method}`);
@@ -260,6 +265,7 @@ test('ask_operator closes the daemon question when the worker-pane prompt is can
 					KHAZAD_RUN_ID: 'kd-run',
 					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
 					KHAZAD_WORKER_TOKEN: 'secret-token',
+					KHAZAD_LAUNCH_ID: '73',
 				},
 				async () => {
 					const result = await tool.execute(

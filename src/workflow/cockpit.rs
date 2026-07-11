@@ -65,6 +65,7 @@ pub(crate) struct CockpitWorkerPaneRequest {
     pub run_id: String,
     pub slice_id: String,
     pub attempt: usize,
+    pub launch_id: Option<i64>,
     pub command: String,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
@@ -75,6 +76,7 @@ pub(crate) struct CockpitTuiWorkerRequest {
     pub run_id: String,
     pub slice_id: String,
     pub attempt: usize,
+    pub launch_id: Option<i64>,
     pub name: String,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
@@ -562,10 +564,11 @@ pub(crate) trait CockpitAdapter {
         request: &CockpitTuiWorkerRequest,
     ) -> Result<CockpitTuiWorkerOpened> {
         let mut opened = self.start_tui_worker_agent(workspace, request)?;
-        opened.pane_label = slot.pane_label(&worker_pane_label(
+        opened.pane_label = slot.pane_label(&worker_launch_pane_label(
             &request.run_id,
             &request.slice_id,
             request.attempt,
+            request.launch_id,
         ));
         opened.slot_name = slot.name.clone();
         opened.slot_index = slot.index;
@@ -704,10 +707,11 @@ impl<A: CockpitAdapter> Cockpit<A> {
             .last()
             .ok_or_else(|| anyhow!("cockpit layout plan omitted worker slot"))?;
         let pane = CockpitPaneRequest {
-            label: worker_pane_label(
+            label: worker_launch_pane_label(
                 &worker_request.run_id,
                 &worker_request.slice_id,
                 worker_request.attempt,
+                worker_request.launch_id,
             ),
             command: worker_request.command.clone(),
             cwd: worker_request.cwd.clone(),
@@ -1337,6 +1341,19 @@ pub(crate) fn worker_pane_label(run_id: &str, slice_id: &str, attempt: usize) ->
     format!("Worker {run_id}/{slice_id} attempt {attempt}")
 }
 
+fn worker_launch_pane_label(
+    run_id: &str,
+    slice_id: &str,
+    attempt: usize,
+    launch_id: Option<i64>,
+) -> String {
+    let retry_label = worker_pane_label(run_id, slice_id, attempt);
+    match launch_id.filter(|launch_id| *launch_id > 0) {
+        Some(launch_id) => format!("{retry_label} launch {launch_id}"),
+        None => retry_label,
+    }
+}
+
 pub(crate) fn cockpit_mode_transport_arg(value: &str) -> Result<String> {
     let mode = CockpitMode::parse(value)?;
     Ok(format!("{COCKPIT_MODE_TRANSPORT_PREFIX}{}", mode.as_str()))
@@ -1699,10 +1716,11 @@ impl HerdrCockpitAdapter {
         slot: &CockpitWorkerSlot,
         request: &CockpitTuiWorkerRequest,
     ) -> Result<CockpitTuiWorkerOpened> {
-        let pane_label = slot.pane_label(&worker_pane_label(
+        let pane_label = slot.pane_label(&worker_launch_pane_label(
             &request.run_id,
             &request.slice_id,
             request.attempt,
+            request.launch_id,
         ));
         let inspection = self.inspect_layout(workspace)?;
         let (target_pane_id, target_tab_id, direction, ratio, replaced_root) = if slot.index == 1 {
@@ -2511,10 +2529,11 @@ mod tests {
             slot: &CockpitWorkerSlot,
             request: &CockpitTuiWorkerRequest,
         ) -> Result<CockpitTuiWorkerOpened> {
-            let pane_label = slot.pane_label(&worker_pane_label(
+            let pane_label = slot.pane_label(&worker_launch_pane_label(
                 &request.run_id,
                 &request.slice_id,
                 request.attempt,
+                request.launch_id,
             ));
             self.calls.lock().unwrap().push(format!(
                 "layout:tui-worker-slot:{}:{}:{}:{}:{}:{}",
@@ -2911,6 +2930,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             run_id: "kd-run".to_string(),
             slice_id: slice_id.to_string(),
             attempt: 1,
+            launch_id: None,
             name: format!("kd-run-{slice_id}-1"),
             argv: vec!["pi".to_string(), format!("@{slice_id}.md")],
             cwd: PathBuf::from("/repo/worker"),
@@ -3126,6 +3146,16 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
     }
 
     #[test]
+    fn cockpit_worker_labels_distinguish_launches_with_the_same_retry_ordinal() {
+        let first = worker_launch_pane_label("kd-run", "SLICE-1", 1, Some(41));
+        let repair = worker_launch_pane_label("kd-run", "SLICE-1", 1, Some(42));
+
+        assert_eq!(first, "Worker kd-run/SLICE-1 attempt 1 launch 41");
+        assert_eq!(repair, "Worker kd-run/SLICE-1 attempt 1 launch 42");
+        assert_ne!(first, repair);
+    }
+
+    #[test]
     fn cockpit_layout_worker_pane_uses_deterministic_slot_and_run_slice_label() {
         let adapter = FakeCockpitAdapter::default();
         let request = CockpitRunRequest {
@@ -3138,6 +3168,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             run_id: "kd-run".to_string(),
             slice_id: "SLICE-1".to_string(),
             attempt: 2,
+            launch_id: None,
             command: "/bin/sh wrapper.sh".to_string(),
             cwd: PathBuf::from("/repo/worker"),
             env: vec![("KHAZAD_COCKPIT_WORKER".to_string(), "1".to_string())],
@@ -3181,6 +3212,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             run_id: "kd-run".to_string(),
             slice_id: "SLICE-1".to_string(),
             attempt: 1,
+            launch_id: None,
             command: "first".to_string(),
             cwd: PathBuf::from("/repo/worker-1"),
             env: Vec::new(),
@@ -3189,6 +3221,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             run_id: "kd-run".to_string(),
             slice_id: "SLICE-2".to_string(),
             attempt: 1,
+            launch_id: None,
             command: "second".to_string(),
             cwd: PathBuf::from("/repo/worker-2"),
             env: Vec::new(),
@@ -3226,6 +3259,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             run_id: "kd-run".to_string(),
             slice_id: "SLICE-1".to_string(),
             attempt: 2,
+            launch_id: None,
             name: "kd-run-SLICE-1-2".to_string(),
             argv: vec!["pi".to_string(), "@prompt.md".to_string()],
             cwd: PathBuf::from("/repo/worker"),
@@ -3280,6 +3314,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
                 run_id: "kd-run".to_string(),
                 slice_id: format!("SLICE-{index}"),
                 attempt: 1,
+                launch_id: None,
                 name: format!("kd-run-SLICE-{index}-1"),
                 argv: vec!["pi".to_string(), format!("@prompt-{index}.md")],
                 cwd: PathBuf::from(format!("/repo/worker-{index}")),

@@ -293,7 +293,10 @@ impl OperatorAttention {
                 SliceStatus::Interrupted => "!",
                 _ => "◐",
             };
-            let label = format!("{marker} {slice_id} {status}");
+            let label = match event.launch_id.filter(|launch_id| *launch_id > 0) {
+                Some(launch_id) => format!("{marker} {slice_id} launch {launch_id} {status}"),
+                None => format!("{marker} {slice_id} {status}"),
+            };
             match rename_default_agent_target(pane_id, &label) {
                 Ok(renamed) => {
                     let _ = self.state.record_event(
@@ -302,6 +305,8 @@ impl OperatorAttention {
                         &json!({
                             "pane_id": pane_id,
                             "slice_id": slice_id,
+                            "launch_id": event.launch_id,
+                            "launch_stem": event.launch_stem,
                             "status": status,
                             "label": label,
                             "adapter": renamed.adapter,
@@ -319,6 +324,9 @@ impl OperatorAttention {
                         )
                         .with_extra("pane_id", pane_id)
                         .with_extra("slice_id", slice_id)
+                        .with_extra("launch_id", event.launch_id)
+                        .with_extra("launch_stem", &event.launch_stem)
+                        .with_extra("label", &label)
                         .with_extra("source_of_truth", "daemon_terminal_summary"),
                     );
                 }
@@ -831,14 +839,24 @@ mod tests {
                 id: 1,
                 run_id: run.id.clone(),
                 typ: "cockpit_worker_ready".to_string(),
-                payload: json!({"pane_id": "pane-1", "slice_id": "slice-001"}),
+                payload: json!({
+                    "pane_id": "pane-1",
+                    "slice_id": "slice-001",
+                    "launch_id": 41,
+                    "launch_stem": "slice-001.launch-41"
+                }),
                 created_at: now,
             },
             Event {
                 id: 2,
                 run_id: run.id.clone(),
                 typ: "cockpit_worker_ready".to_string(),
-                payload: json!({"pane_id": "pane-1", "slice_id": "slice-001"}),
+                payload: json!({
+                    "pane_id": "pane-1",
+                    "slice_id": "slice-001",
+                    "launch_id": 41,
+                    "launch_stem": "slice-001.launch-41"
+                }),
                 created_at: now,
             },
         ];
@@ -867,8 +885,17 @@ mod tests {
                 event.typ == "run_incident"
                     && event.payload["kind"] == "cockpit_worker_rename_failed"
             })
-            .count();
-        assert_eq!(rename_incidents, 1);
+            .collect::<Vec<_>>();
+        assert_eq!(rename_incidents.len(), 1);
+        assert_eq!(rename_incidents[0].payload["launch_id"], 41);
+        assert_eq!(
+            rename_incidents[0].payload["launch_stem"],
+            "slice-001.launch-41"
+        );
+        assert_eq!(
+            rename_incidents[0].payload["label"],
+            "✓ slice-001 launch 41 merged"
+        );
         Ok(())
     }
 
@@ -881,6 +908,7 @@ mod tests {
             run_id: "run".to_string(),
             slice_id: "slice".to_string(),
             attempt: 1,
+            launch_id: None,
             question: "choose".to_string(),
             options: Vec::new(),
             timeout_seconds: 5,

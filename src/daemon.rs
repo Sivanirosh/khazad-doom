@@ -324,20 +324,29 @@ impl Server {
     }
 
     fn open_worker_question(&self, params: &WorkerAskParams) -> Result<WorkerQuestion> {
-        if !self
-            .store
-            .validate_worker_token(&params.run_id, &params.token)?
-        {
+        if params.launch_id.is_some_and(|launch_id| launch_id <= 0) {
+            bail!("worker question launch_id must be positive when supplied");
+        }
+        if !self.worker_question_token_is_authorized(
+            &params.run_id,
+            params.launch_id,
+            &params.token,
+        )? {
             self.store.record_event(
                 &params.run_id,
                 workflow_events::RUN_INCIDENT,
                 &workflow_events::RunIncidentPayload::error(
                     "worker_question_token_rejected",
-                    "workerAsk rejected because the worker token did not match the run",
+                    "workerAsk rejected because the worker token did not match the launch",
                 )
-                .with_extra("slice_id", &params.slice_id),
+                .with_extra("slice_id", &params.slice_id)
+                .with_extra("launch_id", params.launch_id),
             )?;
-            bail!("worker token rejected for run {}", params.run_id);
+            bail!(
+                "worker token rejected for run {} launch {:?}",
+                params.run_id,
+                params.launch_id
+            );
         }
         let timeout_seconds = self.worker_question_timeout_seconds(params);
         let question_id = format!("q-{}", request_id());
@@ -348,24 +357,27 @@ impl Server {
                 .bounded_within_current_slice_or_mission_authority,
             reversible: params.reversible,
         };
-        let question = self.store.open_active_worker_question_with_recommendation(
-            &question_id,
-            &params.run_id,
-            &params.slice_id,
-            params.attempt,
-            &params.question,
-            &params.options,
-            timeout_seconds,
-            &recommendation,
-            workflow_events::WORKER_QUESTION_ASKED,
-            |question| {
-                Ok(workflow_events::WorkerQuestionAskedPayload::from_question(
-                    question,
-                    worker_question_deadline(question),
-                ))
-            },
-            &format!("awaiting operator answer: {}", params.question),
-        )?;
+        let question = self
+            .store
+            .open_active_worker_question_with_launch_id_and_recommendation(
+                &question_id,
+                &params.run_id,
+                &params.slice_id,
+                params.attempt,
+                params.launch_id,
+                &params.question,
+                &params.options,
+                timeout_seconds,
+                &recommendation,
+                workflow_events::WORKER_QUESTION_ASKED,
+                |question| {
+                    Ok(workflow_events::WorkerQuestionAskedPayload::from_question(
+                        question,
+                        worker_question_deadline(question),
+                    ))
+                },
+                &format!("awaiting operator answer: {}", params.question),
+            )?;
 
         self.notify_attention_for_worker_question(&question);
         Ok(question)
@@ -375,19 +387,28 @@ impl Server {
         &self,
         params: WorkerQuestionTimeoutParams,
     ) -> Result<WorkerAskResult> {
-        if !self
-            .store
-            .validate_worker_token(&params.run_id, &params.token)?
-        {
+        if params.launch_id.is_some_and(|launch_id| launch_id <= 0) {
+            bail!("worker question launch_id must be positive when supplied");
+        }
+        if !self.worker_question_token_is_authorized(
+            &params.run_id,
+            params.launch_id,
+            &params.token,
+        )? {
             self.store.record_event(
                 &params.run_id,
                 workflow_events::RUN_INCIDENT,
                 &workflow_events::RunIncidentPayload::error(
                     "worker_question_token_rejected",
-                    "workerQuestionTimeout rejected because the worker token did not match the run",
-                ),
+                    "workerQuestionTimeout rejected because the worker token did not match the launch",
+                )
+                .with_extra("launch_id", params.launch_id),
             )?;
-            bail!("worker token rejected for run {}", params.run_id);
+            bail!(
+                "worker token rejected for run {} launch {:?}",
+                params.run_id,
+                params.launch_id
+            );
         }
         let current = self
             .store
@@ -399,6 +420,14 @@ impl Server {
                 params.question_id,
                 current.run_id,
                 params.run_id
+            );
+        }
+        if current.launch_id != params.launch_id {
+            bail!(
+                "question {:?} belongs to launch {:?}, not {:?}",
+                params.question_id,
+                current.launch_id,
+                params.launch_id
             );
         }
         if current.state != "pending" {
@@ -553,6 +582,20 @@ impl Server {
         });
     }
 
+    fn worker_question_token_is_authorized(
+        &self,
+        run_id: &str,
+        launch_id: Option<i64>,
+        token: &str,
+    ) -> Result<bool> {
+        match launch_id {
+            Some(launch_id) => self
+                .store
+                .validate_worker_launch_token(run_id, launch_id, token),
+            None => self.store.validate_worker_token(run_id, token),
+        }
+    }
+
     fn worker_question_timeout_seconds(&self, params: &WorkerAskParams) -> u64 {
         self.store
             .get_run(&params.run_id)
@@ -574,8 +617,12 @@ impl Server {
     }
 
     fn worker_question_is_currently_awaited(&self, question: &WorkerQuestion) -> Result<bool> {
-        self.store
-            .worker_attempt_is_active(&question.run_id, &question.slice_id, question.attempt)
+        self.store.worker_attempt_is_active_with_launch_id(
+            &question.run_id,
+            &question.slice_id,
+            question.attempt,
+            question.launch_id,
+        )
     }
 
     fn handle(&self, method: &str, raw: Option<serde_json::Value>) -> Result<HandleOutcome> {
@@ -1133,6 +1180,111 @@ mod tests {
     }
 
     #[test]
+    fn worker_question_open_persists_optional_positive_launch_id() -> Result<()> {
+        let (_dir, server, store) = worker_question_test_server(1)?;
+        let launch_id = store.list_worker_attempt_ledger("run-fallback", "slice-1")?[0].launch_id;
+        let mut payload = eligible_worker_ask_params("run-fallback", "launch-scoped question");
+        payload["launch_id"] = json!(launch_id);
+        let opened = server.handle("workerAskOpen", Some(payload))?;
+        let question_id = opened.result["question_id"].as_str().expect("question id");
+        assert_eq!(
+            store
+                .get_worker_question(question_id)?
+                .expect("durable question")
+                .launch_id,
+            Some(launch_id)
+        );
+        assert_eq!(
+            store.list_worker_questions_for_repo(
+                &store.get_run("run-fallback")?.expect("run").repo_path,
+            )?[0]
+                .launch_id,
+            Some(launch_id)
+        );
+
+        let legacy = server.handle(
+            "workerAskOpen",
+            Some(eligible_worker_ask_params(
+                "run-fallback",
+                "legacy question",
+            )),
+        );
+        assert!(
+            legacy.is_err(),
+            "active attempt already has a pending question"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_launch_rejects_the_prior_launch_token_and_question() -> Result<()> {
+        let (_dir, server, store) = worker_question_test_server(60)?;
+        let first = store.list_worker_attempt_ledger("run-fallback", "slice-1")?[0].clone();
+        let mut first_ask = eligible_worker_ask_params("run-fallback", "first launch question");
+        first_ask["launch_id"] = json!(first.launch_id);
+        let opened = server.handle("workerAskOpen", Some(first_ask))?;
+        let old_question_id = opened.result["question_id"]
+            .as_str()
+            .expect("old question id")
+            .to_string();
+
+        store.finish_worker_attempt(first.launch_id, "interrupted", "resume")?;
+        let interrupted = store.interrupt_worker_question_if_inactive_cas(
+            "run-fallback",
+            &old_question_id,
+            "superseded by resume",
+        )?;
+        assert!(interrupted.applied);
+        assert_eq!(interrupted.question.state, "interrupted");
+
+        let second = store.allocate_worker_attempt(
+            "run-fallback",
+            "slice-1",
+            2,
+            1,
+            0,
+            0,
+            "worker",
+            &server.paths.root.join("worktrees"),
+        )?;
+        store.store_worker_launch_token("run-fallback", second.launch_id, "fresh-token")?;
+        store.mark_worker_attempt_launched(second.launch_id)?;
+
+        let mut stale_launch = eligible_worker_ask_params("run-fallback", "stale launch");
+        stale_launch["launch_id"] = json!(first.launch_id);
+        assert!(server.handle("workerAskOpen", Some(stale_launch)).is_err());
+
+        let mut stale_token = eligible_worker_ask_params("run-fallback", "stale token");
+        stale_token["launch_id"] = json!(second.launch_id);
+        assert!(server.handle("workerAskOpen", Some(stale_token)).is_err());
+
+        let mismatched_close = server.handle(
+            "workerQuestionTimeout",
+            Some(json!({
+                "run_id": "run-fallback",
+                "question_id": old_question_id,
+                "token": "fresh-token",
+                "launch_id": second.launch_id
+            })),
+        );
+        assert!(mismatched_close.is_err());
+
+        let mut fresh = eligible_worker_ask_params("run-fallback", "fresh launch");
+        fresh["launch_id"] = json!(second.launch_id);
+        fresh["token"] = json!("fresh-token");
+        let fresh_opened = server.handle("workerAskOpen", Some(fresh))?;
+        assert_ne!(fresh_opened.result["question_id"], old_question_id);
+        assert_eq!(
+            store
+                .get_worker_question(&old_question_id)?
+                .expect("old durable question")
+                .state,
+            "interrupted"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_question_rpc_operator_answer_committed_before_deadline_wins() -> Result<()> {
         let (_dir, server, store) = worker_question_test_server(1)?;
         let opened = server.handle(
@@ -1493,6 +1645,18 @@ mod tests {
         run.repo_path = repo_path.to_string_lossy().into_owned();
         store.insert_run(&run)?;
         store.store_worker_token(&run.id, "secret-token")?;
+        let launch = store.allocate_worker_attempt(
+            &run.id,
+            "slice-1",
+            1,
+            1,
+            0,
+            0,
+            "worker",
+            &paths.root.join("worktrees"),
+        )?;
+        store.store_worker_launch_token(&run.id, launch.launch_id, "secret-token")?;
+        store.mark_worker_attempt_launched(launch.launch_id)?;
         store.upsert_slice_run(&SliceRun {
             run_id: run.id.clone(),
             slice_id: "slice-1".to_string(),

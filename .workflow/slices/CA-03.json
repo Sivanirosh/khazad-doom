@@ -12,12 +12,20 @@
     "src/artifact.rs",
     "src/agent.rs",
     "src/pi_contract.rs",
+    "src/cli.rs",
+    "src/daemon.rs",
+    "src/ipc.rs",
+    "src/workflow/attention.rs",
+    "src/workflow/cockpit.rs",
+    "src/workflow/events.rs",
     "src/workflow/manager.rs",
     "src/workflow/read_model.rs",
     "src/workflow/projection.rs",
     "tests/daemon_integration.rs",
     "tests/daemon",
     "tests/fixtures",
+    "extensions/khazad-worker",
+    "tests/khazad-worker-extension.test.mjs",
     "docs/workflow-invariants.md"
   ],
   "acceptance": [
@@ -28,7 +36,8 @@
     "Resume increments/records an execution epoch and schedules only unfinished work while preserving every prior worker result, raw output, activity observation, branch reference, and failure cause.",
     "Read models and reports expose stable attempt history while preserving compatibility for existing runs that only contain legacy attempt ordinals.",
     "Direct Pi worker cancellation terminates the supervised process group/tree with configured grace and escalation, matching shell supervision rather than killing only the immediate child PID.",
-    "Tests cover retry, repair, interrupted launch, daemon restart/resume, cancellation with a grandchild process, and two resumes without duplicate identities or evidence loss."
+    "Tests cover retry, repair, interrupted launch, daemon restart/resume, cancellation with a grandchild process, and two resumes without duplicate identities or evidence loss.",
+    "Compatibility revision grant: CA-03 may update the daemon, IPC, workflow-event, CLI attention, cockpit, and khazad-worker extension boundaries needed to carry immutable launch identity end to end. The launch_id wire field is additive and optional to decode. Persisted legacy ordinal-only runs and questions remain readable, and requests that omit launch_id continue only through a previously issued legacy run-scoped token; new ledger-backed launches issue launch-scoped credentials and require launch_id for authorization."
   ],
   "must_ask_if": [
     "A migration would discard or rewrite existing attempt evidence rather than reading it compatibly.",

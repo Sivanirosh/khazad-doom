@@ -1628,7 +1628,38 @@ pub struct ImplementationSummary {
     pub plan_revisions: PlanRevisions,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_questions: Vec<WorkerQuestion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_attempts: Vec<WorkerAttemptLedger>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Immutable, daemon-owned evidence for one worker-process allocation. `launch_id`
+/// is the stable identity; retry, repair, envelope, and resume dimensions are
+/// recorded separately and must never be used as an identity substitute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerAttemptLedger {
+    pub run_id: String,
+    pub slice_id: String,
+    pub launch_id: i64,
+    pub launch_ordinal: usize,
+    pub execution_epoch: usize,
+    pub worker_retry_ordinal: usize,
+    pub repair_ordinal: usize,
+    pub envelope_retry_ordinal: usize,
+    pub kind: String,
+    pub state: String,
+    pub branch: String,
+    pub worktree: String,
+    pub output_stem: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_cause: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<WorkerAttemptProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1678,8 +1709,10 @@ pub struct RunProgress {
     pub parallel_slices: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAttemptProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
     pub attempt_started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -1828,6 +1861,9 @@ pub struct WorkerQuestion {
     pub slice_id: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub attempt: usize,
+    /// Immutable daemon launch identity when the question came from a ledger-backed attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
     pub question: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -2223,6 +2259,11 @@ pub struct RunDetails {
     #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
     pub worker_profile: WorkerProfileEvidence,
     pub slice_runs: Vec<SliceRun>,
+    /// Daemon-owned immutable worker-launch history. Entries with `kind` set to
+    /// `legacy-slice-run` synthesize missing persisted legacy retry ordinals
+    /// without replacing newer ledger rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_attempts: Vec<WorkerAttemptLedger>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_slices: Vec<GeneratedSliceRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
