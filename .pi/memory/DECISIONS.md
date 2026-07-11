@@ -1,85 +1,109 @@
 # Decisions
 
-## 2026-06-25: Use JSON Issue Slices as the atomic worker unit
+## 2026-06-25: JSON Issue Slices authorize bounded work
 
 Status: accepted.
 
-Decision: Khazad-Doom workers receive one JSON Issue Slice at a time. Slice JSON is authoritative for scope, acceptance, verification, dependencies, and `must_ask_if` escalation triggers. Planning can stay human-native, but worker authorization is JSON.
+Decision: JSON Issue Slices are the atomic worker authorization envelope for goal, acceptance, literal repo-relative area prefixes, dependencies, verification, and `must_ask_if`. Acceptance is minimum evidence, not a frozen mini-spec: learning may stay inside the fence; moving intent, paths, policy, dependencies, public semantics, or security authority requires approval or a typed follow-up proposal. Closed slices are historical accepted work and are not rerun as dependencies.
 
-## 2026-06-25: Khazad-Doom is a local Rust daemon/CLI
-
-Status: accepted.
-
-Decision: Implement Khazad-Doom as a local Rust CLI plus per-user daemon. The daemon owns durable run state, worker dispatch, cancellation, progress, checkpoints, verification, and handoff artifacts. Repos keep `.workflow` source artifacts; global runtime state lives outside repos.
-
-## 2026-06-25: Use isolated worktrees for workers
-
-Status: accepted; superseded in part by the 2026-07-04 Pi-first decision.
-
-Decision: Run slice workers in isolated git worktrees, allow conservative parallelism only for independent slices, and merge serially through an integration branch. Pi is now the sole real worker harness; `fake` remains as a deterministic smoke-test seam, not a portability layer.
-
-## 2026-06-25: Require structured worker handoffs
+## 2026-06-25: The local Rust daemon owns workflow truth
 
 Status: accepted.
 
-Decision: Workers must return JSON-only structured results, create per-slice commits, and leave clean worktrees. Khazad-Doom writes repo-local handoff packets before dispatch and synthesized implementation summaries/final reports after integration.
+Decision: Khazad-Doom is a local Rust CLI plus per-user daemon. The daemon owns admission, scheduling, state, worktrees, cancellation, questions, replans, verification, repair, integration, publication, incidents, economics, recovery, and handoff. Repository `.workflow` artifacts remain inspectable, but UI state and worker claims never become a second source of truth.
 
-## 2026-06-25: Gate before merge/handoff; bound repair
-
-Status: accepted.
-
-Decision: Do not merge a slice until lightweight checks pass. Run full integration gates before final handoff. Per-slice repair and integration repair are bounded, and the run stops on failed/blocked slices unless resumed after user intervention.
-
-## 2026-06-26: Monitoring is attachable and daemon-owned
+## 2026-06-25: Isolate workers and integrate deterministically
 
 Status: accepted.
 
-Decision: `khazad-doom monitor --repo . --latest` is the CLI live progress path over daemon-owned state. `/khazad-monitor` is an optional Pi overlay over daemon status JSON; closing it only detaches the overlay and never cancels the run.
+Decision: Workers run in isolated worktrees. Independent area-disjoint slices may execute in bounded parallel batches (default parallelism 3), but the whole layer completes before serial integration; overlapping-area slices serialize between merge checkpoints. Every spawned worker is joined, cancellation propagates to descendants, and no sibling merges from a failed layer.
 
-## 2026-06-26: Treat workflow economics as a release invariant
-
-Status: accepted.
-
-Decision: Khazad-Doom must save operator time. Hidden extra agent turns, duplicate expensive verification, unconditional no-op repair, invisible retries, and unmeasured overhead are release blockers. Prefer gate-first repair and visible runtime/economics reporting.
-
-## 2026-06-26: Prefer YAGNI and surgical implementation
+## 2026-06-25: Require structured worker evidence and daemon attestation
 
 Status: accepted.
 
-Decision: Implementer agents should prefer minimal/surgical fixes and avoid speculative abstraction. One-line fixes are preferred when correct and readable, but correctness, workflow invariants, and tests take priority.
+Decision: Workers commit clean worktrees and return closed JSON results containing only worker-authored facts. Acceptance entries are claims; daemon checks and gates attest them. The daemon injects immutable slice, attempt, launch, trigger, and authority identity. Worker, renderer, repair, or planner output cannot self-approve evidence or invent daemon-owned state.
 
-## 2026-06-26: Refactor Khazad-Doom seam-first
-
-Status: accepted.
-
-Decision: `workflow::Manager` is large but currently acts as a deep orchestration module. Refactor only where the new interface is smaller than the behavior it hides; likely first seams are integration gate/shell execution or context structs. Do not split the manager broadly just because it is large.
-
-## 2026-06-27: Formalize exit states without adding gates
+## 2026-06-25: Verification and repair are bounded by authority
 
 Status: accepted.
 
-Decision: For SAW/SAFe-inspired ideas, Khazad-Doom should not add new optional gate machinery or import an 11-agent team model. The useful principles to retain are: make the existing workflow exit states explicit and enforce the separation that a worker must not approve its own evidence. Any reviewer/QA concept should be modeled as read-only attestation over existing run artifacts/evidence, not as a new workflow owner, hidden phase, or second source of truth.
+Decision: Lightweight slice checks precede merge; `verify_profile` belongs only to the integration gate. Verification is observationally pure and may not mutate publication inputs. Gate runs before repair. Envelope retries and mechanical repair are bounded, visible, and separate from implementation attempts; repair cannot broaden paths, change intent, weaken checks, or hide operator-environment failures. A false positive that repairs beyond authority is worse than a false negative that blocks.
 
-## 2026-07-03: Treat slices as bounded intent, not frozen mini-specs
+## 2026-06-26: Monitoring is daemon-owned and non-authoritative
 
 Status: accepted.
 
-Decision: JSON Issue Slices remain the authoritative worker authorization envelope: goal, acceptance, areas, dependencies, verification, and `must_ask_if`. Acceptance criteria are minimum required evidence, not an exhaustive list of every valid test case. Operational rule: learning is allowed inside the fence; moving the fence requires approval. While a slice is open, workers may implement the smallest TDD/code-inspection discovery that is directly implied by the slice goal or acceptance and stays within declared areas. If a discovery changes product intent, public API semantics, dependencies, verification policy, or required paths outside `areas`, the worker must block with an `ask-user` finding or recommend a follow-up slice. Do not add new workflow phases, gates, or schema fields until real runs prove the prompt/doc rule is insufficient.
+Decision: `status`, `watch`, `monitor`, `attend`, the Pi bridge, and Herdr cockpit render one daemon-owned projection. Visibility failures are warning incidents only. Detaching, closing, focusing, renaming, or losing a pane never cancels or changes a run. Pane text, scrollback, labels, IDs, and Herdr metadata are not correctness evidence.
+
+## 2026-06-26: Runtime economy is a release invariant
+
+Status: accepted.
+
+Decision: Hidden agent turns, duplicate expensive verification, unconditional repair, invisible retries, unbounded tails, noisy telemetry writes, and avoidable polling are release defects. Preserve complete raw/structured evidence while bounding diagnostics, memory, updates, persistence, and cancellation latency. Persist economics by dirty revision and use measured 1/3/10-worker evidence before adding pools, brokers, telemetry services, or other infrastructure.
+
+## 2026-06-26: Prefer YAGNI and deep seams
+
+Status: accepted.
+
+Decision: Prefer surgical fixes and interfaces smaller than the behavior they hide. `workflow::Manager` remains a cohesive temporal orchestrator unless measured locality pressure justifies a deep extraction. Do not split by file size or add generic harnesses, event registries, extra gates, planner layers, connection pools, or compatibility abstractions without repeated evidence.
+
+## 2026-06-27: Exit states and evidence ownership stay explicit
+
+Status: accepted.
+
+Decision: Existing lifecycle exit states, incidents, primary terminal reasons, evidence attestation, and plan revisions are explicit read-only summaries of daemon state. Reviewer/QA concepts may attest existing evidence but must not introduce hidden gates, worker self-approval, or a second workflow owner.
 
 ## 2026-07-04: Pi is the sole real worker harness
 
 Status: accepted.
 
-Decision: Khazad-Doom commits to Pi as its only real worker execution harness. Daemon state remains harness-neutral JSON because that neutrality is free and useful; worker execution is Pi-native because speculative multi-harness generality is paid complexity. `FakeRunner` stays permanently as a deterministic test double.
+Decision: Real workers run through Pi's documented surfaces. `fake` is permanently a deterministic test seam, not a portability promise. Daemon state and CLI JSON remain harness-neutral because that is useful and cheap. Silent model fallback and Pi-side acceptance gates are rejected; reports attest the effective provider, model, profile, and reasoning that actually ran.
 
-## 2026-07-04: Daemon owns verification and no silent model failover
-
-Status: accepted.
-
-Decision: The daemon is the single verification owner. Pi-side acceptance gates (`attested`, `checked`, `verified`, `reviewed`) are rejected unless daemon verification is retired. `fallbackModels` or other silent worker-model failover is rejected because handoff attestation must name the model that actually did the work.
-
-## 2026-07-04: Feedback comes to the operator
+## 2026-07-05: Agent profiles are operator-wide
 
 Status: accepted.
 
-Decision: Operators should not need to open a monitor window to learn that a run needs them. Progress and needs-attention states should surface ambiently in the Pi session that started the work, while daemon state remains the source of truth. CLI status/monitor and Pi renderers must paint one shared daemon-side interpretation layer so wording does not diverge.
+Decision: `~/.khazad-doom/agents.toml` is the sole profile source, with explicit run overrides where supported. Repo-local profile fallback is intentionally absent. Worktree setup, profile resolution, and launch preflight are daemon-owned reliability boundaries.
+
+## 2026-07-06: Decisions and replans are typed durable protocols
+
+Status: accepted.
+
+Decision: Operator questions, replan proposals, and grants persist before UI delivery and resolve through first-commit-wins transactional compare-and-set outcomes. Applied, idempotent, conflicting, stale, and missing outcomes remain explicit. Accepted changes use one idempotent apply path with provenance; restart preserves pending decisions and never infers operator intent.
+
+## 2026-07-07: Herdr is the optional-default cockpit
+
+Status: accepted.
+
+Decision: Herdr provides worker, dashboard, gate/repair, and attention surfaces while the daemon remains authoritative. Native Herdr-hosted Pi TUI workers are default when placement is available; direct/JSON-wrapper execution remains an explicit compatibility fallback. Native workers submit only daemon-owned result artifacts. Cockpit placement resolves live anchors by semantic role rather than trusting stale pane IDs.
+
+## 2026-07-09: Operator escalation stays authority-bounded
+
+Status: accepted.
+
+Decision: Worker `ask_operator` state belongs to the daemon even when the dialog appears in the worker Pi pane. A daemon-owned 60-second fallback may choose an exact listed recommendation only with nonempty rationale and bounded, reversible authority. Ambiguous, stale, interrupted, policy/API/security-changing, out-of-area, or otherwise ineligible `must_ask_if` cases still block.
+
+## 2026-07-09: Autonomous frontier reuses replan authority
+
+Status: accepted.
+
+Decision: `off`, `shadow`, `promote`, and `run` are visibility/acceptance levels over the existing typed replan channel. Only deterministic Tier-1 `add_followup_slice` proposals inside the active mission envelope and remaining area/depth/generation/budget limits may auto-accept; generated slices run serially. Workers cannot invent candidates outside a proposal, and all ambiguous, exhausted, rejected, deferred, ineligible `must_ask_if`, or authority-expanding cases stop for the operator.
+
+## 2026-07-11: Identity, admission, merge, and publication are durable protocols
+
+Status: accepted.
+
+Decision: Launch identity is append-only and distinct from attempt/retry/repair ordinals. Run admission and prepared launch intent commit before side effects. Destructive cleanup requires positive resource ownership. Merge authority binds exact run, scope, launch, source, expected head, parentage, ancestry, operation trailer, and predicted tree. Terminalization and authoritative JSON replacement are recoverable; publication uses an explicit pinned manifest and advances only the intended integration ref after a passing gate.
+
+## 2026-07-11: Status and attention derive from one coherent snapshot
+
+Status: accepted.
+
+Decision: Authoritative status reads, evidence lookup, terminal summaries, handoffs, operator actions, and attention policy share one transaction-rooted snapshot and daemon semantic projection. Missing or corrupt indexed evidence is unavailable, never opportunistically reread live. Attention delivery, focus, rename, and dedupe are visibility-only and occur after authoritative state commits.
+
+## 2026-07-11: Active contracts are strict; persisted compatibility is tolerant
+
+Status: accepted.
+
+Decision: Active worker and repair wires deny undeclared daemon-authority fields. Canonical event producers bind typed payloads to typed kinds; selected-slice order, provenance, and follow-up drafts have explicit normalized storage. Rust and Node consume one reviewed versioned fixture bundle with deterministic checking. Persisted legacy runs, queues, events, and unknown future kinds remain readable; dead active-wire compatibility and duplicated JavaScript daemon semantics are not retained.
