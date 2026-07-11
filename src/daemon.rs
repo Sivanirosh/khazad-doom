@@ -865,7 +865,9 @@ impl HandleOutcome {
 fn method_allows_concurrent_handling(method: &str) -> bool {
     matches!(
         method,
-        "workerAsk"
+        "startRun"
+            | "resumeRun"
+            | "workerAsk"
             | "workerAskOpen"
             | "workerQuestionTimeout"
             | "answerQuestion"

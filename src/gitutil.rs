@@ -4288,6 +4288,20 @@ pub fn worktree_add(
     Ok(())
 }
 
+pub fn worktree_add_new(
+    repo_path: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+    branch: &str,
+    start_point: &str,
+) -> Result<()> {
+    let worktree = worktree_path.as_ref().to_string_lossy().to_string();
+    run(
+        repo_path,
+        &["worktree", "add", "-b", branch, &worktree, start_point],
+    )?;
+    Ok(())
+}
+
 pub fn worktree_add_existing(
     repo_path: impl AsRef<Path>,
     worktree_path: impl AsRef<Path>,
@@ -4320,6 +4334,127 @@ pub fn merge_abort(worktree_path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+pub fn ref_exists(repo_path: impl AsRef<Path>, reference: &str) -> Result<bool> {
+    let args = ["show-ref", "--verify", "--quiet", reference];
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path.as_ref())
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "git {} failed with {}{}",
+        args.join(" "),
+        output.status,
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    )
+}
+
+pub fn ref_sha(repo_path: impl AsRef<Path>, reference: &str) -> Result<String> {
+    run(
+        repo_path,
+        &["rev-parse", &format!("{reference}^{{commit}}")],
+    )
+}
+
+pub fn commit_tree_sha(repo_path: impl AsRef<Path>, commit: &str) -> Result<String> {
+    run(repo_path, &["rev-parse", &format!("{commit}^{{tree}}")])
+}
+
+pub fn merge_tree_sha(
+    repo_path: impl AsRef<Path>,
+    expected_head: &str,
+    source_commit: &str,
+) -> Result<String> {
+    let output = run(
+        repo_path,
+        &["merge-tree", "--write-tree", expected_head, source_commit],
+    )?;
+    output
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("git merge-tree returned no result tree"))
+}
+
+pub fn is_ancestor(repo_path: impl AsRef<Path>, ancestor: &str, descendant: &str) -> Result<bool> {
+    let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path.as_ref())
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "git {} failed with {}{}",
+        args.join(" "),
+        output.status,
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    )
+}
+
+pub fn commit_parents(repo_path: impl AsRef<Path>, commit: &str) -> Result<Vec<String>> {
+    let output = run(repo_path, &["rev-list", "--parents", "-n", "1", commit])?;
+    Ok(output
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect())
+}
+
+pub fn merge_in_progress(worktree_path: impl AsRef<Path>) -> Result<bool> {
+    let args = ["rev-parse", "-q", "--verify", "MERGE_HEAD"];
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(worktree_path.as_ref())
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "git {} failed with {}{}",
+        args.join(" "),
+        output.status,
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    )
+}
+
+pub fn branch_delete(repo_path: impl AsRef<Path>, branch: &str) -> Result<()> {
+    run(repo_path, &["branch", "-D", branch])?;
+    Ok(())
+}
+
 pub fn conflicted_files(worktree_path: impl AsRef<Path>) -> Result<Vec<String>> {
     let output = run(worktree_path, &["diff", "--name-only", "--diff-filter=U"])?;
     Ok(output
@@ -4328,6 +4463,58 @@ pub fn conflicted_files(worktree_path: impl AsRef<Path>) -> Result<Vec<String>> 
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+#[cfg(test)]
+mod merge_reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_worktree_creation_preserves_an_existing_branch() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        run(repo.path(), &["init", "-b", "main"])?;
+        run(repo.path(), &["config", "user.name", "Test"])?;
+        run(repo.path(), &["config", "user.email", "test@example.com"])?;
+        fs::write(repo.path().join("base.txt"), "base\n")?;
+        commit_all(repo.path(), "base")?;
+        run(repo.path(), &["switch", "-c", "existing-integration"])?;
+        fs::write(repo.path().join("operator.txt"), "preserve\n")?;
+        commit_all(repo.path(), "operator branch move")?;
+        let existing_head = head_sha(repo.path())?;
+        run(repo.path(), &["switch", "main"])?;
+        let worktree = repo.path().join("integration-worktree");
+
+        worktree_add_new(repo.path(), &worktree, "existing-integration", "main")
+            .expect_err("fresh worktree creation must not reset an existing branch");
+
+        assert_eq!(ref_sha(repo.path(), "existing-integration")?, existing_head);
+        assert!(!worktree.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn predicted_merge_tree_matches_the_applied_merge() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        run(repo.path(), &["init", "-b", "main"])?;
+        run(repo.path(), &["config", "user.name", "Test"])?;
+        run(repo.path(), &["config", "user.email", "test@example.com"])?;
+        fs::write(repo.path().join("base.txt"), "base\n")?;
+        commit_all(repo.path(), "base")?;
+        let expected_head = head_sha(repo.path())?;
+        run(repo.path(), &["switch", "-c", "source"])?;
+        fs::write(repo.path().join("source.txt"), "source\n")?;
+        commit_all(repo.path(), "source")?;
+        let source = head_sha(repo.path())?;
+        run(repo.path(), &["switch", "main"])?;
+        let expected_tree = merge_tree_sha(repo.path(), &expected_head, &source)?;
+        merge(repo.path(), &source, "apply source")?;
+        assert_eq!(commit_tree_sha(repo.path(), "HEAD")?, expected_tree);
+        assert!(is_ancestor(repo.path(), &expected_head, "HEAD")?);
+        assert!(is_ancestor(repo.path(), &source, "HEAD")?);
+        assert_eq!(commit_parents(repo.path(), "HEAD")?.len(), 2);
+        assert!(!merge_in_progress(repo.path())?);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

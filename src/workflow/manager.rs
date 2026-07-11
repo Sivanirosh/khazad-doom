@@ -37,17 +37,20 @@ use crate::domain::{
     AgentProfilesConfig, AutonomyLevel, BranchHandoff, CheckResult, CockpitMode,
     EvidenceAttestation, Finding, FindingDisposition, FollowupSliceDraft, FrontierBudgetState,
     FrontierClassification, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
-    ImplementationSummary, MergeConflictReport, MissionEnvelope, OriginNotificationTarget,
-    PlanRevisions, RepairResult, ReplanDecision, ReplanEvidenceLink, ReplanProposal,
-    ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection, RunStatus,
-    Slice, SliceExitState, SliceProvenance, SliceRun, SliceStatus, SliceValidationReport,
-    SliceWriteResult, WorkerAttemptLedger, WorkerProfileEvidence, WorkerQuestion, WorkerResult,
-    WorkflowConfig, WorkflowExitStates, is_open_status, replan_decision_commands,
+    ImplementationSummary, IntegrationMergeCompletion, IntegrationMergeIntent,
+    IntegrationMergeKind, IntegrationMergeState, MergeConflictReport, MissionEnvelope,
+    OriginNotificationTarget, PlanRevisions, RepairResult, ReplanDecision, ReplanEvidenceLink,
+    ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection,
+    RunLaunchIntent, RunStatus, Slice, SliceExitState, SliceProvenance, SliceRun, SliceStatus,
+    SliceValidationReport, SliceWriteResult, WorkerAttemptLedger, WorkerProfileEvidence,
+    WorkerQuestion, WorkerResult, WorkflowConfig, WorkflowExitStates, is_open_status,
+    replan_decision_commands,
 };
 use crate::gitutil;
 use crate::paths::{self, Paths};
 use crate::state::{
-    ProgressReporter, ProgressScope, Repo, Store as StateStore, TerminalTransition,
+    IntegrationMergePrepareOutcome, ProgressReporter, ProgressScope, Repo, RunAdmissionOutcome,
+    Store as StateStore, TerminalTransition,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -100,6 +103,73 @@ fn inject_terminalization_fault(stage: TerminalizationFaultStage) {
 #[cfg(test)]
 fn take_terminalization_fault(stage: TerminalizationFaultStage) -> bool {
     TERMINALIZATION_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunLaunchFaultStage {
+    AfterAdmission,
+    AfterRunDirectories,
+    AfterCockpit,
+    AfterActivation,
+    SupervisorSpawnFailure,
+    BeforeIntegrationResourceOwnership,
+    AfterIntegrationWorktree,
+    BranchDeletionFailure,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrationMergeFaultStage {
+    AfterIntent,
+    AfterGitMutation,
+    BeforeAbort,
+    AbortFailure,
+    AfterAbort,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUN_LAUNCH_FAULT: std::cell::RefCell<Option<RunLaunchFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+    static INTEGRATION_MERGE_FAULT: std::cell::RefCell<Option<IntegrationMergeFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_run_launch_fault(stage: RunLaunchFaultStage) {
+    RUN_LAUNCH_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_run_launch_fault(stage: RunLaunchFaultStage) -> bool {
+    RUN_LAUNCH_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn inject_integration_merge_fault(stage: IntegrationMergeFaultStage) {
+    INTEGRATION_MERGE_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_integration_merge_fault(stage: IntegrationMergeFaultStage) -> bool {
+    INTEGRATION_MERGE_FAULT.with(|fault| {
         let mut fault = fault.borrow_mut();
         if *fault == Some(stage) {
             *fault = None;
@@ -232,6 +302,20 @@ impl FollowupApplyMode {
             Self::AppendAndRun => "append_and_run",
         }
     }
+}
+
+struct IntegrationMergeRequest<'a> {
+    run: &'a Run,
+    integration_worktree: &'a Path,
+    kind: IntegrationMergeKind,
+    slice_id: &'a str,
+    attempt: usize,
+    launch_id: Option<i64>,
+    source_branch: &'a str,
+    source_commit: &'a str,
+    message: &'a str,
+    completion: IntegrationMergeCompletion,
+    conflict_slice: Option<&'a Slice>,
 }
 
 struct IntegrationRepairContext<'a> {
@@ -1700,17 +1784,6 @@ impl Manager {
         )
     }
 
-    fn ensure_repo_run_available(&self, repo_id: &str, allowed_run_id: Option<&str>) -> Result<()> {
-        if let Some(active) = self.state.active_run_for_repo(repo_id, allowed_run_id)? {
-            bail!(
-                "repo already has active run {} on integration branch {}; wait, cancel it, or resume that run",
-                active.id,
-                active.integration_branch
-            );
-        }
-        Ok(())
-    }
-
     fn runner_for_options(
         &self,
         opts: &StartOptions,
@@ -1884,7 +1957,6 @@ impl Manager {
         let frontier_budget = mission_envelope
             .as_ref()
             .map(|_| FrontierBudgetState::default());
-        self.ensure_repo_run_available(&repo.id, None)?;
         let slices = store.load_slices()?;
         if slices.is_empty() {
             bail!("no JSON slices found in {}", store.slices_dir().display());
@@ -1941,11 +2013,11 @@ impl Manager {
         };
         let run_id = new_run_id();
         let now = Utc::now();
-        let run = Run {
+        let mut run = Run {
             id: run_id.clone(),
             repo_id: repo.id,
             repo_path: repo.path,
-            status: RunStatus::Running,
+            status: RunStatus::Pending,
             base_branch,
             base_sha,
             integration_branch: format!("khazad/{run_id}/integration"),
@@ -1954,64 +2026,9 @@ impl Manager {
             started_at: now,
             updated_at: now,
         };
-        self.state.insert_run(&run)?;
-        self.state.set_frontier_state(
-            &run.id,
-            mission_envelope.as_ref(),
-            frontier_budget.as_ref(),
-        )?;
-        let run_store = artifact::Store::new(&run.repo_path);
-        run_store.ensure_run_dirs(&run.id)?;
-        if let Some(origin) =
-            origin_notification_target_from_start(&opts.origin_notification_target)
-        {
-            let path = run_store.write_origin_notification_target(&run.id, &origin)?;
-            self.state.record_event(
-                &run.id,
-                "origin_notification_target_recorded",
-                &json!({
-                    "path": path,
-                    "target_kind": origin.target_kind,
-                    "delivery_adapter": origin.delivery_adapter,
-                    "delivery_surface": origin.delivery_surface,
-                }),
-            )?;
-        }
-        let runner_metadata = runner.metadata();
-        let worker_profile = worker_profile_evidence(runner.name(), &runner_metadata);
-        let pi_contract = runner.pi_contract_observation();
-        artifact::write_json(
-            artifact::Store::new(&run.repo_path).output_path(&run.id, "preflight.json"),
-            &json!({
-                "agent": runner.name(),
-                "worker_profile": &worker_profile,
-                "worker_evidence_kind": &worker_profile.worker_evidence_kind,
-                "worker_evidence_label": &worker_profile.worker_evidence_label,
-                "profile_summary": runner_metadata.profile_summary(),
-                "launch_summary": runner_metadata.launch_summary(),
-                "profile_source_attribution": &runner_metadata.source_attribution,
-                "pi_contract": pi_contract,
-                "run_id": run.id,
-                "repo_path": run.repo_path,
-                "base_branch": run.base_branch,
-                "base_sha": run.base_sha,
-                "dirty": !dirty_status.trim().is_empty(),
-                "allow_dirty": opts.allow_dirty,
-                "status_porcelain": dirty_status,
-                "selected_slices": &selected_ids,
-                "mission_envelope": &mission_envelope,
-                "frontier_budget": &frontier_budget,
-                "autonomy_effective": mission_envelope.as_ref().map(|envelope| envelope.autonomy_level.as_str()).unwrap_or("off"),
-                "autonomy_note": autonomy_effective_note(mission_envelope.as_ref()),
-                "native_pi_tui_worker": native_pi_tui_worker,
-                "experimental_pi_tui_worker": native_pi_tui_worker,
-                "worker_interface": if native_pi_tui_worker { "native_pi_tui" } else { "json_wrapper" },
-                "daemon_path": std::env::var("PATH").unwrap_or_default(),
-                "created_at": now,
-            }),
-        )?;
-        for slice in &selected_slices {
-            self.state.upsert_slice_run(&SliceRun {
+        let slice_runs = selected_slices
+            .iter()
+            .map(|slice| SliceRun {
                 run_id: run.id.clone(),
                 slice_id: slice.id.clone(),
                 status: SliceStatus::Pending,
@@ -2019,67 +2036,211 @@ impl Manager {
                 commit_sha: String::new(),
                 attempts: 0,
                 last_error: String::new(),
-            })?;
-        }
-        let verify_profiles = selected_verify_profiles(&selected_slices);
-        let verify_profile = verify_profiles.join(", ");
-        self.state.record_event(
-            &run.id,
-            workflow_events::RUN_STARTED,
-            &workflow_events::RunStartedPayload::new(
-                &run,
-                selected_ids,
-                skipped_closed_slices,
-                verify_profile,
-                verify_profiles,
-                runner.name(),
-                &runner_metadata.profile,
-                &runner_metadata.provider,
-                &runner_metadata.model,
-                &runner_metadata.reasoning,
-                &runner_metadata.mode,
-                worker_profile.clone(),
-                runner_metadata.profile_summary(),
-                runner_metadata.launch_summary(),
-                runner_metadata.source_attribution.clone(),
-            ),
+            })
+            .collect::<Vec<_>>();
+        let integration_worktree = self
+            .paths
+            .repo_worktree_dir(&run.repo_id, &run.id)
+            .join("integration");
+        let admission = self.state.admit_run(
+            &run,
+            &slice_runs,
+            mission_envelope.as_ref(),
+            frontier_budget.as_ref(),
+            &integration_worktree,
         )?;
-        if let Some(envelope) = mission_envelope.as_ref() {
-            self.state.record_event(
-                &run.id,
-                "mission_envelope_recorded",
-                &json!({
-                    "mission_envelope": envelope,
-                    "frontier_budget": frontier_budget,
-                    "autonomy_effective": envelope.autonomy_level.as_str(),
-                    "authority": autonomy_authority_label(envelope.autonomy_level),
-                }),
-            )?;
+        if admission.outcome == RunAdmissionOutcome::Conflict {
+            let active = admission.active_run.ok_or_else(|| {
+                anyhow!("canonical repository admission was denied without an active run")
+            })?;
+            bail!(
+                "repository already has active run {} ({})",
+                active.id,
+                active.status
+            );
         }
-        let cockpit_mode = self.record_cockpit_launch(&run, cockpit_mode)?;
-        self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
-
+        let launch_intent = admission
+            .intent
+            .ok_or_else(|| anyhow!("run admission succeeded without a durable launch intent"))?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
+
+        let launch_setup = (|| -> Result<CockpitMode> {
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterAdmission) {
+                bail!("injected launch failure after admission");
+            }
+            let run_store = artifact::Store::new(&run.repo_path);
+            run_store.ensure_run_dirs(&run.id)?;
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterRunDirectories) {
+                bail!("injected launch failure after run directory creation");
+            }
+            if let Some(origin) =
+                origin_notification_target_from_start(&opts.origin_notification_target)
+            {
+                let path = run_store.write_origin_notification_target(&run.id, &origin)?;
+                self.state.record_event(
+                    &run.id,
+                    "origin_notification_target_recorded",
+                    &json!({
+                        "path": path,
+                        "target_kind": origin.target_kind,
+                        "delivery_adapter": origin.delivery_adapter,
+                        "delivery_surface": origin.delivery_surface,
+                    }),
+                )?;
+            }
+            let runner_metadata = runner.metadata();
+            let worker_profile = worker_profile_evidence(runner.name(), &runner_metadata);
+            let pi_contract = runner.pi_contract_observation();
+            artifact::write_json(
+                run_store.output_path(&run.id, "preflight.json"),
+                &json!({
+                    "agent": runner.name(),
+                    "worker_profile": &worker_profile,
+                    "worker_evidence_kind": &worker_profile.worker_evidence_kind,
+                    "worker_evidence_label": &worker_profile.worker_evidence_label,
+                    "profile_summary": runner_metadata.profile_summary(),
+                    "launch_summary": runner_metadata.launch_summary(),
+                    "profile_source_attribution": &runner_metadata.source_attribution,
+                    "pi_contract": pi_contract,
+                    "run_id": run.id,
+                    "repo_path": run.repo_path,
+                    "base_branch": run.base_branch,
+                    "base_sha": run.base_sha,
+                    "dirty": !dirty_status.trim().is_empty(),
+                    "allow_dirty": opts.allow_dirty,
+                    "status_porcelain": dirty_status,
+                    "selected_slices": &selected_ids,
+                    "mission_envelope": &mission_envelope,
+                    "frontier_budget": &frontier_budget,
+                    "autonomy_effective": mission_envelope.as_ref().map(|envelope| envelope.autonomy_level.as_str()).unwrap_or("off"),
+                    "autonomy_note": autonomy_effective_note(mission_envelope.as_ref()),
+                    "native_pi_tui_worker": native_pi_tui_worker,
+                    "experimental_pi_tui_worker": native_pi_tui_worker,
+                    "worker_interface": if native_pi_tui_worker { "native_pi_tui" } else { "json_wrapper" },
+                    "daemon_path": std::env::var("PATH").unwrap_or_default(),
+                    "created_at": now,
+                }),
+            )?;
+            let cockpit_mode = self.record_cockpit_launch(&run, cockpit_mode)?;
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterCockpit) {
+                bail!("injected launch failure after cockpit activation");
+            }
+            self.state
+                .activate_run_launch(&run.id, launch_intent.execution_epoch)?;
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterActivation) {
+                bail!("injected launch failure after durable activation");
+            }
+            run.status = RunStatus::Running;
+            run.updated_at = Utc::now();
+            let verify_profiles = selected_verify_profiles(&selected_slices);
+            let verify_profile = verify_profiles.join(", ");
+            self.state.record_event(
+                &run.id,
+                workflow_events::RUN_STARTED,
+                &workflow_events::RunStartedPayload::new(
+                    &run,
+                    selected_ids.clone(),
+                    skipped_closed_slices.clone(),
+                    verify_profile,
+                    verify_profiles,
+                    runner.name(),
+                    &runner_metadata.profile,
+                    &runner_metadata.provider,
+                    &runner_metadata.model,
+                    &runner_metadata.reasoning,
+                    &runner_metadata.mode,
+                    worker_profile,
+                    runner_metadata.profile_summary(),
+                    runner_metadata.launch_summary(),
+                    runner_metadata.source_attribution.clone(),
+                ),
+            )?;
+            if let Some(envelope) = mission_envelope.as_ref() {
+                self.state.record_event(
+                    &run.id,
+                    "mission_envelope_recorded",
+                    &json!({
+                        "mission_envelope": envelope,
+                        "frontier_budget": frontier_budget,
+                        "autonomy_effective": envelope.autonomy_level.as_str(),
+                        "authority": autonomy_authority_label(envelope.autonomy_level),
+                    }),
+                )?;
+            }
+            self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
+            Ok(cockpit_mode)
+        })();
+        let cockpit_mode = match launch_setup {
+            Ok(cockpit_mode) => cockpit_mode,
+            Err(primary) => {
+                self.active.unregister(&run.id);
+                let primary_text = format!("{primary:#}");
+                let compensation_error = self.compensate_start_setup_artifacts(&run);
+                if let Err(compensation) = self.state.fail_run_launch(
+                    &run.id,
+                    launch_intent.execution_epoch,
+                    &primary_text,
+                    &compensation_error,
+                ) {
+                    bail!(
+                        "run launch failed: {primary_text}; durable launch compensation also failed: {compensation:#}"
+                    );
+                }
+                bail!("activate admitted run: {primary:#}");
+            }
+        };
+
         let manager = self.clone();
         let bg_run = run.clone();
-        thread::spawn(move || {
-            let _guard = ActiveRunGuard {
-                active: manager.active.clone(),
-                run_id: bg_run.id.clone(),
-            };
-            manager.execute_run(
-                bg_run,
-                selected_slices.clone(),
-                selected_slices,
-                cancel,
-                runner,
-                parallelism,
-                IntegrationMode::Fresh,
-                cockpit_mode,
-                native_pi_tui_worker,
-            );
-        });
+        #[cfg(test)]
+        if take_run_launch_fault(RunLaunchFaultStage::SupervisorSpawnFailure) {
+            self.active.unregister(&run.id);
+            let primary = "injected launch failure at run supervisor spawn";
+            let compensation_error = self.compensate_start_setup_artifacts(&run);
+            self.state.fail_run_launch(
+                &run.id,
+                launch_intent.execution_epoch,
+                primary,
+                &compensation_error,
+            )?;
+            bail!(primary);
+        }
+        if let Err(err) = thread::Builder::new()
+            .name(format!("khazad-run-{}", run.id))
+            .spawn(move || {
+                let _guard = ActiveRunGuard {
+                    active: manager.active.clone(),
+                    run_id: bg_run.id.clone(),
+                };
+                manager.execute_run(
+                    bg_run,
+                    selected_slices.clone(),
+                    selected_slices,
+                    cancel,
+                    runner,
+                    parallelism,
+                    IntegrationMode::Fresh,
+                    cockpit_mode,
+                    native_pi_tui_worker,
+                );
+            })
+        {
+            self.active.unregister(&run.id);
+            let primary = format!("spawn run supervisor thread: {err}");
+            let compensation_error = self.compensate_start_setup_artifacts(&run);
+            self.state.fail_run_launch(
+                &run.id,
+                launch_intent.execution_epoch,
+                &primary,
+                &compensation_error,
+            )?;
+            bail!(primary);
+        }
         Ok(run)
     }
 
@@ -2119,7 +2280,7 @@ impl Manager {
     }
 
     pub fn resume_run(&self, mut opts: ResumeOptions) -> Result<Run> {
-        let run = self
+        let mut run = self
             .state
             .get_run(&opts.run_id)?
             .ok_or_else(|| anyhow!("run {:?} not found", opts.run_id))?;
@@ -2159,22 +2320,9 @@ impl Manager {
                 run.status
             );
         }
-        self.ensure_repo_run_available(&run.repo_id, Some(&run.id))?;
         let (resume_envelope, _) = self.state.get_frontier_state(&run.id)?;
-        match resume_envelope
-            .as_ref()
-            .map(|envelope| envelope.autonomy_level)
-        {
-            Some(AutonomyLevel::Promote | AutonomyLevel::Run) => {}
-            Some(AutonomyLevel::Shadow) => {
-                self.classify_pending_frontier_proposals_at_replan_checkpoint(&run, "resume")?;
-                self.block_if_pending_replan(&run, "resume")?;
-            }
-            Some(AutonomyLevel::Off) | None => self.block_if_pending_replan(&run, "resume")?,
-        }
         let store = artifact::Store::new(&run.repo_path);
         let _last_checkpoint = store.read_checkpoint(&run.id).ok();
-        self.prepare_resume_worktrees(&run)?;
         let all_slices = store.load_slices()?;
         let requested: Vec<String> = run
             .selected_slice_id
@@ -2208,13 +2356,6 @@ impl Manager {
             }
             selected_slices.push(slice);
         }
-        // An allocation may have been persisted immediately before a daemon crash.
-        // Preserve that immutable evidence; a resumed worker receives a fresh launch
-        // identity rather than reviving or overwriting the abandoned allocation.
-        self.state.reconcile_unlaunched_worker_attempts(
-            &run.id,
-            "resume began before the allocated worker process was launched",
-        )?;
         let slice_runs = self.state.get_slice_runs(&run.id)?;
         let merged: BTreeSet<_> = slice_runs
             .iter()
@@ -2226,62 +2367,200 @@ impl Manager {
             .filter(|slice| !merged.contains(&slice.id))
             .cloned()
             .collect();
-        for slice in &remaining {
-            // `slice_runs` is a mutable current-summary compatibility projection.
-            // Do not reset its retry budget or discard its last branch/error merely
-            // because the run is being resumed; historical launch evidence lives in
-            // the append-only worker_attempt_ledger.
-            let prior = slice_runs.iter().find(|row| row.slice_id == slice.id);
-            self.state.upsert_slice_run(&SliceRun {
-                run_id: run.id.clone(),
-                slice_id: slice.id.clone(),
-                status: SliceStatus::Pending,
-                branch: prior.map(|row| row.branch.clone()).unwrap_or_default(),
-                commit_sha: prior.map(|row| row.commit_sha.clone()).unwrap_or_default(),
-                attempts: prior.map(|row| row.attempts).unwrap_or_default(),
-                last_error: prior.map(|row| row.last_error.clone()).unwrap_or_default(),
-            })?;
-        }
-        self.state.reopen_run_for_resume(&run.id)?;
         let config = store.read_config()?;
         let cockpit_mode = effective_cockpit_mode(&mut opts.pi_args, &config)?;
         let native_pi_tui_worker = (opts.native_pi_tui_worker
             || run_preflight_native_pi_tui_worker(&run))
             && !matches!(cockpit_mode, CockpitMode::Direct);
-        self.state.record_event(
-            &run.id,
-            "run_resumed",
-            &json!({
-                "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>(),
-                "native_pi_tui_worker": native_pi_tui_worker,
-                "experimental_pi_tui_worker": native_pi_tui_worker,
-            }),
-        )?;
-        self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
         let runner = self.runner_for_parts(&opts.agent, &opts.pi_bin, &opts.pi_args, &config)?;
-        let cockpit_mode = self.record_cockpit_launch(&run, cockpit_mode)?;
+        let integration_worktree = self
+            .paths
+            .repo_worktree_dir(&run.repo_id, &run.id)
+            .join("integration");
+        let admission = self
+            .state
+            .begin_resume_run_launch(&run.id, &integration_worktree)?;
+        if admission.outcome == RunAdmissionOutcome::Conflict {
+            if let Some(active) = admission.active_run {
+                bail!(
+                    "repository already has active run {} ({})",
+                    active.id,
+                    active.status
+                );
+            }
+            bail!(
+                "run {:?} changed while resume admission was prepared",
+                run.id
+            );
+        }
+        let launch_intent = admission
+            .intent
+            .ok_or_else(|| anyhow!("resume admission succeeded without a durable launch intent"))?;
         let cancel = CancellationToken::new();
         self.active.register(run.id.clone(), cancel.clone());
+        let launch_setup = (|| -> Result<CockpitMode> {
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterAdmission) {
+                bail!("injected resume failure after admission");
+            }
+            let merge_blockers = self.reconcile_integration_merges(&run)?;
+            if !merge_blockers.is_empty() {
+                let operations = merge_blockers
+                    .iter()
+                    .map(|intent| {
+                        format!(
+                            "{}={} (head {}, expected {})",
+                            intent.operation_id,
+                            intent.state.as_str(),
+                            intent.resulting_head,
+                            intent.expected_head
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "run {:?} has ambiguous integration Git state: {operations}; preserve branch {} and reconcile the recorded operation before resume",
+                    run.id,
+                    run.integration_branch
+                );
+            }
+            if !self.compensate_incomplete_launch_resources(&run)? {
+                let errors = self
+                    .state
+                    .run_launch_intents_requiring_compensation()?
+                    .into_iter()
+                    .filter(|intent| intent.run_id == run.id)
+                    .filter(|intent| !intent.compensation_error.is_empty())
+                    .map(|intent| {
+                        format!(
+                            "epoch {}: {}",
+                            intent.execution_epoch, intent.compensation_error
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!(
+                    "run {:?} still requires launch resource recovery before resume: {errors}",
+                    run.id
+                );
+            }
+            match resume_envelope
+                .as_ref()
+                .map(|envelope| envelope.autonomy_level)
+            {
+                Some(AutonomyLevel::Promote | AutonomyLevel::Run) => {}
+                Some(AutonomyLevel::Shadow) => {
+                    self.classify_pending_frontier_proposals_at_replan_checkpoint(&run, "resume")?;
+                    self.block_if_pending_replan(&run, "resume")?;
+                }
+                Some(AutonomyLevel::Off) | None => self.block_if_pending_replan(&run, "resume")?,
+            }
+            self.prepare_resume_worktrees(&run)?;
+            // An allocation may have been persisted immediately before a daemon crash.
+            // Preserve that immutable evidence; a resumed worker receives a fresh launch
+            // identity rather than reviving or overwriting the abandoned allocation.
+            self.state.reconcile_unlaunched_worker_attempts(
+                &run.id,
+                "resume began before the allocated worker process was launched",
+            )?;
+            for slice in &remaining {
+                // `slice_runs` is a mutable current-summary compatibility projection.
+                // Do not reset its retry budget or discard its last branch/error merely
+                // because the run is being resumed; historical launch evidence lives in
+                // the append-only worker_attempt_ledger.
+                let prior = slice_runs.iter().find(|row| row.slice_id == slice.id);
+                self.state.upsert_slice_run(&SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: slice.id.clone(),
+                    status: SliceStatus::Pending,
+                    branch: prior.map(|row| row.branch.clone()).unwrap_or_default(),
+                    commit_sha: prior.map(|row| row.commit_sha.clone()).unwrap_or_default(),
+                    attempts: prior.map(|row| row.attempts).unwrap_or_default(),
+                    last_error: prior.map(|row| row.last_error.clone()).unwrap_or_default(),
+                })?;
+            }
+            let cockpit_mode = self.record_cockpit_launch(&run, cockpit_mode)?;
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterCockpit) {
+                bail!("injected resume failure after cockpit activation");
+            }
+            self.state
+                .activate_run_launch(&run.id, launch_intent.execution_epoch)?;
+            #[cfg(test)]
+            if take_run_launch_fault(RunLaunchFaultStage::AfterActivation) {
+                bail!("injected resume failure after durable activation");
+            }
+            run.status = RunStatus::Running;
+            run.error.clear();
+            run.updated_at = Utc::now();
+            self.state.record_event(
+                &run.id,
+                "run_resumed",
+                &json!({
+                    "execution_epoch": launch_intent.execution_epoch,
+                    "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>(),
+                    "native_pi_tui_worker": native_pi_tui_worker,
+                    "experimental_pi_tui_worker": native_pi_tui_worker,
+                }),
+            )?;
+            self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
+            Ok(cockpit_mode)
+        })();
+        let cockpit_mode = match launch_setup {
+            Ok(cockpit_mode) => cockpit_mode,
+            Err(primary) => {
+                self.active.unregister(&run.id);
+                let primary_text = format!("{primary:#}");
+                if let Err(compensation) = self.state.fail_run_launch(
+                    &run.id,
+                    launch_intent.execution_epoch,
+                    &primary_text,
+                    "",
+                ) {
+                    bail!(
+                        "resume launch failed: {primary_text}; durable launch compensation also failed: {compensation:#}"
+                    );
+                }
+                bail!("activate admitted resume: {primary:#}");
+            }
+        };
         let manager = self.clone();
         let bg_run = run.clone();
         let parallelism = effective_parallelism(opts.parallelism, &config);
-        thread::spawn(move || {
-            let _guard = ActiveRunGuard {
-                active: manager.active.clone(),
-                run_id: bg_run.id.clone(),
-            };
-            manager.execute_run(
-                bg_run,
-                remaining,
-                selected_slices,
-                cancel,
-                runner,
-                parallelism,
-                IntegrationMode::Existing,
-                cockpit_mode,
-                native_pi_tui_worker,
-            );
-        });
+        #[cfg(test)]
+        if take_run_launch_fault(RunLaunchFaultStage::SupervisorSpawnFailure) {
+            self.active.unregister(&run.id);
+            let primary = "injected launch failure at resumed run supervisor spawn";
+            self.state
+                .fail_run_launch(&run.id, launch_intent.execution_epoch, primary, "")?;
+            bail!(primary);
+        }
+        if let Err(err) = thread::Builder::new()
+            .name(format!("khazad-resume-{}", run.id))
+            .spawn(move || {
+                let _guard = ActiveRunGuard {
+                    active: manager.active.clone(),
+                    run_id: bg_run.id.clone(),
+                };
+                manager.execute_run(
+                    bg_run,
+                    remaining,
+                    selected_slices,
+                    cancel,
+                    runner,
+                    parallelism,
+                    IntegrationMode::Existing,
+                    cockpit_mode,
+                    native_pi_tui_worker,
+                );
+            })
+        {
+            self.active.unregister(&run.id);
+            let primary = format!("spawn resumed run supervisor thread: {err}");
+            self.state
+                .fail_run_launch(&run.id, launch_intent.execution_epoch, &primary, "")?;
+            bail!(primary);
+        }
         self.state
             .get_run(&run.id)?
             .ok_or_else(|| anyhow!("run {:?} not found after resume", run.id))
@@ -2318,6 +2597,13 @@ impl Manager {
     }
 
     pub fn recover_interrupted_runs(&self) -> Result<usize> {
+        let launch_compensation_retries = self.state.run_launch_intents_requiring_compensation()?;
+        let incomplete_launches = self
+            .state
+            .incomplete_run_launch_intents()?
+            .into_iter()
+            .map(|intent| (intent.run_id.clone(), intent))
+            .collect::<BTreeMap<_, _>>();
         let mut recovered_run_ids = BTreeSet::new();
         for run_id in self
             .state
@@ -2331,14 +2617,21 @@ impl Manager {
                 .state
                 .terminal_transition(&run_id)?
                 .ok_or_else(|| anyhow!("run {run_id:?} lost its durable terminal intent"))?;
+            let merge_blockers = self.reconcile_integration_merges(&run)?;
+            if !merge_blockers.is_empty() {
+                continue;
+            }
             self.terminalize_or_reconcile(&run, &transition)?;
             recovered_run_ids.insert(run_id);
         }
 
         let runs = self.state.active_runs()?;
-        let reason = "daemon restarted before run reached a terminal state";
         for run in &runs {
             if recovered_run_ids.contains(&run.id) {
+                continue;
+            }
+            let merge_blockers = self.reconcile_integration_merges(run)?;
+            if !merge_blockers.is_empty() {
                 continue;
             }
             if let Some(transition) = self.state.terminal_transition(&run.id)? {
@@ -2346,17 +2639,30 @@ impl Manager {
                 recovered_run_ids.insert(run.id.clone());
                 continue;
             }
+            let reason = incomplete_launches.get(&run.id).map_or_else(
+                || "daemon restarted before run reached a terminal state".to_string(),
+                |intent| {
+                    format!(
+                        "daemon restarted during {} launch activation at durable state {}",
+                        intent.action.as_str(),
+                        intent.state.as_str()
+                    )
+                },
+            );
             self.state.record_event(
                 &run.id,
                 "daemon_recovery_started",
-                &json!({ "reason": reason }),
+                &json!({
+                    "reason": reason,
+                    "launch_intent": incomplete_launches.get(&run.id),
+                }),
             )?;
             let interrupted_questions = self.state.prepare_run_terminal_transition(
                 &run.id,
                 RunStatus::Interrupted,
-                reason,
-                reason,
-                reason,
+                &reason,
+                &reason,
+                &reason,
             )?;
             let transition = self
                 .state
@@ -2376,6 +2682,34 @@ impl Manager {
                 &json!({ "status": RunStatus::Interrupted, "reason": reason }),
             )?;
             recovered_run_ids.insert(run.id.clone());
+        }
+        for original_intent in launch_compensation_retries {
+            if original_intent.action != crate::domain::RunLaunchAction::Start {
+                continue;
+            }
+            let Some(intent) = self
+                .state
+                .run_launch_intent(&original_intent.run_id, original_intent.execution_epoch)?
+            else {
+                continue;
+            };
+            if !matches!(
+                intent.state,
+                crate::domain::RunLaunchState::Interrupted
+                    | crate::domain::RunLaunchState::Failed
+                    | crate::domain::RunLaunchState::RecoveryRequired
+            ) {
+                continue;
+            }
+            let run = self.state.get_run(&intent.run_id)?.ok_or_else(|| {
+                anyhow!(
+                    "launch compensation intent references missing run {:?}",
+                    intent.run_id
+                )
+            })?;
+            if self.compensate_launch_resources(&run, &intent)? {
+                recovered_run_ids.insert(run.id);
+            }
         }
         Ok(recovered_run_ids.len())
     }
@@ -2753,6 +3087,18 @@ impl Manager {
     }
 
     fn terminalize_or_reconcile(&self, run: &Run, transition: &TerminalTransition) -> Result<()> {
+        let merge_blockers = self.reconcile_integration_merges(run)?;
+        if !merge_blockers.is_empty() {
+            let operation_ids = merge_blockers
+                .iter()
+                .map(|intent| intent.operation_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "run {:?} retains ambiguous integration operations before terminal cleanup: {operation_ids}",
+                run.id
+            );
+        }
         let store = artifact::Store::new(&run.repo_path);
         let summary_path = store.output_path(&run.id, "run-summary.json");
         let (summary, summary_path) = if transition.summary_written {
@@ -2834,6 +3180,7 @@ impl Manager {
             }
             self.state.mark_terminal_notification_bookkept(&run.id)?;
         }
+        let integration_cleanup_owned = self.start_launch_owns_integration_resources(run)?;
         if self.state.claim_terminal_cleanup(&run.id)? {
             #[cfg(test)]
             if take_terminalization_fault(TerminalizationFaultStage::Cleanup) {
@@ -2845,31 +3192,59 @@ impl Manager {
                 )?;
                 return Ok(());
             }
-            match self.cleanup_run_worktrees(&terminal_run) {
-                Ok(()) => {
-                    if let Err(err) = self.state.mark_terminal_cleanup_completed(
-                        &run.id,
-                        workflow_events::WORKTREES_CLEANED,
-                        &workflow_events::RunCompletedPayload::new(&run.id),
-                    ) {
-                        eprintln!(
-                            "khazad-doom: could not record non-authoritative worktree cleanup for {}: {err:#}",
-                            run.id
-                        );
+            if integration_cleanup_owned {
+                match self.cleanup_run_worktrees(&terminal_run) {
+                    Ok(()) => {
+                        if let Err(err) = self.state.mark_terminal_cleanup_completed(
+                            &run.id,
+                            workflow_events::WORKTREES_CLEANED,
+                            &workflow_events::RunCompletedPayload::new(&run.id),
+                        ) {
+                            eprintln!(
+                                "khazad-doom: could not record non-authoritative worktree cleanup for {}: {err:#}",
+                                run.id
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        let cleanup_error = err.to_string();
+                        if let Err(record_err) = self.state.record_event(
+                            &run.id,
+                            "worktree_cleanup_error",
+                            &workflow_events::RunErrorPayload::new(&cleanup_error),
+                        ) {
+                            eprintln!(
+                                "khazad-doom: could not record non-authoritative worktree cleanup failure for {}: {record_err:#}",
+                                run.id
+                            );
+                        }
                     }
                 }
-                Err(err) => {
-                    let cleanup_error = err.to_string();
-                    if let Err(record_err) = self.state.record_event(
-                        &run.id,
-                        "worktree_cleanup_error",
-                        &workflow_events::RunErrorPayload::new(&cleanup_error),
-                    ) {
-                        eprintln!(
-                            "khazad-doom: could not record non-authoritative worktree cleanup failure for {}: {record_err:#}",
-                            run.id
-                        );
-                    }
+            } else {
+                let incident = workflow_events::RunIncidentPayload::warning(
+                    "unowned_launch_resources_retained",
+                    "retained integration path and branch because fresh-launch resource ownership was not durably recorded",
+                );
+                self.state.mark_terminal_cleanup_completed(
+                    &run.id,
+                    workflow_events::RUN_INCIDENT,
+                    &incident,
+                )?;
+            }
+            if let Err(err) = self.compensate_incomplete_launch_resources(&terminal_run) {
+                let compensation_error = format!("launch resource compensation failed: {err:#}");
+                if let Err(record_err) = self.state.record_event(
+                    &run.id,
+                    workflow_events::RUN_INCIDENT,
+                    &workflow_events::RunIncidentPayload::warning(
+                        "launch_compensation_state_error",
+                        &compensation_error,
+                    ),
+                ) {
+                    eprintln!(
+                        "khazad-doom: could not record launch compensation failure for {}: {record_err:#}",
+                        run.id
+                    );
                 }
             }
         }
@@ -3014,15 +3389,33 @@ impl Manager {
         let reuse_recovery_worktree = matches!(integration_mode, IntegrationMode::Existing)
             && integration_worktree.is_dir()
             && gitutil::has_retained_completion_publication_journal(&integration_worktree)?;
+        let execution_epoch = self.state.current_run_execution_epoch(&run.id)?;
+        let launch_intent = self.state.run_launch_intent(&run.id, execution_epoch)?;
         if !reuse_recovery_worktree {
             match integration_mode {
-                IntegrationMode::Fresh => gitutil::worktree_add(
-                    &run.repo_path,
-                    &integration_worktree,
-                    &run.integration_branch,
-                    &run.base_sha,
-                )
-                .context("create integration worktree")?,
+                IntegrationMode::Fresh => {
+                    gitutil::worktree_add_new(
+                        &run.repo_path,
+                        &integration_worktree,
+                        &run.integration_branch,
+                        &run.base_sha,
+                    )
+                    .context("create integration worktree")?;
+                    #[cfg(test)]
+                    if take_run_launch_fault(
+                        RunLaunchFaultStage::BeforeIntegrationResourceOwnership,
+                    ) {
+                        bail!(
+                            "injected launch failure before integration resource ownership was durable"
+                        );
+                    }
+                    if launch_intent.is_some() {
+                        self.state.record_run_launch_integration_resources_created(
+                            &run.id,
+                            execution_epoch,
+                        )?;
+                    }
+                }
                 IntegrationMode::Existing => gitutil::worktree_add_existing(
                     &run.repo_path,
                     &integration_worktree,
@@ -3032,6 +3425,13 @@ impl Manager {
             }
         }
         setup_phase.finish();
+        #[cfg(test)]
+        if take_run_launch_fault(RunLaunchFaultStage::AfterIntegrationWorktree) {
+            bail!("injected launch failure after integration worktree activation");
+        }
+        if launch_intent.is_some() {
+            self.state.complete_run_launch(&run.id, execution_epoch)?;
+        }
 
         let mut run = run.clone();
         let slice_runs = self.state.get_slice_runs(&run.id)?;
@@ -3101,44 +3501,41 @@ impl Manager {
                         "git merge",
                         "merging slice branch into integration branch",
                     );
-                    if let Err(err) = gitutil::merge(
-                        &integration_worktree,
-                        &worker.branch,
-                        &format!("khazad(slice:{}): merge {}", slice.id, slice.title),
-                    ) {
-                        let report = self.write_merge_conflict_report(
-                            &run,
-                            &slice,
-                            &worker.branch,
-                            &integration_worktree,
-                            &err,
-                        )?;
-                        let _ = gitutil::merge_abort(&integration_worktree);
-                        self.state.update_slice_status(
-                            &run.id,
-                            &slice.id,
-                            SliceStatus::Blocked,
-                            &report.summary,
-                        )?;
-                        return Err(BlockedError::new(report.summary).into());
+                    let source_commit = gitutil::ref_sha(&run.repo_path, &worker.branch)?;
+                    if !worker.result.commit_sha.is_empty()
+                        && worker.result.commit_sha != source_commit
+                    {
+                        return Err(BlockedError::new(format!(
+                            "slice {} reported commit {} but branch {} resolves to {}",
+                            slice.id, worker.result.commit_sha, worker.branch, source_commit
+                        ))
+                        .into());
                     }
-                    self.state.upsert_slice_run(&SliceRun {
-                        run_id: run.id.clone(),
-                        slice_id: slice.id.clone(),
-                        status: SliceStatus::Merged,
-                        branch: worker.branch,
-                        commit_sha: worker.result.commit_sha.clone(),
-                        attempts: worker.attempts,
-                        last_error: String::new(),
-                    })?;
-                    self.state.record_event(
-                        &run.id,
-                        workflow_events::SLICE_MERGED,
-                        &workflow_events::SliceMergedPayload::new(
-                            &slice.id,
-                            &worker.result.commit_sha,
-                        ),
-                    )?;
+                    let merge_message =
+                        format!("khazad(slice:{}): merge {}", slice.id, slice.title);
+                    if let Err(err) = self.journaled_integration_merge(IntegrationMergeRequest {
+                        run: &run,
+                        integration_worktree: &integration_worktree,
+                        kind: IntegrationMergeKind::Slice,
+                        slice_id: &slice.id,
+                        attempt: worker.attempts,
+                        launch_id: Some(worker.launch_id),
+                        source_branch: &worker.branch,
+                        source_commit: &source_commit,
+                        message: &merge_message,
+                        completion: IntegrationMergeCompletion::Slice {
+                            branch: worker.branch.clone(),
+                            commit_sha: source_commit.clone(),
+                            attempts: worker.attempts,
+                        },
+                        conflict_slice: Some(&slice),
+                    }) {
+                        return Err(BlockedError::new(format!(
+                            "merge blocked for slice {}: {err:#}",
+                            slice.id
+                        ))
+                        .into());
+                    }
                     dependency_summary.insert(slice.id.clone(), worker.result.summary.clone());
                     completed_ids.insert(slice.id.clone());
                     checks.extend(worker.checks);
@@ -4575,6 +4972,7 @@ impl Manager {
                     checks: all_checks,
                     branch: worker_branch,
                     attempts: attempt,
+                    launch_id: active_launch_id,
                 });
             }
 
@@ -5929,6 +6327,7 @@ impl Manager {
                     checks: request.all_checks.clone(),
                     branch: launch.ledger.branch.clone(),
                     attempts: request.attempt,
+                    launch_id: launch.ledger.launch_id,
                 }));
             }
             self.record_worker_attempt_failure(WorkerAttemptFailureRecord {
@@ -6546,16 +6945,11 @@ impl Manager {
                     )?;
                     self.block_if_pending_replan(run, "integration repair authority proposal")?;
                 }
-                if let Err(err) = gitutil::merge(
-                    integration_worktree,
-                    &launch.ledger.branch,
-                    &format!(
-                        "khazad(integration-repair): merge launch {}",
-                        launch.ledger.launch_id
-                    ),
-                ) {
-                    let _ = gitutil::merge_abort(integration_worktree);
-                    last_error = format!("integration repair merge failed: {err}");
+                if result.commit_sha != repair_head {
+                    last_error = format!(
+                        "integration repair reported commit {} but branch {} resolves to {}",
+                        result.commit_sha, launch.ledger.branch, repair_head
+                    );
                     self.state.finish_worker_attempt(
                         launch.ledger.launch_id,
                         "failed",
@@ -6563,19 +6957,45 @@ impl Manager {
                     )?;
                     return Err(BlockedError::new(last_error).into());
                 }
+                artifact::write_json(&launch.output_path, &result)?;
+                let merge_message = format!(
+                    "khazad(integration-repair): merge launch {}",
+                    launch.ledger.launch_id
+                );
+                if let Err(err) = self.journaled_integration_merge(IntegrationMergeRequest {
+                    run,
+                    integration_worktree,
+                    kind: IntegrationMergeKind::IntegrationRepair,
+                    slice_id: INTEGRATION_REPAIR_SCOPE_ID,
+                    attempt,
+                    launch_id: Some(launch.ledger.launch_id),
+                    source_branch: &launch.ledger.branch,
+                    source_commit: &repair_head,
+                    message: &merge_message,
+                    completion: IntegrationMergeCompletion::IntegrationRepair {
+                        launch_id: launch.ledger.launch_id,
+                        status: result.status.clone(),
+                        summary: result.summary.clone(),
+                    },
+                    conflict_slice: None,
+                }) {
+                    last_error = format!("integration repair merge failed: {err:#}");
+                    return Err(BlockedError::new(last_error).into());
+                }
+            } else {
+                artifact::write_json(&launch.output_path, &result)?;
+                self.state
+                    .finish_worker_attempt(launch.ledger.launch_id, "succeeded", "")?;
+                self.state.record_event(
+                    &run.id,
+                    workflow_events::INTEGRATION_REPAIR_COMPLETED,
+                    &workflow_events::IntegrationRepairCompletedPayload::new(
+                        &result.status,
+                        &result.summary,
+                        launch.ledger.launch_id,
+                    ),
+                )?;
             }
-            artifact::write_json(&launch.output_path, &result)?;
-            self.state
-                .finish_worker_attempt(launch.ledger.launch_id, "succeeded", "")?;
-            self.state.record_event(
-                &run.id,
-                workflow_events::INTEGRATION_REPAIR_COMPLETED,
-                &workflow_events::IntegrationRepairCompletedPayload::new(
-                    &result.status,
-                    &result.summary,
-                    launch.ledger.launch_id,
-                ),
-            )?;
             return Ok(result);
         }
         Err(anyhow!(
@@ -6583,6 +7003,413 @@ impl Manager {
             DEFAULT_REPAIR_ATTEMPTS,
             last_error
         ))
+    }
+
+    fn journaled_integration_merge(&self, request: IntegrationMergeRequest<'_>) -> Result<String> {
+        let resolved_source = gitutil::ref_sha(&request.run.repo_path, request.source_branch)?;
+        if resolved_source != request.source_commit {
+            bail!(
+                "integration merge source {} moved from recorded commit {} to {}",
+                request.source_branch,
+                request.source_commit,
+                resolved_source
+            );
+        }
+        let expected_head = gitutil::head_sha(request.integration_worktree)?;
+        let source_tree = gitutil::commit_tree_sha(&request.run.repo_path, request.source_commit)?;
+        let (expected_result_tree, merge_prediction_cause) = match gitutil::merge_tree_sha(
+            &request.run.repo_path,
+            &expected_head,
+            request.source_commit,
+        ) {
+            Ok(tree) => (tree, String::new()),
+            Err(err) => (
+                String::new(),
+                format!("expected merge result tree unavailable before Git mutation: {err:#}"),
+            ),
+        };
+        let operation_id = integration_merge_operation_id(
+            &request.run.id,
+            request.kind,
+            request.slice_id,
+            request.attempt,
+            request.launch_id,
+            request.source_commit,
+            &expected_head,
+        );
+        let now = Utc::now();
+        let intent = IntegrationMergeIntent {
+            operation_id: operation_id.clone(),
+            run_id: request.run.id.clone(),
+            kind: request.kind,
+            slice_id: request.slice_id.to_string(),
+            attempt: request.attempt,
+            launch_id: request.launch_id,
+            source_branch: request.source_branch.to_string(),
+            source_commit: request.source_commit.to_string(),
+            source_tree,
+            expected_head,
+            expected_result_tree,
+            resulting_head: String::new(),
+            state: IntegrationMergeState::Prepared,
+            completion: request.completion,
+            primary_cause: merge_prediction_cause,
+            abort_error: String::new(),
+            conflicted_files: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let prepared = self.state.prepare_integration_merge(&intent)?;
+        match prepared.outcome {
+            IntegrationMergePrepareOutcome::AlreadyApplied => {
+                return Ok(prepared.intent.resulting_head);
+            }
+            IntegrationMergePrepareOutcome::Conflict => {
+                bail!(
+                    "integration merge {} conflicts with durable operation {} ({})",
+                    intent.operation_id,
+                    prepared.intent.operation_id,
+                    prepared.intent.state.as_str()
+                );
+            }
+            IntegrationMergePrepareOutcome::AlreadyPrepared => {
+                let current_head = gitutil::head_sha(request.integration_worktree)?;
+                if current_head != intent.expected_head
+                    || gitutil::merge_in_progress(request.integration_worktree)?
+                {
+                    self.reconcile_one_integration_merge(request.run, &prepared.intent)?;
+                    let reconciled = self
+                        .state
+                        .integration_merge_intents(&request.run.id)?
+                        .into_iter()
+                        .find(|candidate| candidate.operation_id == intent.operation_id)
+                        .ok_or_else(|| anyhow!("integration merge intent disappeared"))?;
+                    if reconciled.state == IntegrationMergeState::Applied {
+                        return Ok(reconciled.resulting_head);
+                    }
+                    bail!(
+                        "integration merge {} reconciled as {}; refusing to replay it",
+                        reconciled.operation_id,
+                        reconciled.state.as_str()
+                    );
+                }
+            }
+            IntegrationMergePrepareOutcome::Prepared => {}
+        }
+        #[cfg(test)]
+        if take_integration_merge_fault(IntegrationMergeFaultStage::AfterIntent) {
+            bail!("injected merge failure after durable intent");
+        }
+
+        let merge_message = format!(
+            "{}\n\nKhazad-Merge-Operation: {operation_id}",
+            request.message
+        );
+        if let Err(primary) = gitutil::merge(
+            request.integration_worktree,
+            request.source_commit,
+            &merge_message,
+        ) {
+            let conflicted_files =
+                gitutil::conflicted_files(request.integration_worktree).unwrap_or_default();
+            let report_error = request
+                .conflict_slice
+                .and_then(|slice| {
+                    self.write_merge_conflict_report(
+                        request.run,
+                        slice,
+                        request.source_branch,
+                        request.integration_worktree,
+                        &primary,
+                    )
+                    .err()
+                })
+                .map(|err| format!("write merge conflict evidence: {err:#}"))
+                .unwrap_or_default();
+            let resulting_head =
+                gitutil::ref_sha(&request.run.repo_path, &request.run.integration_branch)
+                    .unwrap_or_default();
+            let mut cause = format!("{primary:#}");
+            if !report_error.is_empty() {
+                cause.push_str("; ");
+                cause.push_str(&report_error);
+            }
+            const ABORT_PENDING: &str = "merge conflict recorded; git merge --abort pending";
+            if let Err(state_error) = self.state.resolve_integration_merge(
+                &operation_id,
+                IntegrationMergeState::Conflicted,
+                &resulting_head,
+                &cause,
+                ABORT_PENDING,
+                &conflicted_files,
+            ) {
+                return Err(primary).context(format!(
+                    "merge failed; recording durable pre-abort conflict evidence also failed: {state_error:#}"
+                ));
+            }
+            #[cfg(test)]
+            if take_integration_merge_fault(IntegrationMergeFaultStage::BeforeAbort) {
+                return Err(primary)
+                    .context("injected merge failure after conflict and before abort");
+            }
+            #[cfg(test)]
+            let abort_result =
+                if take_integration_merge_fault(IntegrationMergeFaultStage::AbortFailure) {
+                    Err(anyhow!("injected git merge --abort failure"))
+                } else {
+                    gitutil::merge_abort(request.integration_worktree)
+                };
+            #[cfg(not(test))]
+            let abort_result = gitutil::merge_abort(request.integration_worktree);
+            let abort_error = abort_result
+                .err()
+                .map(|err| format!("{err:#}"))
+                .unwrap_or_default();
+            #[cfg(test)]
+            if take_integration_merge_fault(IntegrationMergeFaultStage::AfterAbort) {
+                return Err(primary)
+                    .context("injected merge failure after abort and before durable resolution");
+            }
+            if let Err(state_error) = self.state.resolve_integration_merge(
+                &operation_id,
+                IntegrationMergeState::Conflicted,
+                &resulting_head,
+                &cause,
+                &abort_error,
+                &conflicted_files,
+            ) {
+                return Err(primary).context(format!(
+                    "merge failed; recording durable abort outcome also failed: {state_error:#}"
+                ));
+            }
+            if abort_error.is_empty() {
+                return Err(primary).context(format!(
+                    "integration merge {operation_id} conflicted and was aborted"
+                ));
+            }
+            return Err(primary).context(format!(
+                "integration merge {operation_id} conflicted; merge abort also failed: {abort_error}"
+            ));
+        }
+        let resulting_head = gitutil::head_sha(request.integration_worktree)?;
+        #[cfg(test)]
+        if take_integration_merge_fault(IntegrationMergeFaultStage::AfterGitMutation) {
+            bail!("injected merge failure after Git mutation at {resulting_head}");
+        }
+        if resulting_head == intent.expected_head {
+            if !gitutil::is_ancestor(
+                &request.run.repo_path,
+                &intent.source_commit,
+                &resulting_head,
+            )? {
+                bail!(
+                    "integration merge {operation_id} returned success without applying source {}",
+                    intent.source_commit
+                );
+            }
+            self.state
+                .commit_integration_merge(&operation_id, &resulting_head)
+                .with_context(|| {
+                    format!(
+                        "Git completed no-op integration merge {operation_id} at {resulting_head}, but its durable completion is pending replay"
+                    )
+                })?;
+        } else {
+            self.reconcile_one_integration_merge(request.run, &intent)
+                .with_context(|| {
+                    format!(
+                        "Git applied integration merge {operation_id} at {resulting_head}, but its durable completion is pending reconciliation"
+                    )
+                })?;
+        }
+        let reconciled = self
+            .state
+            .integration_merge_intents(&request.run.id)?
+            .into_iter()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .ok_or_else(|| anyhow!("integration merge intent {operation_id:?} disappeared"))?;
+        if reconciled.state != IntegrationMergeState::Applied
+            || reconciled.resulting_head != resulting_head
+        {
+            bail!(
+                "integration merge {operation_id} produced unverified Git state {} at {}; operator reconciliation is required",
+                reconciled.state.as_str(),
+                reconciled.resulting_head
+            );
+        }
+        Ok(resulting_head)
+    }
+
+    fn reconcile_integration_merges(&self, run: &Run) -> Result<Vec<IntegrationMergeIntent>> {
+        for intent in self.state.integration_merge_intents(&run.id)? {
+            self.reconcile_one_integration_merge(run, &intent)?;
+        }
+        Ok(self
+            .state
+            .integration_merge_intents(&run.id)?
+            .into_iter()
+            .filter(|intent| {
+                matches!(
+                    intent.state,
+                    IntegrationMergeState::Conflicted | IntegrationMergeState::Divergent
+                )
+            })
+            .collect())
+    }
+
+    fn reconcile_one_integration_merge(
+        &self,
+        run: &Run,
+        intent: &IntegrationMergeIntent,
+    ) -> Result<()> {
+        if matches!(
+            intent.state,
+            IntegrationMergeState::Applied
+                | IntegrationMergeState::NotStarted
+                | IntegrationMergeState::Divergent
+        ) {
+            return Ok(());
+        }
+        let integration_worktree = self
+            .paths
+            .repo_worktree_dir(&run.repo_id, &run.id)
+            .join("integration");
+        let merge_in_progress =
+            integration_worktree.is_dir() && gitutil::merge_in_progress(&integration_worktree)?;
+        let current_head = match gitutil::ref_sha(&run.repo_path, &run.integration_branch) {
+            Ok(head) => head,
+            Err(err) => {
+                self.state.resolve_integration_merge(
+                    &intent.operation_id,
+                    IntegrationMergeState::Divergent,
+                    "",
+                    &format!(
+                        "integration branch {} cannot be resolved during merge recovery: {err:#}",
+                        run.integration_branch
+                    ),
+                    "",
+                    &[],
+                )?;
+                return Ok(());
+            }
+        };
+        if intent.state == IntegrationMergeState::Conflicted {
+            if merge_in_progress {
+                let conflicted_files =
+                    gitutil::conflicted_files(&integration_worktree).unwrap_or_default();
+                if let Err(err) = gitutil::merge_abort(&integration_worktree) {
+                    self.state.resolve_integration_merge(
+                        &intent.operation_id,
+                        IntegrationMergeState::Conflicted,
+                        &current_head,
+                        &intent.primary_cause,
+                        &format!("{err:#}"),
+                        &conflicted_files,
+                    )?;
+                    return Ok(());
+                }
+            }
+            let recovered_head =
+                gitutil::ref_sha(&run.repo_path, &run.integration_branch).unwrap_or(current_head);
+            if recovered_head == intent.expected_head {
+                self.state.resolve_integration_merge(
+                    &intent.operation_id,
+                    IntegrationMergeState::NotStarted,
+                    &recovered_head,
+                    &intent.primary_cause,
+                    "",
+                    &intent.conflicted_files,
+                )?;
+            }
+            return Ok(());
+        }
+        if merge_in_progress {
+            let conflicted_files =
+                gitutil::conflicted_files(&integration_worktree).unwrap_or_default();
+            let abort_error = gitutil::merge_abort(&integration_worktree)
+                .err()
+                .map(|err| format!("{err:#}"))
+                .unwrap_or_default();
+            let recovered_head =
+                gitutil::ref_sha(&run.repo_path, &run.integration_branch).unwrap_or(current_head);
+            const RECOVERY_CAUSE: &str = "daemon recovery found an interrupted conflicted merge";
+            self.state.resolve_integration_merge(
+                &intent.operation_id,
+                IntegrationMergeState::Conflicted,
+                &recovered_head,
+                RECOVERY_CAUSE,
+                &abort_error,
+                &conflicted_files,
+            )?;
+            if abort_error.is_empty() && recovered_head == intent.expected_head {
+                self.state.resolve_integration_merge(
+                    &intent.operation_id,
+                    IntegrationMergeState::NotStarted,
+                    &recovered_head,
+                    RECOVERY_CAUSE,
+                    "",
+                    &conflicted_files,
+                )?;
+            }
+            return Ok(());
+        }
+        if current_head == intent.expected_head {
+            self.state.resolve_integration_merge(
+                &intent.operation_id,
+                IntegrationMergeState::NotStarted,
+                &current_head,
+                "Git mutation was not started before interruption",
+                "",
+                &[],
+            )?;
+            return Ok(());
+        }
+        if !gitutil::is_ancestor(&run.repo_path, &intent.expected_head, &current_head)? {
+            self.state.resolve_integration_merge(
+                &intent.operation_id,
+                IntegrationMergeState::Divergent,
+                &current_head,
+                "integration branch no longer descends from the journaled expected head",
+                "",
+                &[],
+            )?;
+            return Ok(());
+        }
+        let parents = gitutil::commit_parents(&run.repo_path, &current_head)?;
+        let mut source_parent = false;
+        for parent in parents.iter().skip(1) {
+            if parent == &intent.source_commit
+                || gitutil::is_ancestor(&run.repo_path, &intent.source_commit, parent)?
+            {
+                source_parent = true;
+                break;
+            }
+        }
+        let expected_parents = parents.first() == Some(&intent.expected_head) && source_parent;
+        let operation_marker = format!("Khazad-Merge-Operation: {}", intent.operation_id);
+        let matching_operation = gitutil::run(
+            &run.repo_path,
+            &["show", "-s", "--format=%B", &current_head],
+        )?
+        .lines()
+        .any(|line| line.trim() == operation_marker);
+        let matching_tree = !intent.expected_result_tree.is_empty()
+            && gitutil::commit_tree_sha(&run.repo_path, &current_head)?
+                == intent.expected_result_tree;
+        if expected_parents && matching_operation && matching_tree {
+            self.state
+                .commit_integration_merge(&intent.operation_id, &current_head)?;
+        } else {
+            self.state.resolve_integration_merge(
+                &intent.operation_id,
+                IntegrationMergeState::Divergent,
+                &current_head,
+                "integration branch moved without an unambiguous journaled merge result",
+                "",
+                &[],
+            )?;
+        }
+        Ok(())
     }
 
     fn write_merge_conflict_report(
@@ -6694,6 +7521,111 @@ impl Manager {
         Ok(())
     }
 
+    fn compensate_start_setup_artifacts(&self, run: &Run) -> String {
+        let run_dir = artifact::Store::new(&run.repo_path).run_dir(&run.id);
+        match std::fs::remove_dir_all(&run_dir) {
+            Ok(()) => String::new(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => format!(
+                "remove launch-owned run directory {}: {err}",
+                run_dir.display()
+            ),
+        }
+    }
+
+    fn start_launch_owns_integration_resources(&self, run: &Run) -> Result<bool> {
+        Ok(self
+            .state
+            .run_launch_intent(&run.id, 1)?
+            .map(|intent| {
+                intent.action != crate::domain::RunLaunchAction::Start
+                    || intent.integration_resources_owned
+            })
+            .unwrap_or(true))
+    }
+
+    fn compensate_incomplete_launch_resources(&self, run: &Run) -> Result<bool> {
+        let intents = self.state.run_launch_intents_requiring_compensation()?;
+        let mut all_compensated = true;
+        for intent in intents
+            .iter()
+            .filter(|intent| intent.run_id == run.id)
+            .filter(|intent| intent.action == crate::domain::RunLaunchAction::Start)
+        {
+            all_compensated &= self.compensate_launch_resources(run, intent)?;
+        }
+        Ok(all_compensated)
+    }
+
+    fn compensate_launch_resources(&self, run: &Run, intent: &RunLaunchIntent) -> Result<bool> {
+        let mut compensation_errors = Vec::new();
+        if intent
+            .compensation_error
+            .contains("remove launch-owned run directory")
+        {
+            let run_dir_error = self.compensate_start_setup_artifacts(run);
+            if !run_dir_error.is_empty() {
+                compensation_errors.push(run_dir_error);
+            }
+        }
+        let integration_path = Path::new(&intent.integration_worktree);
+        let full_ref = format!("refs/heads/{}", intent.integration_branch);
+        let branch_exists = gitutil::ref_exists(&run.repo_path, &full_ref)?;
+        if !intent.integration_resources_owned && (integration_path.exists() || branch_exists) {
+            compensation_errors.push(format!(
+                "retaining integration path {} and branch {} because this launch did not durably prove it created them; inspect and remove only after verifying ownership",
+                intent.integration_worktree, intent.integration_branch
+            ));
+        }
+        if intent.integration_resources_owned {
+            if let Err(err) = self.cleanup_run_worktrees(run) {
+                compensation_errors.push(format!(
+                    "remove launch-owned integration worktrees under {}: {err:#}",
+                    integration_path
+                        .parent()
+                        .unwrap_or(integration_path)
+                        .display()
+                ));
+            }
+            if branch_exists {
+                let branch_head = gitutil::ref_sha(&run.repo_path, &intent.integration_branch)?;
+                if branch_head != run.base_sha {
+                    compensation_errors.push(format!(
+                        "refusing to delete launch-owned branch {} because it moved from base {} to {}; inspect it and delete it explicitly only if safe",
+                        intent.integration_branch, run.base_sha, branch_head
+                    ));
+                } else {
+                    #[cfg(test)]
+                    let deletion =
+                        if take_run_launch_fault(RunLaunchFaultStage::BranchDeletionFailure) {
+                            Err(anyhow!("injected integration branch deletion failure"))
+                        } else {
+                            gitutil::branch_delete(&run.repo_path, &intent.integration_branch)
+                        };
+                    #[cfg(not(test))]
+                    let deletion =
+                        gitutil::branch_delete(&run.repo_path, &intent.integration_branch);
+                    if let Err(err) = deletion {
+                        compensation_errors.push(format!(
+                            "delete launch-owned branch {} at {}: {err:#}; retry cleanup with `git -C {} branch -D {}` after verifying no operator commits",
+                            intent.integration_branch,
+                            branch_head,
+                            run.repo_path,
+                            intent.integration_branch
+                        ));
+                    }
+                }
+            }
+        }
+        let compensation_error = compensation_errors.join("; ");
+        self.state.record_run_launch_compensation(
+            &run.id,
+            intent.execution_epoch,
+            &compensation_error,
+        )?;
+        Ok(compensation_error.is_empty())
+    }
+
     fn cleanup_run_worktrees(&self, run: &Run) -> Result<()> {
         let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
         if !root.exists() {
@@ -6745,6 +7677,7 @@ struct SliceWorkerOutcome {
     checks: Vec<CheckResult>,
     branch: String,
     attempts: usize,
+    launch_id: i64,
 }
 
 struct ParallelWorkerHandle {
@@ -8007,6 +8940,31 @@ fn selected_slice_ids(selected_slice_id: &str) -> Vec<String> {
         .collect()
 }
 
+fn integration_merge_operation_id(
+    run_id: &str,
+    kind: IntegrationMergeKind,
+    slice_id: &str,
+    attempt: usize,
+    launch_id: Option<i64>,
+    source_commit: &str,
+    expected_head: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        run_id,
+        kind.as_str(),
+        slice_id,
+        &attempt.to_string(),
+        &launch_id.unwrap_or_default().to_string(),
+        source_commit,
+        expected_head,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("merge-{}", &hex::encode(hasher.finalize())[..24])
+}
+
 fn queue_snapshot_hash(ids: &[String]) -> String {
     let mut hasher = Sha256::new();
     for id in ids {
@@ -8525,10 +9483,12 @@ impl Error for BlockedError {}
 mod tests {
     use super::{
         AgentCallContext, DEFAULT_REPAIR_ATTEMPTS, DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS,
-        INTEGRATION_REPAIR_SCOPE_ID, IntegrationRepairContext, MAX_WORKER_ATTEMPTS, Manager,
-        RepairPolicy, ResumeOptions, RunEconomicsRecorder, RunReadModelBuilder,
+        INTEGRATION_REPAIR_SCOPE_ID, IntegrationMergeFaultStage, IntegrationMergeRequest,
+        IntegrationMode, IntegrationRepairContext, MAX_WORKER_ATTEMPTS, Manager, RepairPolicy,
+        ResumeOptions, RunEconomicsRecorder, RunLaunchFaultStage, RunReadModelBuilder,
         RunReadModelOptions, StartOptions, VerificationCommandCache, WorkerAttemptContext,
-        check_failure_needs_operator, existing_completion_publication, queue_snapshot_hash,
+        check_failure_needs_operator, existing_completion_publication,
+        inject_integration_merge_fault, inject_run_launch_fault, queue_snapshot_hash,
         repair_authority_violations, selected_slice_ids, should_run_integration_repair,
         validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
         validate_worker_result, worker_attempt_retry_disposition,
@@ -8538,7 +9498,8 @@ mod tests {
     use crate::domain::{
         AcceptanceEvidence, AutonomyLevel, CheckResult, CockpitMode, Finding, FindingDisposition,
         FollowupSliceDraft, FrontierBudgetState, FrontierClassification, GateCommandResult,
-        GateResult, Handoff, ImplementationSummary, MissionEnvelope, OriginNotificationTarget,
+        GateResult, Handoff, ImplementationSummary, IntegrationMergeCompletion,
+        IntegrationMergeKind, IntegrationMergeState, MissionEnvelope, OriginNotificationTarget,
         RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
         ReplanProposalState, ReplanProposedChange, Run, RunEconomics, RunStatus, Slice,
         SliceProvenance, SliceRun, SliceStatus, TerminalNotificationRecord, VerifyCommand,
@@ -8547,7 +9508,10 @@ mod tests {
     };
     use crate::gitutil;
     use crate::paths::Paths;
-    use crate::state::{Store as StateStore, WorkerQuestionDecisionCommand};
+    use crate::state::{
+        IntegrationMergeTransactionFaultStage, Store as StateStore, WorkerQuestionDecisionCommand,
+        inject_integration_merge_transaction_fault,
+    };
     use crate::workflow::events as workflow_events;
     use anyhow::Result;
     use chrono::Utc;
@@ -8696,6 +9660,24 @@ mod tests {
             started_at: now,
             updated_at: now,
         })
+    }
+
+    fn terminalize_test_fixture_run(
+        manager: &Manager,
+        state: &StateStore,
+        run: &Run,
+    ) -> Result<()> {
+        state.prepare_run_terminal_transition(
+            &run.id,
+            RunStatus::Interrupted,
+            "test fixture completed",
+            "test fixture completed",
+            "test fixture completed",
+        )?;
+        let transition = state
+            .terminal_transition(&run.id)?
+            .expect("test terminal transition");
+        manager.terminalize_or_reconcile(run, &transition)
     }
 
     fn workflow_slices_snapshot(store: &ArtifactStore) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -9623,6 +10605,7 @@ mod tests {
                     "{label}"
                 );
             }
+            terminalize_test_fixture_run(&manager, &state, &run)?;
         }
         Ok(())
     }
@@ -9998,6 +10981,7 @@ mod tests {
             state.pending_replan_proposals(&no_envelope_run.id)?.len(),
             1
         );
+        terminalize_test_fixture_run(&manager, &state, &no_envelope_run)?;
 
         let mut unsupported_run = test_run("kd-auto-accept-unsupported", repo.path(), "slice-001")?;
         state.insert_run(&unsupported_run)?;
@@ -10024,6 +11008,7 @@ mod tests {
             .remove(0);
         assert!(unsupported.operator_decision.is_none());
         assert!(unsupported.frontier_classification.is_none());
+        terminalize_test_fixture_run(&manager, &state, &unsupported_run)?;
 
         let mut budget_stop_run = test_run("kd-auto-accept-budget-stop", repo.path(), "slice-001")?;
         state.insert_run(&budget_stop_run)?;
@@ -10078,6 +11063,7 @@ mod tests {
                 .iter()
                 .any(|event| event.typ == "frontier_auto_accept_stopped")
         );
+        terminalize_test_fixture_run(&manager, &state, &budget_stop_run)?;
 
         let mut depth_stop_run = test_run("kd-auto-accept-depth-stop", repo.path(), "slice-001")?;
         state.insert_run(&depth_stop_run)?;
@@ -10865,6 +11851,694 @@ mod tests {
                 .contains("mission envelope max_auto_promotions must be >= 0"),
             "{err:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_admission_boundary_failures_release_the_active_repo_claim() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let store = ArtifactStore::new(repo.path());
+        store.ensure_layout()?;
+        store.write_slice(&slice("slice-001"), true)?;
+        gitutil::commit_all(repo.path(), "add launch slice")?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        for stage in [
+            RunLaunchFaultStage::AfterAdmission,
+            RunLaunchFaultStage::AfterRunDirectories,
+            RunLaunchFaultStage::AfterCockpit,
+            RunLaunchFaultStage::AfterActivation,
+            RunLaunchFaultStage::SupervisorSpawnFailure,
+        ] {
+            inject_run_launch_fault(stage);
+            let error = manager
+                .start_run(StartOptions {
+                    repo_path: repo.path().to_path_buf(),
+                    slice_ids: vec!["slice-001".to_string()],
+                    all: false,
+                    agent: "fake".to_string(),
+                    pi_bin: String::new(),
+                    pi_args: Vec::new(),
+                    native_pi_tui_worker: false,
+                    parallelism: 1,
+                    allow_dirty: true,
+                    origin_notification_target: String::new(),
+                    mission_envelope: None,
+                })
+                .expect_err("launch boundary fault");
+            assert!(
+                format!("{error:#}").contains("injected launch failure"),
+                "{error:#}"
+            );
+            assert!(state.active_runs()?.is_empty());
+            assert!(state.incomplete_run_launch_intents()?.is_empty());
+            let failed = state.latest_runs(1)?.pop().expect("failed admitted run");
+            assert_eq!(failed.status, RunStatus::Failed);
+            let intent = state
+                .run_launch_intent(&failed.id, 1)?
+                .expect("durable failed launch intent");
+            assert_eq!(intent.state, crate::domain::RunLaunchState::Failed);
+            assert!(intent.primary_cause.contains("injected launch failure"));
+            assert!(intent.compensation_error.is_empty());
+            assert!(
+                !store.run_dir(&failed.id).exists(),
+                "launch-owned run directory leaked at {:?}",
+                stage
+            );
+            assert!(!gitutil::ref_exists(
+                repo.path(),
+                &format!("refs/heads/khazad/{}/integration", failed.id)
+            )?);
+            assert_eq!(failed.base_branch, base_branch);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resume_admission_boundary_failures_restore_prior_terminal_state() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        artifact_store.ensure_layout()?;
+        let test_slice = slice("slice-001");
+        artifact_store.write_slice(&test_slice, true)?;
+        gitutil::commit_all(repo.path(), "add resume launch slice")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let now = Utc::now();
+        let run = Run {
+            id: "run-resume-boundaries".to_string(),
+            repo_id: "repo-resume-boundaries".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Failed,
+            base_branch: gitutil::current_branch(repo.path())?,
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/run-resume-boundaries/integration".to_string(),
+            selected_slice_id: test_slice.id.clone(),
+            error: "prior terminal failure".to_string(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: test_slice.id,
+            status: SliceStatus::Pending,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 0,
+            last_error: String::new(),
+        })?;
+        artifact_store.ensure_run_dirs(&run.id)?;
+        let retained_evidence = artifact_store.output_path(&run.id, "prior-evidence.json");
+        fs::write(&retained_evidence, b"{}\n")?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        for (index, stage) in [
+            RunLaunchFaultStage::AfterAdmission,
+            RunLaunchFaultStage::AfterCockpit,
+            RunLaunchFaultStage::AfterActivation,
+            RunLaunchFaultStage::SupervisorSpawnFailure,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            inject_run_launch_fault(stage);
+            let error = manager
+                .resume_run(ResumeOptions {
+                    run_id: run.id.clone(),
+                    agent: "fake".to_string(),
+                    pi_bin: String::new(),
+                    pi_args: Vec::new(),
+                    native_pi_tui_worker: false,
+                    parallelism: 1,
+                })
+                .expect_err("resume launch boundary fault");
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("injected resume failure")
+                    || error.contains("injected launch failure"),
+                "{error}"
+            );
+            let restored = state.get_run(&run.id)?.expect("restored run");
+            assert_eq!(restored.status, RunStatus::Failed);
+            assert_eq!(restored.error, "prior terminal failure");
+            assert!(restored.updated_at >= run.updated_at);
+            assert!(state.active_runs()?.is_empty());
+            assert!(state.incomplete_run_launch_intents()?.is_empty());
+            assert!(
+                retained_evidence.exists(),
+                "resume failure discarded prior run evidence at {:?}",
+                stage
+            );
+            let intent = state
+                .run_launch_intent(&run.id, index + 2)?
+                .expect("failed resume intent");
+            assert_eq!(intent.action, crate::domain::RunLaunchAction::Resume);
+            assert_eq!(intent.state, crate::domain::RunLaunchState::Failed);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_launch_worktree_is_compensated_and_branch_failure_is_reconcilable() -> Result<()>
+    {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        artifact_store.ensure_layout()?;
+        let test_slice = slice("slice-001");
+        artifact_store.write_slice(&test_slice, true)?;
+        gitutil::commit_all(repo.path(), "add launch slice")?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let now = Utc::now();
+        let mut run = Run {
+            id: "run-incomplete-launch".to_string(),
+            repo_id: "repo-incomplete-launch".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Pending,
+            base_branch,
+            base_sha,
+            integration_branch: "khazad/run-incomplete-launch/integration".to_string(),
+            selected_slice_id: test_slice.id.clone(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        let root = paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let integration = root.join("integration");
+        let admission = state.admit_run(
+            &run,
+            &[SliceRun {
+                run_id: run.id.clone(),
+                slice_id: test_slice.id,
+                status: SliceStatus::Pending,
+                branch: String::new(),
+                commit_sha: String::new(),
+                attempts: 0,
+                last_error: String::new(),
+            }],
+            None,
+            None,
+            &integration,
+        )?;
+        assert_eq!(
+            admission.outcome,
+            crate::state::RunAdmissionOutcome::Prepared
+        );
+        state.activate_run_launch(&run.id, 1)?;
+        run.status = RunStatus::Running;
+        let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
+
+        inject_run_launch_fault(RunLaunchFaultStage::AfterIntegrationWorktree);
+        let error = manager
+            .run_slices(
+                &run,
+                &[],
+                &[],
+                &CancellationToken::new(),
+                Arc::new(FakeRunner),
+                1,
+                IntegrationMode::Fresh,
+                CockpitMode::Direct,
+                false,
+            )
+            .expect_err("fault after integration worktree");
+        assert!(error.to_string().contains("after integration worktree"));
+        assert!(integration.exists());
+        assert!(gitutil::ref_exists(
+            repo.path(),
+            "refs/heads/khazad/run-incomplete-launch/integration"
+        )?);
+        assert_eq!(
+            state.run_launch_intent(&run.id, 1)?.expect("intent").state,
+            crate::domain::RunLaunchState::Activated
+        );
+
+        state.prepare_run_terminal_transition(
+            &run.id,
+            RunStatus::Failed,
+            "crashed during launch activation",
+            "crashed during launch activation",
+            "launch stopped before worker dispatch",
+        )?;
+        let transition = state
+            .terminal_transition(&run.id)?
+            .expect("terminal transition");
+        inject_run_launch_fault(RunLaunchFaultStage::BranchDeletionFailure);
+        manager.terminalize_or_reconcile(&run, &transition)?;
+        assert!(!integration.exists());
+        let intent = state.run_launch_intent(&run.id, 1)?.expect("intent");
+        assert_eq!(
+            intent.state,
+            crate::domain::RunLaunchState::RecoveryRequired
+        );
+        assert!(
+            intent
+                .compensation_error
+                .contains("injected integration branch deletion")
+        );
+        assert!(gitutil::ref_exists(
+            repo.path(),
+            "refs/heads/khazad/run-incomplete-launch/integration"
+        )?);
+        assert!(state.active_runs()?.is_empty());
+
+        drop(manager);
+        drop(state);
+        let restarted_state = StateStore::open(paths.db_file())?;
+        let restarted = Manager::with_runner(paths, restarted_state.clone(), Arc::new(FakeRunner));
+        assert_eq!(restarted.recover_interrupted_runs()?, 1);
+        assert_eq!(
+            restarted_state
+                .run_launch_intent(&run.id, 1)?
+                .expect("intent")
+                .state,
+            crate::domain::RunLaunchState::Compensated
+        );
+        assert!(!gitutil::ref_exists(
+            repo.path(),
+            "refs/heads/khazad/run-incomplete-launch/integration"
+        )?);
+        assert_eq!(restarted.recover_interrupted_runs()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_integration_resource_ownership_record_retains_created_resources() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        artifact_store.ensure_layout()?;
+        gitutil::commit_all(repo.path(), "initialize ownership-gap fixture")?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let now = Utc::now();
+        let mut run = Run {
+            id: "run-ownership-gap".to_string(),
+            repo_id: "repo-ownership-gap".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Pending,
+            base_branch: gitutil::current_branch(repo.path())?,
+            base_sha: gitutil::head_sha(repo.path())?,
+            integration_branch: "khazad/run-ownership-gap/integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        let integration = paths
+            .repo_worktree_dir(&run.repo_id, &run.id)
+            .join("integration");
+        state.admit_run(&run, &[], None, None, &integration)?;
+        state.activate_run_launch(&run.id, 1)?;
+        run.status = RunStatus::Running;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+
+        inject_run_launch_fault(RunLaunchFaultStage::BeforeIntegrationResourceOwnership);
+        let error = manager
+            .run_slices(
+                &run,
+                &[],
+                &[],
+                &CancellationToken::new(),
+                Arc::new(FakeRunner),
+                1,
+                IntegrationMode::Fresh,
+                CockpitMode::Direct,
+                false,
+            )
+            .expect_err("fault before ownership record");
+        assert!(
+            error
+                .to_string()
+                .contains("before integration resource ownership")
+        );
+        assert!(integration.exists());
+        assert!(gitutil::ref_exists(
+            repo.path(),
+            &format!("refs/heads/{}", run.integration_branch)
+        )?);
+        assert!(
+            !state
+                .run_launch_intent(&run.id, 1)?
+                .expect("intent")
+                .integration_resources_owned
+        );
+
+        state.prepare_run_terminal_transition(
+            &run.id,
+            RunStatus::Failed,
+            "interrupted before resource ownership record",
+            "interrupted before resource ownership record",
+            "interrupted before resource ownership record",
+        )?;
+        let transition = state
+            .terminal_transition(&run.id)?
+            .expect("terminal transition");
+        manager.terminalize_or_reconcile(&run, &transition)?;
+        let intent = state.run_launch_intent(&run.id, 1)?.expect("intent");
+        assert_eq!(
+            intent.state,
+            crate::domain::RunLaunchState::RecoveryRequired
+        );
+        assert!(intent.compensation_error.contains("did not durably prove"));
+        assert!(integration.exists());
+
+        gitutil::worktree_remove(repo.path(), &integration)?;
+        gitutil::branch_delete(repo.path(), &run.integration_branch)?;
+        assert!(manager.compensate_launch_resources(&run, &intent)?);
+        assert_eq!(
+            state.run_launch_intent(&run.id, 1)?.expect("intent").state,
+            crate::domain::RunLaunchState::Compensated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn moved_launch_owned_branch_is_retained_until_operator_reconciliation() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        artifact_store.ensure_layout()?;
+        gitutil::commit_all(repo.path(), "initialize workflow")?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let now = Utc::now();
+        let run = Run {
+            id: "run-moved-launch-branch".to_string(),
+            repo_id: "repo-moved-launch-branch".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Pending,
+            base_branch: base_branch.clone(),
+            base_sha: base_sha.clone(),
+            integration_branch: "khazad/run-moved-launch-branch/integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        let integration = paths
+            .repo_worktree_dir(&run.repo_id, &run.id)
+            .join("integration");
+        assert_eq!(
+            state
+                .admit_run(&run, &[], None, None, &integration)?
+                .outcome,
+            crate::state::RunAdmissionOutcome::Prepared
+        );
+        state.activate_run_launch(&run.id, 1)?;
+        gitutil::run(repo.path(), &["branch", &run.integration_branch, &base_sha])?;
+        state.record_run_launch_integration_resources_created(&run.id, 1)?;
+        gitutil::run(repo.path(), &["checkout", &run.integration_branch])?;
+        fs::write(repo.path().join("operator.txt"), "preserve this commit\n")?;
+        gitutil::commit_all(repo.path(), "operator moved launch branch")?;
+        let operator_head = gitutil::head_sha(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+
+        state.prepare_run_terminal_transition(
+            &run.id,
+            RunStatus::Failed,
+            "launch failed after branch creation",
+            "launch failed after branch creation",
+            "launch failed after branch creation",
+        )?;
+        let transition = state
+            .terminal_transition(&run.id)?
+            .expect("terminal transition");
+        let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
+        manager.terminalize_or_reconcile(&run, &transition)?;
+        let intent = state.run_launch_intent(&run.id, 1)?.expect("intent");
+        assert_eq!(
+            intent.state,
+            crate::domain::RunLaunchState::RecoveryRequired
+        );
+        assert!(intent.compensation_error.contains("moved from base"));
+        assert_eq!(
+            gitutil::ref_sha(repo.path(), &run.integration_branch)?,
+            operator_head
+        );
+        let failure_events = state
+            .get_events(&run.id, 100)?
+            .into_iter()
+            .filter(|event| event.typ == "run_launch_compensation_failed")
+            .count();
+        assert_eq!(failure_events, 1);
+
+        drop(manager);
+        drop(state);
+        let restarted_state = StateStore::open(paths.db_file())?;
+        let restarted = Manager::with_runner(paths, restarted_state.clone(), Arc::new(FakeRunner));
+        assert_eq!(restarted.recover_interrupted_runs()?, 0);
+        assert_eq!(
+            gitutil::ref_sha(repo.path(), &run.integration_branch)?,
+            operator_head
+        );
+        assert_eq!(
+            restarted_state
+                .get_events(&run.id, 100)?
+                .into_iter()
+                .filter(|event| event.typ == "run_launch_compensation_failed")
+                .count(),
+            failure_events
+        );
+
+        gitutil::branch_delete(repo.path(), &run.integration_branch)?;
+        assert_eq!(restarted.recover_interrupted_runs()?, 1);
+        assert_eq!(
+            restarted_state
+                .run_launch_intent(&run.id, 1)?
+                .expect("intent")
+                .state,
+            crate::domain::RunLaunchState::Compensated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unclaimed_same_head_branch_and_worktree_path_are_never_compensated() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let artifact_store = ArtifactStore::new(repo.path());
+        artifact_store.ensure_layout()?;
+        gitutil::commit_all(repo.path(), "initialize unclaimed resource fixture")?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let now = Utc::now();
+        let run = Run {
+            id: "run-unclaimed-resources".to_string(),
+            repo_id: "repo-unclaimed-resources".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Pending,
+            base_branch: gitutil::current_branch(repo.path())?,
+            base_sha: base_sha.clone(),
+            integration_branch: "khazad/run-unclaimed-resources/integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        let integration = paths
+            .repo_worktree_dir(&run.repo_id, &run.id)
+            .join("integration");
+        state.admit_run(&run, &[], None, None, &integration)?;
+        state.activate_run_launch(&run.id, 1)?;
+
+        // These resources appear after admission but before any successful
+        // worktree creation/ownership record. Matching names and SHA are not
+        // proof that the daemon created them.
+        gitutil::run(repo.path(), &["branch", &run.integration_branch, &base_sha])?;
+        fs::create_dir_all(&integration)?;
+        let operator_marker = integration.join("operator-owned.txt");
+        fs::write(&operator_marker, "retain\n")?;
+        state.prepare_run_terminal_transition(
+            &run.id,
+            RunStatus::Failed,
+            "launch failed before worktree creation",
+            "launch failed before worktree creation",
+            "launch failed before worktree creation",
+        )?;
+        let transition = state
+            .terminal_transition(&run.id)?
+            .expect("terminal transition");
+        let manager = Manager::with_runner(paths.clone(), state.clone(), Arc::new(FakeRunner));
+        manager.terminalize_or_reconcile(&run, &transition)?;
+
+        let intent = state.run_launch_intent(&run.id, 1)?.expect("intent");
+        assert!(!intent.integration_resources_owned);
+        assert_eq!(
+            intent.state,
+            crate::domain::RunLaunchState::RecoveryRequired
+        );
+        assert!(intent.compensation_error.contains("did not durably prove"));
+        assert_eq!(
+            gitutil::ref_sha(repo.path(), &run.integration_branch)?,
+            base_sha
+        );
+        assert_eq!(fs::read_to_string(&operator_marker)?, "retain\n");
+        let failure_events = state
+            .get_events(&run.id, 100)?
+            .into_iter()
+            .filter(|event| event.typ == "run_launch_compensation_failed")
+            .count();
+        assert_eq!(failure_events, 1);
+
+        drop(manager);
+        drop(state);
+        let reopened = StateStore::open(paths.db_file())?;
+        let restarted = Manager::with_runner(paths, reopened.clone(), Arc::new(FakeRunner));
+        assert_eq!(restarted.recover_interrupted_runs()?, 0);
+        assert_eq!(fs::read_to_string(&operator_marker)?, "retain\n");
+        assert_eq!(
+            reopened
+                .get_events(&run.id, 100)?
+                .into_iter()
+                .filter(|event| event.typ == "run_launch_compensation_failed")
+                .count(),
+            failure_events
+        );
+
+        fs::remove_dir_all(&integration)?;
+        gitutil::branch_delete(repo.path(), &run.integration_branch)?;
+        assert_eq!(restarted.recover_interrupted_runs()?, 1);
+        assert_eq!(
+            reopened
+                .run_launch_intent(&run.id, 1)?
+                .expect("intent")
+                .state,
+            crate::domain::RunLaunchState::Compensated
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restart_reconciles_prepared_and_activated_launch_intents_once() -> Result<()> {
+        for activated in [false, true] {
+            let repo = tempfile::tempdir()?;
+            init_git_repo(repo.path())?;
+            let artifact_store = ArtifactStore::new(repo.path());
+            artifact_store.ensure_layout()?;
+            let test_slice = slice("slice-001");
+            artifact_store.write_slice(&test_slice, true)?;
+            gitutil::commit_all(repo.path(), "add launch recovery slice")?;
+
+            let home = tempfile::tempdir()?;
+            let paths = Paths {
+                root: home.path().to_path_buf(),
+            };
+            paths.ensure()?;
+            let state = StateStore::open(paths.db_file())?;
+            let suffix = if activated { "activated" } else { "prepared" };
+            let now = Utc::now();
+            let run = Run {
+                id: format!("run-recover-{suffix}"),
+                repo_id: format!("repo-recover-{suffix}"),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                status: RunStatus::Pending,
+                base_branch: gitutil::current_branch(repo.path())?,
+                base_sha: gitutil::head_sha(repo.path())?,
+                integration_branch: format!("khazad/run-recover-{suffix}/integration"),
+                selected_slice_id: test_slice.id.clone(),
+                error: String::new(),
+                started_at: now,
+                updated_at: now,
+            };
+            let root = paths.repo_worktree_dir(&run.repo_id, &run.id);
+            let integration = root.join("integration");
+            state.admit_run(
+                &run,
+                &[SliceRun {
+                    run_id: run.id.clone(),
+                    slice_id: test_slice.id,
+                    status: SliceStatus::Pending,
+                    branch: String::new(),
+                    commit_sha: String::new(),
+                    attempts: 0,
+                    last_error: String::new(),
+                }],
+                None,
+                None,
+                &integration,
+            )?;
+            if activated {
+                state.activate_run_launch(&run.id, 1)?;
+                fs::create_dir_all(integration.parent().expect("integration parent"))?;
+                gitutil::worktree_add_new(
+                    repo.path(),
+                    &integration,
+                    &run.integration_branch,
+                    &run.base_sha,
+                )?;
+                state.record_run_launch_integration_resources_created(&run.id, 1)?;
+            }
+            drop(state);
+
+            let reopened = StateStore::open(paths.db_file())?;
+            let manager = Manager::with_runner(paths, reopened.clone(), Arc::new(FakeRunner));
+            assert_eq!(manager.recover_interrupted_runs()?, 1);
+            let recovered = reopened.get_run(&run.id)?.expect("recovered run");
+            assert_eq!(recovered.status, RunStatus::Interrupted);
+            assert_eq!(
+                reopened
+                    .run_launch_intent(&run.id, 1)?
+                    .expect("recovered intent")
+                    .state,
+                crate::domain::RunLaunchState::Compensated
+            );
+            assert!(reopened.active_runs()?.is_empty());
+            assert!(reopened.incomplete_run_launch_intents()?.is_empty());
+            assert!(!integration.exists());
+            assert!(!gitutil::ref_exists(
+                repo.path(),
+                &format!("refs/heads/{}", run.integration_branch)
+            )?);
+            assert!(
+                reopened
+                    .list_worker_attempt_ledger(&run.id, "slice-001")?
+                    .is_empty()
+            );
+            let event_count = reopened.get_events(&run.id, 200)?.len();
+            assert_eq!(manager.recover_interrupted_runs()?, 0);
+            assert_eq!(reopened.get_events(&run.id, 200)?.len(), event_count);
+        }
         Ok(())
     }
 
@@ -14233,6 +15907,17 @@ mod tests {
         assert_eq!(slice_runs.len(), 1);
         assert_eq!(slice_runs[0].slice_id, "slice-002");
         assert_eq!(slice_runs[0].status, SliceStatus::Merged);
+        let successful_launch = state
+            .list_worker_attempt_ledger(&run.id, "slice-002")?
+            .into_iter()
+            .find(|attempt| attempt.state == "succeeded")
+            .expect("successful slice launch");
+        let merge_intent = state
+            .integration_merge_intents(&run.id)?
+            .into_iter()
+            .find(|intent| intent.kind == IntegrationMergeKind::Slice)
+            .expect("slice merge journal");
+        assert_eq!(merge_intent.launch_id, Some(successful_launch.launch_id));
         let events = state.get_events(&run.id, 200)?;
         let started = events
             .iter()
@@ -14408,6 +16093,713 @@ mod tests {
         assert!(err.to_string().contains("already has active run"));
         let completed = wait_for_run(&state, &run.id)?;
         assert_eq!(completed.status, RunStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_head_is_not_started_until_a_no_op_merge_is_replayed() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        gitutil::run(
+            repo.path(),
+            &["branch", "worker/already-integrated", &base_sha],
+        )?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let integration_worktree = paths
+            .repo_worktree_dir("repo-no-op", "run-no-op")
+            .join("integration");
+        fs::create_dir_all(integration_worktree.parent().expect("integration parent"))?;
+        gitutil::worktree_add_new(
+            repo.path(),
+            &integration_worktree,
+            "khazad/run-no-op/integration",
+            &base_sha,
+        )?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = Run {
+            id: "run-no-op".to_string(),
+            repo_id: "repo-no-op".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch,
+            base_sha: base_sha.clone(),
+            integration_branch: "khazad/run-no-op/integration".to_string(),
+            selected_slice_id: "S-no-op".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "S-no-op".to_string(),
+            status: SliceStatus::ReadyToMerge,
+            branch: "worker/already-integrated".to_string(),
+            commit_sha: base_sha.clone(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        let conflict_slice = slice("S-no-op");
+        let merge_once = || IntegrationMergeRequest {
+            run: &run,
+            integration_worktree: &integration_worktree,
+            kind: IntegrationMergeKind::Slice,
+            slice_id: "S-no-op",
+            attempt: 1,
+            launch_id: Some(16),
+            source_branch: "worker/already-integrated",
+            source_commit: &base_sha,
+            message: "merge already integrated source",
+            completion: IntegrationMergeCompletion::Slice {
+                branch: "worker/already-integrated".to_string(),
+                commit_sha: base_sha.clone(),
+                attempts: 1,
+            },
+            conflict_slice: Some(&conflict_slice),
+        };
+
+        inject_integration_merge_fault(IntegrationMergeFaultStage::AfterIntent);
+        manager
+            .journaled_integration_merge(merge_once())
+            .expect_err("fault after durable intent");
+        assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+        assert_eq!(
+            state.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::NotStarted
+        );
+        assert_eq!(
+            state.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::ReadyToMerge
+        );
+
+        assert_eq!(manager.journaled_integration_merge(merge_once())?, base_sha);
+        assert_eq!(gitutil::head_sha(&integration_worktree)?, base_sha);
+        assert_eq!(
+            state.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::Applied
+        );
+        assert_eq!(
+            state.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::Merged
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_reconciliation_converges_after_git_mutation_without_duplicate_merge() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", "-b", "worker/S-1"])?;
+        fs::write(repo.path().join("source.txt"), "source\n")?;
+        gitutil::commit_all(repo.path(), "source change")?;
+        let source_commit = gitutil::head_sha(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let integration_worktree = paths
+            .repo_worktree_dir("repo-merge", "run-merge-reconcile")
+            .join("integration");
+        fs::create_dir_all(integration_worktree.parent().expect("integration parent"))?;
+        gitutil::worktree_add_new(
+            repo.path(),
+            &integration_worktree,
+            "khazad/run-merge-reconcile/integration",
+            &base_sha,
+        )?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = Run {
+            id: "run-merge-reconcile".to_string(),
+            repo_id: "repo-merge".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch,
+            base_sha,
+            integration_branch: "khazad/run-merge-reconcile/integration".to_string(),
+            selected_slice_id: "S-1".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "S-1".to_string(),
+            status: SliceStatus::ReadyToMerge,
+            branch: "worker/S-1".to_string(),
+            commit_sha: source_commit.clone(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        inject_integration_merge_fault(IntegrationMergeFaultStage::AfterGitMutation);
+        let error = manager
+            .journaled_integration_merge(IntegrationMergeRequest {
+                run: &run,
+                integration_worktree: &integration_worktree,
+                kind: IntegrationMergeKind::Slice,
+                slice_id: "S-1",
+                attempt: 1,
+                launch_id: Some(17),
+                source_branch: "worker/S-1",
+                source_commit: &source_commit,
+                message: "merge S-1",
+                completion: IntegrationMergeCompletion::Slice {
+                    branch: "worker/S-1".to_string(),
+                    commit_sha: source_commit.clone(),
+                    attempts: 1,
+                },
+                conflict_slice: Some(&slice("S-1")),
+            })
+            .expect_err("fault after git mutation");
+        assert!(error.to_string().contains("after Git mutation"));
+        let applied_head = gitutil::head_sha(&integration_worktree)?;
+        assert_eq!(
+            gitutil::commit_parents(&integration_worktree, &applied_head)?.len(),
+            2
+        );
+        assert_eq!(
+            state.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::Prepared
+        );
+        assert_eq!(
+            state.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::ReadyToMerge
+        );
+
+        assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+        assert_eq!(gitutil::head_sha(&integration_worktree)?, applied_head);
+        assert_eq!(
+            state.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::Applied
+        );
+        assert_eq!(
+            state.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::Merged
+        );
+        assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+        assert_eq!(
+            gitutil::commit_parents(&integration_worktree, &applied_head)?.len(),
+            2
+        );
+        assert_eq!(
+            state
+                .get_events(&run.id, 100)?
+                .iter()
+                .filter(|event| event.typ == "integration_merge_applied")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_reconciliation_preserves_operator_commit_after_journaled_merge() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", "-b", "worker/post-merge"])?;
+        fs::write(repo.path().join("source.txt"), "source\n")?;
+        gitutil::commit_all(repo.path(), "source change")?;
+        let source_commit = gitutil::head_sha(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let integration_worktree = paths
+            .repo_worktree_dir("repo-post-merge", "run-post-merge")
+            .join("integration");
+        fs::create_dir_all(integration_worktree.parent().expect("integration parent"))?;
+        gitutil::worktree_add_new(
+            repo.path(),
+            &integration_worktree,
+            "khazad/run-post-merge/integration",
+            &base_sha,
+        )?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = Run {
+            id: "run-post-merge".to_string(),
+            repo_id: "repo-post-merge".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch,
+            base_sha,
+            integration_branch: "khazad/run-post-merge/integration".to_string(),
+            selected_slice_id: "S-post-merge".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "S-post-merge".to_string(),
+            status: SliceStatus::ReadyToMerge,
+            branch: "worker/post-merge".to_string(),
+            commit_sha: source_commit.clone(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        inject_integration_merge_fault(IntegrationMergeFaultStage::AfterGitMutation);
+        manager
+            .journaled_integration_merge(IntegrationMergeRequest {
+                run: &run,
+                integration_worktree: &integration_worktree,
+                kind: IntegrationMergeKind::Slice,
+                slice_id: "S-post-merge",
+                attempt: 1,
+                launch_id: Some(171),
+                source_branch: "worker/post-merge",
+                source_commit: &source_commit,
+                message: "merge S-post-merge",
+                completion: IntegrationMergeCompletion::Slice {
+                    branch: "worker/post-merge".to_string(),
+                    commit_sha: source_commit.clone(),
+                    attempts: 1,
+                },
+                conflict_slice: Some(&slice("S-post-merge")),
+            })
+            .expect_err("fault after journaled Git mutation");
+        let journaled_merge = gitutil::head_sha(&integration_worktree)?;
+        fs::write(integration_worktree.join("operator.txt"), "preserve me\n")?;
+        gitutil::commit_all(&integration_worktree, "operator commit after daemon merge")?;
+        let operator_head = gitutil::head_sha(&integration_worktree)?;
+        assert_ne!(operator_head, journaled_merge);
+
+        let blockers = manager.reconcile_integration_merges(&run)?;
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(gitutil::head_sha(&integration_worktree)?, operator_head);
+        let intent = &state.integration_merge_intents(&run.id)?[0];
+        assert_eq!(intent.state, IntegrationMergeState::Divergent);
+        assert_eq!(intent.resulting_head, operator_head);
+        assert_eq!(
+            state.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::Blocked
+        );
+        assert_eq!(
+            state
+                .get_events(&run.id, 100)?
+                .iter()
+                .filter(|event| event.typ == "integration_merge_applied")
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn integration_repair_merge_reconciliation_completes_exact_launch_once() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = Run {
+            id: "run-repair-merge-reconcile".to_string(),
+            repo_id: "repo-repair-merge".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: base_branch.clone(),
+            base_sha: base_sha.clone(),
+            integration_branch: "khazad/run-repair-merge-reconcile/integration".to_string(),
+            selected_slice_id: "S-1".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        let root = paths.repo_worktree_dir(&run.repo_id, &run.id);
+        let repair_launch = state.allocate_run_worker_attempt(
+            &run.id,
+            INTEGRATION_REPAIR_SCOPE_ID,
+            1,
+            0,
+            1,
+            0,
+            "integration-repair",
+            &root,
+        )?;
+        state.mark_worker_attempt_launched(repair_launch.launch_id)?;
+        gitutil::run(repo.path(), &["checkout", "-b", &repair_launch.branch])?;
+        fs::write(repo.path().join("integration-fix.txt"), "fixed\n")?;
+        gitutil::commit_all(repo.path(), "integration repair")?;
+        let source_commit = gitutil::head_sha(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+
+        let integration_worktree = root.join("integration");
+        fs::create_dir_all(integration_worktree.parent().expect("integration parent"))?;
+        gitutil::worktree_add_new(
+            repo.path(),
+            &integration_worktree,
+            &run.integration_branch,
+            &base_sha,
+        )?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        inject_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::AppliedEvent,
+        );
+        manager
+            .journaled_integration_merge(IntegrationMergeRequest {
+                run: &run,
+                integration_worktree: &integration_worktree,
+                kind: IntegrationMergeKind::IntegrationRepair,
+                slice_id: INTEGRATION_REPAIR_SCOPE_ID,
+                attempt: 1,
+                launch_id: Some(repair_launch.launch_id),
+                source_branch: &repair_launch.branch,
+                source_commit: &source_commit,
+                message: "merge integration repair",
+                completion: IntegrationMergeCompletion::IntegrationRepair {
+                    launch_id: repair_launch.launch_id,
+                    status: "fixed".to_string(),
+                    summary: "integration repair applied".to_string(),
+                },
+                conflict_slice: None,
+            })
+            .expect_err("fault after integration repair Git mutation");
+        assert_eq!(
+            state.list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?[0]
+                .state
+                .as_str(),
+            "running"
+        );
+
+        assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+        assert_eq!(
+            state.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::Applied
+        );
+        assert_eq!(
+            state.list_worker_attempt_ledger(&run.id, INTEGRATION_REPAIR_SCOPE_ID)?[0]
+                .state
+                .as_str(),
+            "succeeded"
+        );
+        assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+        let events = state.get_events(&run.id, 200)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.typ == "integration_repair_completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.typ == "worker_attempt_finished"
+                        && event.payload["launch_id"] == repair_launch.launch_id
+                })
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_reconciliation_preserves_divergent_operator_commit() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let base_sha = gitutil::head_sha(repo.path())?;
+        let base_branch = gitutil::current_branch(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", "-b", "worker/S-1"])?;
+        fs::write(repo.path().join("source.txt"), "source\n")?;
+        gitutil::commit_all(repo.path(), "source change")?;
+        let source_commit = gitutil::head_sha(repo.path())?;
+        gitutil::run(repo.path(), &["checkout", &base_branch])?;
+
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let integration_worktree = paths
+            .repo_worktree_dir("repo-divergent", "run-divergent")
+            .join("integration");
+        fs::create_dir_all(integration_worktree.parent().expect("integration parent"))?;
+        gitutil::worktree_add_new(
+            repo.path(),
+            &integration_worktree,
+            "khazad/run-divergent/integration",
+            &base_sha,
+        )?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = Run {
+            id: "run-divergent".to_string(),
+            repo_id: "repo-divergent".to_string(),
+            repo_path: repo.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch,
+            base_sha,
+            integration_branch: "khazad/run-divergent/integration".to_string(),
+            selected_slice_id: "S-1".to_string(),
+            error: String::new(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.insert_run(&run)?;
+        state.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "S-1".to_string(),
+            status: SliceStatus::ReadyToMerge,
+            branch: "worker/S-1".to_string(),
+            commit_sha: source_commit.clone(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+        let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+        inject_integration_merge_fault(IntegrationMergeFaultStage::AfterIntent);
+        manager
+            .journaled_integration_merge(IntegrationMergeRequest {
+                run: &run,
+                integration_worktree: &integration_worktree,
+                kind: IntegrationMergeKind::Slice,
+                slice_id: "S-1",
+                attempt: 1,
+                launch_id: Some(18),
+                source_branch: "worker/S-1",
+                source_commit: &source_commit,
+                message: "merge S-1",
+                completion: IntegrationMergeCompletion::Slice {
+                    branch: "worker/S-1".to_string(),
+                    commit_sha: source_commit.clone(),
+                    attempts: 1,
+                },
+                conflict_slice: Some(&slice("S-1")),
+            })
+            .expect_err("fault after durable intent");
+        gitutil::merge(
+            &integration_worktree,
+            &source_commit,
+            "operator merge without daemon operation identity",
+        )?;
+        let operator_head = gitutil::head_sha(&integration_worktree)?;
+        assert_eq!(
+            gitutil::commit_parents(&integration_worktree, &operator_head)?.len(),
+            2
+        );
+
+        let blockers = manager.reconcile_integration_merges(&run)?;
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(gitutil::head_sha(&integration_worktree)?, operator_head);
+        let intent = &state.integration_merge_intents(&run.id)?[0];
+        assert_eq!(intent.state, IntegrationMergeState::Divergent);
+        assert_eq!(intent.resulting_head, operator_head);
+        assert!(!intent.primary_cause.is_empty());
+        assert_eq!(
+            state.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::Blocked
+        );
+        state.prepare_run_terminal_transition(
+            &run.id,
+            RunStatus::Failed,
+            "merge recovery is ambiguous",
+            "merge recovery is ambiguous",
+            "merge recovery is ambiguous",
+        )?;
+        let transition = state
+            .terminal_transition(&run.id)?
+            .expect("prepared terminal transition");
+        let terminal_error = manager
+            .terminalize_or_reconcile(&run, &transition)
+            .expect_err("divergent journal must block terminal cleanup");
+        assert!(terminal_error.to_string().contains("ambiguous integration"));
+        assert_eq!(manager.recover_interrupted_runs()?, 0);
+        assert_eq!(gitutil::head_sha(&integration_worktree)?, operator_head);
+        assert!(integration_worktree.exists());
+        assert_eq!(
+            state.get_run(&run.id)?.expect("preserved run").status,
+            RunStatus::Running
+        );
+        assert_eq!(state.active_runs()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_conflict_boundaries_reconcile_abort_and_retain_failures() -> Result<()> {
+        for (index, stage) in [
+            IntegrationMergeFaultStage::BeforeAbort,
+            IntegrationMergeFaultStage::AfterAbort,
+            IntegrationMergeFaultStage::AbortFailure,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let repo = tempfile::tempdir()?;
+            init_git_repo(repo.path())?;
+            fs::write(repo.path().join("shared.txt"), "base\n")?;
+            gitutil::commit_all(repo.path(), "shared base")?;
+            let base_branch = gitutil::current_branch(repo.path())?;
+            let base_sha = gitutil::head_sha(repo.path())?;
+            let source_branch = format!("worker/conflict-{index}");
+            gitutil::run(repo.path(), &["checkout", "-b", &source_branch])?;
+            fs::write(repo.path().join("shared.txt"), "source\n")?;
+            gitutil::commit_all(repo.path(), "source conflict")?;
+            let source_commit = gitutil::head_sha(repo.path())?;
+            gitutil::run(repo.path(), &["checkout", &base_branch])?;
+
+            let home = tempfile::tempdir()?;
+            let paths = Paths {
+                root: home.path().to_path_buf(),
+            };
+            paths.ensure()?;
+            let run_id = format!("run-conflict-boundary-{index}");
+            let repo_id = format!("repo-conflict-boundary-{index}");
+            let integration_branch = format!("khazad/{run_id}/integration");
+            let integration_worktree = paths
+                .repo_worktree_dir(&repo_id, &run_id)
+                .join("integration");
+            fs::create_dir_all(integration_worktree.parent().expect("integration parent"))?;
+            gitutil::worktree_add_new(
+                repo.path(),
+                &integration_worktree,
+                &integration_branch,
+                &base_sha,
+            )?;
+            fs::write(integration_worktree.join("shared.txt"), "integration\n")?;
+            gitutil::commit_all(&integration_worktree, "integration conflict")?;
+            let expected_head = gitutil::head_sha(&integration_worktree)?;
+
+            let state = StateStore::open(paths.db_file())?;
+            let run = Run {
+                id: run_id.clone(),
+                repo_id,
+                repo_path: repo.path().to_string_lossy().to_string(),
+                status: RunStatus::Running,
+                base_branch,
+                base_sha,
+                integration_branch,
+                selected_slice_id: "S-conflict".to_string(),
+                error: String::new(),
+                started_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            state.insert_run(&run)?;
+            state.upsert_slice_run(&SliceRun {
+                run_id: run.id.clone(),
+                slice_id: "S-conflict".to_string(),
+                status: SliceStatus::ReadyToMerge,
+                branch: source_branch.clone(),
+                commit_sha: source_commit.clone(),
+                attempts: 1,
+                last_error: String::new(),
+            })?;
+            let manager = Manager::with_runner(paths, state.clone(), Arc::new(FakeRunner));
+            let conflict_slice = slice("S-conflict");
+            inject_integration_merge_fault(stage);
+            manager
+                .journaled_integration_merge(IntegrationMergeRequest {
+                    run: &run,
+                    integration_worktree: &integration_worktree,
+                    kind: IntegrationMergeKind::Slice,
+                    slice_id: "S-conflict",
+                    attempt: 1,
+                    launch_id: Some(30 + index as i64),
+                    source_branch: &source_branch,
+                    source_commit: &source_commit,
+                    message: "conflicting merge",
+                    completion: IntegrationMergeCompletion::Slice {
+                        branch: source_branch.clone(),
+                        commit_sha: source_commit.clone(),
+                        attempts: 1,
+                    },
+                    conflict_slice: Some(&conflict_slice),
+                })
+                .expect_err("injected conflict boundary must stop publication");
+
+            let intent = state.integration_merge_intents(&run.id)?[0].clone();
+            match stage {
+                IntegrationMergeFaultStage::BeforeAbort => {
+                    assert_eq!(intent.state, IntegrationMergeState::Conflicted);
+                    assert!(intent.abort_error.contains("abort pending"));
+                    assert!(gitutil::merge_in_progress(&integration_worktree)?);
+                    assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+                    let reconciled = &state.integration_merge_intents(&run.id)?[0];
+                    assert_eq!(reconciled.state, IntegrationMergeState::NotStarted);
+                    assert!(reconciled.primary_cause.contains("CONFLICT"));
+                    assert!(reconciled.abort_error.is_empty());
+                    assert!(!gitutil::merge_in_progress(&integration_worktree)?);
+                }
+                IntegrationMergeFaultStage::AfterAbort => {
+                    assert_eq!(intent.state, IntegrationMergeState::Conflicted);
+                    assert!(intent.abort_error.contains("abort pending"));
+                    assert!(!gitutil::merge_in_progress(&integration_worktree)?);
+                    assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+                    let reconciled = &state.integration_merge_intents(&run.id)?[0];
+                    assert_eq!(reconciled.state, IntegrationMergeState::NotStarted);
+                    assert!(reconciled.primary_cause.contains("CONFLICT"));
+                    assert!(reconciled.abort_error.is_empty());
+                    manager
+                        .journaled_integration_merge(IntegrationMergeRequest {
+                            run: &run,
+                            integration_worktree: &integration_worktree,
+                            kind: IntegrationMergeKind::Slice,
+                            slice_id: "S-conflict",
+                            attempt: 1,
+                            launch_id: Some(30 + index as i64),
+                            source_branch: &source_branch,
+                            source_commit: &source_commit,
+                            message: "conflicting merge",
+                            completion: IntegrationMergeCompletion::Slice {
+                                branch: source_branch.clone(),
+                                commit_sha: source_commit.clone(),
+                                attempts: 1,
+                            },
+                            conflict_slice: Some(&conflict_slice),
+                        })
+                        .expect_err("safe not-started replay reaches the same conflict");
+                    assert_eq!(
+                        state.integration_merge_intents(&run.id)?[0].state,
+                        IntegrationMergeState::Conflicted
+                    );
+                }
+                IntegrationMergeFaultStage::AbortFailure => {
+                    assert_eq!(intent.state, IntegrationMergeState::Conflicted);
+                    assert!(
+                        intent
+                            .abort_error
+                            .contains("injected git merge --abort failure")
+                    );
+                    assert!(gitutil::merge_in_progress(&integration_worktree)?);
+                    assert!(manager.reconcile_integration_merges(&run)?.is_empty());
+                    let reconciled = &state.integration_merge_intents(&run.id)?[0];
+                    assert_eq!(reconciled.state, IntegrationMergeState::NotStarted);
+                    assert!(reconciled.abort_error.is_empty());
+                    assert!(!gitutil::merge_in_progress(&integration_worktree)?);
+                }
+                IntegrationMergeFaultStage::AfterIntent
+                | IntegrationMergeFaultStage::AfterGitMutation => unreachable!(),
+            }
+            assert_eq!(gitutil::head_sha(&integration_worktree)?, expected_head);
+            assert_ne!(
+                state.get_slice_runs(&run.id)?[0].status,
+                SliceStatus::Merged
+            );
+        }
         Ok(())
     }
 

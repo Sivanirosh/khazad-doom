@@ -554,6 +554,195 @@ pub struct Run {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLaunchAction {
+    Start,
+    Resume,
+}
+
+impl RunLaunchAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Resume => "resume",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "start" => Ok(Self::Start),
+            "resume" => Ok(Self::Resume),
+            _ => anyhow::bail!("unknown run launch action {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLaunchState {
+    Prepared,
+    Activated,
+    Completed,
+    Failed,
+    Interrupted,
+    Compensated,
+    RecoveryRequired,
+}
+
+impl RunLaunchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Activated => "activated",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Compensated => "compensated",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "activated" => Ok(Self::Activated),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            "compensated" => Ok(Self::Compensated),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            _ => anyhow::bail!("unknown run launch state {value:?}"),
+        }
+    }
+
+    pub fn is_incomplete(self) -> bool {
+        matches!(self, Self::Prepared | Self::Activated)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLaunchIntent {
+    pub run_id: String,
+    pub execution_epoch: usize,
+    pub action: RunLaunchAction,
+    pub state: RunLaunchState,
+    pub repo_id: String,
+    pub integration_branch: String,
+    pub integration_worktree: String,
+    #[serde(default)]
+    pub integration_resources_owned: bool,
+    pub prior_status: Option<RunStatus>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prior_error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub primary_cause: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compensation_error: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationMergeKind {
+    Slice,
+    IntegrationRepair,
+}
+
+impl IntegrationMergeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slice => "slice",
+            Self::IntegrationRepair => "integration_repair",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "slice" => Ok(Self::Slice),
+            "integration_repair" => Ok(Self::IntegrationRepair),
+            _ => anyhow::bail!("unknown integration merge kind {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationMergeState {
+    Prepared,
+    Applied,
+    NotStarted,
+    Conflicted,
+    Divergent,
+}
+
+impl IntegrationMergeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Applied => "applied",
+            Self::NotStarted => "not_started",
+            Self::Conflicted => "conflicted",
+            Self::Divergent => "divergent",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "applied" => Ok(Self::Applied),
+            "not_started" => Ok(Self::NotStarted),
+            "conflicted" => Ok(Self::Conflicted),
+            "divergent" => Ok(Self::Divergent),
+            _ => anyhow::bail!("unknown integration merge state {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntegrationMergeCompletion {
+    Slice {
+        branch: String,
+        commit_sha: String,
+        attempts: usize,
+    },
+    IntegrationRepair {
+        launch_id: i64,
+        status: String,
+        summary: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationMergeIntent {
+    pub operation_id: String,
+    pub run_id: String,
+    pub kind: IntegrationMergeKind,
+    pub slice_id: String,
+    pub attempt: usize,
+    pub launch_id: Option<i64>,
+    pub source_branch: String,
+    pub source_commit: String,
+    pub source_tree: String,
+    pub expected_head: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expected_result_tree: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resulting_head: String,
+    pub state: IntegrationMergeState,
+    pub completion: IntegrationMergeCompletion,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub primary_cause: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub abort_error: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted_files: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomyLevel {

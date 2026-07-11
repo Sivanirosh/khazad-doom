@@ -1,8 +1,10 @@
 use crate::domain::{
-    DecisionCommandOutcome, Event, FrontierBudgetState, FrontierClassification, MissionEnvelope,
-    ReplanDecision, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposalState,
-    ReplanProposedChange, Run, RunProgress, RunStatus, SliceRun, SliceStatus, WorkerAttemptLedger,
-    WorkerAttemptProgress, WorkerQuestion, WorkerQuestionAnswerSource,
+    DecisionCommandOutcome, Event, FrontierBudgetState, FrontierClassification,
+    IntegrationMergeCompletion, IntegrationMergeIntent, IntegrationMergeKind,
+    IntegrationMergeState, MissionEnvelope, ReplanDecision, ReplanEvidenceLink, ReplanProposal,
+    ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run, RunLaunchAction,
+    RunLaunchIntent, RunLaunchState, RunProgress, RunStatus, SliceRun, SliceStatus,
+    WorkerAttemptLedger, WorkerAttemptProgress, WorkerQuestion, WorkerQuestionAnswerSource,
     WorkerQuestionRecommendation,
 };
 use crate::pi_contract;
@@ -24,6 +26,33 @@ pub struct Repo {
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunAdmissionOutcome {
+    Prepared,
+    Conflict,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunAdmissionTransition {
+    pub(crate) outcome: RunAdmissionOutcome,
+    pub(crate) intent: Option<RunLaunchIntent>,
+    pub(crate) active_run: Option<Run>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegrationMergePrepareOutcome {
+    Prepared,
+    AlreadyPrepared,
+    AlreadyApplied,
+    Conflict,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IntegrationMergePrepareTransition {
+    pub(crate) outcome: IntegrationMergePrepareOutcome,
+    pub(crate) intent: IntegrationMergeIntent,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +416,69 @@ fn take_decision_transaction_fault(stage: DecisionTransactionFaultStage) -> bool
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionTransactionFaultStage {
+    BeforePreparedEvent,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum IntegrationMergeTransactionFaultStage {
+    PreparedEvent,
+    AppliedEvent,
+    ResolutionEvent,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_TRANSACTION_FAULT:
+        std::cell::RefCell<Option<AdmissionTransactionFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+    static INTEGRATION_MERGE_TRANSACTION_FAULT:
+        std::cell::RefCell<Option<IntegrationMergeTransactionFaultStage>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_admission_transaction_fault(stage: AdmissionTransactionFaultStage) {
+    ADMISSION_TRANSACTION_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_integration_merge_transaction_fault(
+    stage: IntegrationMergeTransactionFaultStage,
+) {
+    INTEGRATION_MERGE_TRANSACTION_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+}
+
+#[cfg(test)]
+fn take_admission_transaction_fault(stage: AdmissionTransactionFaultStage) -> bool {
+    ADMISSION_TRANSACTION_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn take_integration_merge_transaction_fault(stage: IntegrationMergeTransactionFaultStage) -> bool {
+    INTEGRATION_MERGE_TRANSACTION_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if *fault == Some(stage) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalTransitionFaultStage {
     BeforeTerminalEvent,
 }
@@ -531,6 +623,49 @@ impl Store {
                 started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TRIGGER IF NOT EXISTS runs_one_active_repo_insert
+            BEFORE INSERT ON runs
+            WHEN NEW.status IN ('pending', 'running')
+            BEGIN
+                SELECT RAISE(ABORT, 'active run already exists for canonical repository')
+                WHERE EXISTS (
+                    SELECT 1 FROM runs
+                    WHERE repo_id=NEW.repo_id
+                      AND status IN ('pending', 'running')
+                      AND id<>NEW.id
+                );
+            END;
+            CREATE TRIGGER IF NOT EXISTS runs_one_active_repo_update
+            BEFORE UPDATE OF repo_id, status ON runs
+            WHEN NEW.status IN ('pending', 'running')
+            BEGIN
+                SELECT RAISE(ABORT, 'active run already exists for canonical repository')
+                WHERE EXISTS (
+                    SELECT 1 FROM runs
+                    WHERE repo_id=NEW.repo_id
+                      AND status IN ('pending', 'running')
+                      AND id<>NEW.id
+                );
+            END;
+            CREATE TABLE IF NOT EXISTS run_launch_intents (
+                run_id TEXT NOT NULL,
+                execution_epoch INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                state TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                integration_branch TEXT NOT NULL,
+                integration_worktree TEXT NOT NULL,
+                integration_resources_owned INTEGER NOT NULL DEFAULT 0,
+                prior_status TEXT NOT NULL DEFAULT '',
+                prior_error TEXT NOT NULL DEFAULT '',
+                primary_cause TEXT NOT NULL DEFAULT '',
+                compensation_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, execution_epoch)
+            );
+            CREATE INDEX IF NOT EXISTS run_launch_intents_state_idx
+                ON run_launch_intents (state, updated_at);
             CREATE TABLE IF NOT EXISTS slice_runs (
                 run_id TEXT NOT NULL,
                 slice_id TEXT NOT NULL,
@@ -541,6 +676,31 @@ impl Store {
                 last_error TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (run_id, slice_id)
             );
+            CREATE TABLE IF NOT EXISTS integration_merge_intents (
+                operation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                slice_id TEXT NOT NULL DEFAULT '',
+                attempt INTEGER NOT NULL,
+                launch_id INTEGER,
+                source_branch TEXT NOT NULL,
+                source_commit TEXT NOT NULL,
+                source_tree TEXT NOT NULL,
+                expected_head TEXT NOT NULL,
+                expected_result_tree TEXT NOT NULL DEFAULT '',
+                resulting_head TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL,
+                completion_json TEXT NOT NULL,
+                primary_cause TEXT NOT NULL DEFAULT '',
+                abort_error TEXT NOT NULL DEFAULT '',
+                conflicted_files_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS integration_merge_one_prepared_per_run
+                ON integration_merge_intents (run_id) WHERE state='prepared';
+            CREATE INDEX IF NOT EXISTS integration_merge_intents_run_state_idx
+                ON integration_merge_intents (run_id, state, created_at);
             CREATE TABLE IF NOT EXISTS worker_attempt_ledger (
                 launch_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
@@ -656,6 +816,12 @@ impl Store {
             "runs",
             "execution_epoch",
             "execution_epoch INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            &conn,
+            "run_launch_intents",
+            "integration_resources_owned",
+            "integration_resources_owned INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
             &conn,
@@ -870,30 +1036,779 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_run(&self, run: &Run) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            r#"INSERT INTO runs
-               (id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
-                selected_slice_id, error, started_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+    pub(crate) fn admit_run(
+        &self,
+        run: &Run,
+        slice_runs: &[SliceRun],
+        mission_envelope: Option<&MissionEnvelope>,
+        frontier_budget: Option<&FrontierBudgetState>,
+        integration_worktree: &Path,
+    ) -> Result<RunAdmissionTransition> {
+        if run.status != RunStatus::Pending {
+            anyhow::bail!("new run admission requires pending status");
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(active_run) = active_run_for_repo_conn(&tx, &run.repo_id, None)? {
+            tx.commit()?;
+            return Ok(RunAdmissionTransition {
+                outcome: RunAdmissionOutcome::Conflict,
+                intent: None,
+                active_run: Some(active_run),
+            });
+        }
+        insert_run_tx(&tx, run, mission_envelope, frontier_budget)?;
+        for slice_run in slice_runs {
+            upsert_slice_run_tx(&tx, slice_run)?;
+        }
+        let intent = RunLaunchIntent {
+            run_id: run.id.clone(),
+            execution_epoch: 1,
+            action: RunLaunchAction::Start,
+            state: RunLaunchState::Prepared,
+            repo_id: run.repo_id.clone(),
+            integration_branch: run.integration_branch.clone(),
+            integration_worktree: integration_worktree.display().to_string(),
+            integration_resources_owned: false,
+            prior_status: None,
+            prior_error: String::new(),
+            primary_cause: String::new(),
+            compensation_error: String::new(),
+            created_at: run.started_at,
+            updated_at: run.updated_at,
+        };
+        insert_run_launch_intent_tx(&tx, &intent)?;
+        #[cfg(test)]
+        if take_admission_transaction_fault(AdmissionTransactionFaultStage::BeforePreparedEvent) {
+            anyhow::bail!("injected run admission transaction failure");
+        }
+        insert_event_tx(
+            &tx,
+            &run.id,
+            "run_launch_prepared",
+            &intent,
+            &run.updated_at.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(RunAdmissionTransition {
+            outcome: RunAdmissionOutcome::Prepared,
+            intent: Some(intent),
+            active_run: None,
+        })
+    }
+
+    pub(crate) fn begin_resume_run_launch(
+        &self,
+        run_id: &str,
+        integration_worktree: &Path,
+    ) -> Result<RunAdmissionTransition> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run =
+            run_by_id(&tx, run_id)?.ok_or_else(|| anyhow::anyhow!("run {run_id:?} not found"))?;
+        if !matches!(
+            run.status,
+            RunStatus::Interrupted | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Blocked
+        ) {
+            let active_run = if matches!(run.status, RunStatus::Pending | RunStatus::Running) {
+                Some(run)
+            } else {
+                None
+            };
+            tx.commit()?;
+            return Ok(RunAdmissionTransition {
+                outcome: RunAdmissionOutcome::Conflict,
+                intent: None,
+                active_run,
+            });
+        }
+        let incomplete_terminal = tx
+            .query_row(
+                "SELECT committed_at FROM terminal_transitions WHERE run_id=?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|committed_at| committed_at.is_empty());
+        if incomplete_terminal {
+            anyhow::bail!(
+                "run {run_id:?} has an incomplete terminalization; reconcile it before resuming"
+            );
+        }
+        if let Some(active_run) = active_run_for_repo_conn(&tx, &run.repo_id, Some(run_id))? {
+            tx.commit()?;
+            return Ok(RunAdmissionTransition {
+                outcome: RunAdmissionOutcome::Conflict,
+                intent: None,
+                active_run: Some(active_run),
+            });
+        }
+        let previous_epoch = tx.query_row(
+            "SELECT execution_epoch FROM runs WHERE id=?1",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let execution_epoch = previous_epoch.max(1) as usize + 1;
+        let now = Utc::now();
+        let changed = tx.execute(
+            r#"UPDATE runs
+               SET status=?1, error='', execution_epoch=?2, updated_at=?3
+               WHERE id=?4 AND status=?5"#,
             params![
-                &run.id,
-                &run.repo_id,
-                &run.repo_path,
+                RunStatus::Pending.as_str(),
+                execution_epoch as i64,
+                now.to_rfc3339(),
+                run_id,
                 run.status.as_str(),
-                &run.base_branch,
-                &run.base_sha,
-                &run.integration_branch,
-                &run.selected_slice_id,
-                &run.error,
-                run.started_at.to_rfc3339(),
-                run.updated_at.to_rfc3339()
             ],
         )?;
+        if changed != 1 {
+            anyhow::bail!("run {run_id:?} changed while preparing resume admission");
+        }
+        tx.execute(
+            "DELETE FROM terminal_transitions WHERE run_id=?1",
+            params![run_id],
+        )?;
+        let intent = RunLaunchIntent {
+            run_id: run.id.clone(),
+            execution_epoch,
+            action: RunLaunchAction::Resume,
+            state: RunLaunchState::Prepared,
+            repo_id: run.repo_id.clone(),
+            integration_branch: run.integration_branch.clone(),
+            integration_worktree: integration_worktree.display().to_string(),
+            integration_resources_owned: false,
+            prior_status: Some(run.status),
+            prior_error: run.error.clone(),
+            primary_cause: String::new(),
+            compensation_error: String::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        insert_run_launch_intent_tx(&tx, &intent)?;
+        #[cfg(test)]
+        if take_admission_transaction_fault(AdmissionTransactionFaultStage::BeforePreparedEvent) {
+            anyhow::bail!("injected resume admission transaction failure");
+        }
+        insert_event_tx(
+            &tx,
+            run_id,
+            "run_launch_prepared",
+            &intent,
+            &now.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(RunAdmissionTransition {
+            outcome: RunAdmissionOutcome::Prepared,
+            intent: Some(intent),
+            active_run: None,
+        })
+    }
+
+    pub(crate) fn activate_run_launch(&self, run_id: &str, execution_epoch: usize) -> Result<()> {
+        self.transition_run_launch(
+            run_id,
+            execution_epoch,
+            RunLaunchState::Prepared,
+            RunLaunchState::Activated,
+            true,
+        )
+    }
+
+    pub(crate) fn complete_run_launch(&self, run_id: &str, execution_epoch: usize) -> Result<()> {
+        self.transition_run_launch(
+            run_id,
+            execution_epoch,
+            RunLaunchState::Activated,
+            RunLaunchState::Completed,
+            false,
+        )
+    }
+
+    pub(crate) fn record_run_launch_integration_resources_created(
+        &self,
+        run_id: &str,
+        execution_epoch: usize,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut intent =
+            run_launch_intent_by_key(&tx, run_id, execution_epoch)?.ok_or_else(|| {
+                anyhow::anyhow!("run launch intent {run_id}/{execution_epoch} not found")
+            })?;
+        if intent.action != RunLaunchAction::Start {
+            anyhow::bail!("resume launch intent cannot own pre-existing integration resources");
+        }
+        if intent.integration_resources_owned {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if intent.state != RunLaunchState::Activated {
+            anyhow::bail!(
+                "run launch intent {run_id}/{execution_epoch} is {}; integration resources can be claimed only while activated",
+                intent.state.as_str()
+            );
+        }
+        let now = Utc::now();
+        let changed = tx.execute(
+            r#"UPDATE run_launch_intents
+               SET integration_resources_owned=1, updated_at=?1
+               WHERE run_id=?2 AND execution_epoch=?3 AND state=?4
+                 AND integration_resources_owned=0"#,
+            params![
+                now.to_rfc3339(),
+                run_id,
+                execution_epoch as i64,
+                RunLaunchState::Activated.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!(
+                "run launch intent {run_id}/{execution_epoch} changed while recording integration resource ownership"
+            );
+        }
+        intent.integration_resources_owned = true;
+        intent.updated_at = now;
+        insert_event_tx(
+            &tx,
+            run_id,
+            "run_launch_integration_resources_created",
+            &intent,
+            &now.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn transition_run_launch(
+        &self,
+        run_id: &str,
+        execution_epoch: usize,
+        expected: RunLaunchState,
+        target: RunLaunchState,
+        activate_run: bool,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let intent = run_launch_intent_by_key(&tx, run_id, execution_epoch)?.ok_or_else(|| {
+            anyhow::anyhow!("run launch intent {run_id}/{execution_epoch} not found")
+        })?;
+        if intent.state == target {
+            tx.commit()?;
+            return Ok(());
+        }
+        if intent.state != expected {
+            anyhow::bail!(
+                "run launch intent {run_id}/{execution_epoch} is {}; expected {}",
+                intent.state.as_str(),
+                expected.as_str()
+            );
+        }
+        let now = Utc::now().to_rfc3339();
+        if activate_run {
+            let changed = tx.execute(
+                r#"UPDATE runs SET status=?1, updated_at=?2
+                   WHERE id=?3 AND execution_epoch=?4 AND status=?5"#,
+                params![
+                    RunStatus::Running.as_str(),
+                    &now,
+                    run_id,
+                    execution_epoch as i64,
+                    RunStatus::Pending.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("run {run_id:?} is no longer pending for launch activation");
+            }
+        }
+        tx.execute(
+            r#"UPDATE run_launch_intents SET state=?1, updated_at=?2
+               WHERE run_id=?3 AND execution_epoch=?4 AND state=?5"#,
+            params![
+                target.as_str(),
+                &now,
+                run_id,
+                execution_epoch as i64,
+                expected.as_str(),
+            ],
+        )?;
+        let mut transitioned = intent;
+        transitioned.state = target;
+        transitioned.updated_at = DateTime::parse_from_rfc3339(&now)?.with_timezone(&Utc);
+        insert_event_tx(
+            &tx,
+            run_id,
+            match target {
+                RunLaunchState::Activated => "run_launch_activated",
+                RunLaunchState::Completed => "run_launch_completed",
+                _ => "run_launch_transitioned",
+            },
+            &transitioned,
+            &now,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
+    pub(crate) fn fail_run_launch(
+        &self,
+        run_id: &str,
+        execution_epoch: usize,
+        primary_cause: &str,
+        compensation_error: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut intent) = run_launch_intent_by_key(&tx, run_id, execution_epoch)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if !intent.state.is_incomplete() {
+            if intent.state == RunLaunchState::Failed
+                && intent.primary_cause == primary_cause
+                && intent.compensation_error == compensation_error
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "run launch intent {run_id}/{execution_epoch} is already {}",
+                intent.state.as_str()
+            );
+        }
+        let now = Utc::now();
+        let (status, error) = match intent.action {
+            RunLaunchAction::Start => (RunStatus::Failed, primary_cause.to_string()),
+            RunLaunchAction::Resume => (
+                intent.prior_status.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resume launch intent {run_id}/{execution_epoch} lost prior status"
+                    )
+                })?,
+                intent.prior_error.clone(),
+            ),
+        };
+        tx.execute(
+            r#"UPDATE runs SET status=?1, error=?2, updated_at=?3
+               WHERE id=?4 AND execution_epoch=?5 AND status IN ('pending', 'running')"#,
+            params![
+                status.as_str(),
+                error,
+                now.to_rfc3339(),
+                run_id,
+                execution_epoch as i64,
+            ],
+        )?;
+        tx.execute(
+            r#"UPDATE run_launch_intents
+               SET state=?1, primary_cause=?2, compensation_error=?3, updated_at=?4
+               WHERE run_id=?5 AND execution_epoch=?6"#,
+            params![
+                RunLaunchState::Failed.as_str(),
+                primary_cause,
+                compensation_error,
+                now.to_rfc3339(),
+                run_id,
+                execution_epoch as i64,
+            ],
+        )?;
+        intent.state = RunLaunchState::Failed;
+        intent.primary_cause = primary_cause.to_string();
+        intent.compensation_error = compensation_error.to_string();
+        intent.updated_at = now;
+        insert_event_tx(&tx, run_id, "run_launch_failed", &intent, &now.to_rfc3339())?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn record_run_launch_compensation(
+        &self,
+        run_id: &str,
+        execution_epoch: usize,
+        compensation_error: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut intent =
+            run_launch_intent_by_key(&tx, run_id, execution_epoch)?.ok_or_else(|| {
+                anyhow::anyhow!("run launch intent {run_id}/{execution_epoch} not found")
+            })?;
+        if intent.action != RunLaunchAction::Start {
+            anyhow::bail!("resume launch resources are not owned by the resume intent");
+        }
+        let target = if compensation_error.is_empty() {
+            RunLaunchState::Compensated
+        } else {
+            RunLaunchState::RecoveryRequired
+        };
+        if intent.state == target && intent.compensation_error == compensation_error {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if !matches!(
+            intent.state,
+            RunLaunchState::Interrupted | RunLaunchState::Failed | RunLaunchState::RecoveryRequired
+        ) {
+            anyhow::bail!(
+                "run launch intent {run_id}/{execution_epoch} is {}; cannot record compensation",
+                intent.state.as_str()
+            );
+        }
+        let now = Utc::now();
+        tx.execute(
+            r#"UPDATE run_launch_intents SET state=?1, compensation_error=?2, updated_at=?3
+               WHERE run_id=?4 AND execution_epoch=?5"#,
+            params![
+                target.as_str(),
+                compensation_error,
+                now.to_rfc3339(),
+                run_id,
+                execution_epoch as i64,
+            ],
+        )?;
+        intent.state = target;
+        intent.compensation_error = compensation_error.to_string();
+        intent.updated_at = now;
+        insert_event_tx(
+            &tx,
+            run_id,
+            if target == RunLaunchState::Compensated {
+                "run_launch_compensated"
+            } else {
+                "run_launch_compensation_failed"
+            },
+            &intent,
+            &now.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn run_launch_intent(
+        &self,
+        run_id: &str,
+        execution_epoch: usize,
+    ) -> Result<Option<RunLaunchIntent>> {
+        let conn = self.conn()?;
+        run_launch_intent_by_key(&conn, run_id, execution_epoch)
+    }
+
+    pub(crate) fn incomplete_run_launch_intents(&self) -> Result<Vec<RunLaunchIntent>> {
+        self.run_launch_intents_in_states(&[RunLaunchState::Prepared, RunLaunchState::Activated])
+    }
+
+    pub(crate) fn run_launch_intents_requiring_compensation(&self) -> Result<Vec<RunLaunchIntent>> {
+        self.run_launch_intents_in_states(&[
+            RunLaunchState::Interrupted,
+            RunLaunchState::Failed,
+            RunLaunchState::RecoveryRequired,
+        ])
+    }
+
+    fn run_launch_intents_in_states(
+        &self,
+        states: &[RunLaunchState],
+    ) -> Result<Vec<RunLaunchIntent>> {
+        let conn = self.conn()?;
+        let state_values = states
+            .iter()
+            .map(|state| format!("'{}'", state.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"SELECT run_id, execution_epoch, action, state, repo_id, integration_branch,
+                      integration_worktree, integration_resources_owned, prior_status, prior_error,
+                      primary_cause, compensation_error, created_at, updated_at
+               FROM run_launch_intents WHERE state IN ({state_values})
+               ORDER BY created_at, run_id, execution_epoch"#
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], run_launch_intent_tuple_from_row)?;
+        let mut intents = Vec::new();
+        for row in rows {
+            intents.push(run_launch_intent_from_tuple(row?)?);
+        }
+        Ok(intents)
+    }
+
+    pub(crate) fn prepare_integration_merge(
+        &self,
+        intent: &IntegrationMergeIntent,
+    ) -> Result<IntegrationMergePrepareTransition> {
+        if intent.state != IntegrationMergeState::Prepared || !intent.resulting_head.is_empty() {
+            anyhow::bail!("new integration merge intent must be prepared without a result head");
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(mut existing) = integration_merge_intent_by_id(&tx, &intent.operation_id)? {
+            if !integration_merge_authority_matches(&existing, intent) {
+                anyhow::bail!(
+                    "integration merge operation {:?} conflicts with its durable command identity",
+                    intent.operation_id
+                );
+            }
+            let outcome = match existing.state {
+                IntegrationMergeState::Prepared => IntegrationMergePrepareOutcome::AlreadyPrepared,
+                IntegrationMergeState::Applied => IntegrationMergePrepareOutcome::AlreadyApplied,
+                IntegrationMergeState::NotStarted => {
+                    let now = Utc::now();
+                    tx.execute(
+                        r#"UPDATE integration_merge_intents
+                           SET state='prepared', resulting_head='', primary_cause='', abort_error='',
+                               conflicted_files_json='[]', updated_at=?1
+                           WHERE operation_id=?2 AND state='not_started'"#,
+                        params![now.to_rfc3339(), &intent.operation_id],
+                    )?;
+                    existing.state = IntegrationMergeState::Prepared;
+                    existing.resulting_head.clear();
+                    existing.primary_cause.clear();
+                    existing.abort_error.clear();
+                    existing.conflicted_files.clear();
+                    existing.updated_at = now;
+                    insert_event_tx(
+                        &tx,
+                        &intent.run_id,
+                        "integration_merge_reprepared",
+                        &existing,
+                        &now.to_rfc3339(),
+                    )?;
+                    IntegrationMergePrepareOutcome::Prepared
+                }
+                IntegrationMergeState::Conflicted | IntegrationMergeState::Divergent => {
+                    IntegrationMergePrepareOutcome::Conflict
+                }
+            };
+            tx.commit()?;
+            return Ok(IntegrationMergePrepareTransition {
+                outcome,
+                intent: existing,
+            });
+        }
+        if let Some(existing) = prepared_integration_merge_for_run(&tx, &intent.run_id)? {
+            tx.commit()?;
+            return Ok(IntegrationMergePrepareTransition {
+                outcome: IntegrationMergePrepareOutcome::Conflict,
+                intent: existing,
+            });
+        }
+        let run_status = tx
+            .query_row(
+                "SELECT status FROM runs WHERE id=?1",
+                params![&intent.run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("run {:?} not found", intent.run_id))?;
+        if RunStatus::parse(&run_status)? != RunStatus::Running {
+            anyhow::bail!(
+                "run {:?} is not running; cannot prepare integration merge",
+                intent.run_id
+            );
+        }
+        insert_integration_merge_intent_tx(&tx, intent)?;
+        #[cfg(test)]
+        if take_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::PreparedEvent,
+        ) {
+            anyhow::bail!("injected merge preparation transaction failure");
+        }
+        insert_event_tx(
+            &tx,
+            &intent.run_id,
+            "integration_merge_prepared",
+            intent,
+            &intent.created_at.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(IntegrationMergePrepareTransition {
+            outcome: IntegrationMergePrepareOutcome::Prepared,
+            intent: intent.clone(),
+        })
+    }
+
+    pub(crate) fn commit_integration_merge(
+        &self,
+        operation_id: &str,
+        resulting_head: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut intent = integration_merge_intent_by_id(&tx, operation_id)?.ok_or_else(|| {
+            anyhow::anyhow!("integration merge intent {operation_id:?} not found")
+        })?;
+        if intent.state == IntegrationMergeState::Applied {
+            if intent.resulting_head != resulting_head {
+                anyhow::bail!(
+                    "integration merge {operation_id:?} was already applied at {}, not {}",
+                    intent.resulting_head,
+                    resulting_head
+                );
+            }
+            tx.commit()?;
+            return Ok(false);
+        }
+        if intent.state != IntegrationMergeState::Prepared {
+            anyhow::bail!(
+                "integration merge {operation_id:?} is {}; cannot apply it",
+                intent.state.as_str()
+            );
+        }
+        let now = Utc::now();
+        tx.execute(
+            r#"UPDATE integration_merge_intents
+               SET state='applied', resulting_head=?1, updated_at=?2
+               WHERE operation_id=?3 AND state='prepared'"#,
+            params![resulting_head, now.to_rfc3339(), operation_id],
+        )?;
+        intent.state = IntegrationMergeState::Applied;
+        intent.resulting_head = resulting_head.to_string();
+        intent.updated_at = now;
+        apply_integration_merge_completion_tx(&tx, &intent, &now.to_rfc3339())?;
+        #[cfg(test)]
+        if take_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::AppliedEvent,
+        ) {
+            anyhow::bail!("injected merge completion transaction failure");
+        }
+        insert_event_tx(
+            &tx,
+            &intent.run_id,
+            "integration_merge_applied",
+            &intent,
+            &now.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn resolve_integration_merge(
+        &self,
+        operation_id: &str,
+        state: IntegrationMergeState,
+        resulting_head: &str,
+        primary_cause: &str,
+        abort_error: &str,
+        conflicted_files: &[String],
+    ) -> Result<bool> {
+        if matches!(
+            state,
+            IntegrationMergeState::Prepared | IntegrationMergeState::Applied
+        ) {
+            anyhow::bail!("integration merge resolution requires a non-applied terminal state");
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut intent = integration_merge_intent_by_id(&tx, operation_id)?.ok_or_else(|| {
+            anyhow::anyhow!("integration merge intent {operation_id:?} not found")
+        })?;
+        if intent.state == state
+            && intent.resulting_head == resulting_head
+            && intent.primary_cause == primary_cause
+            && intent.abort_error == abort_error
+            && intent.conflicted_files == conflicted_files
+        {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let valid_transition = intent.state == IntegrationMergeState::Prepared
+            || (intent.state == IntegrationMergeState::Conflicted
+                && matches!(
+                    state,
+                    IntegrationMergeState::Conflicted | IntegrationMergeState::NotStarted
+                ));
+        if !valid_transition {
+            anyhow::bail!(
+                "integration merge {operation_id:?} is {}; cannot resolve it as {}",
+                intent.state.as_str(),
+                state.as_str()
+            );
+        }
+        let now = Utc::now();
+        tx.execute(
+            r#"UPDATE integration_merge_intents
+               SET state=?1, resulting_head=?2, primary_cause=?3, abort_error=?4,
+                   conflicted_files_json=?5, updated_at=?6
+               WHERE operation_id=?7"#,
+            params![
+                state.as_str(),
+                resulting_head,
+                primary_cause,
+                abort_error,
+                serde_json::to_string(conflicted_files)?,
+                now.to_rfc3339(),
+                operation_id,
+            ],
+        )?;
+        intent.state = state;
+        intent.resulting_head = resulting_head.to_string();
+        intent.primary_cause = primary_cause.to_string();
+        intent.abort_error = abort_error.to_string();
+        intent.conflicted_files = conflicted_files.to_vec();
+        intent.updated_at = now;
+        if intent.kind == IntegrationMergeKind::Slice
+            && matches!(
+                state,
+                IntegrationMergeState::Conflicted | IntegrationMergeState::Divergent
+            )
+        {
+            tx.execute(
+                "UPDATE slice_runs SET status=?1, last_error=?2 WHERE run_id=?3 AND slice_id=?4",
+                params![
+                    SliceStatus::Blocked.as_str(),
+                    primary_cause,
+                    &intent.run_id,
+                    &intent.slice_id,
+                ],
+            )?;
+        }
+        #[cfg(test)]
+        if take_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::ResolutionEvent,
+        ) {
+            anyhow::bail!("injected merge resolution transaction failure");
+        }
+        insert_event_tx(
+            &tx,
+            &intent.run_id,
+            "integration_merge_reconciled",
+            &intent,
+            &now.to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn integration_merge_intents(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<IntegrationMergeIntent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT operation_id, run_id, kind, slice_id, attempt, launch_id,
+                      source_branch, source_commit, source_tree, expected_head,
+                      expected_result_tree, resulting_head, state, completion_json,
+                      primary_cause, abort_error, conflicted_files_json, created_at, updated_at
+               FROM integration_merge_intents WHERE run_id=?1
+               ORDER BY created_at, operation_id"#,
+        )?;
+        let rows = stmt.query_map(params![run_id], integration_merge_intent_tuple_from_row)?;
+        let mut intents = Vec::new();
+        for row in rows {
+            intents.push(integration_merge_intent_from_tuple(row?)?);
+        }
+        Ok(intents)
+    }
+
+    #[cfg(test)]
+    pub fn insert_run(&self, run: &Run) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_run_tx(&tx, run, None, None)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn set_frontier_state(
         &self,
         run_id: &str,
@@ -1257,6 +2172,34 @@ impl Store {
             "UPDATE runs SET status=?1, error=?2, updated_at=?3 WHERE id=?4",
             params![transition.status.as_str(), transition.error, now, run_id],
         )?;
+        let launch_state = if matches!(transition.status, RunStatus::Failed | RunStatus::Blocked) {
+            RunLaunchState::Failed
+        } else {
+            RunLaunchState::Interrupted
+        };
+        let launch_changed = tx.execute(
+            r#"UPDATE run_launch_intents
+               SET state=?1,
+                   primary_cause=CASE WHEN primary_cause='' THEN ?2 ELSE primary_cause END,
+                   updated_at=?3
+               WHERE run_id=?4
+                 AND execution_epoch=(SELECT execution_epoch FROM runs WHERE id=?4)
+                 AND state IN ('prepared', 'activated')"#,
+            params![launch_state.as_str(), &transition.error, &now, run_id,],
+        )?;
+        if launch_changed == 1 {
+            insert_event_tx(
+                &tx,
+                run_id,
+                "run_launch_interrupted",
+                &serde_json::json!({
+                    "state": launch_state,
+                    "terminal_status": transition.status,
+                    "primary_cause": transition.error,
+                }),
+                &now,
+            )?;
+        }
         #[cfg(test)]
         if take_terminal_transition_fault(TerminalTransitionFaultStage::BeforeTerminalEvent) {
             anyhow::bail!("injected terminal state/event commit failure");
@@ -1291,46 +2234,17 @@ impl Store {
         Ok(epoch.max(1) as usize)
     }
 
+    #[cfg(test)]
     pub(crate) fn reopen_run_for_resume(&self, run_id: &str) -> Result<usize> {
-        let mut conn = self.conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let transition = tx
-            .query_row(
-                r#"SELECT status, error, progress_message, question_interruption_reason,
-                          summary_written_at, committed_at
-                   FROM terminal_transitions WHERE run_id=?1"#,
-                params![run_id],
-                terminal_transition_tuple_from_row,
-            )
-            .optional()?
-            .map(terminal_transition_from_tuple)
-            .transpose()?;
-        if transition
-            .as_ref()
-            .is_some_and(|transition| !transition.committed)
-        {
-            anyhow::bail!(
-                "run {run_id:?} has an incomplete terminalization; reconcile it before resuming"
-            );
+        let transition = self.begin_resume_run_launch(run_id, Path::new(""))?;
+        if transition.outcome != RunAdmissionOutcome::Prepared {
+            anyhow::bail!("run {run_id:?} could not acquire resume admission");
         }
-        let changed = tx.execute(
-            "UPDATE runs SET status=?1, error='', execution_epoch=execution_epoch+1, updated_at=?2 WHERE id=?3",
-            params![RunStatus::Running.as_str(), Utc::now().to_rfc3339(), run_id],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("run {run_id:?} disappeared while reopening for resume");
-        }
-        tx.execute(
-            "DELETE FROM terminal_transitions WHERE run_id=?1",
-            params![run_id],
-        )?;
-        let epoch = tx.query_row(
-            "SELECT execution_epoch FROM runs WHERE id=?1",
-            params![run_id],
-            |row| row.get::<_, i64>(0),
-        )?;
-        tx.commit()?;
-        Ok(epoch.max(1) as usize)
+        let intent = transition
+            .intent
+            .ok_or_else(|| anyhow::anyhow!("resume admission lost its launch intent"))?;
+        self.activate_run_launch(run_id, intent.execution_epoch)?;
+        Ok(intent.execution_epoch)
     }
 
     pub(crate) fn terminal_transition_needs_reconciliation(&self, run_id: &str) -> Result<bool> {
@@ -3620,36 +4534,6 @@ impl Store {
         Ok(runs)
     }
 
-    pub fn active_run_for_repo(
-        &self,
-        repo_id: &str,
-        allowed_run_id: Option<&str>,
-    ) -> Result<Option<Run>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
-                      selected_slice_id, error, started_at, updated_at
-               FROM runs
-               WHERE repo_id=?1 AND status IN (?2, ?3)
-               ORDER BY started_at ASC"#,
-        )?;
-        let rows = stmt.query_map(
-            params![
-                repo_id,
-                RunStatus::Pending.as_str(),
-                RunStatus::Running.as_str()
-            ],
-            run_tuple_from_row,
-        )?;
-        for row in rows {
-            let run = run_from_tuple(row?)?;
-            if Some(run.id.as_str()) != allowed_run_id {
-                return Ok(Some(run));
-            }
-        }
-        Ok(None)
-    }
-
     pub fn latest_run_for_repo(&self, repo_path: &str, active_only: bool) -> Result<Option<Run>> {
         let conn = self.conn()?;
         let sql = if active_only {
@@ -3750,6 +4634,338 @@ fn interrupt_active_worker_attempts(
     Ok(active_attempts.len())
 }
 
+fn insert_run_tx(
+    conn: &Connection,
+    run: &Run,
+    mission_envelope: Option<&MissionEnvelope>,
+    frontier_budget: Option<&FrontierBudgetState>,
+) -> Result<()> {
+    let envelope_json = mission_envelope
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
+    let budget_json = frontier_budget
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
+    conn.execute(
+        r#"INSERT INTO runs
+           (id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+            selected_slice_id, error, execution_epoch, mission_envelope_json,
+            frontier_budget_json, started_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13)"#,
+        params![
+            &run.id,
+            &run.repo_id,
+            &run.repo_path,
+            run.status.as_str(),
+            &run.base_branch,
+            &run.base_sha,
+            &run.integration_branch,
+            &run.selected_slice_id,
+            &run.error,
+            envelope_json,
+            budget_json,
+            run.started_at.to_rfc3339(),
+            run.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_slice_run_tx(conn: &Connection, slice_run: &SliceRun) -> Result<()> {
+    conn.execute(
+        r#"INSERT INTO slice_runs (run_id, slice_id, status, branch, commit_sha, attempts, last_error)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(run_id, slice_id) DO UPDATE SET
+             status=excluded.status,
+             branch=excluded.branch,
+             commit_sha=excluded.commit_sha,
+             attempts=excluded.attempts,
+             last_error=excluded.last_error"#,
+        params![
+            &slice_run.run_id,
+            &slice_run.slice_id,
+            slice_run.status.as_str(),
+            &slice_run.branch,
+            &slice_run.commit_sha,
+            slice_run.attempts as i64,
+            &slice_run.last_error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_run_launch_intent_tx(conn: &Connection, intent: &RunLaunchIntent) -> Result<()> {
+    conn.execute(
+        r#"INSERT INTO run_launch_intents
+           (run_id, execution_epoch, action, state, repo_id, integration_branch,
+            integration_worktree, integration_resources_owned, prior_status, prior_error,
+            primary_cause, compensation_error, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
+        params![
+            &intent.run_id,
+            intent.execution_epoch as i64,
+            intent.action.as_str(),
+            intent.state.as_str(),
+            &intent.repo_id,
+            &intent.integration_branch,
+            &intent.integration_worktree,
+            intent.integration_resources_owned,
+            intent
+                .prior_status
+                .map(RunStatus::as_str)
+                .unwrap_or_default(),
+            &intent.prior_error,
+            &intent.primary_cause,
+            &intent.compensation_error,
+            intent.created_at.to_rfc3339(),
+            intent.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_event_tx<T: Serialize>(
+    conn: &Connection,
+    run_id: &str,
+    event_type: &str,
+    payload: &T,
+    created_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            run_id,
+            event_type,
+            serde_json::to_string(payload)?,
+            created_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn active_run_for_repo_conn(
+    conn: &Connection,
+    repo_id: &str,
+    exclude_run_id: Option<&str>,
+) -> Result<Option<Run>> {
+    let row = conn
+        .query_row(
+            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha,
+                      integration_branch, selected_slice_id, error, started_at, updated_at
+               FROM runs
+               WHERE repo_id=?1 AND status IN ('pending', 'running')
+                 AND (?2 IS NULL OR id<>?2)
+               ORDER BY updated_at DESC, id DESC LIMIT 1"#,
+            params![repo_id, exclude_run_id],
+            run_tuple_from_row,
+        )
+        .optional()?;
+    row.map(run_from_tuple).transpose()
+}
+
+fn run_launch_intent_by_key(
+    conn: &Connection,
+    run_id: &str,
+    execution_epoch: usize,
+) -> Result<Option<RunLaunchIntent>> {
+    conn.query_row(
+        r#"SELECT run_id, execution_epoch, action, state, repo_id, integration_branch,
+                  integration_worktree, integration_resources_owned, prior_status, prior_error,
+                  primary_cause, compensation_error, created_at, updated_at
+           FROM run_launch_intents WHERE run_id=?1 AND execution_epoch=?2"#,
+        params![run_id, execution_epoch as i64],
+        run_launch_intent_tuple_from_row,
+    )
+    .optional()?
+    .map(run_launch_intent_from_tuple)
+    .transpose()
+}
+
+fn insert_integration_merge_intent_tx(
+    conn: &Connection,
+    intent: &IntegrationMergeIntent,
+) -> Result<()> {
+    conn.execute(
+        r#"INSERT INTO integration_merge_intents
+           (operation_id, run_id, kind, slice_id, attempt, launch_id, source_branch,
+            source_commit, source_tree, expected_head, expected_result_tree, resulting_head,
+            state, completion_json, primary_cause, abort_error, conflicted_files_json,
+            created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18, ?19)"#,
+        params![
+            &intent.operation_id,
+            &intent.run_id,
+            intent.kind.as_str(),
+            &intent.slice_id,
+            intent.attempt as i64,
+            intent.launch_id,
+            &intent.source_branch,
+            &intent.source_commit,
+            &intent.source_tree,
+            &intent.expected_head,
+            &intent.expected_result_tree,
+            &intent.resulting_head,
+            intent.state.as_str(),
+            serde_json::to_string(&intent.completion)?,
+            &intent.primary_cause,
+            &intent.abort_error,
+            serde_json::to_string(&intent.conflicted_files)?,
+            intent.created_at.to_rfc3339(),
+            intent.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn integration_merge_authority_matches(
+    existing: &IntegrationMergeIntent,
+    command: &IntegrationMergeIntent,
+) -> bool {
+    existing.operation_id == command.operation_id
+        && existing.run_id == command.run_id
+        && existing.kind == command.kind
+        && existing.slice_id == command.slice_id
+        && existing.attempt == command.attempt
+        && existing.launch_id == command.launch_id
+        && existing.source_branch == command.source_branch
+        && existing.source_commit == command.source_commit
+        && existing.source_tree == command.source_tree
+        && existing.expected_head == command.expected_head
+        && existing.expected_result_tree == command.expected_result_tree
+        && existing.completion == command.completion
+}
+
+fn integration_merge_intent_by_id(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<Option<IntegrationMergeIntent>> {
+    conn.query_row(
+        r#"SELECT operation_id, run_id, kind, slice_id, attempt, launch_id,
+                  source_branch, source_commit, source_tree, expected_head,
+                  expected_result_tree, resulting_head, state, completion_json,
+                  primary_cause, abort_error, conflicted_files_json, created_at, updated_at
+           FROM integration_merge_intents WHERE operation_id=?1"#,
+        params![operation_id],
+        integration_merge_intent_tuple_from_row,
+    )
+    .optional()?
+    .map(integration_merge_intent_from_tuple)
+    .transpose()
+}
+
+fn prepared_integration_merge_for_run(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<IntegrationMergeIntent>> {
+    conn.query_row(
+        r#"SELECT operation_id, run_id, kind, slice_id, attempt, launch_id,
+                  source_branch, source_commit, source_tree, expected_head,
+                  expected_result_tree, resulting_head, state, completion_json,
+                  primary_cause, abort_error, conflicted_files_json, created_at, updated_at
+           FROM integration_merge_intents WHERE run_id=?1 AND state='prepared'
+           ORDER BY created_at, operation_id LIMIT 1"#,
+        params![run_id],
+        integration_merge_intent_tuple_from_row,
+    )
+    .optional()?
+    .map(integration_merge_intent_from_tuple)
+    .transpose()
+}
+
+fn apply_integration_merge_completion_tx(
+    conn: &Connection,
+    intent: &IntegrationMergeIntent,
+    now: &str,
+) -> Result<()> {
+    match &intent.completion {
+        IntegrationMergeCompletion::Slice {
+            branch,
+            commit_sha,
+            attempts,
+        } => {
+            let slice_run = SliceRun {
+                run_id: intent.run_id.clone(),
+                slice_id: intent.slice_id.clone(),
+                status: SliceStatus::Merged,
+                branch: branch.clone(),
+                commit_sha: commit_sha.clone(),
+                attempts: *attempts,
+                last_error: String::new(),
+            };
+            upsert_slice_run_tx(conn, &slice_run)?;
+            insert_event_tx(
+                conn,
+                &intent.run_id,
+                "slice_merged",
+                &serde_json::json!({
+                    "slice_id": intent.slice_id,
+                    "commit_sha": commit_sha,
+                }),
+                now,
+            )?;
+        }
+        IntegrationMergeCompletion::IntegrationRepair {
+            launch_id,
+            status,
+            summary,
+        } => {
+            if intent.launch_id != Some(*launch_id) {
+                anyhow::bail!(
+                    "integration repair merge {:?} has inconsistent launch identity",
+                    intent.operation_id
+                );
+            }
+            let (run_id, slice_id, prior_state): (String, String, String) = conn
+                .query_row(
+                    "SELECT run_id, slice_id, state FROM worker_attempt_ledger WHERE launch_id=?1",
+                    params![launch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .context("integration repair merge lost its worker attempt")?;
+            if run_id != intent.run_id || !matches!(prior_state.as_str(), "running" | "interrupted")
+            {
+                anyhow::bail!(
+                    "integration repair launch {launch_id} is {prior_state} for run {run_id:?}"
+                );
+            }
+            conn.execute(
+                r#"UPDATE worker_attempt_ledger
+                   SET state='succeeded', finished_at=?1, failure_cause=''
+                   WHERE launch_id=?2 AND state IN ('running', 'interrupted')"#,
+                params![now, launch_id],
+            )?;
+            insert_event_tx(
+                conn,
+                &intent.run_id,
+                "worker_attempt_finished",
+                &serde_json::json!({
+                    "launch_id": launch_id,
+                    "slice_id": slice_id,
+                    "state": "succeeded",
+                    "failure_cause": "",
+                }),
+                now,
+            )?;
+            insert_event_tx(
+                conn,
+                &intent.run_id,
+                "integration_repair_completed",
+                &serde_json::json!({
+                    "status": status,
+                    "summary": summary,
+                    "launch_id": launch_id,
+                }),
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -3776,7 +4992,44 @@ type RunTuple = (
     String,
 );
 type TerminalTransitionTuple = (String, String, String, String, String, String);
+type RunLaunchIntentTuple = (
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
+type IntegrationMergeIntentTuple = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 type SliceRunTuple = (String, String, String, String, String, i64, String);
 type EventTuple = (i64, String, String, String, String);
 type ReplanProposalTuple = (
@@ -3830,6 +5083,27 @@ fn run_tuple_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunTuple> {
     ))
 }
 
+fn run_launch_intent_tuple_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RunLaunchIntentTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    ))
+}
+
 fn terminal_transition_tuple_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<TerminalTransitionTuple> {
@@ -3840,6 +5114,32 @@ fn terminal_transition_tuple_from_row(
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+    ))
+}
+
+fn integration_merge_intent_tuple_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<IntegrationMergeIntentTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
     ))
 }
 
@@ -3949,6 +5249,45 @@ fn run_from_tuple(row: RunTuple) -> Result<Run> {
     })
 }
 
+fn run_launch_intent_from_tuple(row: RunLaunchIntentTuple) -> Result<RunLaunchIntent> {
+    let (
+        run_id,
+        execution_epoch,
+        action,
+        state,
+        repo_id,
+        integration_branch,
+        integration_worktree,
+        integration_resources_owned,
+        prior_status,
+        prior_error,
+        primary_cause,
+        compensation_error,
+        created_at,
+        updated_at,
+    ) = row;
+    Ok(RunLaunchIntent {
+        run_id,
+        execution_epoch: execution_epoch.max(1) as usize,
+        action: RunLaunchAction::parse(&action)?,
+        state: RunLaunchState::parse(&state)?,
+        repo_id,
+        integration_branch,
+        integration_worktree,
+        integration_resources_owned,
+        prior_status: if prior_status.is_empty() {
+            None
+        } else {
+            Some(RunStatus::parse(&prior_status)?)
+        },
+        prior_error,
+        primary_cause,
+        compensation_error,
+        created_at: parse_time("created_at", &created_at)?,
+        updated_at: parse_time("updated_at", &updated_at)?,
+    })
+}
+
 fn terminal_transition_from_tuple(row: TerminalTransitionTuple) -> Result<TerminalTransition> {
     let (
         status,
@@ -3965,6 +5304,55 @@ fn terminal_transition_from_tuple(row: TerminalTransitionTuple) -> Result<Termin
         question_interruption_reason,
         summary_written: !summary_written_at.trim().is_empty(),
         committed: !committed_at.trim().is_empty(),
+    })
+}
+
+fn integration_merge_intent_from_tuple(
+    row: IntegrationMergeIntentTuple,
+) -> Result<IntegrationMergeIntent> {
+    let (
+        operation_id,
+        run_id,
+        kind,
+        slice_id,
+        attempt,
+        launch_id,
+        source_branch,
+        source_commit,
+        source_tree,
+        expected_head,
+        expected_result_tree,
+        resulting_head,
+        state,
+        completion_json,
+        primary_cause,
+        abort_error,
+        conflicted_files_json,
+        created_at,
+        updated_at,
+    ) = row;
+    Ok(IntegrationMergeIntent {
+        operation_id,
+        run_id,
+        kind: IntegrationMergeKind::parse(&kind)?,
+        slice_id,
+        attempt: attempt.max(0) as usize,
+        launch_id,
+        source_branch,
+        source_commit,
+        source_tree,
+        expected_head,
+        expected_result_tree,
+        resulting_head,
+        state: IntegrationMergeState::parse(&state)?,
+        completion: serde_json::from_str(&completion_json)
+            .with_context(|| format!("parse merge completion {completion_json:?}"))?,
+        primary_cause,
+        abort_error,
+        conflicted_files: serde_json::from_str(&conflicted_files_json)
+            .with_context(|| format!("parse merge conflicted files {conflicted_files_json:?}"))?,
+        created_at: parse_time("created_at", &created_at)?,
+        updated_at: parse_time("updated_at", &updated_at)?,
     })
 }
 
@@ -4635,6 +6023,38 @@ mod tests {
         }
     }
 
+    fn merge_intent(
+        run_id: &str,
+        operation_id: &str,
+        now: DateTime<Utc>,
+    ) -> IntegrationMergeIntent {
+        IntegrationMergeIntent {
+            operation_id: operation_id.to_string(),
+            run_id: run_id.to_string(),
+            kind: IntegrationMergeKind::Slice,
+            slice_id: "S-1".to_string(),
+            attempt: 2,
+            launch_id: Some(41),
+            source_branch: "worker/S-1".to_string(),
+            source_commit: "source".to_string(),
+            source_tree: "source-tree".to_string(),
+            expected_head: "expected".to_string(),
+            expected_result_tree: "result-tree".to_string(),
+            resulting_head: String::new(),
+            state: IntegrationMergeState::Prepared,
+            completion: IntegrationMergeCompletion::Slice {
+                branch: "worker/S-1".to_string(),
+                commit_sha: "source".to_string(),
+                attempts: 2,
+            },
+            primary_cause: String::new(),
+            abort_error: String::new(),
+            conflicted_files: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_active_test_question(
         store: &Store,
@@ -4660,6 +6080,325 @@ mod tests {
             |question| Ok(serde_json::json!({ "question_id": question.id })),
             "awaiting operator answer",
         )
+    }
+
+    #[test]
+    fn concurrent_run_admission_has_one_durable_repo_winner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.sqlite");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        let mut first = run(
+            "run-admission-a",
+            "/tmp/canonical-repo",
+            RunStatus::Pending,
+            now,
+        );
+        first.repo_id = "canonical-repo".to_string();
+        let mut second = run(
+            "run-admission-b",
+            "/tmp/canonical-repo",
+            RunStatus::Pending,
+            now,
+        );
+        second.repo_id = "canonical-repo".to_string();
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = [first, second]
+            .into_iter()
+            .map(|run| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || -> Result<RunAdmissionOutcome> {
+                    let store = Store::open(path)?;
+                    barrier.wait();
+                    Ok(store
+                        .admit_run(
+                            &run,
+                            &[],
+                            None,
+                            None,
+                            Path::new("/tmp/worktrees/integration"),
+                        )?
+                        .outcome)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission thread"))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RunAdmissionOutcome::Prepared)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RunAdmissionOutcome::Conflict)
+                .count(),
+            1
+        );
+
+        let store = Store::open(&path)?;
+        assert_eq!(store.active_runs()?.len(), 1);
+        assert_eq!(store.incomplete_run_launch_intents()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_fault_rolls_back_run_intent_and_active_repo_claim() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        let pending = run(
+            "run-admission-fault",
+            "/tmp/admission-fault",
+            RunStatus::Pending,
+            now,
+        );
+        inject_admission_transaction_fault(AdmissionTransactionFaultStage::BeforePreparedEvent);
+        let error = store
+            .admit_run(
+                &pending,
+                &[],
+                None,
+                None,
+                Path::new("/tmp/worktrees/integration"),
+            )
+            .expect_err("admission fault must roll back");
+        assert!(error.to_string().contains("injected run admission"));
+        assert!(store.get_run(&pending.id)?.is_none());
+        assert!(store.active_runs()?.is_empty());
+        assert!(store.incomplete_run_launch_intents()?.is_empty());
+        assert!(store.get_events(&pending.id, 20)?.is_empty());
+
+        let retry = store.admit_run(
+            &pending,
+            &[],
+            None,
+            None,
+            Path::new("/tmp/worktrees/integration"),
+        )?;
+        assert_eq!(retry.outcome, RunAdmissionOutcome::Prepared);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_resume_admission_has_one_epoch_and_one_repo_winner() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.sqlite");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        let mut first = run("run-resume-a", "/tmp/resume-repo", RunStatus::Failed, now);
+        first.repo_id = "resume-repo".to_string();
+        let mut second = run("run-resume-b", "/tmp/resume-repo", RunStatus::Failed, now);
+        second.repo_id = "resume-repo".to_string();
+        store.insert_run(&first)?;
+        store.insert_run(&second)?;
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = [first.id.clone(), second.id.clone()]
+            .into_iter()
+            .map(|run_id| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || -> Result<RunAdmissionOutcome> {
+                    let store = Store::open(path)?;
+                    barrier.wait();
+                    Ok(store
+                        .begin_resume_run_launch(&run_id, Path::new("/tmp/worktrees/integration"))?
+                        .outcome)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("resume admission thread"))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RunAdmissionOutcome::Prepared)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RunAdmissionOutcome::Conflict)
+                .count(),
+            1
+        );
+        let store = Store::open(&path)?;
+        assert_eq!(store.active_runs()?.len(), 1);
+        assert_eq!(store.incomplete_run_launch_intents()?.len(), 1);
+        assert_eq!(store.incomplete_run_launch_intents()?[0].execution_epoch, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn integration_merge_transaction_faults_roll_back_authority() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        let run = run(
+            "run-merge-fault",
+            "/tmp/merge-fault",
+            RunStatus::Running,
+            now,
+        );
+        store.insert_run(&run)?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "S-1".to_string(),
+            status: SliceStatus::ReadyToMerge,
+            branch: "worker/S-1".to_string(),
+            commit_sha: "source".to_string(),
+            attempts: 2,
+            last_error: String::new(),
+        })?;
+        let intent = merge_intent(&run.id, "merge-fault-operation", now);
+
+        inject_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::PreparedEvent,
+        );
+        assert!(store.prepare_integration_merge(&intent).is_err());
+        assert!(store.integration_merge_intents(&run.id)?.is_empty());
+
+        store.prepare_integration_merge(&intent)?;
+        inject_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::AppliedEvent,
+        );
+        assert!(
+            store
+                .commit_integration_merge(&intent.operation_id, "result")
+                .is_err()
+        );
+        assert_eq!(
+            store.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::Prepared
+        );
+        assert_eq!(
+            store.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::ReadyToMerge
+        );
+        assert!(!store.get_events(&run.id, 20)?.iter().any(|event| {
+            matches!(
+                event.typ.as_str(),
+                "slice_merged" | "integration_merge_applied"
+            )
+        }));
+
+        inject_integration_merge_transaction_fault(
+            IntegrationMergeTransactionFaultStage::ResolutionEvent,
+        );
+        assert!(
+            store
+                .resolve_integration_merge(
+                    &intent.operation_id,
+                    IntegrationMergeState::Divergent,
+                    "operator-head",
+                    "operator commit",
+                    "",
+                    &[],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.integration_merge_intents(&run.id)?[0].state,
+            IntegrationMergeState::Prepared
+        );
+        assert_eq!(
+            store.get_slice_runs(&run.id)?[0].status,
+            SliceStatus::ReadyToMerge
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn integration_merge_completion_is_atomic_with_slice_state_and_events() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let now = Utc::now();
+        let run = run(
+            "run-merge-journal",
+            "/tmp/merge-repo",
+            RunStatus::Running,
+            now,
+        );
+        store.insert_run(&run)?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: run.id.clone(),
+            slice_id: "S-1".to_string(),
+            status: SliceStatus::ReadyToMerge,
+            branch: "worker/S-1".to_string(),
+            commit_sha: "source".to_string(),
+            attempts: 2,
+            last_error: String::new(),
+        })?;
+        let intent = IntegrationMergeIntent {
+            operation_id: "merge-operation-1".to_string(),
+            run_id: run.id.clone(),
+            kind: IntegrationMergeKind::Slice,
+            slice_id: "S-1".to_string(),
+            attempt: 2,
+            launch_id: Some(41),
+            source_branch: "worker/S-1".to_string(),
+            source_commit: "source".to_string(),
+            source_tree: "source-tree".to_string(),
+            expected_head: "expected".to_string(),
+            expected_result_tree: "result-tree".to_string(),
+            resulting_head: String::new(),
+            state: IntegrationMergeState::Prepared,
+            completion: IntegrationMergeCompletion::Slice {
+                branch: "worker/S-1".to_string(),
+                commit_sha: "source".to_string(),
+                attempts: 2,
+            },
+            primary_cause: String::new(),
+            abort_error: String::new(),
+            conflicted_files: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            store.prepare_integration_merge(&intent)?.outcome,
+            IntegrationMergePrepareOutcome::Prepared
+        );
+        assert!(store.commit_integration_merge(&intent.operation_id, "result")?);
+        assert!(!store.commit_integration_merge(&intent.operation_id, "result")?);
+
+        let stored = store.integration_merge_intents(&run.id)?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, IntegrationMergeState::Applied);
+        assert_eq!(stored[0].resulting_head, "result");
+        let slice = store.get_slice_runs(&run.id)?.remove(0);
+        assert_eq!(slice.status, SliceStatus::Merged);
+        assert_eq!(slice.commit_sha, "source");
+        let events = store.get_events(&run.id, 20)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.typ == "integration_merge_applied")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.typ == "slice_merged")
+                .count(),
+            1
+        );
+        Ok(())
     }
 
     #[test]
@@ -4738,7 +6477,7 @@ mod tests {
         let repo_b = "/tmp/repo-b";
         let repo_tie = "/tmp/repo-tie";
 
-        store.insert_run(&run("run-active-a", repo_a, RunStatus::Running, now))?;
+        store.insert_run(&run("run-active-a", repo_a, RunStatus::Interrupted, now))?;
         store.insert_run(&run(
             "run-active-b",
             repo_a,
@@ -4757,8 +6496,8 @@ mod tests {
             RunStatus::Running,
             now + ChronoDuration::seconds(3),
         ))?;
-        store.insert_run(&run("run-tie-a", repo_tie, RunStatus::Running, now))?;
-        store.insert_run(&run("run-tie-b", repo_tie, RunStatus::Running, now))?;
+        store.insert_run(&run("run-tie-a", repo_tie, RunStatus::Completed, now))?;
+        store.insert_run(&run("run-tie-b", repo_tie, RunStatus::Completed, now))?;
 
         let active = store
             .latest_run_for_repo(repo_a, true)?
@@ -4776,8 +6515,8 @@ mod tests {
         assert_eq!(scoped.id, "run-other-repo");
 
         let tied = store
-            .latest_run_for_repo(repo_tie, true)?
-            .expect("tie-broken active run");
+            .latest_run_for_repo(repo_tie, false)?
+            .expect("tie-broken historical run");
         assert_eq!(tied.id, "run-tie-b");
 
         assert!(store.latest_run_for_repo("/tmp/missing", true)?.is_none());
@@ -7209,6 +8948,12 @@ mod tests {
         assert_eq!(store.current_run_execution_epoch("run-epoch")?, 1);
         assert_eq!(store.reopen_run_for_resume("run-epoch")?, 2);
         assert_eq!(store.current_run_execution_epoch("run-epoch")?, 2);
+        store.activate_run_launch("run-epoch", 2)?;
+        store.fail_run_launch("run-epoch", 2, "resume attempt failed", "")?;
+        assert_eq!(
+            store.get_run("run-epoch")?.expect("restored run").status,
+            RunStatus::Failed
+        );
         assert_eq!(store.reopen_run_for_resume("run-epoch")?, 3);
         assert_eq!(store.current_run_execution_epoch("run-epoch")?, 3);
         Ok(())

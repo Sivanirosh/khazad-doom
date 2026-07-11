@@ -27,7 +27,6 @@ pub(crate) const RUN_ERROR: &str = "run_error";
 pub(crate) const RUN_INCIDENT: &str = "run_incident";
 pub(crate) const RUN_STARTED: &str = "run_started";
 pub(crate) const REPLAN_PROPOSAL_DECIDED: &str = "replan_proposal_decided";
-pub(crate) const SLICE_MERGED: &str = "slice_merged";
 pub(crate) const SLICE_STARTED: &str = "slice_started";
 pub(crate) const TERMINAL_NOTIFICATION_SENT: &str = "terminal_notification_sent";
 pub(crate) const TERMINAL_NOTIFICATION_SKIPPED: &str = "terminal_notification_skipped";
@@ -368,22 +367,6 @@ impl SliceStartedPayload {
     pub(crate) fn new(slice_id: impl Into<String>) -> Self {
         Self {
             slice_id: slice_id.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct SliceMergedPayload {
-    pub slice_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub commit_sha: String,
-}
-
-impl SliceMergedPayload {
-    pub(crate) fn new(slice_id: impl Into<String>, commit_sha: impl Into<String>) -> Self {
-        Self {
-            slice_id: slice_id.into(),
-            commit_sha: commit_sha.into(),
         }
     }
 }

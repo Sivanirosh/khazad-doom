@@ -3035,6 +3035,203 @@ fn integration_verification_mutation_has_no_repair_publication_or_final_sha() ->
 }
 
 #[test]
+fn concurrent_daemon_admission_rpcs_have_one_durable_winner_black_box() -> TestResult {
+    let bin = binary_path();
+    let home = tempfile::tempdir()?;
+    let repo = tempfile::tempdir()?;
+    let fake_bin = tempfile::tempdir()?;
+    let fake_pi = write_cancellable_fake_pi(fake_bin.path())?;
+    init_git_repo(repo.path())?;
+    let guard = DaemonGuard::new(bin.clone(), home.path().to_path_buf());
+
+    kd_ok(&bin, home.path(), &["init", "--repo", path(repo.path())])?;
+    write_slice(
+        repo.path(),
+        json!({
+            "id": "slice-admission",
+            "title": "Admission race fixture",
+            "goal": "Keep one admitted worker active while a competing RPC is rejected.",
+            "acceptance": ["admission race is serialized"],
+            "verify": []
+        }),
+    )?;
+    git(repo.path(), &["add", ".gitignore", ".workflow"])?;
+    git(repo.path(), &["commit", "-m", "add admission race slice"])?;
+    kd_ok(&bin, home.path(), &["daemon", "start"])?;
+
+    let start_params = || {
+        json!({
+            "repo_path": path(repo.path()),
+            "slice_id": "",
+            "slice_ids": ["slice-admission"],
+            "all": false,
+            "agent": "pi",
+            "pi_bin": path(&fake_pi),
+            "pi_args": [],
+            "native_pi_tui_worker": false,
+            "parallelism": 1,
+            "allow_dirty": true,
+            "origin_notification_target": "",
+            "mission_envelope": null
+        })
+    };
+    let assert_one_winner = |outcomes: &[Result<Value, String>; 2]| {
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "admission outcomes: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1,
+            "admission outcomes: {outcomes:?}"
+        );
+        let error = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .expect("conflicting admission error");
+        assert!(
+            error.contains("already has active run") || error.contains("cannot be resumed"),
+            "unexpected admission error: {error}"
+        );
+    };
+    let winner_id = |outcomes: &[Result<Value, String>; 2]| -> String {
+        outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().ok())
+            .and_then(|value| value["run_id"].as_str())
+            .expect("successful admission run id")
+            .to_string()
+    };
+    let assert_db = |expected_runs: i64, expected_intents: i64, expected_epoch: i64| {
+        let conn = rusqlite::Connection::open(home.path().join("state.sqlite"))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let run_count =
+            conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))?;
+        let active_count = conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE status IN ('pending','running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let intent_count =
+            conn.query_row("SELECT COUNT(*) FROM run_launch_intents", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let max_epoch = conn.query_row("SELECT MAX(execution_epoch) FROM runs", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        if run_count != expected_runs
+            || active_count != 1
+            || intent_count != expected_intents
+            || max_epoch != expected_epoch
+        {
+            return Err(format!(
+                "unexpected admission state: runs={run_count} active={active_count} intents={intent_count} epoch={max_epoch}"
+            )
+            .into());
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
+    let start_start = race_daemon_socket_rpcs(
+        home.path(),
+        "startRun",
+        start_params(),
+        "startRun",
+        start_params(),
+    );
+    assert_one_winner(&start_start);
+    let original_run_id = winner_id(&start_start);
+    assert_db(1, 1, 1)?;
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &original_run_id,
+            "--reason",
+            "prepare resume race",
+        ],
+    )?;
+    wait_for_terminal_status(&bin, home.path(), &original_run_id, "cancelled")?;
+
+    let resume_params = || {
+        json!({
+            "run_id": original_run_id,
+            "agent": "pi",
+            "pi_bin": path(&fake_pi),
+            "pi_args": [],
+            "native_pi_tui_worker": false,
+            "parallelism": 1
+        })
+    };
+    let resume_resume = race_daemon_socket_rpcs(
+        home.path(),
+        "resumeRun",
+        resume_params(),
+        "resumeRun",
+        resume_params(),
+    );
+    assert_one_winner(&resume_resume);
+    assert_eq!(winner_id(&resume_resume), original_run_id);
+    assert_db(1, 2, 2)?;
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &original_run_id,
+            "--reason",
+            "prepare mixed race",
+        ],
+    )?;
+    wait_for_terminal_status(&bin, home.path(), &original_run_id, "cancelled")?;
+
+    let start_resume = race_daemon_socket_rpcs(
+        home.path(),
+        "startRun",
+        start_params(),
+        "resumeRun",
+        resume_params(),
+    );
+    assert_one_winner(&start_resume);
+    let mixed_winner = winner_id(&start_resume);
+    let expected_runs = if mixed_winner == original_run_id {
+        1
+    } else {
+        2
+    };
+    assert_db(expected_runs, 3, if expected_runs == 1 { 3 } else { 2 })?;
+    kd_ok(
+        &bin,
+        home.path(),
+        &[
+            "cancel",
+            "--run",
+            &mixed_winner,
+            "--reason",
+            "race complete",
+        ],
+    )?;
+    wait_for_terminal_status(&bin, home.path(), &mixed_winner, "cancelled")?;
+    let conn = rusqlite::Connection::open(home.path().join("state.sqlite"))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE status IN ('pending','running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    guard.stop();
+    Ok(())
+}
+
+#[test]
 fn daemon_status_responds_while_raw_socket_client_is_idle_black_box() -> TestResult {
     let bin = binary_path();
     let home = tempfile::tempdir()?;
@@ -5854,6 +6051,35 @@ fn force_question_deadline(home: &Path, question_id: &str, fallback_eligible: bo
         return Err(format!("question {question_id:?} was not updated").into());
     }
     Ok(())
+}
+
+fn race_daemon_socket_rpcs(
+    home: &Path,
+    first_method: &str,
+    first_params: Value,
+    second_method: &str,
+    second_params: Value,
+) -> [Result<Value, String>; 2] {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let first_home = home.to_path_buf();
+    let first_method = first_method.to_string();
+    let first_barrier = barrier.clone();
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        daemon_rpc(&first_home, &first_method, first_params).map_err(|error| error.to_string())
+    });
+    let second_home = home.to_path_buf();
+    let second_method = second_method.to_string();
+    let second_barrier = barrier.clone();
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        daemon_rpc(&second_home, &second_method, second_params).map_err(|error| error.to_string())
+    });
+    barrier.wait();
+    [
+        first.join().expect("first admission RPC thread"),
+        second.join().expect("second admission RPC thread"),
+    ]
 }
 
 fn race_question_socket_rpcs(
