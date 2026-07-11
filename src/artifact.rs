@@ -531,10 +531,13 @@ impl Store {
 
     pub fn read_config(&self) -> Result<WorkflowConfig> {
         let path = self.config_path();
-        if !path.exists() {
-            return Ok(WorkflowConfig::default());
-        }
-        read_json(path)
+        let config = if path.exists() {
+            read_json(path)?
+        } else {
+            WorkflowConfig::default()
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn ensure_default_config(&self) -> Result<()> {
@@ -2196,6 +2199,74 @@ mod tests {
         assert_eq!(config.worker_question_timeout_seconds, 60);
         assert!(store.area_contract_path().exists());
         assert!(!store.workflow_dir().join("agents.toml").exists());
+    }
+
+    #[test]
+    fn bounded_runtime_config_has_safe_defaults_and_rejects_values_above_hard_maximums() {
+        let repo = tempfile::tempdir().unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+
+        let defaults = store.read_config().unwrap().runtime;
+        assert_eq!(defaults.retained_output_bytes, 64 * 1024);
+        assert_eq!(defaults.observation_flush_bytes, 16 * 1024);
+        assert_eq!(defaults.observation_flush_millis, 250);
+        assert_eq!(defaults.poll_initial_millis, 25);
+        assert_eq!(defaults.poll_max_millis, 500);
+        assert_eq!(defaults.economics_checkpoint_millis, 500);
+        assert!(defaults.raw_output_spill);
+
+        super::write_json(
+            store.config_path(),
+            &serde_json::json!({
+                "runtime": {
+                    "retained_output_bytes": crate::domain::MAX_RETAINED_OUTPUT_BYTES + 1
+                }
+            }),
+        )
+        .unwrap();
+        let error = store
+            .read_config()
+            .expect_err("hard maximum must reject accidental unbounded retention");
+        assert!(format!("{error:#}").contains("retained_output_bytes"));
+    }
+
+    #[test]
+    fn bounded_runtime_zero_values_have_deliberate_validation_semantics() {
+        let repo = tempfile::tempdir().unwrap();
+        let store = Store::new(repo.path());
+        store.ensure_layout().unwrap();
+        super::write_json(
+            store.config_path(),
+            &serde_json::json!({
+                "runtime": {
+                    "retained_output_bytes": 0,
+                    "retained_output_lines": 0,
+                    "observation_flush_millis": 0,
+                    "raw_output_spill": true
+                }
+            }),
+        )
+        .unwrap();
+        let runtime = store.read_config().unwrap().runtime;
+        assert_eq!(runtime.retained_output_bytes, 0);
+        assert_eq!(runtime.observation_flush_millis, 0);
+
+        super::write_json(
+            store.config_path(),
+            &serde_json::json!({
+                "runtime": {
+                    "retained_output_bytes": 0,
+                    "retained_output_lines": 0,
+                    "raw_output_spill": false
+                }
+            }),
+        )
+        .unwrap();
+        let error = store
+            .read_config()
+            .expect_err("zero retention without spill would silently drop evidence");
+        assert!(format!("{error:#}").contains("raw_output_spill"));
     }
 
     #[test]

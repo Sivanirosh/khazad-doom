@@ -3,8 +3,8 @@ use super::shell::{ShellCommand, ShellCommandError, ShellProgress};
 use super::{CancelledError, check_cancelled};
 use crate::agent::CancellationToken;
 use crate::domain::{
-    CommandExecutionEconomics, Finding, GateCommandResult, GateResult, Slice, VerifyCommand,
-    WorkflowConfig,
+    CommandExecutionEconomics, Finding, GateCommandResult, GateResult, RuntimeConfig, Slice,
+    VerifyCommand, WorkflowConfig,
 };
 use crate::gitutil;
 use crate::state::{ProgressReporter, ProgressScope};
@@ -71,6 +71,9 @@ pub(crate) struct WorkflowGate {
     progress: ProgressReporter,
     economics: Option<RunEconomicsRecorder>,
     cache: VerificationCommandCache,
+    runtime: RuntimeConfig,
+    output_dir: Option<PathBuf>,
+    termination_grace: Duration,
 }
 
 impl WorkflowGate {
@@ -80,6 +83,9 @@ impl WorkflowGate {
             progress,
             economics: None,
             cache: VerificationCommandCache::default(),
+            runtime: RuntimeConfig::default(),
+            output_dir: None,
+            termination_grace: Duration::from_secs(1),
         }
     }
 
@@ -92,7 +98,22 @@ impl WorkflowGate {
             progress,
             economics: Some(economics),
             cache,
+            runtime: RuntimeConfig::default(),
+            output_dir: None,
+            termination_grace: Duration::from_secs(1),
         }
+    }
+
+    pub(crate) fn runtime_output(
+        mut self,
+        runtime: RuntimeConfig,
+        output_dir: PathBuf,
+        termination_grace_seconds: u64,
+    ) -> Self {
+        self.runtime = runtime;
+        self.output_dir = Some(output_dir);
+        self.termination_grace = Duration::from_secs(termination_grace_seconds);
+        self
     }
 
     pub(crate) fn verify_slice_commands(
@@ -491,6 +512,10 @@ impl WorkflowGate {
                     cache_hit: false,
                     skip_reason: String::new(),
                     failure_kind: "invalid_cwd".to_string(),
+                    output_total_bytes: 0,
+                    output_retained_bytes: 0,
+                    output_truncated: false,
+                    output_spill_paths: Vec::new(),
                     verification_workspace: None,
                 };
                 self.record_verify_command_economics(
@@ -542,6 +567,10 @@ impl WorkflowGate {
                         cache_hit: false,
                         skip_reason: String::new(),
                         failure_kind: "verification_workspace_dirty".to_string(),
+                        output_total_bytes: 0,
+                        output_retained_bytes: 0,
+                        output_truncated: false,
+                        output_spill_paths: Vec::new(),
                         verification_workspace: Some(guard.precommand_evidence()),
                     };
                     self.record_verify_command_economics(&request, &result, &tree_sha, &cache_key);
@@ -572,6 +601,10 @@ impl WorkflowGate {
                         cache_hit: false,
                         skip_reason: String::new(),
                         failure_kind: "verification_snapshot_failed".to_string(),
+                        output_total_bytes: 0,
+                        output_retained_bytes: 0,
+                        output_truncated: false,
+                        output_spill_paths: Vec::new(),
                         verification_workspace: None,
                     };
                     self.record_verify_command_economics(&request, &result, &tree_sha, &cache_key);
@@ -686,12 +719,28 @@ impl WorkflowGate {
             );
         }
         let started_at = Instant::now();
-        let output = ShellCommand::new(&cwd.path, &request.command.command)
+        let mut command = ShellCommand::new(&cwd.path, &request.command.command)
             .pinned_cwd(&cwd.directory)?
             .timeout(request.timeout)
+            .termination_grace(self.termination_grace)
             .envs(&request.command.env)
             .progress(Some(progress))
-            .run(cancel);
+            .output_bounds(
+                self.runtime.retained_output_bytes,
+                self.runtime.retained_output_lines,
+            );
+        if self.runtime.raw_output_spill
+            && let Some(output_dir) = &self.output_dir
+        {
+            command = command.spill_to(command_output_stem(
+                output_dir,
+                request.phase,
+                request.slice_id,
+                request.attempt,
+                &dedupe_key,
+            ));
+        }
+        let output = command.run(cancel);
         let duration_ms = started_at.elapsed().as_millis();
         let supervision_failed = output.as_ref().err().is_some_and(|err| {
             err.downcast_ref::<ShellCommandError>()
@@ -701,6 +750,16 @@ impl WorkflowGate {
         let mut result = match output {
             Ok(output) => {
                 let failure_kind = command_failure_kind(output.exit_code(), output.success());
+                let output_total_bytes = output
+                    .stdout_total_bytes()
+                    .saturating_add(output.stderr_total_bytes());
+                let output_retained_bytes = output.retained_output_bytes();
+                let output_truncated = output.output_truncated();
+                let output_spill_paths = [output.stdout_spill_path(), output.stderr_spill_path()]
+                    .into_iter()
+                    .flatten()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect();
                 GateCommandResult {
                     command: request.command.command.clone(),
                     status: if output.success() { "passed" } else { "failed" }.to_string(),
@@ -716,6 +775,10 @@ impl WorkflowGate {
                     cache_hit: false,
                     skip_reason: String::new(),
                     failure_kind,
+                    output_total_bytes,
+                    output_retained_bytes,
+                    output_truncated,
+                    output_spill_paths,
                     verification_workspace: None,
                 }
             }
@@ -740,6 +803,10 @@ impl WorkflowGate {
                     cache_hit: false,
                     skip_reason: String::new(),
                     failure_kind,
+                    output_total_bytes: 0,
+                    output_retained_bytes: 0,
+                    output_truncated: false,
+                    output_spill_paths: Vec::new(),
                     verification_workspace: None,
                 }
             }
@@ -828,6 +895,10 @@ impl WorkflowGate {
             cache_hit: false,
             skip_reason: reason.to_string(),
             failure_kind: String::new(),
+            output_total_bytes: 0,
+            output_retained_bytes: 0,
+            output_truncated: false,
+            output_spill_paths: Vec::new(),
             verification_workspace: None,
         })
     }
@@ -851,6 +922,10 @@ impl WorkflowGate {
             cache_hit: false,
             skip_reason: String::new(),
             failure_kind: "verification_precommand_changed".to_string(),
+            output_total_bytes: 0,
+            output_retained_bytes: 0,
+            output_truncated: false,
+            output_spill_paths: Vec::new(),
             verification_workspace: evidence,
         };
         self.record_verify_command_economics(request, &result, tree_sha, cache_key);
@@ -1164,6 +1239,39 @@ fn verify_command_cwd_label(command: &VerifyCommand) -> String {
     }
 }
 
+fn command_output_stem(
+    output_dir: &Path,
+    phase: &str,
+    slice_id: &str,
+    attempt: usize,
+    dedupe_key: &str,
+) -> PathBuf {
+    fn safe(value: &str) -> String {
+        let value = value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if value.is_empty() {
+            "run".to_string()
+        } else {
+            value
+        }
+    }
+    let digest = dedupe_key.get(..16).unwrap_or(dedupe_key);
+    output_dir.join(format!(
+        "{}-{}-attempt-{}-{digest}",
+        safe(phase),
+        safe(slice_id),
+        attempt
+    ))
+}
+
 fn verify_command_key(command: &VerifyCommand) -> String {
     let mut digest = Sha256::new();
     update_length_prefixed_digest(&mut digest, b"verify-command-v1");
@@ -1434,7 +1542,7 @@ mod tests {
         pause_next_integration_gate_before_outer_guard, verify_command_cwd, verify_command_key,
     };
     use crate::agent::CancellationToken;
-    use crate::domain::{Slice, VerifyCommand, VerifyProfile, WorkflowConfig};
+    use crate::domain::{RuntimeConfig, Slice, VerifyCommand, VerifyProfile, WorkflowConfig};
     use crate::state::{ProgressReporter, Store as StateStore};
     use anyhow::Result;
     use std::collections::BTreeMap;
@@ -1484,6 +1592,58 @@ mod tests {
             &["commit", "--allow-empty", "-m", "initial"],
         )?;
         Ok(worktree)
+    }
+
+    #[test]
+    fn bounded_gate_output_reports_retention_and_append_only_spill_metadata() -> Result<()> {
+        let (home, gate) = test_gate()?;
+        let worktree = clean_git_worktree()?;
+        let runtime = RuntimeConfig {
+            retained_output_bytes: 1024,
+            retained_output_lines: 32,
+            ..RuntimeConfig::default()
+        };
+        let output_dir = home.path().join("runtime-output");
+        let gate = gate.runtime_output(runtime.clone(), output_dir, 1);
+        let mut config = WorkflowConfig {
+            runtime,
+            ..WorkflowConfig::default()
+        };
+        config.verify_profiles.insert(
+            "bounded".to_string(),
+            VerifyProfile {
+                commands: vec![VerifyCommand {
+                    command: "head -c 2097152 /dev/zero | tr '\\0' x".to_string(),
+                    timeout_seconds: 10,
+                    cwd: String::new(),
+                    env: BTreeMap::new(),
+                }],
+            },
+        );
+        let mut selected = slice("slice-bounded");
+        selected.verify_profile = "bounded".to_string();
+
+        let result = gate.run_integration_gate(
+            IntegrationGateRequest {
+                slices: &[selected],
+                integration_worktree: worktree.path(),
+                config: &config,
+            },
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(result.status, "passed");
+        let command = result.commands.first().expect("command result");
+        assert_eq!(command.output_total_bytes, 2 * 1024 * 1024);
+        assert!(command.output_retained_bytes <= 1024);
+        assert!(command.output_truncated);
+        assert_eq!(command.output_spill_paths.len(), 2);
+        assert_eq!(
+            fs::metadata(&command.output_spill_paths[0])?.len()
+                + fs::metadata(&command.output_spill_paths[1])?.len(),
+            2 * 1024 * 1024
+        );
+        Ok(())
     }
 
     #[test]

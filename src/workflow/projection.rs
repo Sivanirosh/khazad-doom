@@ -416,6 +416,10 @@ fn gate_pane_gate_result_from_economics(details: &RunDetails) -> Option<GateResu
             cache_hit: command.cache_hit,
             skip_reason: command.skip_reason.clone(),
             failure_kind: String::new(),
+            output_total_bytes: 0,
+            output_retained_bytes: 0,
+            output_truncated: false,
+            output_spill_paths: Vec::new(),
             verification_workspace: None,
         })
         .collect::<Vec<_>>();

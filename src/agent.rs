@@ -1,5 +1,5 @@
 use crate::artifact::{PiTuiWorkerArtifacts, PiWrapperArtifacts};
-use crate::domain::Handoff;
+use crate::domain::{Handoff, RuntimeConfig};
 use crate::pi_contract::{self, PiContractObservation, PiContractWarning, PiParser};
 use crate::{artifact, gitutil};
 use anyhow::{Context, Result, bail};
@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -133,6 +133,8 @@ pub struct Job {
     #[allow(dead_code)]
     pub env: BTreeMap<String, String>,
     pub termination_grace_seconds: u64,
+    pub runtime: RuntimeConfig,
+    pub raw_output_stem: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +413,32 @@ impl Runner for PiRunner {
             bail!("job cancelled");
         }
         let spec = self.command_spec();
+        let stdout_spill_path = job
+            .raw_output_stem
+            .as_deref()
+            .map(|stem| stem.with_extension("stdout.log"));
+        let stdout_spill_existed = stdout_spill_path.as_deref().is_some_and(Path::exists);
+        let stdout_spill = open_worker_output_spill(job.raw_output_stem.as_deref(), "stdout.log")?;
+        let stderr_spill =
+            match open_worker_output_spill(job.raw_output_stem.as_deref(), "stderr.log") {
+                Ok(spill) => spill,
+                Err(err) => {
+                    drop(stdout_spill);
+                    if !stdout_spill_existed && let Some(path) = stdout_spill_path {
+                        let _ = fs::remove_file(path);
+                    }
+                    return Err(err);
+                }
+            };
+        let stdout_stats = Arc::new(Mutex::new(OutputSpillStats::default()));
+        let stderr_stats = Arc::new(Mutex::new(OutputSpillStats::default()));
+        let _output_capture = WorkerOutputCaptureGuard::new(
+            job.raw_output_stem.clone(),
+            job.runtime.retained_output_bytes,
+            job.runtime.retained_output_lines,
+            stdout_stats.clone(),
+            stderr_stats.clone(),
+        );
         let mut cmd = Command::new(&spec.bin);
         cmd.args(&spec.args)
             .envs(&job.env)
@@ -442,23 +470,37 @@ impl Runner for PiRunner {
 
         let stderr = child.stderr.take().context("pi stderr")?;
         let stderr_events = events.clone();
+        let stderr_bytes = job.runtime.retained_output_bytes;
+        let stderr_lines = job.runtime.retained_output_lines;
         let stderr_thread = thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            let mut buf = String::new();
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                emit_runner_event(&stderr_events, RunnerEvent::stderr(Some(pid), line.clone()));
-                buf.push_str(&line);
-                buf.push('\n');
+            let mut reader = TeeReader::new(stderr, stderr_spill, stderr_stats);
+            let mut chunk = [0_u8; 8 * 1024];
+            let mut tail = String::new();
+            loop {
+                let read = reader.read(&mut chunk).context("read Pi stderr")?;
+                if read == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&chunk[..read]);
+                let event_text = bounded_utf8_tail(&text, stderr_bytes, stderr_lines);
+                emit_runner_event(&stderr_events, RunnerEvent::stderr(Some(pid), event_text));
+                append_bounded_utf8(&mut tail, &text, stderr_bytes, stderr_lines);
             }
-            buf
+            Ok::<String, anyhow::Error>(tail)
         });
 
         let stdout = child.stdout.take().context("pi stdout")?;
         let stdout_events = events.clone();
+        let retained_output_bytes = job.runtime.retained_output_bytes;
+        let retained_output_lines = job.runtime.retained_output_lines;
         let parser_thread = thread::spawn(move || {
-            let mut parser = PiParser::default();
-            parser.parse(stdout, stdout_events, Some(pid))?;
+            let mut parser =
+                PiParser::with_output_bounds(retained_output_bytes, retained_output_lines);
+            parser.parse(
+                TeeReader::new(stdout, stdout_spill, stdout_stats),
+                stdout_events,
+                Some(pid),
+            )?;
             Ok::<PiParser, anyhow::Error>(parser)
         });
 
@@ -470,7 +512,7 @@ impl Runner for PiRunner {
                     Duration::from_secs(job.termination_grace_seconds),
                 );
                 let parser = join_parser(parser_thread)?;
-                let stderr = stderr_thread.join().unwrap_or_default();
+                let stderr = join_stderr(stderr_thread)?;
                 return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
             }
             if let Some(status) = child.try_wait()? {
@@ -494,7 +536,7 @@ impl Runner for PiRunner {
                 Duration::from_secs(job.termination_grace_seconds),
             );
             let parser = join_parser(parser_thread)?;
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let stderr = join_stderr(stderr_thread)?;
             return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
         }
         // A successfully exited Pi parent can leave descendants holding the
@@ -508,11 +550,11 @@ impl Runner for PiRunner {
         );
         if cancel.is_cancelled() {
             let parser = join_parser(parser_thread)?;
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let stderr = join_stderr(stderr_thread)?;
             return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
         }
         let parser = join_parser(parser_thread)?;
-        let stderr = stderr_thread.join().unwrap_or_default();
+        let stderr = join_stderr(stderr_thread)?;
         if !status.success() {
             let msg = stderr.trim();
             let message = if msg.is_empty() {
@@ -576,74 +618,178 @@ fn join_parser(parser_thread: thread::JoinHandle<Result<PiParser>>) -> Result<Pi
         .map_err(|_| anyhow::anyhow!("pi stdout parser panicked"))?
 }
 
-fn terminate_child(child: &mut std::process::Child, grace: Duration) {
-    let pid = child.id();
-    #[cfg(unix)]
-    {
-        let mut child_exited = matches!(child.try_wait(), Ok(Some(_)));
-        if !child_process_group_exists(pid) {
-            if !child_exited {
-                let _ = child.wait();
-            }
-            return;
-        }
-        request_child_terminate(pid);
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if !child_exited {
-                child_exited = matches!(child.try_wait(), Ok(Some(_)));
-            }
-            if !child_process_group_exists(pid) {
-                if !child_exited {
-                    let _ = child.wait();
-                }
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        request_child_kill(pid);
-        if !child_exited {
-            let _ = child.wait();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        request_child_terminate(pid);
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+fn join_stderr(stderr_thread: thread::JoinHandle<Result<String>>) -> Result<String> {
+    stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("pi stderr capture panicked"))?
+}
+
+#[derive(Default)]
+struct OutputSpillStats {
+    bytes: u64,
+    newline_count: usize,
+    ends_with_newline: bool,
+}
+
+impl OutputSpillStats {
+    fn line_count(&self) -> usize {
+        self.newline_count
+            .saturating_add(usize::from(self.bytes > 0 && !self.ends_with_newline))
     }
 }
 
-#[cfg(unix)]
-fn request_child_terminate(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+struct TeeReader<R> {
+    inner: R,
+    spill: Option<File>,
+    stats: Arc<Mutex<OutputSpillStats>>,
+}
+
+impl<R> TeeReader<R> {
+    fn new(inner: R, spill: Option<File>, stats: Arc<Mutex<OutputSpillStats>>) -> Self {
+        Self {
+            inner,
+            spill,
+            stats,
+        }
     }
 }
-#[cfg(not(unix))]
-fn request_child_terminate(_pid: u32) {}
-#[cfg(unix)]
-fn request_child_kill(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+
+impl<R: Read> Read for TeeReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if read > 0 {
+            if let Some(spill) = self.spill.as_mut() {
+                spill.write_all(&buf[..read]).map_err(|err| {
+                    std::io::Error::new(err.kind(), format!("write Pi raw output spill: {err}"))
+                })?;
+            }
+            let mut stats = self.stats.lock().expect("Pi output stats mutex poisoned");
+            stats.bytes = stats.bytes.saturating_add(read as u64);
+            stats.newline_count = stats
+                .newline_count
+                .saturating_add(buf[..read].iter().filter(|byte| **byte == b'\n').count());
+            stats.ends_with_newline = buf[read - 1] == b'\n';
+        }
+        Ok(read)
     }
 }
-#[cfg(not(unix))]
-fn request_child_kill(_pid: u32) {}
-#[cfg(unix)]
-fn child_process_group_exists(pid: u32) -> bool {
-    let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+
+struct WorkerOutputCaptureGuard {
+    stem: Option<PathBuf>,
+    retained_output_bytes: usize,
+    retained_output_lines: usize,
+    stdout_stats: Arc<Mutex<OutputSpillStats>>,
+    stderr_stats: Arc<Mutex<OutputSpillStats>>,
+}
+
+impl WorkerOutputCaptureGuard {
+    fn new(
+        stem: Option<PathBuf>,
+        retained_output_bytes: usize,
+        retained_output_lines: usize,
+        stdout_stats: Arc<Mutex<OutputSpillStats>>,
+        stderr_stats: Arc<Mutex<OutputSpillStats>>,
+    ) -> Self {
+        Self {
+            stem,
+            retained_output_bytes,
+            retained_output_lines,
+            stdout_stats,
+            stderr_stats,
+        }
+    }
+}
+
+impl Drop for WorkerOutputCaptureGuard {
+    fn drop(&mut self) {
+        let Some(stem) = &self.stem else { return };
+        let stdout_path = stem.with_extension("stdout.log");
+        let stderr_path = stem.with_extension("stderr.log");
+        let stdout_bytes = fs::metadata(&stdout_path).map_or(0, |metadata| metadata.len());
+        let stderr_bytes = fs::metadata(&stderr_path).map_or(0, |metadata| metadata.len());
+        let total_bytes = stdout_bytes.saturating_add(stderr_bytes);
+        let stdout_lines = self
+            .stdout_stats
+            .lock()
+            .expect("Pi stdout stats mutex poisoned")
+            .line_count();
+        let stderr_lines = self
+            .stderr_stats
+            .lock()
+            .expect("Pi stderr stats mutex poisoned")
+            .line_count();
+        let _ = artifact::write_json(
+            stem.with_extension("runtime.json"),
+            &json!({
+                "schema_version": 1,
+                "capture": "bounded_tail_with_append_only_raw_spill",
+                "total_bytes": total_bytes,
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": stderr_bytes,
+                "stdout_lines": stdout_lines,
+                "stderr_lines": stderr_lines,
+                "retained_output_bytes_per_stream": self.retained_output_bytes,
+                "retained_output_lines_per_stream": self.retained_output_lines,
+                "truncated": stdout_bytes > self.retained_output_bytes as u64
+                    || stderr_bytes > self.retained_output_bytes as u64
+                    || stdout_lines > self.retained_output_lines
+                    || stderr_lines > self.retained_output_lines,
+                "spill_paths": [stdout_path, stderr_path],
+            }),
+        );
+    }
+}
+
+fn open_worker_output_spill(stem: Option<&Path>, extension: &str) -> Result<Option<File>> {
+    let Some(stem) = stem else {
+        return Ok(None);
+    };
+    let path = stem.with_extension(extension);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create Pi output spill directory {}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open Pi output spill {}", path.display()))
+        .map(Some)
+}
+
+fn append_bounded_utf8(target: &mut String, text: &str, max_bytes: usize, max_lines: usize) {
+    if max_bytes == 0 || max_lines == 0 {
+        target.clear();
+        return;
+    }
+    target.push_str(text);
+    if target.len() > max_bytes {
+        let mut remove = target.len() - max_bytes;
+        while remove < target.len() && !target.is_char_boundary(remove) {
+            remove += 1;
+        }
+        target.drain(..remove);
+    }
+    while target.lines().count() > max_lines {
+        let Some(newline) = target.find('\n') else {
+            target.clear();
+            break;
+        };
+        target.drain(..=newline);
+    }
+}
+
+fn bounded_utf8_tail(text: &str, max_bytes: usize, max_lines: usize) -> String {
+    let mut tail = String::new();
+    append_bounded_utf8(&mut tail, text, max_bytes, max_lines);
+    tail
+}
+
+fn terminate_child(child: &mut std::process::Child, grace: Duration) {
+    crate::workflow::shell::terminate_child_tree(
+        child,
+        crate::workflow::shell::ProcessSupervisionPolicy::process_group(grace),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,7 +977,7 @@ pub(crate) fn wait_for_pi_wrapper_launch(
         if artifacts.exit_path.exists() {
             return Err(PiWrapperLaunchError::LaunchUncertain(format!(
                 "Herdr worker wrapper exited without a readable launch record; Pi launch is uncertain: {}",
-                bounded_file_text(&artifacts.stderr_path, 2000)
+                bounded_file_text(&artifacts.stderr_path, 2000, 100)
             )));
         }
         if Instant::now() >= deadline {
@@ -844,6 +990,14 @@ pub(crate) fn wait_for_pi_wrapper_launch(
     }
 }
 
+#[derive(Default)]
+struct IncrementalFileLines {
+    offset: u64,
+    pending: Vec<u8>,
+    pending_nonempty: bool,
+    total_lines: usize,
+}
+
 pub(crate) fn collect_pi_wrapper_result(
     job: &Job,
     artifacts: &PiWrapperArtifacts,
@@ -851,23 +1005,27 @@ pub(crate) fn collect_pi_wrapper_result(
     events: Option<RunnerEventSink>,
     pid: u32,
 ) -> Result<ResultData> {
-    let mut stdout_offset = 0_u64;
-    let mut stderr_offset = 0_u64;
+    let mut stdout_lines = IncrementalFileLines::default();
+    let mut stderr_lines = IncrementalFileLines::default();
     let mut next_observation = Instant::now();
     let exit_code = loop {
         emit_new_file_lines(
             &artifacts.stdout_path,
-            &mut stdout_offset,
+            &mut stdout_lines,
             &events,
             pid,
             RunnerEvent::stdout,
+            false,
+            &job.runtime,
         )?;
         emit_new_file_lines(
             &artifacts.stderr_path,
-            &mut stderr_offset,
+            &mut stderr_lines,
             &events,
             pid,
             RunnerEvent::stderr,
+            false,
+            &job.runtime,
         )?;
         if cancel.is_cancelled() {
             terminate_wrapped_process(
@@ -875,10 +1033,14 @@ pub(crate) fn collect_pi_wrapper_result(
                 &artifacts.exit_path,
                 Duration::from_secs(job.termination_grace_seconds),
             );
-            let transcript = wrapper_transcript(artifacts, Some(pid));
+            let transcript = wrapper_transcript(artifacts, Some(pid), &job.runtime);
             return Err(RunnerError::new("job cancelled", transcript).into());
         }
         if let Some(code) = read_wrapper_exit_code(artifacts)? {
+            crate::workflow::shell::terminate_remaining_process_group(
+                pid,
+                Duration::from_secs(job.termination_grace_seconds),
+            );
             emit_runner_event(&events, RunnerEvent::finished(Some(pid), Some(code)));
             break code;
         }
@@ -891,19 +1053,25 @@ pub(crate) fn collect_pi_wrapper_result(
 
     emit_new_file_lines(
         &artifacts.stdout_path,
-        &mut stdout_offset,
+        &mut stdout_lines,
         &events,
         pid,
         RunnerEvent::stdout,
+        true,
+        &job.runtime,
     )?;
     emit_new_file_lines(
         &artifacts.stderr_path,
-        &mut stderr_offset,
+        &mut stderr_lines,
         &events,
         pid,
         RunnerEvent::stderr,
+        true,
+        &job.runtime,
     )?;
     let data = parse_pi_artifact_result(job, artifacts, exit_code, Some(pid))?;
+    let stdout_bytes = fs::metadata(&artifacts.stdout_path).map_or(0, |metadata| metadata.len());
+    let stderr_bytes = fs::metadata(&artifacts.stderr_path).map_or(0, |metadata| metadata.len());
     artifact::write_json(
         &artifacts.result_path,
         &json!({
@@ -911,6 +1079,22 @@ pub(crate) fn collect_pi_wrapper_result(
             "usage": data.usage,
             "contract_warnings": data.contract_warnings,
             "source": "khazad_owned_wrapper_artifacts",
+            "output_capture": {
+                "schema_version": 1,
+                "capture": "bounded_tail_with_append_only_raw_spill",
+                "total_bytes": stdout_bytes.saturating_add(stderr_bytes),
+                "stdout_bytes": stdout_bytes,
+                "stderr_bytes": stderr_bytes,
+                "stdout_lines": stdout_lines.total_lines,
+                "stderr_lines": stderr_lines.total_lines,
+                "retained_output_bytes_per_stream": job.runtime.retained_output_bytes,
+                "retained_output_lines_per_stream": job.runtime.retained_output_lines,
+                "truncated": stdout_bytes > job.runtime.retained_output_bytes as u64
+                    || stderr_bytes > job.runtime.retained_output_bytes as u64
+                    || stdout_lines.total_lines > job.runtime.retained_output_lines
+                    || stderr_lines.total_lines > job.runtime.retained_output_lines,
+                "spill_paths": [artifacts.stdout_path.clone(), artifacts.stderr_path.clone()],
+            },
         }),
     )?;
     Ok(data)
@@ -928,9 +1112,16 @@ fn parse_pi_artifact_result(
             artifacts.stdout_path.display()
         )
     })?;
-    let mut parser = PiParser::default();
+    let mut parser = PiParser::with_output_bounds(
+        job.runtime.retained_output_bytes,
+        job.runtime.retained_output_lines,
+    );
     parser.parse(stdout, None, pid)?;
-    let stderr = fs::read_to_string(&artifacts.stderr_path).unwrap_or_default();
+    let stderr = bounded_file_text(
+        &artifacts.stderr_path,
+        job.runtime.retained_output_bytes,
+        job.runtime.retained_output_lines,
+    );
     if exit_code != 0 {
         let status = format!("exit status: {exit_code}");
         let msg = stderr.trim();
@@ -964,10 +1155,19 @@ fn parse_pi_artifact_result(
     })
 }
 
-fn wrapper_transcript(artifacts: &PiWrapperArtifacts, pid: Option<u32>) -> RunnerTranscript {
+fn wrapper_transcript(
+    artifacts: &PiWrapperArtifacts,
+    pid: Option<u32>,
+    runtime: &RuntimeConfig,
+) -> RunnerTranscript {
     let stdout = File::open(&artifacts.stdout_path);
-    let stderr = fs::read_to_string(&artifacts.stderr_path).unwrap_or_default();
-    let mut parser = PiParser::default();
+    let stderr = bounded_file_text(
+        &artifacts.stderr_path,
+        runtime.retained_output_bytes,
+        runtime.retained_output_lines,
+    );
+    let mut parser =
+        PiParser::with_output_bounds(runtime.retained_output_bytes, runtime.retained_output_lines);
     if let Ok(stdout) = stdout {
         let _ = parser.parse(stdout, None, pid);
     }
@@ -1000,36 +1200,81 @@ fn read_wrapper_status(path: &Path) -> Result<Option<PiWrapperStatus>> {
 
 fn emit_new_file_lines(
     path: &Path,
-    offset: &mut u64,
+    state: &mut IncrementalFileLines,
     events: &Option<RunnerEventSink>,
     pid: u32,
     make_event: fn(Option<u32>, String) -> RunnerEvent,
+    final_read: bool,
+    runtime: &RuntimeConfig,
 ) -> Result<()> {
     let Ok(mut file) = File::open(path) else {
         return Ok(());
     };
-    file.seek(SeekFrom::Start(*offset))?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    *offset += text.len() as u64;
-    for line in text.lines() {
-        emit_runner_event(events, make_event(Some(pid), line.to_string()));
+    file.seek(SeekFrom::Start(state.offset))?;
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        state.offset = state.offset.saturating_add(read as u64);
+        for segment in chunk[..read].split_inclusive(|byte| *byte == b'\n') {
+            let complete = segment.ends_with(b"\n");
+            let payload = segment.strip_suffix(b"\n").unwrap_or(segment);
+            append_bounded_bytes(&mut state.pending, payload, runtime.retained_output_bytes);
+            state.pending_nonempty |= !payload.is_empty();
+            if complete {
+                emit_pending_file_line(state, events, pid, make_event, runtime);
+            }
+        }
+    }
+    if final_read && state.pending_nonempty {
+        emit_pending_file_line(state, events, pid, make_event, runtime);
     }
     Ok(())
 }
 
-fn terminate_wrapped_process(pid: u32, exit_path: &Path, grace: Duration) {
-    request_child_terminate(pid);
-    if grace.as_millis() > 0 {
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if exit_path.exists() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+fn append_bounded_bytes(target: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) {
+    if max_bytes == 0 {
+        target.clear();
+        return;
     }
-    request_child_kill(pid);
+    target.extend_from_slice(bytes);
+    if target.len() > max_bytes {
+        target.drain(..target.len() - max_bytes);
+    }
+}
+
+fn emit_pending_file_line(
+    state: &mut IncrementalFileLines,
+    events: &Option<RunnerEventSink>,
+    pid: u32,
+    make_event: fn(Option<u32>, String) -> RunnerEvent,
+    runtime: &RuntimeConfig,
+) {
+    let line = state.pending.strip_suffix(b"\r").unwrap_or(&state.pending);
+    emit_runner_event(
+        events,
+        make_event(
+            Some(pid),
+            bounded_utf8_tail(
+                &String::from_utf8_lossy(line),
+                runtime.retained_output_bytes,
+                runtime.retained_output_lines,
+            ),
+        ),
+    );
+    state.pending.clear();
+    state.pending_nonempty = false;
+    state.total_lines = state.total_lines.saturating_add(1);
+}
+
+fn terminate_wrapped_process(pid: u32, exit_path: &Path, grace: Duration) {
+    crate::workflow::shell::terminate_process_group_until(
+        pid,
+        crate::workflow::shell::ProcessSupervisionPolicy::process_group(grace),
+        || exit_path.exists(),
+    );
 }
 
 fn wrapper_script(
@@ -1076,15 +1321,28 @@ if [ "$code" -ne 0 ]; then
 fi
 : > "$STDOUT"
 : > "$STDERR"
-env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
-pid=$!
-if ! write_json "$STATUS" "{{\"state\":\"launched\",\"pid\":$pid}}"; then
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" || true
-  exit 125
+if ! command -v setsid >/dev/null 2>&1; then
+  write_json "$STATUS" '{{"state":"handoff_failed","exit_code":127,"error":"setsid unavailable"}}' || exit 125
+  exit 127
 fi
+setsid /bin/sh -c '
+  status=$1
+  writer=$2
+  writer_arg=$3
+  shift 3
+  pid=$$
+  if ! printf "{{\"state\":\"launched\",\"pid\":%s}}\\n" "$pid" | "$writer" "$writer_arg" "$status"; then
+    exit 125
+  fi
+  exec "$@"
+' sh "$STATUS" "$ATOMIC_JSON_WRITER" {atomic_json_writer_arg} env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
+pid=$!
 wait "$pid"
 code=$?
+if ! /bin/grep -q '"state"[[:space:]]*:[[:space:]]*"launched"' "$STATUS"; then
+  write_json "$STATUS" "{{\"state\":\"handoff_failed\",\"exit_code\":$code}}" || exit 125
+  exit "$code"
+fi
 exit_written=0
 if write_json "$EXIT" "{{\"exit_code\":$code}}"; then
   exit_written=1
@@ -1174,10 +1432,25 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn bounded_file_text(path: &Path, max_bytes: usize) -> String {
-    fs::read_to_string(path)
-        .map(|text| tail_text(&text, max_bytes))
-        .unwrap_or_default()
+fn bounded_file_text(path: &Path, max_bytes: usize, max_lines: usize) -> String {
+    if max_bytes == 0 || max_lines == 0 {
+        return String::new();
+    }
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let start = length.saturating_sub(max_bytes as u64);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    bounded_utf8_tail(&String::from_utf8_lossy(&bytes), max_bytes, max_lines)
 }
 
 fn tail_text(text: &str, max_bytes: usize) -> String {
@@ -1362,16 +1635,390 @@ fn is_zero(value: &usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_AUTH_REQUIRED_FAILURE_KIND, CancellationToken, Job, PiCommandSpec, PiRunner,
-        PiWrapperLaunchError, Runner, RunnerError, RunnerMetadata, RunnerSpec, RunnerTranscript,
-        extract_json_object, parse_pi_tui_worker_result_artifact, prepare_pi_tui_worker_artifacts,
+        AGENT_AUTH_REQUIRED_FAILURE_KIND, CancellationToken, IncrementalFileLines, Job,
+        PiCommandSpec, PiRunner, PiWrapperLaunchError, Runner, RunnerError, RunnerEvent,
+        RunnerMetadata, RunnerSpec, RunnerTranscript, emit_new_file_lines, extract_json_object,
+        parse_pi_tui_worker_result_artifact, prepare_pi_tui_worker_artifacts,
         prepare_pi_wrapper_artifacts, wait_for_pi_wrapper_launch,
     };
     use crate::artifact;
+    use crate::domain::RuntimeConfig;
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+    use std::fs;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_wrapper_line_reader_preserves_split_utf8_and_json_without_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stdout.jsonl");
+        let bytes = "{\"type\":\"message_update\",\"text\":\"snowman ☃\"}\n".as_bytes();
+        let split = bytes
+            .windows("☃".len())
+            .position(|window| window == "☃".as_bytes())
+            .unwrap()
+            + 1;
+        fs::write(&path, &bytes[..split]).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink_observed = observed.clone();
+        let sink: super::RunnerEventSink = Arc::new(move |event| {
+            sink_observed.lock().unwrap().push(event.text);
+        });
+        let mut state = super::IncrementalFileLines::default();
+        let runtime = RuntimeConfig {
+            retained_output_bytes: 64 * 1024,
+            retained_output_lines: 1_000,
+            ..RuntimeConfig::default()
+        };
+        emit_new_file_lines(
+            &path,
+            &mut state,
+            &Some(sink.clone()),
+            7,
+            super::RunnerEvent::stdout,
+            false,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(state.offset, split as u64);
+        assert_eq!(state.pending, bytes[..split]);
+        assert!(observed.lock().unwrap().is_empty());
+
+        fs::write(&path, bytes).unwrap();
+        emit_new_file_lines(
+            &path,
+            &mut state,
+            &Some(sink),
+            7,
+            super::RunnerEvent::stdout,
+            true,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            &[String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap()]
+        );
+        assert_eq!(state.offset, bytes.len() as u64);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.total_lines, 1);
+    }
+
+    #[test]
+    fn zero_retention_wrapper_reader_counts_an_unterminated_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stdout.jsonl");
+        fs::write(&path, "unterminated").unwrap();
+        let runtime = RuntimeConfig {
+            retained_output_bytes: 0,
+            retained_output_lines: 0,
+            raw_output_spill: true,
+            ..RuntimeConfig::default()
+        };
+        let mut state = IncrementalFileLines::default();
+
+        super::emit_new_file_lines(
+            &path,
+            &mut state,
+            &None,
+            7,
+            RunnerEvent::stdout,
+            true,
+            &runtime,
+        )
+        .unwrap();
+
+        assert_eq!(state.total_lines, 1);
+        assert!(state.pending.is_empty());
+        assert!(!state.pending_nonempty);
+    }
+
+    #[test]
+    fn bounded_wrapper_line_reader_streams_multi_megabyte_delimiter_free_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stderr.log");
+        let runtime = RuntimeConfig {
+            retained_output_bytes: 1_024,
+            retained_output_lines: 32,
+            ..RuntimeConfig::default()
+        };
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink_observed = observed.clone();
+        let sink: super::RunnerEventSink = Arc::new(move |event| {
+            sink_observed.lock().unwrap().push(event.text);
+        });
+        let mut state = super::IncrementalFileLines::default();
+        fs::write(&path, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+        emit_new_file_lines(
+            &path,
+            &mut state,
+            &Some(sink.clone()),
+            7,
+            super::RunnerEvent::stderr,
+            false,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(state.offset, 4 * 1024 * 1024);
+        assert!(state.pending.len() <= 1_024);
+        assert!(observed.lock().unwrap().is_empty());
+
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![b'y'; 4 * 1024 * 1024]).unwrap();
+        file.write_all(b"\n").unwrap();
+        emit_new_file_lines(
+            &path,
+            &mut state,
+            &Some(sink),
+            7,
+            super::RunnerEvent::stderr,
+            false,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(state.offset, 8 * 1024 * 1024 + 1);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.total_lines, 1);
+        assert_eq!(observed.lock().unwrap()[0].len(), 1_024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_normal_completion_reaps_a_surviving_term_ignoring_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&temp.path().join("worker.json"))
+            .unwrap();
+        fs::write(&artifacts.stdout_path, "").unwrap();
+        fs::write(&artifacts.stderr_path, "").unwrap();
+        artifact::write_json(&artifacts.exit_path, &json!({"exit_code": 0})).unwrap();
+        let mut child = std::process::Command::new("setsid")
+            .args(["sh", "-c", "(trap '' TERM; sleep 30) & exit 0"])
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        let _ = child.wait();
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: String::new(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
+        };
+
+        super::collect_pi_wrapper_result(&job, &artifacts, CancellationToken::new(), None, pgid)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::workflow::shell::supervised_process_group_exists(pgid)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::workflow::shell::supervised_process_group_exists(
+            pgid
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_cancellation_kills_term_ignoring_group_even_after_exit_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let exit_path = temp.path().join("exit.json");
+        fs::write(&exit_path, "{}").unwrap();
+        let mut child = std::process::Command::new("setsid")
+            .args(["sh", "-c", "(trap '' TERM; sleep 30) & wait"])
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        thread::sleep(Duration::from_millis(25));
+
+        super::terminate_wrapped_process(pgid, &exit_path, Duration::from_millis(50));
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::workflow::shell::supervised_process_group_exists(pgid)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::workflow::shell::supervised_process_group_exists(
+            pgid
+        ));
+    }
+
+    #[test]
+    fn wrapper_preserves_authoritative_result_larger_than_diagnostic_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let output_path = temp.path().join("worker-output.json");
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&output_path)
+            .unwrap();
+        let payload = serde_json::json!({"payload": "x".repeat(100 * 1024)}).to_string();
+        let event = serde_json::json!({
+            "type": "agent_end",
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "text", "text": payload}]
+            }]
+        });
+        fs::write(&artifacts.stdout_path, format!("{event}\n")).unwrap();
+        fs::write(&artifacts.stderr_path, "").unwrap();
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{}".to_string(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig {
+                retained_output_bytes: 1_024,
+                retained_output_lines: 32,
+                ..RuntimeConfig::default()
+            },
+            raw_output_stem: None,
+        };
+
+        let result = super::parse_pi_artifact_result(&job, &artifacts, 0, None).unwrap();
+        assert_eq!(
+            result.output.unwrap()["payload"].as_str().unwrap().len(),
+            100 * 1024
+        );
+    }
+
+    #[test]
+    fn direct_pi_spill_setup_removes_partial_new_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let stem = temp.path().join("capture");
+        fs::create_dir(stem.with_extension("stderr.log")).unwrap();
+        let runner = PiRunner {
+            bin: "sh".to_string(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: String::new(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: Some(stem.clone()),
+        };
+
+        let error = runner
+            .run(job, CancellationToken::new(), None)
+            .expect_err("second direct spill open must fail");
+        assert!(format!("{error:#}").contains("output spill"));
+        assert!(!stem.with_extension("stdout.log").exists());
+        assert!(!stem.with_extension("runtime.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_pi_metadata_reports_line_limit_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi-lines");
+        fs::write(
+            &script,
+            "#!/bin/sh\ni=0; while [ $i -lt 40 ]; do echo x >&2; i=$((i + 1)); done\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let stem = temp.path().join("capture");
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: String::new(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig {
+                retained_output_bytes: 1_024,
+                retained_output_lines: 32,
+                ..RuntimeConfig::default()
+            },
+            raw_output_stem: Some(stem.clone()),
+        };
+
+        runner.run(job, CancellationToken::new(), None).unwrap();
+        let metadata: serde_json::Value =
+            artifact::read_json(stem.with_extension("runtime.json")).unwrap();
+        assert_eq!(metadata["stderr_lines"], 40);
+        assert_eq!(metadata["truncated"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_direct_pi_stderr_spills_full_output_and_retains_only_configured_tail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi");
+        fs::write(
+            &script,
+            "#!/bin/sh\nhead -c 2097152 /dev/zero | tr '\\0' e >&2\nexit 17\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let runtime = RuntimeConfig {
+            retained_output_bytes: 1024,
+            retained_output_lines: 32,
+            ..RuntimeConfig::default()
+        };
+        let stem = temp.path().join("direct-worker");
+        let error = runner
+            .run(
+                Job {
+                    kind: "test".to_string(),
+                    prompt: "test".to_string(),
+                    cwd: temp.path().to_path_buf(),
+                    json_schema: String::new(),
+                    env: BTreeMap::new(),
+                    termination_grace_seconds: 0,
+                    runtime,
+                    raw_output_stem: Some(stem.clone()),
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .unwrap_err();
+        let runner_error = error.downcast_ref::<RunnerError>().unwrap();
+        assert!(runner_error.transcript().stderr_tail.len() <= 1024);
+        assert_eq!(
+            fs::metadata(stem.with_extension("stderr.log"))
+                .unwrap()
+                .len(),
+            2 * 1024 * 1024
+        );
+        let metadata: serde_json::Value =
+            artifact::read_json(stem.with_extension("runtime.json")).unwrap();
+        assert_eq!(metadata["total_bytes"], 2 * 1024 * 1024);
+        assert_eq!(metadata["truncated"], true);
+    }
 
     #[test]
     fn classifies_pi_auth_failure_only_without_assistant_output() {
@@ -1469,6 +2116,8 @@ mod tests {
             json_schema: "{\"type\":\"object\"}".to_string(),
             env: BTreeMap::new(),
             termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
         };
 
         let argv =
@@ -1515,6 +2164,8 @@ mod tests {
             json_schema: "{\"type\":\"object\"}".to_string(),
             env: BTreeMap::new(),
             termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
         };
 
         prepare_pi_wrapper_artifacts(&spec, &job, &artifacts).unwrap();
@@ -1524,8 +2175,67 @@ mod tests {
         assert!(script.contains(crate::artifact::ATOMIC_JSON_WRITER_ARG));
         assert!(!script.contains("> \"$STATUS\""));
         assert!(!script.contains("> \"$EXIT\""));
+        assert!(script.contains("command -v setsid"));
+        assert!(script.contains("setsid /bin/sh -c"));
         let command: serde_json::Value = artifact::read_json(&artifacts.command_path).unwrap();
         assert!(command["atomic_json_writer"].is_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_records_prelaunch_failure_when_discovered_setsid_cannot_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let setsid = bin.join("setsid");
+        fs::write(&setsid, "#!/bin/sh\nexit 42\n").unwrap();
+        let writer = bin.join("atomic-writer");
+        fs::write(&writer, "#!/bin/sh\n/bin/cat > \"$2\"\n").unwrap();
+        for path in [&setsid, &writer] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&temp.path().join("worker.json"))
+            .unwrap();
+        let spec = PiCommandSpec {
+            bin: "pi-never-runs".to_string(),
+            args: Vec::new(),
+        };
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), bin.to_string_lossy().to_string());
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: String::new(),
+            env,
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
+        };
+        fs::write(&artifacts.prompt_path, "").unwrap();
+        fs::write(&artifacts.env_path, super::env_file_text(&job.env)).unwrap();
+        fs::write(
+            &artifacts.wrapper_path,
+            super::wrapper_script(&spec, &job, &artifacts, &writer),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&artifacts.wrapper_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&artifacts.wrapper_path, permissions).unwrap();
+
+        let status = std::process::Command::new(&artifacts.wrapper_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(42));
+        let launch: serde_json::Value = artifact::read_json(&artifacts.status_path).unwrap();
+        assert_eq!(launch["state"], "handoff_failed");
+        assert_eq!(launch["exit_code"], 42);
     }
 
     #[test]
@@ -1584,6 +2294,8 @@ mod tests {
             json_schema: "{}".to_string(),
             env,
             termination_grace_seconds: 1,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
         };
         let result = thread::spawn(move || runner.run(job, cancelled, None));
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1633,6 +2345,8 @@ mod tests {
             json_schema: "{}".to_string(),
             env,
             termination_grace_seconds: 1,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
         };
         let result = thread::spawn(move || runner.run(job, CancellationToken::new(), None));
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1682,6 +2396,8 @@ mod tests {
             json_schema: "{}".to_string(),
             env,
             termination_grace_seconds: 1,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
         };
         let result = thread::spawn(move || runner.run(job, cancelled, None));
         let deadline = Instant::now() + Duration::from_secs(2);

@@ -3,8 +3,8 @@ use crate::agent::CancellationToken;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -63,14 +63,154 @@ impl std::error::Error for ShellCommandError {}
 
 pub(crate) type ShellProgress = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GracefulSignalTarget {
+    #[allow(dead_code)] // Production shell supervision signals its authenticated root process.
+    Process,
+    ProcessGroup,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProcessSupervisionPolicy {
+    pub graceful_signal: i32,
+    pub graceful_target: GracefulSignalTarget,
+    pub grace: Duration,
+    pub poll_interval: Duration,
+}
+
+impl ProcessSupervisionPolicy {
+    pub(crate) fn process_group(grace: Duration) -> Self {
+        Self {
+            graceful_signal: libc::SIGTERM,
+            graceful_target: GracefulSignalTarget::ProcessGroup,
+            grace,
+            poll_interval: Duration::from_millis(50),
+        }
+    }
+}
+
+/// Shared TERM/grace/KILL/reap policy for Pi, repair, verification, and
+/// cancellable Git process trees. Unix callers create a dedicated process
+/// group first; other platforms use the strongest child-only fallback exposed
+/// by `std::process::Child`.
+pub(crate) fn terminate_child_tree(
+    child: &mut std::process::Child,
+    policy: ProcessSupervisionPolicy,
+) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        signal_supervised_process(pid, policy.graceful_signal, policy.graceful_target);
+        let deadline = Instant::now() + policy.grace;
+        loop {
+            let child_exited = matches!(child.try_wait(), Ok(Some(_)));
+            if !supervised_process_group_exists(pid) {
+                if !child_exited {
+                    let _ = child.wait();
+                }
+                return;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(
+                policy
+                    .poll_interval
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        signal_supervised_process(pid, libc::SIGKILL, GracefulSignalTarget::ProcessGroup);
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = policy;
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+pub(crate) fn terminate_process_group_until(
+    pgid: u32,
+    policy: ProcessSupervisionPolicy,
+    mut complete: impl FnMut() -> bool,
+) {
+    #[cfg(unix)]
+    {
+        signal_supervised_process(pgid, policy.graceful_signal, policy.graceful_target);
+        let deadline = Instant::now() + policy.grace;
+        while Instant::now() < deadline {
+            if complete() && !supervised_process_group_exists(pgid) {
+                return;
+            }
+            thread::sleep(
+                policy
+                    .poll_interval
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        signal_supervised_process(pgid, libc::SIGKILL, GracefulSignalTarget::ProcessGroup);
+    }
+    #[cfg(not(unix))]
+    {
+        // A wrapper handoff has no portable child handle after daemon restart;
+        // retain the bounded wait while direct children use `Child::kill` above.
+        let deadline = Instant::now() + policy.grace;
+        while Instant::now() < deadline && !complete() {
+            thread::sleep(policy.poll_interval);
+        }
+    }
+}
+
+pub(crate) fn terminate_remaining_process_group(pgid: u32, grace: Duration) {
+    #[cfg(unix)]
+    {
+        signal_supervised_process(pgid, libc::SIGTERM, GracefulSignalTarget::ProcessGroup);
+        let deadline = Instant::now() + grace;
+        while supervised_process_group_exists(pgid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if supervised_process_group_exists(pgid) {
+            signal_supervised_process(pgid, libc::SIGKILL, GracefulSignalTarget::ProcessGroup);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, grace);
+    }
+}
+
+#[cfg(unix)]
+fn signal_supervised_process(pid: u32, signal: i32, target: GracefulSignalTarget) {
+    let target = match target {
+        GracefulSignalTarget::Process => pid as i32,
+        GracefulSignalTarget::ProcessGroup => -(pid as i32),
+    };
+    unsafe {
+        let _ = libc::kill(target, signal);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn supervised_process_group_exists(pgid: u32) -> bool {
+    let status = unsafe { libc::kill(-(pgid as i32), 0) };
+    status == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 pub(crate) struct ShellCommand {
     cwd: PathBuf,
     command: String,
     timeout: Duration,
+    termination_grace: Duration,
     env: BTreeMap<OsString, OsString>,
     env_remove: Vec<OsString>,
     progress: Option<ShellProgress>,
     pinned_cwd: Option<File>,
+    retained_output_bytes: usize,
+    retained_output_lines: usize,
+    spill_stem: Option<PathBuf>,
 }
 
 impl ShellCommand {
@@ -79,15 +219,24 @@ impl ShellCommand {
             cwd: cwd.as_ref().to_path_buf(),
             command: command.into(),
             timeout: Duration::ZERO,
+            termination_grace: Duration::from_secs(1),
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             progress: None,
             pinned_cwd: None,
+            retained_output_bytes: 64 * 1024,
+            retained_output_lines: 1_000,
+            spill_stem: None,
         }
     }
 
     pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub(crate) fn termination_grace(mut self, grace: Duration) -> Self {
+        self.termination_grace = grace;
         self
     }
 
@@ -112,6 +261,17 @@ impl ShellCommand {
 
     pub(crate) fn progress(mut self, progress: Option<ShellProgress>) -> Self {
         self.progress = progress;
+        self
+    }
+
+    pub(crate) fn output_bounds(mut self, retained_bytes: usize, retained_lines: usize) -> Self {
+        self.retained_output_bytes = retained_bytes;
+        self.retained_output_lines = retained_lines;
+        self
+    }
+
+    pub(crate) fn spill_to(mut self, stem: PathBuf) -> Self {
+        self.spill_stem = Some(stem);
         self
     }
 
@@ -203,25 +363,44 @@ impl ShellCommand {
         supervisor_result.parent_after_spawn();
         let stdout = child.stdout.take().context("command stdout")?;
         let stderr = child.stderr.take().context("command stderr")?;
-        let monitor = ShellCommandMonitor::spawn(stdout, stderr, self.progress);
+        let monitor = match ShellCommandMonitor::spawn(
+            stdout,
+            stderr,
+            self.progress,
+            self.retained_output_bytes,
+            self.retained_output_lines,
+            self.spill_stem.as_deref(),
+        ) {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                terminate_process_group(&mut child, self.termination_grace);
+                let cleanup = terminate_supervised_descendants(supervision.identity());
+                let supervisor = finish_supervisor_result(&mut supervisor_result);
+                cleanup?;
+                supervisor?;
+                return Err(err);
+            }
+        };
 
         let started_at = Instant::now();
         let mut last_heartbeat = Instant::now();
         let status = loop {
             if cancel.is_cancelled() {
-                terminate_process_group(&mut child);
+                terminate_process_group(&mut child, self.termination_grace);
                 let cleanup = terminate_supervised_descendants(supervision.identity());
-                let _ = monitor.finish();
+                let capture = monitor.finish();
                 finish_supervisor_result(&mut supervisor_result)?;
                 cleanup?;
+                capture?;
                 return Err(CancelledError::new("run cancelled").into());
             }
             if !self.timeout.is_zero() && started_at.elapsed() >= self.timeout {
-                terminate_process_group(&mut child);
+                terminate_process_group(&mut child, self.termination_grace);
                 let cleanup = terminate_supervised_descendants(supervision.identity());
-                let _ = monitor.finish();
+                let capture = monitor.finish();
                 finish_supervisor_result(&mut supervisor_result)?;
                 cleanup?;
+                capture?;
                 return Err(ShellCommandError::new(
                     ShellFailureKind::Timeout,
                     format!("command timed out after {} seconds", self.timeout.as_secs()),
@@ -237,9 +416,12 @@ impl ShellCommand {
             }
             thread::sleep(Duration::from_millis(100));
         };
-        terminate_remaining_process_group(child.id());
+        terminate_remaining_process_group(
+            child.id(),
+            self.termination_grace.min(Duration::from_secs(1)),
+        );
         let cleanup = terminate_supervised_descendants(supervision.identity());
-        let (stdout, stderr) = monitor.finish();
+        let (stdout, stderr) = monitor.finish()?;
         finish_supervisor_result(&mut supervisor_result)?;
         cleanup?;
         if status.code().is_none() {
@@ -255,8 +437,12 @@ impl ShellCommand {
         Ok(ShellOutput {
             success: status.success(),
             exit_code: status.code(),
-            stdout,
-            stderr,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_total_bytes: stdout.total_bytes,
+            stderr_total_bytes: stderr.total_bytes,
+            stdout_spill_path: stdout.spill_path,
+            stderr_spill_path: stderr.spill_path,
         })
     }
 }
@@ -267,6 +453,10 @@ pub(crate) struct ShellOutput {
     exit_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_total_bytes: usize,
+    stderr_total_bytes: usize,
+    stdout_spill_path: Option<PathBuf>,
+    stderr_spill_path: Option<PathBuf>,
 }
 
 impl ShellOutput {
@@ -288,6 +478,30 @@ impl ShellOutput {
         &self.stderr
     }
 
+    pub(crate) fn stdout_total_bytes(&self) -> usize {
+        self.stdout_total_bytes
+    }
+
+    pub(crate) fn stderr_total_bytes(&self) -> usize {
+        self.stderr_total_bytes
+    }
+
+    pub(crate) fn retained_output_bytes(&self) -> usize {
+        self.stdout.len().saturating_add(self.stderr.len())
+    }
+
+    pub(crate) fn output_truncated(&self) -> bool {
+        self.stdout_total_bytes > self.stdout.len() || self.stderr_total_bytes > self.stderr.len()
+    }
+
+    pub(crate) fn stdout_spill_path(&self) -> Option<&Path> {
+        self.stdout_spill_path.as_deref()
+    }
+
+    pub(crate) fn stderr_spill_path(&self) -> Option<&Path> {
+        self.stderr_spill_path.as_deref()
+    }
+
     pub(crate) fn combined_output(&self) -> String {
         format!(
             "{}{}",
@@ -301,13 +515,65 @@ impl ShellOutput {
     }
 }
 
+#[derive(Debug)]
+struct BoundedStreamCapture {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    retained_bytes: usize,
+    retained_lines: usize,
+}
+
+impl BoundedStreamCapture {
+    fn new(retained_bytes: usize, retained_lines: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(retained_bytes.min(64 * 1024)),
+            total_bytes: 0,
+            retained_bytes,
+            retained_lines,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        self.bytes.extend_from_slice(bytes);
+        if self.retained_bytes == 0 || self.retained_lines == 0 {
+            self.bytes.clear();
+            return;
+        }
+        if self.bytes.len() > self.retained_bytes {
+            let remove = self.bytes.len() - self.retained_bytes;
+            self.bytes.drain(0..remove);
+        }
+        while logical_line_count(&self.bytes) > self.retained_lines {
+            let Some(newline) = self.bytes.iter().position(|byte| *byte == b'\n') else {
+                self.bytes.clear();
+                break;
+            };
+            self.bytes.drain(0..=newline);
+        }
+    }
+}
+
+fn logical_line_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+}
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    spill_path: Option<PathBuf>,
+}
+
 struct ShellCommandMonitor {
-    stdout_buf: Arc<Mutex<Vec<u8>>>,
-    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stdout_buf: Arc<Mutex<BoundedStreamCapture>>,
+    stderr_buf: Arc<Mutex<BoundedStreamCapture>>,
     combined_tail: Arc<Mutex<Vec<u8>>>,
     progress: Option<ShellProgress>,
-    stdout_thread: thread::JoinHandle<()>,
-    stderr_thread: thread::JoinHandle<()>,
+    stdout_thread: thread::JoinHandle<Option<String>>,
+    stderr_thread: thread::JoinHandle<Option<String>>,
+    stdout_spill_path: Option<PathBuf>,
+    stderr_spill_path: Option<PathBuf>,
 }
 
 impl ShellCommandMonitor {
@@ -315,30 +581,66 @@ impl ShellCommandMonitor {
         stdout: impl Read + Send + 'static,
         stderr: impl Read + Send + 'static,
         progress: Option<ShellProgress>,
-    ) -> Self {
-        let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        retained_bytes: usize,
+        retained_lines: usize,
+        spill_stem: Option<&Path>,
+    ) -> Result<Self> {
+        let stdout_spill_path = spill_stem.map(|stem| stem.with_extension("stdout.log"));
+        let stderr_spill_path = spill_stem.map(|stem| stem.with_extension("stderr.log"));
+        let stdout_spill_existed = stdout_spill_path.as_deref().is_some_and(Path::exists);
+        let stdout_spill = open_output_spill(stdout_spill_path.as_deref()).map_err(|err| {
+            ShellCommandError::new(
+                ShellFailureKind::Supervision,
+                format!("output spill setup failed: {err:#}"),
+            )
+        })?;
+        let stderr_spill = match open_output_spill(stderr_spill_path.as_deref()) {
+            Ok(spill) => spill,
+            Err(err) => {
+                drop(stdout_spill);
+                if !stdout_spill_existed && let Some(path) = stdout_spill_path.as_deref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(ShellCommandError::new(
+                    ShellFailureKind::Supervision,
+                    format!("output spill setup failed: {err:#}"),
+                )
+                .into());
+            }
+        };
+        let stdout_buf = Arc::new(Mutex::new(BoundedStreamCapture::new(
+            retained_bytes,
+            retained_lines,
+        )));
+        let stderr_buf = Arc::new(Mutex::new(BoundedStreamCapture::new(
+            retained_bytes,
+            retained_lines,
+        )));
         let combined_tail = Arc::new(Mutex::new(Vec::new()));
         let stdout_thread = spawn_output_reader(
             stdout,
             stdout_buf.clone(),
             combined_tail.clone(),
             progress.clone(),
+            stdout_spill,
         );
         let stderr_thread = spawn_output_reader(
             stderr,
             stderr_buf.clone(),
             combined_tail.clone(),
             progress.clone(),
+            stderr_spill,
         );
-        Self {
+        Ok(Self {
             stdout_buf,
             stderr_buf,
             combined_tail,
             progress,
             stdout_thread,
             stderr_thread,
-        }
+            stdout_spill_path,
+            stderr_spill_path,
+        })
     }
 
     fn emit_progress(&self) {
@@ -347,42 +649,95 @@ impl ShellCommandMonitor {
         }
     }
 
-    fn finish(self) -> (Vec<u8>, Vec<u8>) {
+    fn finish(self) -> Result<(CapturedStream, CapturedStream)> {
         let Self {
             stdout_buf,
             stderr_buf,
             stdout_thread,
             stderr_thread,
+            stdout_spill_path,
+            stderr_spill_path,
             ..
         } = self;
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
-        (
-            stdout_buf.lock().expect("stdout mutex poisoned").clone(),
-            stderr_buf.lock().expect("stderr mutex poisoned").clone(),
-        )
+        let stdout_error = stdout_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))?;
+        let stderr_error = stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))?;
+        if let Some(error) = stdout_error.or(stderr_error) {
+            return Err(ShellCommandError::new(
+                ShellFailureKind::Supervision,
+                format!("output spill failed: {error}"),
+            )
+            .into());
+        }
+        let stdout = Arc::try_unwrap(stdout_buf)
+            .map_err(|_| anyhow::anyhow!("stdout capture still referenced"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("stdout capture mutex poisoned"))?;
+        let stderr = Arc::try_unwrap(stderr_buf)
+            .map_err(|_| anyhow::anyhow!("stderr capture still referenced"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("stderr capture mutex poisoned"))?;
+        Ok((
+            CapturedStream {
+                bytes: stdout.bytes,
+                total_bytes: stdout.total_bytes,
+                spill_path: stdout_spill_path,
+            },
+            CapturedStream {
+                bytes: stderr.bytes,
+                total_bytes: stderr.total_bytes,
+                spill_path: stderr_spill_path,
+            },
+        ))
     }
+}
+
+fn open_output_spill(path: Option<&Path>) -> Result<Option<File>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create output spill directory {}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open output spill {}", path.display()))
+        .map(Some)
 }
 
 fn spawn_output_reader<R: Read + Send + 'static>(
     mut reader: R,
-    stream_buf: Arc<Mutex<Vec<u8>>>,
+    stream_buf: Arc<Mutex<BoundedStreamCapture>>,
     combined_tail: Arc<Mutex<Vec<u8>>>,
     progress: Option<ShellProgress>,
-) -> thread::JoinHandle<()> {
+    mut spill: Option<File>,
+) -> thread::JoinHandle<Option<String>> {
     thread::spawn(move || {
+        let mut spill_error = None;
         let mut buf = [0_u8; 4096];
         let mut last_emit = Instant::now() - Duration::from_secs(1);
         loop {
             let read = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(read) => read,
-                Err(_) => break,
+                Err(err) => return Some(format!("read command output: {err}")),
             };
+            if let Some(file) = spill.as_mut()
+                && let Err(err) = file.write_all(&buf[..read])
+            {
+                spill_error = Some(err.to_string());
+                spill = None;
+            }
             stream_buf
                 .lock()
                 .expect("stream mutex poisoned")
-                .extend_from_slice(&buf[..read]);
+                .push(&buf[..read]);
             let output_tail = {
                 let mut combined = combined_tail.lock().expect("combined mutex poisoned");
                 combined.extend_from_slice(&buf[..read]);
@@ -402,6 +757,7 @@ fn spawn_output_reader<R: Read + Send + 'static>(
         if let Some(progress) = &progress {
             progress(tail_text(&combined_tail));
         }
+        spill_error
     })
 }
 
@@ -856,57 +1212,21 @@ fn process_parent_from_stat(stat: &[u8]) -> Option<i32> {
 }
 
 #[cfg(not(test))]
-fn terminate_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as i32;
-    unsafe {
-        let _ = libc::kill(pid, libc::SIGUSR1);
-    }
-    for _ in 0..30 {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    signal_process_group(child.id(), libc::SIGKILL);
-    let _ = child.wait();
+fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
+    terminate_child_tree(
+        child,
+        ProcessSupervisionPolicy {
+            graceful_signal: libc::SIGUSR1,
+            graceful_target: GracefulSignalTarget::Process,
+            grace,
+            poll_interval: Duration::from_millis(50),
+        },
+    );
 }
 
 #[cfg(test)]
-fn terminate_process_group(child: &mut std::process::Child) {
-    let pgid = child.id();
-    signal_process_group(pgid, libc::SIGTERM);
-    for _ in 0..10 {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    // Always escalate to the whole process group. The shell may exit after
-    // SIGTERM while a descendant in the same process group ignores it.
-    signal_process_group(pgid, libc::SIGKILL);
-    let _ = child.wait();
-}
-
-fn terminate_remaining_process_group(pgid: u32) {
-    signal_process_group(pgid, libc::SIGTERM);
-    for _ in 0..10 {
-        if !process_group_exists(pgid) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    signal_process_group(pgid, libc::SIGKILL);
-}
-
-fn signal_process_group(pgid: u32, signal: i32) {
-    unsafe {
-        let _ = libc::kill(-(pgid as i32), signal);
-    }
-}
-
-fn process_group_exists(pgid: u32) -> bool {
-    let status = unsafe { libc::kill(-(pgid as i32), 0) };
-    status == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
+    terminate_child_tree(child, ProcessSupervisionPolicy::process_group(grace));
 }
 
 struct SupervisorResultPipe {
@@ -1324,13 +1644,18 @@ fn supervised_processes(inode: u64) -> Result<Vec<i32>, ShellCommandError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROGRESS_OUTPUT_TAIL_BYTES, ShellCommand, ShellProgress, TEST_SUPERVISOR_RESULT_MODE,
+        PROGRESS_OUTPUT_TAIL_BYTES, ProcessSupervisionPolicy, ShellCommand, ShellProgress,
+        TEST_SUPERVISOR_RESULT_MODE, supervised_process_group_exists, terminate_child_tree,
     };
     use crate::agent::CancellationToken;
     use anyhow::Result;
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1338,6 +1663,35 @@ mod tests {
     fn process_exists(pid: i32) -> bool {
         let status = unsafe { libc::kill(pid, 0) };
         status == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervision_policy_escalates_across_a_term_ignoring_process_tree() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("(trap '' TERM; sleep 30) & wait");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id();
+        let started = Instant::now();
+        terminate_child_tree(
+            &mut child,
+            ProcessSupervisionPolicy::process_group(Duration::from_millis(50)),
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while supervised_process_group_exists(pgid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!supervised_process_group_exists(pgid));
     }
 
     #[test]
@@ -1621,6 +1975,66 @@ mod tests {
             ),
             libc::SECCOMP_RET_ERRNO | libc::EPERM as u32
         );
+    }
+
+    #[test]
+    fn bounded_shell_capture_spills_multi_megabyte_output_and_retains_only_tail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let spill_stem = temp.path().join("verify-output");
+        let output = ShellCommand::new(
+            temp.path(),
+            "head -c 2097152 /dev/zero | tr '\\0' o; head -c 1048576 /dev/zero | tr '\\0' e >&2",
+        )
+        .timeout(Duration::from_secs(10))
+        .output_bounds(1024, 32)
+        .spill_to(spill_stem.clone())
+        .run(&CancellationToken::new())?;
+
+        assert!(output.success());
+        assert!(output.stdout().len() <= 1024);
+        assert!(output.stderr().len() <= 1024);
+        assert_eq!(output.stdout_total_bytes(), 2 * 1024 * 1024);
+        assert_eq!(output.stderr_total_bytes(), 1024 * 1024);
+        assert!(output.output_truncated());
+        assert_eq!(
+            fs::metadata(spill_stem.with_extension("stdout.log"))?.len(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            fs::metadata(spill_stem.with_extension("stderr.log"))?.len(),
+            1024 * 1024
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_shell_capture_surfaces_spill_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let blocked_parent = temp.path().join("not-a-directory");
+        fs::write(&blocked_parent, b"file")?;
+        let error = ShellCommand::new(temp.path(), "printf evidence")
+            .output_bounds(1024, 32)
+            .spill_to(blocked_parent.join("capture"))
+            .run(&CancellationToken::new())
+            .expect_err("spill setup failure must be explicit");
+        assert!(format!("{error:#}").contains("output spill"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn spill_setup_removes_a_new_stdout_file_when_stderr_open_fails() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let spill_stem = temp.path().join("capture");
+        fs::create_dir(spill_stem.with_extension("stderr.log"))?;
+        let error = ShellCommand::new(temp.path(), "sleep 30")
+            .output_bounds(1024, 32)
+            .spill_to(spill_stem.clone())
+            .run(&CancellationToken::new())
+            .expect_err("second spill setup failure must be explicit");
+
+        assert!(format!("{error:#}").contains("output spill"), "{error:#}");
+        assert!(!spill_stem.with_extension("stdout.log").exists());
+        Ok(())
     }
 
     #[test]

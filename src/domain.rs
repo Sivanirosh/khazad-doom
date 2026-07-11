@@ -195,6 +195,117 @@ fn split_slice_github_issue(value: &str) -> (&str, Option<SliceProvenance>) {
     }
 }
 
+pub const MAX_RETAINED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RETAINED_OUTPUT_LINES: usize = 100_000;
+pub const MAX_OBSERVATION_FLUSH_BYTES: usize = 1024 * 1024;
+pub const MAX_OBSERVATION_FLUSH_MILLIS: u64 = 5_000;
+pub const MAX_RUNTIME_POLL_MILLIS: u64 = 5_000;
+pub const MAX_ECONOMICS_CHECKPOINT_MILLIS: u64 = 60_000;
+pub const MAX_WORKER_TERMINATION_GRACE_SECONDS: u64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Maximum bytes retained per output stream in memory. Zero retains none;
+    /// raw spill must then remain enabled so evidence is not silently dropped.
+    pub retained_output_bytes: usize,
+    /// Maximum logical lines retained per output stream. Zero retains none.
+    pub retained_output_lines: usize,
+    /// Flush ordinary worker observations after this many accumulated bytes.
+    /// Zero flushes every observation.
+    pub observation_flush_bytes: usize,
+    /// Flush ordinary worker observations after this interval. Zero flushes
+    /// every observation rather than creating an unbounded timer.
+    pub observation_flush_millis: u64,
+    /// Initial adaptive supervisor/state polling delay. Must be positive.
+    pub poll_initial_millis: u64,
+    /// Maximum adaptive polling delay and therefore maximum quiet-state
+    /// attention latency. Must be at least the initial delay.
+    pub poll_max_millis: u64,
+    /// Minimum interval between growing economics artifact checkpoints. Zero
+    /// deliberately persists every mutation.
+    pub economics_checkpoint_millis: u64,
+    /// Stream complete raw command/worker bytes to append-only artifacts when
+    /// a caller supplies an attempt artifact path.
+    pub raw_output_spill: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            retained_output_bytes: 64 * 1024,
+            retained_output_lines: 1_000,
+            observation_flush_bytes: 16 * 1024,
+            observation_flush_millis: 250,
+            poll_initial_millis: 25,
+            poll_max_millis: 500,
+            economics_checkpoint_millis: 500,
+            raw_output_spill: true,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.retained_output_bytes > MAX_RETAINED_OUTPUT_BYTES {
+            anyhow::bail!(
+                "runtime.retained_output_bytes={} exceeds hard maximum {}",
+                self.retained_output_bytes,
+                MAX_RETAINED_OUTPUT_BYTES
+            );
+        }
+        if self.retained_output_lines > MAX_RETAINED_OUTPUT_LINES {
+            anyhow::bail!(
+                "runtime.retained_output_lines={} exceeds hard maximum {}",
+                self.retained_output_lines,
+                MAX_RETAINED_OUTPUT_LINES
+            );
+        }
+        if self.observation_flush_bytes > MAX_OBSERVATION_FLUSH_BYTES {
+            anyhow::bail!(
+                "runtime.observation_flush_bytes={} exceeds hard maximum {}",
+                self.observation_flush_bytes,
+                MAX_OBSERVATION_FLUSH_BYTES
+            );
+        }
+        if self.observation_flush_millis > MAX_OBSERVATION_FLUSH_MILLIS {
+            anyhow::bail!(
+                "runtime.observation_flush_millis={} exceeds hard maximum {}",
+                self.observation_flush_millis,
+                MAX_OBSERVATION_FLUSH_MILLIS
+            );
+        }
+        if self.poll_initial_millis == 0 {
+            anyhow::bail!("runtime.poll_initial_millis must be positive");
+        }
+        if self.poll_max_millis < self.poll_initial_millis
+            || self.poll_max_millis > MAX_RUNTIME_POLL_MILLIS
+        {
+            anyhow::bail!(
+                "runtime.poll_max_millis={} must be between poll_initial_millis={} and hard maximum {}",
+                self.poll_max_millis,
+                self.poll_initial_millis,
+                MAX_RUNTIME_POLL_MILLIS
+            );
+        }
+        if self.economics_checkpoint_millis > MAX_ECONOMICS_CHECKPOINT_MILLIS {
+            anyhow::bail!(
+                "runtime.economics_checkpoint_millis={} exceeds hard maximum {}",
+                self.economics_checkpoint_millis,
+                MAX_ECONOMICS_CHECKPOINT_MILLIS
+            );
+        }
+        if (self.retained_output_bytes == 0 || self.retained_output_lines == 0)
+            && !self.raw_output_spill
+        {
+            anyhow::bail!(
+                "runtime.raw_output_spill must be true when retained output bytes or lines are zero"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkflowConfig {
@@ -217,6 +328,8 @@ pub struct WorkflowConfig {
     pub worker_no_output_warning_seconds: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub worker_termination_grace_seconds: u64,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     #[serde(
         default = "default_integration_repair_policy",
         skip_serializing_if = "is_default_integration_repair_policy"
@@ -234,6 +347,20 @@ pub struct WorkflowConfig {
     pub verify_profiles: BTreeMap<String, VerifyProfile>,
 }
 
+impl WorkflowConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.runtime.validate()?;
+        if self.worker_termination_grace_seconds > MAX_WORKER_TERMINATION_GRACE_SECONDS {
+            anyhow::bail!(
+                "worker_termination_grace_seconds={} exceeds hard maximum {}",
+                self.worker_termination_grace_seconds,
+                MAX_WORKER_TERMINATION_GRACE_SECONDS
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +372,7 @@ impl Default for WorkflowConfig {
             worker_question_timeout_seconds: 60,
             worker_no_output_warning_seconds: 900,
             worker_termination_grace_seconds: 30,
+            runtime: RuntimeConfig::default(),
             integration_repair: default_integration_repair_policy(),
             gate_fail_fast: true,
             worktree_setup: Vec::new(),
@@ -1539,6 +1667,14 @@ pub struct GateCommandResult {
     pub skip_reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub failure_kind: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub output_total_bytes: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub output_retained_bytes: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_spill_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_workspace: Option<VerificationWorkspaceEvidence>,
 }
@@ -1750,6 +1886,16 @@ pub struct RunEconomics {
     pub duplicate_command_count: usize,
     pub cache_hits: usize,
     pub cache_misses: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub worker_observation_event_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub worker_observation_bytes: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub worker_observation_state_write_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub supervisor_poll_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub economics_checkpoint_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_calls: Vec<AgentCallEconomics>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

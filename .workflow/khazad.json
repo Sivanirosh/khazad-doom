@@ -6,6 +6,16 @@
   "worker_question_timeout_seconds": 60,
   "worker_no_output_warning_seconds": 900,
   "worker_termination_grace_seconds": 30,
+  "runtime": {
+    "retained_output_bytes": 65536,
+    "retained_output_lines": 1000,
+    "observation_flush_bytes": 16384,
+    "observation_flush_millis": 250,
+    "poll_initial_millis": 25,
+    "poll_max_millis": 500,
+    "economics_checkpoint_millis": 500,
+    "raw_output_spill": true
+  },
   "handoff": {
     "push": false,
     "create_pr": false

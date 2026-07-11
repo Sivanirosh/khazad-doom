@@ -6,7 +6,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 pub const SUPPORTED_PI_CONTRACT_VERSION: u64 = 1;
 pub const PI_JSON_MODE_FLAGS: &[&str] = &["--mode", "json", "--no-session"];
@@ -685,55 +687,195 @@ fn provider_from_auth_failure(stderr: &str) -> Option<String> {
     (!provider.is_empty()).then(|| provider.to_string())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct PiLineSpool {
+    memory: Vec<u8>,
+    file: Option<File>,
+    path: Option<PathBuf>,
+}
+
+impl PiLineSpool {
+    const MEMORY_BYTES: usize = 64 * 1024;
+
+    fn new() -> Self {
+        Self {
+            memory: Vec::new(),
+            file: None,
+            path: None,
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.file.is_none() && self.memory.len().saturating_add(bytes.len()) > Self::MEMORY_BYTES
+        {
+            let (mut file, path) = create_pi_line_spool()?;
+            file.write_all(&self.memory)?;
+            self.memory.clear();
+            self.file = Some(file);
+            self.path = path;
+        }
+        if let Some(file) = &mut self.file {
+            file.write_all(bytes)?;
+        } else {
+            self.memory.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    fn parse_value(&mut self) -> Result<Option<Value>> {
+        if let Some(file) = &mut self.file {
+            file.seek(SeekFrom::Start(0))?;
+            Ok(serde_json::from_reader(file).ok())
+        } else {
+            Ok(serde_json::from_slice(&self.memory).ok())
+        }
+    }
+}
+
+impl Drop for PiLineSpool {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn create_pi_line_spool() -> Result<(File, Option<PathBuf>)> {
+    for _ in 0..16 {
+        let path = std::env::temp_dir().join(format!(
+            "khazad-pi-line-{}-{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    if let Err(err) = std::fs::remove_file(&path) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        return Err(err.into());
+                    }
+                    return Ok((file, None));
+                }
+                #[cfg(not(unix))]
+                return Ok((file, Some(path)));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyhow::bail!("could not allocate a private Pi line spool")
+}
+
 pub struct PiParser {
     stream_text: BTreeMap<usize, String>,
     complete_text: BTreeMap<usize, String>,
-    final_assistant: Option<Value>,
+    final_assistant_text: Option<String>,
     usage: Usage,
     raw_tail: String,
     warnings: Vec<PiContractWarning>,
     warned_unknown_event: bool,
     warned_future_version: bool,
+    retained_output_bytes: usize,
+    retained_output_lines: usize,
+}
+
+impl Default for PiParser {
+    fn default() -> Self {
+        Self::with_output_bounds(64 * 1024, 1_000)
+    }
 }
 
 impl PiParser {
+    pub fn with_output_bounds(retained_output_bytes: usize, retained_output_lines: usize) -> Self {
+        Self {
+            stream_text: BTreeMap::new(),
+            complete_text: BTreeMap::new(),
+            final_assistant_text: None,
+            usage: Usage::default(),
+            raw_tail: String::new(),
+            warnings: Vec::new(),
+            warned_unknown_event: false,
+            warned_future_version: false,
+            retained_output_bytes,
+            retained_output_lines,
+        }
+    }
     pub fn parse(
         &mut self,
         stdout: impl Read,
         events: Option<RunnerEventSink>,
         pid: Option<u32>,
     ) -> Result<()> {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let line = line?;
-            if let Some(sink) = &events {
-                sink(RunnerEvent::stdout(pid, line.clone()));
+        let mut reader = stdout;
+        let mut chunk = [0_u8; 8 * 1024];
+        let mut line = PiLineSpool::new();
+        let mut line_tail = String::new();
+        let mut line_bytes = 0_usize;
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
             }
-            self.remember_raw_line(&line);
-            if line.trim().is_empty() {
-                continue;
+            for segment in chunk[..read].split_inclusive(|byte| *byte == b'\n') {
+                let complete = segment.ends_with(b"\n");
+                let payload = segment.strip_suffix(b"\n").unwrap_or(segment);
+                line.write_all(payload)?;
+                line_bytes = line_bytes.saturating_add(payload.len());
+                append_bounded_output(
+                    &mut line_tail,
+                    &String::from_utf8_lossy(payload),
+                    self.retained_output_bytes,
+                    self.retained_output_lines,
+                );
+                if complete {
+                    self.handle_wire_line(&mut line, line_bytes, &line_tail, &events, pid)?;
+                    line = PiLineSpool::new();
+                    line_tail.clear();
+                    line_bytes = 0;
+                }
             }
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
+        }
+        if line_bytes > 0 {
+            self.handle_wire_line(&mut line, line_bytes, &line_tail, &events, pid)?;
+        }
+        Ok(())
+    }
+
+    fn handle_wire_line(
+        &mut self,
+        line: &mut PiLineSpool,
+        line_bytes: usize,
+        line_tail: &str,
+        events: &Option<RunnerEventSink>,
+        pid: Option<u32>,
+    ) -> Result<()> {
+        if let Some(sink) = events {
+            sink(RunnerEvent::stdout(pid, line_tail.to_string()));
+        }
+        self.remember_raw_line(line_tail);
+        if line_bytes == 0 {
+            return Ok(());
+        }
+        if let Some(event) = line.parse_value()? {
             self.handle(&event);
         }
         Ok(())
     }
 
     pub fn final_text(&self) -> String {
-        if let Some(msg) = &self.final_assistant
-            && let Some(content) = msg.get("content").and_then(Value::as_array)
+        if let Some(text) = &self.final_assistant_text
+            && !text.is_empty()
         {
-            let parts: Vec<_> = content
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-                .collect();
-            if !parts.is_empty() {
-                return parts.join("\n");
-            }
+            return text.clone();
         }
         if !self.complete_text.is_empty() {
             return join_indexed(&self.complete_text);
@@ -758,8 +900,19 @@ impl PiParser {
     }
 
     fn remember_raw_line(&mut self, line: &str) {
-        append_bounded(&mut self.raw_tail, line, 12_000);
-        append_bounded(&mut self.raw_tail, "\n", 12_000);
+        let max_bytes = self.retained_output_bytes.min(12_000);
+        append_bounded_output(
+            &mut self.raw_tail,
+            line,
+            max_bytes,
+            self.retained_output_lines,
+        );
+        append_bounded_output(
+            &mut self.raw_tail,
+            "\n",
+            max_bytes,
+            self.retained_output_lines,
+        );
     }
 
     fn handle(&mut self, event: &Value) {
@@ -806,7 +959,18 @@ impl PiParser {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             return;
         }
-        self.final_assistant = Some(msg.clone());
+        let text = msg
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            self.final_assistant_text = Some(text);
+        }
         if let Some(usage) = msg.get("usage") {
             self.usage = usage_from_value(usage);
         }
@@ -867,6 +1031,21 @@ fn append_bounded(target: &mut String, text: &str, max_bytes: usize) {
             remove += 1;
         }
         target.drain(..remove);
+    }
+}
+
+fn append_bounded_output(target: &mut String, text: &str, max_bytes: usize, max_lines: usize) {
+    if max_bytes == 0 || max_lines == 0 {
+        target.clear();
+        return;
+    }
+    append_bounded(target, text, max_bytes);
+    while target.lines().count() > max_lines {
+        let Some(newline) = target.find('\n') else {
+            target.clear();
+            break;
+        };
+        target.drain(..=newline);
     }
 }
 
@@ -1052,6 +1231,43 @@ mod tests {
         assert_eq!(assistant_lines[1], "[pi] assistant: xxxxxxxxxx");
         assert!(rendered.iter().all(|line| !line.contains("chunks")));
         assert!(rendered.len() < 10);
+    }
+
+    #[test]
+    fn parser_preserves_authoritative_result_larger_than_diagnostic_tail() {
+        let payload = serde_json::json!({"payload": "x".repeat(100 * 1024)}).to_string();
+        let event = serde_json::json!({
+            "type": "agent_end",
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "text", "text": payload}]
+            }]
+        });
+        let mut wire = serde_json::to_vec(&event).unwrap();
+        wire.push(b'\n');
+        let mut parser = PiParser::with_output_bounds(1_024, 32);
+        parser.parse(Cursor::new(wire), None, None).unwrap();
+
+        assert_eq!(parser.final_text(), payload);
+        assert!(parser.transcript("").stdout_tail.len() <= 1_024);
+    }
+
+    #[test]
+    fn parser_bounds_a_multi_megabyte_line_without_a_delimiter() {
+        let largest_observation = std::sync::Arc::new(std::sync::Mutex::new(0_usize));
+        let observed = largest_observation.clone();
+        let sink = std::sync::Arc::new(move |event: crate::agent::RunnerEvent| {
+            let mut largest = observed.lock().unwrap();
+            *largest = (*largest).max(event.text.len());
+        });
+        let mut parser = PiParser::with_output_bounds(1_024, 32);
+        parser
+            .parse(Cursor::new(vec![b'x'; 8 * 1024 * 1024]), Some(sink), None)
+            .unwrap();
+
+        assert!(*largest_observation.lock().unwrap() <= 1_024);
+        assert!(parser.transcript("").stdout_tail.len() <= 1_024);
+        assert!(parser.final_text().is_empty());
     }
 
     #[test]

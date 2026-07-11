@@ -26,7 +26,7 @@ use super::{
 };
 use crate::agent::{
     CancellationToken, Job, PiCommandSpec, PiWrapperLaunchError, Runner, RunnerError, RunnerEvent,
-    RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, RunnerTranscript,
+    RunnerEventKind, RunnerEventSink, RunnerLaunchFailure, RunnerMetadata, RunnerTranscript,
     collect_pi_wrapper_result, parse_pi_tui_worker_result_artifact,
     prepare_pi_tui_worker_artifacts, prepare_pi_wrapper_artifacts, runner_from_spec,
     wait_for_pi_wrapper_launch, worker_evidence_kind_for_runner, worker_evidence_label_for_runner,
@@ -360,6 +360,8 @@ struct IntegrationRepairContext<'a> {
 struct SupervisedWorkerJobOutcome {
     result: Result<crate::agent::ResultData>,
     operator_pause: Duration,
+    supervisor_poll_count: usize,
+    observation_metrics: WorkerObservationMetrics,
 }
 
 #[derive(Clone)]
@@ -391,6 +393,10 @@ struct WorkerAttemptContext {
     timeout_seconds: u64,
     no_output_warning_seconds: u64,
     termination_grace_seconds: u64,
+    observation_flush_bytes: usize,
+    observation_flush_millis: u64,
+    poll_initial_millis: u64,
+    poll_max_millis: u64,
     native_pi_tui_worker: bool,
 }
 
@@ -561,8 +567,130 @@ impl WorkerAttemptContext {
             timeout_seconds: config.worker_attempt_timeout_seconds,
             no_output_warning_seconds: config.worker_no_output_warning_seconds,
             termination_grace_seconds: config.worker_termination_grace_seconds,
+            observation_flush_bytes: config.runtime.observation_flush_bytes,
+            observation_flush_millis: config.runtime.observation_flush_millis,
+            poll_initial_millis: config.runtime.poll_initial_millis,
+            poll_max_millis: config.runtime.poll_max_millis,
             native_pi_tui_worker,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkerObservationMetrics {
+    event_count: usize,
+    event_bytes: usize,
+    state_write_count: usize,
+}
+
+struct WorkerObservationBuffer {
+    pending: Option<RunnerEvent>,
+    pending_bytes: usize,
+    last_flush: Instant,
+    metrics: WorkerObservationMetrics,
+}
+
+#[derive(Clone)]
+struct WorkerEventObserver {
+    state: StateStore,
+    context: WorkerAttemptContext,
+    buffer: Arc<Mutex<WorkerObservationBuffer>>,
+}
+
+impl WorkerEventObserver {
+    fn new(state: StateStore, context: WorkerAttemptContext) -> Self {
+        Self {
+            state,
+            context,
+            buffer: Arc::new(Mutex::new(WorkerObservationBuffer {
+                pending: None,
+                pending_bytes: 0,
+                last_flush: Instant::now(),
+                metrics: WorkerObservationMetrics::default(),
+            })),
+        }
+    }
+
+    fn sink(&self) -> RunnerEventSink {
+        let observer = self.clone();
+        Arc::new(move |event| observer.observe(event))
+    }
+
+    fn observe(&self, event: RunnerEvent) {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .expect("worker observation mutex poisoned");
+        buffer.metrics.event_count = buffer.metrics.event_count.saturating_add(1);
+        buffer.metrics.event_bytes = buffer.metrics.event_bytes.saturating_add(event.text.len());
+        let semantic = event.kind == RunnerEventKind::Stdout
+            && crate::pi_contract::semantic_progress_from_stdout_line(&event.text).is_some();
+        let ordinary_output = matches!(
+            event.kind,
+            RunnerEventKind::Stdout | RunnerEventKind::Stderr
+        ) && !semantic;
+        if ordinary_output {
+            buffer.pending_bytes = buffer.pending_bytes.saturating_add(event.text.len());
+            buffer.pending = Some(event);
+            let bytes_due = self.context.observation_flush_bytes == 0
+                || buffer.pending_bytes >= self.context.observation_flush_bytes;
+            let time_due = self.context.observation_flush_millis == 0
+                || buffer.last_flush.elapsed()
+                    >= Duration::from_millis(self.context.observation_flush_millis);
+            if bytes_due || time_due {
+                self.flush_locked(&mut buffer);
+            }
+            return;
+        }
+        self.flush_locked(&mut buffer);
+        self.persist_locked(&mut buffer, &event);
+    }
+
+    fn flush_due(&self) {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .expect("worker observation mutex poisoned");
+        if buffer.pending.is_some()
+            && (self.context.observation_flush_millis == 0
+                || buffer.last_flush.elapsed()
+                    >= Duration::from_millis(self.context.observation_flush_millis))
+        {
+            self.flush_locked(&mut buffer);
+        }
+    }
+
+    fn finish(&self) -> WorkerObservationMetrics {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .expect("worker observation mutex poisoned");
+        self.flush_locked(&mut buffer);
+        buffer.metrics
+    }
+
+    fn flush_locked(&self, buffer: &mut WorkerObservationBuffer) {
+        if let Some(event) = buffer.pending.take() {
+            self.persist_locked(buffer, &event);
+        }
+        buffer.pending_bytes = 0;
+        buffer.last_flush = Instant::now();
+    }
+
+    fn persist_locked(&self, buffer: &mut WorkerObservationBuffer, event: &RunnerEvent) {
+        let _ = self.state.observe_worker_attempt(
+            &self.context.run_id,
+            &self.context.phase,
+            &self.context.slice_id,
+            self.context.wire_attempt(),
+            self.context.launch_id,
+            event.pid,
+            event.kind.as_str(),
+            &event.text,
+            self.context.timeout_seconds,
+            self.context.no_output_warning_seconds,
+        );
+        buffer.metrics.state_write_count = buffer.metrics.state_write_count.saturating_add(1);
     }
 }
 
@@ -1210,25 +1338,6 @@ impl Manager {
         }
     }
 
-    fn worker_event_sink(&self, context: &WorkerAttemptContext) -> RunnerEventSink {
-        let state = self.state.clone();
-        let context = context.clone();
-        Arc::new(move |event: RunnerEvent| {
-            let _ = state.observe_worker_attempt(
-                &context.run_id,
-                &context.phase,
-                &context.slice_id,
-                context.wire_attempt(),
-                context.launch_id,
-                event.pid,
-                event.kind.as_str(),
-                &event.text,
-                context.timeout_seconds,
-                context.no_output_warning_seconds,
-            );
-        })
-    }
-
     fn run_supervised_worker_job(
         &self,
         runner: Arc<dyn Runner>,
@@ -1256,7 +1365,8 @@ impl Manager {
         ) -> Result<crate::agent::ResultData>,
     {
         job.termination_grace_seconds = context.termination_grace_seconds;
-        let events = Some(self.worker_event_sink(&context));
+        let observer = WorkerEventObserver::new(self.state.clone(), context.clone());
+        let events = Some(observer.sink());
         let attempt_cancel = CancellationToken::new();
         let timed_out = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -1270,10 +1380,22 @@ impl Manager {
         let supervisor_context = context.clone();
         let operator_pause = Arc::new(Mutex::new(Duration::ZERO));
         let supervisor_operator_pause = operator_pause.clone();
+        let supervisor_observer = observer.clone();
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let supervisor_poll_count = poll_count.clone();
         let supervisor = thread::spawn(move || {
             let mut active_elapsed = Duration::ZERO;
             let mut last_tick = Instant::now();
+            let mut last_paused = false;
+            let initial_poll = Duration::from_millis(supervisor_context.poll_initial_millis);
+            let max_poll = Duration::from_millis(supervisor_context.poll_max_millis);
+            let mut poll_delay = initial_poll;
             loop {
+                if done_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                supervisor_poll_count.fetch_add(1, Ordering::SeqCst);
+                supervisor_observer.flush_due();
                 let now = Instant::now();
                 let delta = now.saturating_duration_since(last_tick);
                 last_tick = now;
@@ -1292,9 +1414,6 @@ impl Manager {
                 } else {
                     active_elapsed += delta;
                 }
-                if done_flag.load(Ordering::SeqCst) {
-                    return;
-                }
                 if parent_cancel.is_cancelled() {
                     timeout_cancel.cancel();
                     return;
@@ -1304,7 +1423,13 @@ impl Manager {
                     timeout_cancel.cancel();
                     return;
                 }
-                thread::park_timeout(Duration::from_millis(100));
+                poll_delay = if paused != last_paused {
+                    initial_poll
+                } else {
+                    poll_delay.saturating_mul(2).min(max_poll)
+                };
+                last_paused = paused;
+                thread::park_timeout(poll_delay);
             }
         });
         let supervisor_thread = supervisor.thread().clone();
@@ -1313,6 +1438,7 @@ impl Manager {
         done.store(true, Ordering::SeqCst);
         supervisor_thread.unpark();
         let _ = supervisor.join();
+        let observation_metrics = observer.finish();
         if timed_out.load(Ordering::SeqCst) {
             let message = format!(
                 "worker attempt {} exceeded worker_attempt_timeout_seconds={}",
@@ -1341,6 +1467,8 @@ impl Manager {
         SupervisedWorkerJobOutcome {
             result,
             operator_pause,
+            supervisor_poll_count: poll_count.load(Ordering::SeqCst),
+            observation_metrics,
         }
     }
 
@@ -1359,6 +1487,12 @@ impl Manager {
         let started_at = Instant::now();
         let outcome = self.run_supervised_worker_job(runner, job, cancel, context.clone());
         let operator_pause = outcome.operator_pause;
+        economics.record_runtime_observation(
+            outcome.observation_metrics.event_count,
+            outcome.observation_metrics.event_bytes,
+            outcome.observation_metrics.state_write_count,
+            outcome.supervisor_poll_count,
+        );
         match outcome.result {
             Ok(data) => {
                 let duration = started_at.elapsed().saturating_sub(operator_pause);
@@ -1445,6 +1579,12 @@ impl Manager {
             },
         );
         let operator_pause = outcome.operator_pause;
+        economics.record_runtime_observation(
+            outcome.observation_metrics.event_count,
+            outcome.observation_metrics.event_bytes,
+            outcome.observation_metrics.state_write_count,
+            outcome.supervisor_poll_count,
+        );
         match outcome.result {
             Ok(data) => {
                 let duration = started_at.elapsed().saturating_sub(operator_pause);
@@ -3422,7 +3562,10 @@ impl Manager {
             MAX_WORKER_ATTEMPTS,
             DEFAULT_REPAIR_ATTEMPTS,
         )
-        .with_snapshot_path(store.output_path(&run.id, "economics.json"));
+        .with_snapshot_path_and_interval(
+            store.output_path(&run.id, "economics.json"),
+            Duration::from_millis(config.runtime.economics_checkpoint_millis),
+        );
         let _economics_status = EconomicsStatusSnapshotGuard::new(
             self.state.clone(),
             run.id.clone(),
@@ -3648,6 +3791,11 @@ impl Manager {
             economics.clone(),
             verification_cache.clone(),
         )
+        .runtime_output(
+            config.runtime.clone(),
+            store.output_path(&run.id, "command-output"),
+            config.worker_termination_grace_seconds,
+        )
         .run_integration_gate(
             IntegrationGateRequest {
                 slices: &gate_slices,
@@ -3714,6 +3862,11 @@ impl Manager {
                 self.progress_reporter(&run.id),
                 economics.clone(),
                 verification_cache.clone(),
+            )
+            .runtime_output(
+                config.runtime.clone(),
+                store.output_path(&run.id, "command-output"),
+                config.worker_termination_grace_seconds,
             )
             .run_integration_gate(
                 IntegrationGateRequest {
@@ -3962,6 +4115,11 @@ impl Manager {
             self.progress_reporter(&run.id),
             economics,
             verification_cache,
+        )
+        .runtime_output(
+            config.runtime.clone(),
+            artifact::Store::new(&run.repo_path).output_path(&run.id, "command-output"),
+            config.worker_termination_grace_seconds,
         )
         .run_worktree_setup(
             WorktreeSetupRequest {
@@ -5000,6 +5158,7 @@ impl Manager {
                     config,
                     economics: economics.clone(),
                     verification_cache: verification_cache.clone(),
+                    output_dir: store.output_path(&run.id, "command-output"),
                 },
                 cancel,
             ) {
@@ -5290,6 +5449,11 @@ impl Manager {
             self.progress_reporter(ctx.run_id),
             ctx.economics.clone(),
             ctx.verification_cache.clone(),
+        )
+        .runtime_output(
+            ctx.config.runtime.clone(),
+            ctx.output_dir.clone(),
+            ctx.config.worker_termination_grace_seconds,
         )
         .verify_slice_commands(
             SliceVerificationRequest {
@@ -5916,6 +6080,12 @@ impl Manager {
                     request.worker_token,
                 ),
                 termination_grace_seconds: request.config.worker_termination_grace_seconds,
+                runtime: request.config.runtime.clone(),
+                raw_output_stem: request
+                    .config
+                    .runtime
+                    .raw_output_spill
+                    .then(|| request.output_path.with_extension("raw")),
             },
             request.cancel,
             WorkerAttemptContext::new(
@@ -6190,6 +6360,12 @@ impl Manager {
                         &launch.token,
                     ),
                     termination_grace_seconds: request.config.worker_termination_grace_seconds,
+                    runtime: request.config.runtime.clone(),
+                    raw_output_stem: request
+                        .config
+                        .runtime
+                        .raw_output_spill
+                        .then(|| launch.output_path.with_extension("raw")),
                 },
                 request.cancel,
                 WorkerAttemptContext::new(
@@ -6358,6 +6534,7 @@ impl Manager {
                     config: request.config,
                     economics: request.economics.clone(),
                     verification_cache: request.verification_cache.clone(),
+                    output_dir: store.output_path(&request.run.id, "command-output"),
                 },
                 request.cancel,
             )?;
@@ -6538,6 +6715,11 @@ impl Manager {
                         &launch.token,
                     ),
                     termination_grace_seconds: config.worker_termination_grace_seconds,
+                    runtime: config.runtime.clone(),
+                    raw_output_stem: config
+                        .runtime
+                        .raw_output_spill
+                        .then(|| launch.output_path.with_extension("raw")),
                 },
                 cancel,
                 WorkerAttemptContext::new(
@@ -6821,6 +7003,11 @@ impl Manager {
                         &launch.token,
                     ),
                     termination_grace_seconds: config.worker_termination_grace_seconds,
+                    runtime: config.runtime.clone(),
+                    raw_output_stem: config
+                        .runtime
+                        .raw_output_spill
+                        .then(|| launch.output_path.with_extension("raw")),
                 },
                 cancel,
                 WorkerAttemptContext::new(
@@ -7774,6 +7961,7 @@ struct LightweightCheckContext<'a> {
     config: &'a WorkflowConfig,
     economics: RunEconomicsRecorder,
     verification_cache: VerificationCommandCache,
+    output_dir: PathBuf,
 }
 
 fn remember_attempt_failure(
@@ -9508,17 +9696,20 @@ impl Error for BlockedError {}
 mod tests {
     use super::{
         AgentCallContext, DEFAULT_REPAIR_ATTEMPTS, DEFAULT_WORKER_ENVELOPE_RETRY_ATTEMPTS,
-        INTEGRATION_REPAIR_SCOPE_ID, IntegrationMergeFaultStage, IntegrationMergeRequest,
-        IntegrationMode, IntegrationRepairContext, MAX_WORKER_ATTEMPTS, Manager, RepairPolicy,
-        ResumeOptions, RunEconomicsRecorder, RunLaunchFaultStage, RunReadModelBuilder,
-        RunReadModelOptions, StartOptions, VerificationCommandCache, WorkerAttemptContext,
-        check_failure_needs_operator, existing_completion_publication,
+        EconomicsStatusSnapshotGuard, INTEGRATION_REPAIR_SCOPE_ID, IntegrationMergeFaultStage,
+        IntegrationMergeRequest, IntegrationMode, IntegrationRepairContext, MAX_WORKER_ATTEMPTS,
+        Manager, RepairPolicy, ResumeOptions, RunEconomicsRecorder, RunLaunchFaultStage,
+        RunReadModelBuilder, RunReadModelOptions, StartOptions, VerificationCommandCache,
+        WorkerAttemptContext, check_failure_needs_operator, existing_completion_publication,
         inject_integration_merge_fault, inject_run_launch_fault, queue_snapshot_hash,
         repair_authority_violations, selected_slice_ids, should_run_integration_repair,
         validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
         validate_worker_result, worker_attempt_retry_disposition,
     };
-    use crate::agent::{CancellationToken, Job, ResultData, Runner, RunnerEventSink, Usage};
+    use crate::agent::{
+        CancellationToken, Job, PiRunner, ResultData, Runner, RunnerEvent, RunnerEventSink,
+        RunnerMetadata, Usage,
+    };
     use crate::artifact::{self, Store as ArtifactStore};
     use crate::domain::{
         AcceptanceEvidence, AutonomyLevel, CheckResult, CockpitMode, Finding, FindingDisposition,
@@ -9526,8 +9717,8 @@ mod tests {
         GateResult, Handoff, ImplementationSummary, IntegrationMergeCompletion,
         IntegrationMergeKind, IntegrationMergeState, MissionEnvelope, OriginNotificationTarget,
         RepairResult, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource,
-        ReplanProposalState, ReplanProposedChange, Run, RunEconomics, RunStatus, Slice,
-        SliceProvenance, SliceRun, SliceStatus, TerminalNotificationRecord, VerifyCommand,
+        ReplanProposalState, ReplanProposedChange, Run, RunEconomics, RunStatus, RuntimeConfig,
+        Slice, SliceProvenance, SliceRun, SliceStatus, TerminalNotificationRecord, VerifyCommand,
         VerifyProfile, WorkerQuestionAnswerSource, WorkerQuestionRecommendation, WorkerResult,
         WorkflowConfig,
     };
@@ -9538,7 +9729,7 @@ mod tests {
         inject_integration_merge_transaction_fault,
     };
     use crate::workflow::events as workflow_events;
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
     use chrono::Utc;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -9902,6 +10093,8 @@ mod tests {
             json_schema: String::new(),
             env: BTreeMap::new(),
             termination_grace_seconds: 0,
+            runtime: Default::default(),
+            raw_output_stem: None,
         };
 
         let economics = RunEconomicsRecorder::new("test", true, 1, 0);
@@ -9956,6 +10149,352 @@ mod tests {
         assert_eq!(legacy.cockpit_launch_identity(), 3);
     }
 
+    fn sqlite_row_count(path: &Path) -> Result<u64> {
+        let connection = rusqlite::Connection::open(path)?;
+        let mut statement = connection.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        names.into_iter().try_fold(0_u64, |total, name| {
+            let quoted = name.replace('"', "\"\"");
+            let count =
+                connection.query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), [], |row| {
+                    row.get::<_, u64>(0)
+                })?;
+            Ok(total.saturating_add(count))
+        })
+    }
+
+    #[test]
+    fn soak_runtime_matrix() -> Result<()> {
+        let Ok(worker_count) = std::env::var("KHAZAD_SOAK_WORKERS") else {
+            return Ok(());
+        };
+        let worker_count = worker_count.parse::<usize>()?;
+        assert!([1, 3, 10].contains(&worker_count));
+        let baseline = std::env::var("KHAZAD_SOAK_PROFILE").as_deref() == Ok("baseline");
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-runtime-soak", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let runtime = if baseline {
+            RuntimeConfig {
+                observation_flush_bytes: 1,
+                observation_flush_millis: 0,
+                poll_initial_millis: 100,
+                poll_max_millis: 100,
+                raw_output_spill: false,
+                ..RuntimeConfig::default()
+            }
+        } else {
+            RuntimeConfig {
+                observation_flush_bytes: 16 * 1024,
+                observation_flush_millis: 250,
+                poll_initial_millis: 10,
+                poll_max_millis: 100,
+                ..RuntimeConfig::default()
+            }
+        };
+        let config = WorkflowConfig {
+            worker_attempt_timeout_seconds: 0,
+            runtime,
+            ..WorkflowConfig::default()
+        };
+        let pi_script = home.path().join("deterministic-soak-pi");
+        fs::write(
+            &pi_script,
+            "#!/bin/sh\nline=$(head -c 1024 /dev/zero | tr '\\0' x)\ni=0\nwhile [ $i -lt 1024 ]; do printf '%s\\n' \"$line\" >&2; i=$((i + 1)); done\nsleep 0.1\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&pi_script)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&pi_script, permissions)?;
+        }
+        let output_dir = home.path().join("soak-output");
+        let started = Instant::now();
+        let mut workers = Vec::new();
+        for index in 0..worker_count {
+            let manager = Manager::new(paths.clone(), state.clone());
+            let repo_path = repo.path().to_path_buf();
+            let run_id = run.id.clone();
+            let config = config.clone();
+            let runner = Arc::new(PiRunner {
+                bin: pi_script.to_string_lossy().to_string(),
+                extra_args: Vec::new(),
+                metadata: RunnerMetadata::default(),
+            });
+            let raw_output_stem = output_dir.join(format!("worker-{index}.raw"));
+            workers.push(thread::spawn(move || {
+                let slice_id = format!("soak-{index}");
+                let context = WorkerAttemptContext::new(
+                    &run_id,
+                    "runtime_soak",
+                    &slice_id,
+                    1,
+                    None,
+                    None,
+                    &config,
+                    false,
+                );
+                let job = Job {
+                    kind: "runtime-soak".to_string(),
+                    prompt: String::new(),
+                    cwd: repo_path,
+                    json_schema: String::new(),
+                    env: BTreeMap::new(),
+                    termination_grace_seconds: 0,
+                    runtime: config.runtime,
+                    raw_output_stem: (!baseline).then_some(raw_output_stem),
+                };
+                manager.run_supervised_worker_job(runner, job, &CancellationToken::new(), context)
+            }));
+        }
+        let mut polls = 0usize;
+        let mut state_writes = 0usize;
+        let mut output_bytes = 0usize;
+        for worker in workers {
+            let outcome = worker.join().expect("runtime soak worker panicked");
+            outcome.result?;
+            polls = polls.saturating_add(outcome.supervisor_poll_count);
+            state_writes =
+                state_writes.saturating_add(outcome.observation_metrics.state_write_count);
+            output_bytes = output_bytes.saturating_add(outcome.observation_metrics.event_bytes);
+        }
+        let sqlite_bytes = [
+            paths.db_file(),
+            paths.db_file().with_extension("sqlite-wal"),
+        ]
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+        let sqlite_rows = sqlite_row_count(&paths.db_file())?;
+        let artifact_bytes = fs::read_dir(&output_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        let peak_rss_kib = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmHWM:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+            })
+            .unwrap_or(0);
+        println!(
+            "KHAZAD_SOAK_RESULT={}",
+            json!({
+                "profile": if baseline { "baseline" } else { "final" },
+                "workers": worker_count,
+                "wall_time_ms": started.elapsed().as_millis(),
+                "peak_rss_kib": peak_rss_kib,
+                "sqlite_bytes": sqlite_bytes,
+                "sqlite_rows": sqlite_rows,
+                "artifact_bytes": artifact_bytes,
+                "output_bytes": output_bytes,
+                "poll_count": polls,
+                "state_write_count": state_writes,
+                "command_count": 0,
+                "agent_calls": worker_count,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_final_economics_and_status_source_agree() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-runtime-economics-status", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let economics = RunEconomicsRecorder::new("auto", true, 2, 1);
+        let guard =
+            EconomicsStatusSnapshotGuard::new(state.clone(), run.id.clone(), economics.clone())?;
+        economics.record_runtime_observation(1_002, 100_000, 8, 4);
+        drop(guard);
+
+        let snapshot = state
+            .status_snapshot(&run.id, 10)?
+            .expect("status snapshot");
+        let source = snapshot
+            .status_sources
+            .iter()
+            .find(|source| source.source == "economics")
+            .expect("economics status source");
+        let projected: RunEconomics = serde_json::from_value(source.payload.clone())?;
+        let final_economics = economics.snapshot();
+        assert_eq!(
+            serde_json::to_value(projected)?,
+            serde_json::to_value(final_economics)?,
+            "terminal status must capture the complete final economics snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_worker_observation_coalesces_high_volume_activity_writes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-worker-output-coalesce", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let manager = Manager::new(paths, state);
+        let config = WorkflowConfig {
+            worker_attempt_timeout_seconds: 0,
+            runtime: RuntimeConfig {
+                observation_flush_bytes: 16 * 1024,
+                observation_flush_millis: 5_000,
+                ..RuntimeConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let context = WorkerAttemptContext::new(
+            &run.id,
+            "worker",
+            "slice-001",
+            1,
+            None,
+            None,
+            &config,
+            false,
+        );
+        let outcome = manager.run_supervised_worker_job_with(
+            Job {
+                kind: "worker".to_string(),
+                prompt: String::new(),
+                cwd: repo.path().to_path_buf(),
+                json_schema: String::new(),
+                env: BTreeMap::new(),
+                termination_grace_seconds: 0,
+                runtime: config.runtime.clone(),
+                raw_output_stem: None,
+            },
+            &CancellationToken::new(),
+            context,
+            move |_job, _cancel, events| {
+                let events = events.expect("worker observation sink");
+                events(RunnerEvent::started(Some(42)));
+                for _ in 0..1_000 {
+                    events(RunnerEvent::stderr(Some(42), "x".repeat(100)));
+                }
+                events(RunnerEvent::finished(Some(42), Some(0)));
+                Ok(ResultData {
+                    output: None,
+                    usage: Usage::default(),
+                    contract_warnings: Vec::new(),
+                })
+            },
+        );
+
+        outcome.result?;
+        assert_eq!(outcome.observation_metrics.event_count, 1_002);
+        assert_eq!(outcome.observation_metrics.event_bytes, 100_000);
+        assert!(
+            outcome.observation_metrics.state_write_count <= 10,
+            "ordinary activity should be byte-coalesced: {:?}",
+            outcome.observation_metrics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_quiet_worker_polling_preserves_cancellation_latency() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        init_git_repo(repo.path())?;
+        let home = tempfile::tempdir()?;
+        let paths = Paths {
+            root: home.path().to_path_buf(),
+        };
+        paths.ensure()?;
+        let state = StateStore::open(paths.db_file())?;
+        let run = test_run("run-worker-adaptive-poll", repo.path(), "slice-001")?;
+        state.insert_run(&run)?;
+        let manager = Manager::new(paths, state);
+        let config = WorkflowConfig {
+            worker_attempt_timeout_seconds: 0,
+            runtime: RuntimeConfig {
+                poll_initial_millis: 10,
+                poll_max_millis: 100,
+                ..RuntimeConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let context = WorkerAttemptContext::new(
+            &run.id,
+            "worker",
+            "slice-001",
+            1,
+            None,
+            None,
+            &config,
+            false,
+        );
+        let parent_cancel = CancellationToken::new();
+        let trigger = parent_cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let outcome = manager.run_supervised_worker_job_with(
+            Job {
+                kind: "worker".to_string(),
+                prompt: String::new(),
+                cwd: repo.path().to_path_buf(),
+                json_schema: String::new(),
+                env: BTreeMap::new(),
+                termination_grace_seconds: 0,
+                runtime: config.runtime,
+                raw_output_stem: None,
+            },
+            &parent_cancel,
+            context,
+            move |_job, cancel, _events| {
+                while !cancel.is_cancelled() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(anyhow!("cancelled"))
+            },
+        );
+        assert!(outcome.result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(350));
+        assert!(
+            outcome.supervisor_poll_count <= 6,
+            "adaptive polling should back off for a quiet worker: {} polls",
+            outcome.supervisor_poll_count
+        );
+        Ok(())
+    }
+
     #[test]
     fn supervised_worker_uses_configured_process_termination_grace() -> Result<()> {
         let repo = tempfile::tempdir()?;
@@ -9993,6 +10532,8 @@ mod tests {
                 json_schema: String::new(),
                 env: BTreeMap::new(),
                 termination_grace_seconds: 0,
+                runtime: Default::default(),
+                raw_output_stem: None,
             },
             &CancellationToken::new(),
             context,
@@ -10085,6 +10626,8 @@ mod tests {
                 json_schema: String::new(),
                 env: BTreeMap::new(),
                 termination_grace_seconds: 0,
+                runtime: Default::default(),
+                raw_output_stem: None,
             },
             &CancellationToken::new(),
             context,
@@ -15180,6 +15723,10 @@ mod tests {
                 cache_hit: false,
                 skip_reason: String::new(),
                 failure_kind,
+                output_total_bytes: 0,
+                output_retained_bytes: 0,
+                output_truncated: false,
+                output_spill_paths: Vec::new(),
                 verification_workspace: None,
             }],
             findings: Vec::new(),
@@ -16050,6 +16597,7 @@ mod tests {
                 worker_question_timeout_seconds: 1800,
                 worker_no_output_warning_seconds: 900,
                 worker_termination_grace_seconds: 30,
+                runtime: Default::default(),
                 integration_repair: "auto".to_string(),
                 gate_fail_fast: true,
                 worktree_setup: Vec::new(),

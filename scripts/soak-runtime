@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-}"
+if [[ "$mode" != "--quick" ]]; then
+  echo "usage: scripts/soak-runtime --quick [--output PATH]" >&2
+  exit 2
+fi
+shift
+output="target/ca07-runtime-soak-quick.json"
+if [[ "${1:-}" == "--output" ]]; then
+  [[ $# -eq 2 ]] || { echo "--output requires one path" >&2; exit 2; }
+  output="$2"
+  shift 2
+fi
+[[ $# -eq 0 ]] || { echo "unexpected arguments: $*" >&2; exit 2; }
+
+mkdir -p "$(dirname "$output")"
+rows="$(mktemp)"
+trap 'rm -f "$rows"' EXIT
+
+for profile in baseline final; do
+  for workers in 1 3 10; do
+    log="$(mktemp)"
+    if ! KHAZAD_SOAK_PROFILE="$profile" KHAZAD_SOAK_WORKERS="$workers" \
+        cargo test soak_runtime_matrix --quiet -- --nocapture --test-threads=1 \
+        >"$log" 2>&1; then
+      cat "$log" >&2
+      rm -f "$log"
+      exit 1
+    fi
+    result="$(grep '^KHAZAD_SOAK_RESULT=' "$log" | tail -1 | cut -d= -f2-)"
+    if [[ -z "$result" ]]; then
+      cat "$log" >&2
+      rm -f "$log"
+      echo "runtime soak did not emit $profile metrics for worker count $workers" >&2
+      exit 1
+    fi
+    printf '%s\n' "$result" >>"$rows"
+    rm -f "$log"
+  done
+done
+
+python3 - "$rows" "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+rows_path, output_path = map(pathlib.Path, sys.argv[1:])
+measurements = [json.loads(line) for line in rows_path.read_text().splitlines() if line]
+baseline = [row for row in measurements if row["profile"] == "baseline"]
+final = [row for row in measurements if row["profile"] == "final"]
+payload = {
+    "schema_version": 2,
+    "profile": "quick",
+    "baseline_policy": "CA-06 fixed-poll/per-observation/no-spill",
+    "same_worker_path": True,
+    "baseline_workloads": baseline,
+    "final_workloads": final,
+    "bounds": {
+        "retained_output_bytes_per_stream": 65536,
+        "retained_output_lines_per_stream": 1000,
+        "observation_flush_bytes": 16384,
+        "observation_flush_millis": 250,
+        "poll_initial_millis": 10,
+        "poll_max_millis": 100,
+    },
+}
+output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+print(json.dumps(payload, indent=2, sort_keys=True))
+print(f"runtime soak evidence: {output_path}")
+PY
