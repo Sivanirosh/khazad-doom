@@ -2,7 +2,9 @@
   "id": "CA-04",
   "title": "Transactional operator decisions",
   "goal": "Replace race-prone check-then-write question and replan transitions with typed compare-and-set StateStore commands that mutate state and append the matching event atomically.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-04",
+  "closed_at": "2026-07-11T08:43:15.762892461Z",
   "depends_on": [
     "CA-03"
   ],
