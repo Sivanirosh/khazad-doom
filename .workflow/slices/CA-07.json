@@ -2,7 +2,9 @@
   "id": "CA-07",
   "title": "Bounded long-session runtime",
   "goal": "Measure and bound worker output, telemetry, polling, economics persistence, and child-process supervision so 1/3/10-worker sessions have explicit resource behavior without premature infrastructure expansion.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-07",
+  "closed_at": "2026-07-11T15:23:27.052451620Z",
   "depends_on": [
     "CA-06"
   ],
