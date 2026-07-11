@@ -1,20 +1,21 @@
+use super::events::RunErrorPayload;
 use super::projection::project_run;
-use crate::artifact;
+use crate::artifact::CompletionPublicationReceipt;
 use crate::domain::{
     Event, FrontierAuthorizerRecord, FrontierBudgetConsumption, FrontierBudgetState,
     FrontierFogRecord, FrontierGeneratedSliceEdge, FrontierOperatorStop, FrontierProposalOutcome,
     FrontierSummary, FrontierTierReasonRecord, GeneratedSliceRecord, ImplementationSummary,
     MissionEnvelope, PlanRevisionDecisionSummary, PlanRevisionRecord, PlanRevisions,
     ReplanProposal, ReplanProposalState, ReplanStatus, Run, RunDetails, RunEconomics, RunIncident,
-    RunProgress, RunStatus, Slice, SliceProvenance, SliceRun, SliceStatus, TerminalReason,
-    WorkerAttemptLedger, WorkerProfileEvidence, WorkerQuestion, frontier_classification_annotation,
+    RunProgress, RunStatus, SliceRun, SliceStatus, StatusFeed, StatusSnapshotMetadata,
+    StatusSourceMetadata, StatusTerminalizationProjection, TerminalReason, WorkerAttemptLedger,
+    WorkerProfileEvidence, WorkerQuestion, frontier_classification_annotation,
     frontier_classification_would_auto_promote, replan_decision_commands,
 };
-use crate::gitutil;
-use crate::state::Store as StateStore;
-use anyhow::Result;
-use chrono::Utc;
+use crate::state::{RunStateSnapshot, Store as StateStore};
+use anyhow::{Context, Result};
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_STATUS_EVENTS_LIMIT: usize = 50;
 const TERMINAL_SUMMARY_EVENTS_LIMIT: usize = 500;
@@ -70,6 +71,10 @@ struct TerminalStatusOverride {
 pub(crate) struct RunReadModel {
     pub(crate) details: RunDetails,
     pub(crate) plan_revisions: PlanRevisions,
+    pub(crate) final_report: Option<ImplementationSummary>,
+    pub(crate) run_summary: Option<serde_json::Value>,
+    pub(crate) completion_publication: Option<CompletionPublicationReceipt>,
+    pub(crate) semantic_events: Vec<Event>,
 }
 
 pub(crate) struct RunReadModelBuilder<'a> {
@@ -81,32 +86,80 @@ impl<'a> RunReadModelBuilder<'a> {
         Self { state }
     }
 
-    pub(crate) fn snapshot(&self, run: &Run, options: RunReadModelOptions) -> Result<RunReadModel> {
-        let run = apply_terminal_override(run, &options);
-        let run_id = run.id.clone();
-        let slice_runs = self.state.get_slice_runs(&run_id)?;
-        let worker_attempts = worker_attempt_history(self.state, &run, &slice_runs)?;
-        let mut progress = self.state.get_progress(&run_id)?;
-        let events = self.state.get_events(&run_id, options.events_limit())?;
-        if let Some(progress) = progress.as_mut() {
-            annotate_parallel_progress(progress, &slice_runs, &events);
-        }
-        let economics = read_run_economics(&run).ok();
-        let worker_profile = read_worker_profile(&run, economics.as_ref()).unwrap_or_default();
-        let incident_events = self.state.get_incident_events(&run_id)?;
-        let incidents = run_incidents_from_events(&incident_events);
-        let questions = self
+    pub(crate) fn snapshot(
+        &self,
+        run_id: &str,
+        options: RunReadModelOptions,
+    ) -> Result<RunReadModel> {
+        let snapshot = self
             .state
-            .list_worker_questions(&run_id)
+            .status_snapshot(run_id, options.events_limit())?
+            .with_context(|| format!("run {run_id:?} not found"))?;
+        self.build(snapshot, options)
+    }
+
+    pub(crate) fn latest_snapshot(
+        &self,
+        repo_path: &str,
+        active_only: bool,
+        options: RunReadModelOptions,
+    ) -> Result<Option<RunReadModel>> {
+        self.state
+            .latest_status_snapshot(repo_path, active_only, options.events_limit())?
+            .map(|snapshot| self.build(snapshot, options))
+            .transpose()
+    }
+
+    fn build(
+        &self,
+        snapshot: RunStateSnapshot,
+        options: RunReadModelOptions,
+    ) -> Result<RunReadModel> {
+        let run = apply_terminal_override(
+            &snapshot.run,
+            snapshot.terminal_transition.as_ref(),
+            &options,
+        )?;
+        let run_id = run.id.clone();
+        let economics = indexed_economics(&snapshot)?;
+        let final_report = indexed_final_report(&snapshot)?;
+        let run_summary = indexed_run_summary(&snapshot)?;
+        let completion_publication = completion_publication(&snapshot.events)?;
+        let worker_profile = read_worker_profile(&snapshot, economics.as_ref()).unwrap_or_default();
+        let incidents = run_incidents_from_events(&snapshot.events);
+        let semantic_events = snapshot.events.clone();
+        let metadata = StatusSnapshotMetadata {
+            revision: snapshot.revision.clone(),
+            sources: status_source_metadata(&snapshot),
+        };
+        let terminalization = snapshot
+            .terminal_transition
+            .as_ref()
+            .map(|transition| StatusTerminalizationProjection {
+                state: if transition.committed {
+                    "committed".to_string()
+                } else {
+                    "intended".to_string()
+                },
+                target_status: transition.status.as_str().to_string(),
+                summary_written: transition.summary_written,
+                committed: transition.committed,
+            })
             .unwrap_or_default();
-        let proposals = self.state.list_replan_proposals(&run_id)?;
-        let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run_id)?;
-        let generated_slices = generated_slices_from_proposals(&run, &proposals, &slice_runs);
+        let slice_runs = snapshot.slice_runs;
+        let worker_attempts = worker_attempt_history(snapshot.worker_attempts, &run, &slice_runs);
+        let mut progress = snapshot.progress;
+        if let Some(progress) = progress.as_mut() {
+            annotate_parallel_progress(progress, &slice_runs, &snapshot.events);
+        }
+        let questions = snapshot.questions;
+        let proposals = snapshot.replan_proposals;
+        let generated_slices = generated_slices_from_proposals(&proposals, &slice_runs);
         let replan = replan_status_from_proposals(&run_id, proposals.clone());
         let plan_revisions = plan_revisions_from_proposals(
             &run,
-            mission_envelope.as_ref(),
-            frontier_budget.as_ref(),
+            snapshot.mission_envelope.as_ref(),
+            snapshot.frontier_budget.as_ref(),
             proposals,
             &generated_slices,
         )?;
@@ -114,12 +167,16 @@ impl<'a> RunReadModelBuilder<'a> {
             &run,
             &slice_runs,
             progress.as_ref(),
-            &events,
-            &incident_events,
+            &snapshot.events,
+            &snapshot.events,
             &questions,
             options.include_run_summary_evidence(),
         );
         let mut details = RunDetails {
+            snapshot: metadata,
+            launch_intents: snapshot.launch_intents,
+            integration_merge_intents: snapshot.merge_intents,
+            terminalization,
             worker_profile,
             slice_runs,
             worker_attempts,
@@ -128,43 +185,52 @@ impl<'a> RunReadModelBuilder<'a> {
             incidents,
             questions,
             replan,
-            mission_envelope,
-            frontier_budget,
+            mission_envelope: snapshot.mission_envelope,
+            frontier_budget: snapshot.frontier_budget,
             frontier: plan_revisions.frontier.clone(),
-            events,
+            events: snapshot.event_tail,
             economics,
             primary_terminal_reason,
             feed: None,
             run,
         };
-        details.feed = Some(project_run(&details));
+        // Projection receives complete semantic history; only the independently
+        // bounded `details.events` tail crosses the wire.
+        let mut projection_details = details.clone();
+        projection_details.events = semantic_events.clone();
+        details.feed = Some(project_run(&projection_details));
         Ok(RunReadModel {
             details,
             plan_revisions,
+            final_report,
+            run_summary,
+            completion_publication,
+            semantic_events,
         })
     }
 
-    pub(crate) fn plan_revisions_for_run(&self, run: &Run) -> Result<PlanRevisions> {
-        let proposals = self.state.list_replan_proposals(&run.id)?;
-        let slice_runs = self.state.get_slice_runs(&run.id)?;
-        let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
-        let generated_slices = generated_slices_from_proposals(run, &proposals, &slice_runs);
+    pub(crate) fn plan_revisions_for_run(&self, run_id: &str) -> Result<PlanRevisions> {
+        let snapshot = self
+            .state
+            .status_snapshot(run_id, DEFAULT_STATUS_EVENTS_LIMIT)?
+            .with_context(|| format!("run {run_id:?} not found"))?;
+        let generated_slices =
+            generated_slices_from_proposals(&snapshot.replan_proposals, &snapshot.slice_runs);
         plan_revisions_from_proposals(
-            run,
-            mission_envelope.as_ref(),
-            frontier_budget.as_ref(),
-            proposals,
+            &snapshot.run,
+            snapshot.mission_envelope.as_ref(),
+            snapshot.frontier_budget.as_ref(),
+            snapshot.replan_proposals,
             &generated_slices,
         )
     }
 }
 
 fn worker_attempt_history(
-    state: &StateStore,
+    mut attempts: Vec<WorkerAttemptLedger>,
     run: &Run,
     slice_runs: &[SliceRun],
-) -> Result<Vec<WorkerAttemptLedger>> {
-    let mut attempts = state.list_worker_attempt_ledger_for_run(&run.id)?;
+) -> Vec<WorkerAttemptLedger> {
     for slice_run in slice_runs {
         for ordinal in 1..=slice_run.attempts {
             let has_durable_worker_launch = attempts.iter().any(|attempt| {
@@ -215,24 +281,90 @@ fn worker_attempt_history(
             .then_with(|| left.slice_id.cmp(&right.slice_id))
             .then_with(|| left.launch_ordinal.cmp(&right.launch_ordinal))
     });
-    Ok(attempts)
+    attempts
 }
 
-fn apply_terminal_override(run: &Run, options: &RunReadModelOptions) -> Run {
+fn apply_terminal_override(
+    run: &Run,
+    transition: Option<&crate::state::TerminalTransition>,
+    options: &RunReadModelOptions,
+) -> Result<Run> {
     let mut run = run.clone();
     if let Some(terminal) = &options.terminal_override {
+        let run_matches = run.status == terminal.status && run.error == terminal.error;
+        let transition_matches = transition.is_some_and(|transition| {
+            transition.status == terminal.status && transition.error == terminal.error
+        });
+        if !run_matches && !transition_matches {
+            anyhow::bail!(
+                "terminal projection context {} {:?} does not match snapshot revision for run {:?}",
+                terminal.status,
+                terminal.error,
+                run.id
+            );
+        }
         run.status = terminal.status;
         run.error = terminal.error.clone();
-        run.updated_at = Utc::now();
     }
-    run
+    Ok(run)
 }
 
 fn generated_slices_from_proposals(
-    run: &Run,
     proposals: &[ReplanProposal],
     slice_runs: &[SliceRun],
 ) -> Vec<GeneratedSliceRecord> {
+    let generated_ids = proposals
+        .iter()
+        .filter_map(|proposal| {
+            let decision = proposal.operator_decision.as_ref()?;
+            (!decision.generated_slice_id.trim().is_empty())
+                .then(|| decision.generated_slice_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut generations = proposals
+        .iter()
+        .filter_map(|proposal| {
+            let decision = proposal.operator_decision.as_ref()?;
+            (!decision.generated_slice_id.trim().is_empty()
+                && decision.generated_slice_generation > 0)
+                .then(|| {
+                    (
+                        decision.generated_slice_id.clone(),
+                        decision.generated_slice_generation,
+                    )
+                })
+        })
+        .collect::<HashMap<_, _>>();
+
+    // Older decision_json rows predate durable generation. Recover their value
+    // only from persisted proposal lineage, never from live slice files.
+    loop {
+        let mut changed = false;
+        for proposal in proposals {
+            let Some(decision) = proposal.operator_decision.as_ref() else {
+                continue;
+            };
+            if decision.generated_slice_id.trim().is_empty()
+                || generations.contains_key(&decision.generated_slice_id)
+            {
+                continue;
+            }
+            let parent = proposal.source.slice_id.as_str();
+            let generation = if generated_ids.contains(parent) {
+                generations.get(parent).map(|generation| generation + 1)
+            } else {
+                Some(1)
+            };
+            if let Some(generation) = generation {
+                generations.insert(decision.generated_slice_id.clone(), generation);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let mut records = Vec::new();
     for proposal in proposals {
         let Some(decision) = proposal.operator_decision.as_ref() else {
@@ -241,33 +373,17 @@ fn generated_slices_from_proposals(
         if decision.generated_slice_id.trim().is_empty() {
             continue;
         }
-        let provenance = slice_provenance_for_generated_slice(run, &decision.generated_slice_id);
         let slice_run = slice_runs
             .iter()
             .find(|slice_run| slice_run.slice_id == decision.generated_slice_id);
         records.push(GeneratedSliceRecord {
             slice_id: decision.generated_slice_id.clone(),
-            parent_slice_id: provenance
-                .as_ref()
-                .map(|provenance| provenance.parent_slice_id.clone())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| proposal.source.slice_id.clone()),
-            origin_proposal_id: provenance
-                .as_ref()
-                .map(|provenance| provenance.origin_proposal_id.clone())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| proposal.id.clone()),
-            generation: provenance
-                .as_ref()
-                .map(|provenance| provenance.generation)
-                .unwrap_or_else(|| {
-                    proposal
-                        .proposed_changes
-                        .iter()
-                        .find_map(|change| change.followup_slice_draft())
-                        .and_then(|draft| (!draft.id.trim().is_empty()).then_some(1))
-                        .unwrap_or(0)
-                }),
+            parent_slice_id: proposal.source.slice_id.clone(),
+            origin_proposal_id: proposal.id.clone(),
+            generation: generations
+                .get(&decision.generated_slice_id)
+                .copied()
+                .unwrap_or(decision.generated_slice_generation),
             status: slice_run
                 .map(|slice_run| slice_run.status.as_str().to_string())
                 .unwrap_or_else(|| decision.apply_status.clone()),
@@ -282,24 +398,6 @@ fn generated_slices_from_proposals(
         });
     }
     records
-}
-
-fn slice_provenance_for_generated_slice(run: &Run, slice_id: &str) -> Option<SliceProvenance> {
-    let store = artifact::Store::new(&run.repo_path);
-    if let Ok(slice) = artifact::read_json::<Slice>(store.slice_path(slice_id))
-        && let Some(provenance) = slice.provenance()
-    {
-        return Some(provenance);
-    }
-    let branch = run.integration_branch.trim();
-    if branch.is_empty() {
-        return None;
-    }
-    let spec = format!("{branch}:.workflow/slices/{slice_id}.json");
-    gitutil::run(&run.repo_path, &["show", &spec])
-        .ok()
-        .and_then(|text| serde_json::from_str::<Slice>(&text).ok())
-        .and_then(|slice| slice.provenance())
 }
 
 pub(crate) fn replan_status_from_proposals(
@@ -521,9 +619,17 @@ fn terminal_reason_from_event(
         .get("retryable")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or_else(|| default_retryable(run.status));
+    let decoded_run_error =
+        (event.typ == "run_error").then(|| RunErrorPayload::from_value(payload));
     let summary = payload_string(payload, "message")
         .or_else(|| payload_string(payload, "error"))
         .or_else(|| payload_string(payload, "summary"))
+        .or_else(|| {
+            decoded_run_error
+                .as_ref()
+                .map(|payload| payload.error.clone())
+                .filter(|error| !error.trim().is_empty())
+        })
         .unwrap_or_else(|| fallback_run_error(run));
     let resolution_owner = payload_string(payload, "resolution_owner").unwrap_or_else(|| {
         if operator_action_required {
@@ -633,14 +739,10 @@ fn default_disposition(status: RunStatus) -> String {
     .to_string()
 }
 
-fn default_evidence_links(run: &Run, include_run_summary_evidence: bool) -> Vec<String> {
-    let store = artifact::Store::new(&run.repo_path);
-    let summary_path = store.output_path(&run.id, "run-summary.json");
-    if include_run_summary_evidence || summary_path.exists() {
-        vec![summary_path.to_string_lossy().to_string()]
-    } else {
-        Vec::new()
-    }
+fn default_evidence_links(_run: &Run, _include_run_summary_evidence: bool) -> Vec<String> {
+    // Artifact paths are not evidence until their contents are pinned into the
+    // same SQLite revision. Source freshness is exposed in snapshot metadata.
+    Vec::new()
 }
 
 fn terminal_inspection_commands(run: &Run) -> Vec<String> {
@@ -747,53 +849,207 @@ fn payload_text(payload: &serde_json::Value, field: &str, fallback: &str) -> Str
         .to_string()
 }
 
-fn read_run_economics(run: &Run) -> Result<RunEconomics> {
-    let store = artifact::Store::new(&run.repo_path);
-    let live_path = store.output_path(&run.id, "economics.json");
-    if live_path.exists()
-        && let Ok(economics) = artifact::read_json(live_path)
-    {
-        return Ok(economics);
+const EXTERNAL_STATUS_SOURCES: &[&str] = &[
+    "economics",
+    "slice_definitions",
+    "git_integration_head",
+    "final_report",
+    "preflight",
+    "run_summary",
+];
+
+fn status_source_metadata(snapshot: &RunStateSnapshot) -> Vec<StatusSourceMetadata> {
+    let mut sources = vec![StatusSourceMetadata {
+        source: "sqlite".to_string(),
+        state: "fresh".to_string(),
+        indexed_event_id: Some(snapshot.revision.max_event_id),
+        content_sha256: String::new(),
+        observed_at: snapshot.revision.captured_at,
+        detail: "authoritative run state read from one SQLite transaction".to_string(),
+    }];
+    for source in EXTERNAL_STATUS_SOURCES {
+        if let Some(indexed) = snapshot
+            .status_sources
+            .iter()
+            .find(|indexed| indexed.source == *source)
+        {
+            let state = if indexed.indexed_event_id == snapshot.revision.max_event_id {
+                "fresh"
+            } else {
+                "stale"
+            };
+            sources.push(StatusSourceMetadata {
+                source: (*source).to_string(),
+                state: state.to_string(),
+                indexed_event_id: Some(indexed.indexed_event_id),
+                content_sha256: indexed.content_sha256.clone(),
+                observed_at: Some(indexed.observed_at),
+                detail: if state == "fresh" {
+                    "payload is pinned inside this SQLite snapshot".to_string()
+                } else {
+                    "payload event frontier does not match this SQLite snapshot".to_string()
+                },
+            });
+        } else {
+            sources.push(StatusSourceMetadata {
+                source: (*source).to_string(),
+                state: "unavailable".to_string(),
+                indexed_event_id: None,
+                content_sha256: String::new(),
+                observed_at: None,
+                detail: "source is not indexed in this SQLite snapshot; live reads are forbidden"
+                    .to_string(),
+            });
+        }
     }
-    let summary: ImplementationSummary =
-        artifact::read_json(store.output_path(&run.id, "final-report.json"))?;
-    Ok(summary.economics)
+    for indexed in &snapshot.status_sources {
+        if EXTERNAL_STATUS_SOURCES
+            .iter()
+            .any(|source| *source == indexed.source)
+        {
+            continue;
+        }
+        sources.push(StatusSourceMetadata {
+            source: indexed.source.clone(),
+            state: if indexed.indexed_event_id == snapshot.revision.max_event_id {
+                "fresh".to_string()
+            } else {
+                "stale".to_string()
+            },
+            indexed_event_id: Some(indexed.indexed_event_id),
+            content_sha256: indexed.content_sha256.clone(),
+            observed_at: Some(indexed.observed_at),
+            detail: "unknown additive source retained for tolerant clients".to_string(),
+        });
+    }
+    sources
+}
+
+fn indexed_economics(snapshot: &RunStateSnapshot) -> Result<Option<RunEconomics>> {
+    let Some(source) = snapshot
+        .status_sources
+        .iter()
+        .find(|source| source.source == "economics")
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(source.payload.clone())
+        .context("decode required indexed economics status source")
+        .map(Some)
+}
+
+fn indexed_final_report(snapshot: &RunStateSnapshot) -> Result<Option<ImplementationSummary>> {
+    let Some(source) = snapshot
+        .status_sources
+        .iter()
+        .find(|source| source.source == "final_report")
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(source.payload.clone())
+        .context("decode required indexed final-report status source")
+        .map(Some)
+}
+
+fn indexed_run_summary(snapshot: &RunStateSnapshot) -> Result<Option<serde_json::Value>> {
+    let Some(source) = snapshot
+        .status_sources
+        .iter()
+        .find(|source| source.source == "run_summary")
+    else {
+        return Ok(None);
+    };
+    let payload = source
+        .payload
+        .as_object()
+        .context("decode required indexed run-summary object")?;
+    let required_string = |field: &str| -> Result<&str> {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("decode required indexed run-summary field {field:?}"))
+    };
+    let run_id = required_string("run_id")?;
+    if run_id != snapshot.run.id {
+        anyhow::bail!(
+            "indexed run-summary belongs to run {run_id:?}, not snapshot run {:?}",
+            snapshot.run.id
+        );
+    }
+    for field in [
+        "repo_path",
+        "status",
+        "integration_branch",
+        "selected_slice_id",
+        "message",
+        "primary_failure",
+        "cancel_reason",
+    ] {
+        required_string(field)?;
+    }
+    let feed = payload
+        .get("feed")
+        .context("decode required indexed run-summary field \"feed\"")?;
+    serde_json::from_value::<StatusFeed>(feed.clone())
+        .context("decode required indexed run-summary feed")?;
+    let commands = payload
+        .get("next_commands")
+        .and_then(serde_json::Value::as_array)
+        .context("decode required indexed run-summary field \"next_commands\"")?;
+    if commands.iter().any(|command| !command.is_string()) {
+        anyhow::bail!("decode required indexed run-summary next_commands as strings");
+    }
+    Ok(Some(source.payload.clone()))
+}
+
+fn completion_publication(events: &[Event]) -> Result<Option<CompletionPublicationReceipt>> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.typ == "completion_publication_committed")
+        .map(|event| {
+            serde_json::from_value(event.payload.clone())
+                .context("decode durable completion publication receipt from status snapshot")
+        })
+        .transpose()
 }
 
 fn read_worker_profile(
-    run: &Run,
+    snapshot: &RunStateSnapshot,
     economics: Option<&RunEconomics>,
 ) -> Option<WorkerProfileEvidence> {
-    let store = artifact::Store::new(&run.repo_path);
-    if let Ok(summary) = artifact::read_json::<ImplementationSummary>(
-        store.output_path(&run.id, "final-report.json"),
-    ) && !summary.worker_profile.is_empty()
-    {
-        return Some(summary.worker_profile);
-    }
-    if let Ok(value) =
-        artifact::read_json::<serde_json::Value>(store.output_path(&run.id, "preflight.json"))
-        && let Some(profile) = WorkerProfileEvidence::from_json_surface(&value)
-    {
-        return Some(profile);
-    }
-    economics.and_then(|economics| {
-        economics.agent_calls.iter().find_map(|call| {
-            let value = json!({
-                "agent": call.runner,
-                "agent_profile": call.agent_profile,
-                "agent_provider": call.agent_provider,
-                "agent_model": call.agent_model,
-                "agent_reasoning": call.agent_reasoning,
-                "agent_mode": call.agent_mode,
-                "profile_summary": call.profile_summary,
-                "launch_summary": call.launch_summary,
-                "worker_evidence_kind": call.worker_evidence_kind(),
-                "worker_evidence_label": call.worker_evidence_label(),
-            });
-            WorkerProfileEvidence::from_json_surface(&value)
+    snapshot
+        .status_sources
+        .iter()
+        .filter(|source| source.indexed_event_id == snapshot.revision.max_event_id)
+        .rev()
+        .find_map(|source| WorkerProfileEvidence::from_json_surface(&source.payload))
+        .or_else(|| {
+            snapshot
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| WorkerProfileEvidence::from_json_surface(&event.payload))
         })
-    })
+        .or_else(|| {
+            economics.and_then(|economics| {
+                economics.agent_calls.iter().find_map(|call| {
+                    let value = json!({
+                        "agent": call.runner,
+                        "agent_profile": call.agent_profile,
+                        "agent_provider": call.agent_provider,
+                        "agent_model": call.agent_model,
+                        "agent_reasoning": call.agent_reasoning,
+                        "agent_mode": call.agent_mode,
+                        "profile_summary": call.profile_summary,
+                        "launch_summary": call.launch_summary,
+                        "worker_evidence_kind": call.worker_evidence_kind(),
+                        "worker_evidence_label": call.worker_evidence_label(),
+                    });
+                    WorkerProfileEvidence::from_json_surface(&value)
+                })
+            })
+        })
 }
 
 fn annotate_parallel_progress(
@@ -1503,6 +1759,7 @@ fn plan_revision_decision_summary(
         apply_status: decision.apply_status,
         apply_reason: decision.apply_reason,
         generated_slice_id: decision.generated_slice_id,
+        generated_slice_generation: decision.generated_slice_generation,
         generated_slice_commit: decision.generated_slice_commit,
         apply_before_checkpoint_id: decision.apply_before_checkpoint_id,
         apply_after_checkpoint_id: decision.apply_after_checkpoint_id,
@@ -1668,7 +1925,7 @@ mod worker_attempt_history_tests {
             .unwrap();
 
         let model = RunReadModelBuilder::new(&state)
-            .snapshot(&run, RunReadModelOptions::status(10))
+            .snapshot(&run.id, RunReadModelOptions::status(10))
             .unwrap();
         assert_eq!(model.details.worker_attempts.len(), 2);
         let first = &model.details.worker_attempts[0];
@@ -1683,11 +1940,93 @@ mod worker_attempt_history_tests {
         assert_eq!(latest.branch, "legacy-branch");
         assert_eq!(latest.created_at, run.started_at);
         let repeated = RunReadModelBuilder::new(&state)
-            .snapshot(&run, RunReadModelOptions::status(10))
+            .snapshot(&run.id, RunReadModelOptions::status(10))
             .unwrap();
         assert_eq!(
             repeated.details.worker_attempts,
             model.details.worker_attempts
+        );
+    }
+
+    #[test]
+    fn legacy_generated_slice_decisions_recover_recursive_generation_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let state = StateStore::open(&database).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-legacy-generation".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: "root".to_string(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        for (proposal_id, parent_slice) in [("proposal-1", "root"), ("proposal-2", "child-1")] {
+            state
+                .create_replan_proposal(
+                    &run.id,
+                    proposal_id,
+                    crate::domain::ReplanProposalSource {
+                        kind: "worker".to_string(),
+                        slice_id: parent_slice.to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    vec![crate::domain::ReplanProposedChange {
+                        kind: "followup_slice".to_string(),
+                        target: String::new(),
+                        summary: "legacy generated slice".to_string(),
+                    }],
+                    "low",
+                )
+                .unwrap();
+        }
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        for (proposal_id, generated_slice_id) in
+            [("proposal-1", "child-1"), ("proposal-2", "child-2")]
+        {
+            let decision = json!({
+                "decision": "accepted",
+                "rationale": "legacy decision",
+                "authorizer": "operator",
+                "source": "test",
+                "decided_at": now,
+                "applied": true,
+                "applied_at": now,
+                "apply_status": "applied",
+                "apply_reason": "legacy apply",
+                "generated_slice_id": generated_slice_id,
+                "generated_slice_commit": "commit"
+            });
+            conn.execute(
+                "UPDATE replan_proposals SET state='accepted', decision_json=?1 WHERE run_id=?2 AND id=?3",
+                rusqlite::params![decision.to_string(), &run.id, proposal_id],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        drop(state);
+
+        let reopened = StateStore::open(&database).unwrap();
+        let model = RunReadModelBuilder::new(&reopened)
+            .snapshot(&run.id, RunReadModelOptions::status(10))
+            .unwrap();
+        assert_eq!(
+            model
+                .details
+                .generated_slices
+                .iter()
+                .map(|slice| (slice.slice_id.as_str(), slice.generation))
+                .collect::<Vec<_>>(),
+            vec![("child-1", 1), ("child-2", 2)]
         );
     }
 
@@ -1741,10 +2080,10 @@ mod worker_attempt_history_tests {
             .unwrap();
 
         let first = RunReadModelBuilder::new(&state)
-            .snapshot(&run, RunReadModelOptions::status(10))
+            .snapshot(&run.id, RunReadModelOptions::status(10))
             .unwrap();
         let repeated = RunReadModelBuilder::new(&state)
-            .snapshot(&run, RunReadModelOptions::status(10))
+            .snapshot(&run.id, RunReadModelOptions::status(10))
             .unwrap();
 
         assert_eq!(
@@ -1820,7 +2159,7 @@ mod worker_attempt_history_tests {
         }
 
         let model = RunReadModelBuilder::new(&state)
-            .snapshot(&run, RunReadModelOptions::status(10))
+            .snapshot(&run.id, RunReadModelOptions::status(10))
             .unwrap();
         assert_eq!(
             model
@@ -1838,5 +2177,325 @@ mod worker_attempt_history_tests {
                 .iter()
                 .all(|row| row.kind == "slice-worker")
         );
+    }
+
+    #[test]
+    fn indexed_source_metadata_is_fresh_only_at_its_exact_event_frontier() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-source-frontier".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .record_event(&run.id, "economics_ready", &json!({"generation": 1}))
+            .unwrap();
+        let economics = RunEconomics {
+            repair_policy: "on-failure".to_string(),
+            ..RunEconomics::default()
+        };
+        state
+            .record_status_source_snapshot(&run.id, "economics", || &economics)
+            .unwrap();
+
+        let fresh = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(10))
+            .unwrap();
+        let source = fresh
+            .details
+            .snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == "economics")
+            .unwrap();
+        assert_eq!(source.state, "fresh");
+        assert!(!source.content_sha256.is_empty());
+        assert!(fresh.details.economics.is_some());
+
+        state
+            .record_event(&run.id, "newer_state", &json!({"generation": 2}))
+            .unwrap();
+        let stale = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(10))
+            .unwrap();
+        let source = stale
+            .details
+            .snapshot
+            .sources
+            .iter()
+            .find(|source| source.source == "economics")
+            .unwrap();
+        assert_eq!(source.state, "stale");
+        assert_eq!(
+            stale.details.economics.as_ref().unwrap().repair_policy,
+            "on-failure"
+        );
+    }
+
+    #[test]
+    fn malformed_fresh_economics_source_is_an_explicit_read_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-bad-economics".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .record_status_source_snapshot(&run.id, "economics", || json!({"repair_policy": 7}))
+            .unwrap();
+
+        let error = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(10))
+            .expect_err("malformed required economics must fail");
+        assert!(
+            format!("{error:#}").contains("decode required indexed economics status source"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_indexed_run_summary_is_an_explicit_read_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-bad-summary".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Completed,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .record_status_source_snapshot(
+                &run.id,
+                "run_summary",
+                || json!({"run_id": run.id, "status": "completed"}),
+            )
+            .unwrap();
+
+        let error = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(10))
+            .expect_err("malformed required run summary must fail");
+        assert!(
+            format!("{error:#}").contains("decode required indexed run-summary field"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn complete_history_drives_terminal_reason_while_response_tail_stays_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-history-tail".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Failed,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .record_event(
+                &run.id,
+                "run_error",
+                &json!({"error": "old decisive failure"}),
+            )
+            .unwrap();
+        for index in 0..4 {
+            state
+                .record_event(&run.id, "noise", &json!({"index": index}))
+                .unwrap();
+        }
+
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(1))
+            .unwrap();
+        assert_eq!(model.details.events.len(), 1);
+        assert_eq!(model.details.events[0].typ, "noise");
+        assert_eq!(
+            model
+                .details
+                .primary_terminal_reason
+                .as_ref()
+                .unwrap()
+                .summary,
+            "old decisive failure"
+        );
+    }
+
+    #[test]
+    fn feed_semantics_use_complete_history_while_wire_events_remain_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-complete-feed-history".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        state
+            .record_event(
+                &run.id,
+                "implementation_summary",
+                &json!({
+                    "verify_profile": "full",
+                    "integration_gate": {
+                        "status": "passed",
+                        "summary": "integration gate passed",
+                        "commands": [],
+                        "findings": []
+                    }
+                }),
+            )
+            .unwrap();
+        for index in 0..12 {
+            state
+                .record_event(&run.id, "later_event", &json!({"index": index}))
+                .unwrap();
+        }
+
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(2))
+            .unwrap();
+        assert_eq!(model.details.events.len(), 2);
+        assert!(
+            model
+                .details
+                .events
+                .iter()
+                .all(|event| event.typ != "implementation_summary")
+        );
+        assert_eq!(model.details.feed.as_ref().unwrap().gate.state, "passed");
+    }
+
+    #[test]
+    fn terminal_override_must_match_the_snapshot_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-override-mismatch".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+
+        let error = RunReadModelBuilder::new(&state)
+            .snapshot(
+                &run.id,
+                RunReadModelOptions::terminal_summary(RunStatus::Failed, "not committed"),
+            )
+            .expect_err("unrelated terminal override must fail");
+        assert!(
+            format!("{error:#}").contains("does not match snapshot revision"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn unindexed_corrupt_artifacts_and_git_movement_are_explicitly_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateStore::open(directory.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let run = Run {
+            id: "run-live-sources-forbidden".to_string(),
+            repo_id: "repo".to_string(),
+            repo_path: directory.path().to_string_lossy().to_string(),
+            status: RunStatus::Running,
+            base_branch: "main".to_string(),
+            base_sha: "base".to_string(),
+            integration_branch: "integration".to_string(),
+            selected_slice_id: String::new(),
+            error: String::new(),
+            started_at: now,
+            updated_at: now,
+        };
+        state.insert_run(&run).unwrap();
+        let output = directory
+            .path()
+            .join(".workflow/runs")
+            .join(&run.id)
+            .join("economics.json");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(&output, "{not-json").unwrap();
+        let git_head = directory.path().join(".git/HEAD");
+        std::fs::create_dir_all(git_head.parent().unwrap()).unwrap();
+        std::fs::write(&git_head, "ref: refs/heads/before\n").unwrap();
+        std::fs::write(&git_head, "ref: refs/heads/after\n").unwrap();
+
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&run.id, RunReadModelOptions::status(10))
+            .unwrap();
+        assert!(model.details.economics.is_none());
+        for name in [
+            "economics",
+            "slice_definitions",
+            "git_integration_head",
+            "final_report",
+            "preflight",
+            "run_summary",
+        ] {
+            let source = model
+                .details
+                .snapshot
+                .sources
+                .iter()
+                .find(|source| source.source == name)
+                .unwrap();
+            assert_eq!(source.state, "unavailable", "{name}");
+        }
     }
 }

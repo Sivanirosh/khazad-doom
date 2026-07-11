@@ -1,11 +1,4 @@
-Khazad-Doom gate/repair activity painter (read-only)
-Run ● running • kd-test
-  - Source: daemon status feed / shell progress; gate results and artifacts remain authoritative
-Integration Gate (running • elapsed 3m05s)
-  - command: cargo test gate --quiet
-  - state: running
-  - message: running integration gate command
-  - updated 5s ago
-Tail (last 2 compact lines)
-  - gate line 1
-  - gate line 2
+daemon-projected gate activity
+Checks running
+  - command cargo test gate --quiet
+  - tail gate line 1 | gate line 2

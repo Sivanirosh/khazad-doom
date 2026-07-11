@@ -3059,6 +3059,8 @@ fn concurrent_daemon_admission_rpcs_have_one_durable_winner_black_box() -> TestR
     git(repo.path(), &["commit", "-m", "add admission race slice"])?;
     kd_ok(&bin, home.path(), &["daemon", "start"])?;
 
+    // Raw RPCs bypass the CLI test helper that forces direct cockpit mode. Carry
+    // the same transport argument so this test cannot open real Herdr panes.
     let start_params = || {
         json!({
             "repo_path": path(repo.path()),
@@ -3067,7 +3069,7 @@ fn concurrent_daemon_admission_rpcs_have_one_durable_winner_black_box() -> TestR
             "all": false,
             "agent": "pi",
             "pi_bin": path(&fake_pi),
-            "pi_args": [],
+            "pi_args": ["__khazad_cockpit_mode=direct"],
             "native_pi_tui_worker": false,
             "parallelism": 1,
             "allow_dirty": true,
@@ -3161,7 +3163,7 @@ fn concurrent_daemon_admission_rpcs_have_one_durable_winner_black_box() -> TestR
             "run_id": original_run_id,
             "agent": "pi",
             "pi_bin": path(&fake_pi),
-            "pi_args": [],
+            "pi_args": ["__khazad_cockpit_mode=direct"],
             "native_pi_tui_worker": false,
             "parallelism": 1
         })
@@ -3703,8 +3705,10 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
     )?;
     let watched = String::from_utf8(watched.stdout)?;
     assert!(watched.contains(&format!("Run: {run_id}")));
-    assert!(watched.contains("Status: completed"));
-    assert!(watched.contains("Phase: completed"));
+    assert!(watched.contains("completed"), "{watched}");
+    assert!(watched.contains("Run ✓ completed"), "{watched}");
+    assert!(!watched.contains("Status:"));
+    assert!(!watched.contains("Phase:"));
 
     guard.stop();
     Ok(())

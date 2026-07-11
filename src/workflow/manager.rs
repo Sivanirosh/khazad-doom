@@ -81,6 +81,31 @@ static WORKTREE_ADD_LOCK: Mutex<()> = Mutex::new(());
 const WORKTREE_REMOVE_ATTEMPTS: usize = 3;
 const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+struct EconomicsStatusSnapshotGuard {
+    state: StateStore,
+    run_id: String,
+    economics: RunEconomicsRecorder,
+}
+
+impl EconomicsStatusSnapshotGuard {
+    fn new(state: StateStore, run_id: String, economics: RunEconomicsRecorder) -> Result<Self> {
+        state.record_status_source_snapshot(&run_id, "economics", || economics.snapshot())?;
+        Ok(Self {
+            state,
+            run_id,
+            economics,
+        })
+    }
+}
+
+impl Drop for EconomicsStatusSnapshotGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .state
+            .record_status_source_snapshot(&self.run_id, "economics", || self.economics.snapshot());
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalizationFaultStage {
@@ -970,11 +995,11 @@ impl Manager {
     }
 
     fn run_read_model(&self, run: &Run, options: RunReadModelOptions) -> Result<RunReadModel> {
-        RunReadModelBuilder::new(&self.state).snapshot(run, options)
+        RunReadModelBuilder::new(&self.state).snapshot(&run.id, options)
     }
 
     fn plan_revisions_for_run(&self, run: &Run) -> Result<PlanRevisions> {
-        RunReadModelBuilder::new(&self.state).plan_revisions_for_run(run)
+        RunReadModelBuilder::new(&self.state).plan_revisions_for_run(&run.id)
     }
 
     fn slice_areas_with_accepted_revision_grants(
@@ -2721,14 +2746,19 @@ impl Manager {
         create_pr: bool,
         dry_run: bool,
     ) -> Result<BranchHandoff> {
-        let run = self
-            .state
-            .get_run(run_id)?
-            .ok_or_else(|| anyhow!("run {run_id:?} not found"))?;
-        if run.status != RunStatus::Completed {
+        let read_model = RunReadModelBuilder::new(&self.state)
+            .snapshot(run_id, RunReadModelOptions::status(500))?;
+        let run = read_model.details.run.clone();
+        let lifecycle = read_model
+            .details
+            .feed
+            .as_ref()
+            .map(|feed| &feed.lifecycle)
+            .context("handoff requires the daemon status projection")?;
+        if !lifecycle.successful {
             bail!(
                 "run {run_id:?} is {}; handoff requires completed",
-                run.status
+                lifecycle.state
             );
         }
         let store = artifact::Store::new(&run.repo_path);
@@ -2745,58 +2775,44 @@ impl Manager {
         let diagnostics = handoff_diagnostics(&run.repo_path);
         let summary_path = store.output_path(&run.id, "implementation-summary.json");
         let final_report_path = store.output_path(&run.id, "final-report.json");
-        let summary = artifact::read_json::<ImplementationSummary>(&summary_path).ok();
-        let read_model = self.run_read_model(&run, RunReadModelOptions::status(500))?;
-        let completed_slices: Vec<String> = summary
-            .as_ref()
-            .map(|summary| {
-                summary
-                    .completed_slices
-                    .iter()
-                    .map(|slice| slice.slice_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let publication_events = self.state.get_events(&run.id, 100_000)?;
-        let receipt_event = publication_events
+        let summary = read_model.final_report.as_ref().ok_or_else(|| {
+            BlockedError::new(
+                "handoff is unavailable; final-report evidence is not indexed in the status snapshot"
+                    .to_string(),
+            )
+        })?;
+        let completed_slices = summary
+            .completed_slices
             .iter()
-            .rev()
-            .find(|event| event.typ == "completion_publication_committed")
-            .ok_or_else(|| {
-                BlockedError::new(
-                    "handoff is not ready; completed run has no durable completion publication receipt"
-                        .to_string(),
-                )
-            })?;
-        let receipt: artifact::CompletionPublicationReceipt =
-            serde_json::from_value(receipt_event.payload.clone())
-                .context("decode durable completion publication receipt for handoff")?;
-        if summary
-            .as_ref()
-            .is_none_or(|summary| summary.final_sha != receipt.commit_sha)
-        {
+            .map(|slice| slice.slice_id.clone())
+            .collect::<Vec<_>>();
+        let receipt = read_model.completion_publication.as_ref().ok_or_else(|| {
+            BlockedError::new(
+                "handoff is not ready; status snapshot has no durable completion publication receipt"
+                    .to_string(),
+            )
+        })?;
+        if summary.final_sha != receipt.commit_sha {
             return Err(BlockedError::new(format!(
                 "handoff summary final SHA does not match durable completion publication receipt {}; operator reconciliation is required",
                 receipt.commit_sha
             ))
             .into());
         }
-        store.validate_completion_publication_receipt_at_ref(&run.integration_branch, &receipt)?;
-        let final_sha = receipt.commit_sha;
-        let exit_states = summary
-            .as_ref()
-            .map(|summary| summary.exit_states.clone())
-            .filter(|exit_states| !exit_states.run.trim().is_empty())
-            .unwrap_or_else(|| historical_handoff_exit_states(run.status, &completed_slices));
-        let evidence_attestation = summary
-            .as_ref()
-            .map(|summary| summary.evidence_attestation.clone())
-            .filter(|attestation| !attestation.status.trim().is_empty())
-            .unwrap_or_else(historical_evidence_attestation);
-        let worker_profile = summary
-            .as_ref()
-            .map(|summary| summary.worker_profile.clone())
-            .filter(|profile| !profile.is_empty())
+        store.validate_completion_publication_receipt_at_ref(&run.integration_branch, receipt)?;
+        let final_sha = receipt.commit_sha.clone();
+        let exit_states = if !summary.exit_states.run.trim().is_empty() {
+            summary.exit_states.clone()
+        } else {
+            historical_handoff_exit_states(run.status, &completed_slices)
+        };
+        let evidence_attestation = if !summary.evidence_attestation.status.trim().is_empty() {
+            summary.evidence_attestation.clone()
+        } else {
+            historical_evidence_attestation()
+        };
+        let worker_profile = (!summary.worker_profile.is_empty())
+            .then(|| summary.worker_profile.clone())
             .or_else(|| {
                 (!read_model.details.worker_profile.is_empty())
                     .then(|| read_model.details.worker_profile.clone())
@@ -2987,19 +3003,38 @@ impl Manager {
             RunReadModelOptions::terminal_summary(status, message.to_string()),
         )?;
         let details = read_model.details;
-        let events = details.events.clone();
+        let snapshot_run = details.run.clone();
         let slice_runs = details.slice_runs.clone();
         let progress = details.progress.clone();
-        let cancel_reason = latest_cancel_reason(&events);
-        let primary_failure = primary_failure_for_terminal_summary(message, &slice_runs, &events);
+        let terminal_reason = details.primary_terminal_reason.clone();
+        let primary_failure = terminal_reason
+            .as_ref()
+            .map(|reason| reason.summary.clone())
+            .unwrap_or_default();
+        let cancel_reason = terminal_reason
+            .as_ref()
+            .filter(|_| snapshot_run.status == RunStatus::Cancelled)
+            .map(|reason| reason.summary.clone())
+            .unwrap_or_default();
+        let next_commands = details
+            .feed
+            .as_ref()
+            .map(|feed| {
+                feed.actions
+                    .iter()
+                    .map(|action| action.command.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let summary = json!({
-            "run_id": run.id,
-            "repo_path": run.repo_path,
-            "status": status,
-            "base_branch": run.base_branch,
-            "base_sha": run.base_sha,
-            "integration_branch": run.integration_branch,
-            "selected_slice_id": run.selected_slice_id,
+            "run_id": snapshot_run.id,
+            "repo_path": snapshot_run.repo_path,
+            "status": snapshot_run.status,
+            "base_branch": snapshot_run.base_branch,
+            "base_sha": snapshot_run.base_sha,
+            "integration_branch": snapshot_run.integration_branch,
+            "selected_slice_id": snapshot_run.selected_slice_id,
+            "snapshot": details.snapshot,
             "worker_profile": details.worker_profile,
             "message": message,
             "primary_failure": primary_failure,
@@ -3012,15 +3047,18 @@ impl Manager {
             "mission_envelope": details.mission_envelope,
             "frontier_budget": details.frontier_budget,
             "economics": details.economics,
-            "primary_terminal_reason": details.primary_terminal_reason,
+            "primary_terminal_reason": terminal_reason,
             "feed": details.feed,
             "plan_revisions": read_model.plan_revisions,
-            "worktree_snapshots": self.run_worktree_snapshots(run),
-            "next_commands": terminal_next_commands(run, status),
+            "worktree_snapshots": [],
+            "worktree_snapshot_state": "unavailable",
+            "next_commands": next_commands,
             "created_at": Utc::now(),
         });
         let summary_path = store.output_path(&run.id, "run-summary.json");
         artifact::write_json(&summary_path, &summary)?;
+        self.state
+            .record_status_source_snapshot(&run.id, "run_summary", || &summary)?;
         Ok((summary, summary_path))
     }
 
@@ -3029,8 +3067,6 @@ impl Manager {
         run: &Run,
         status: RunStatus,
         message: &str,
-        summary: &serde_json::Value,
-        summary_path: &Path,
     ) -> Result<()> {
         #[cfg(test)]
         if take_terminalization_fault(TerminalizationFaultStage::Notification) {
@@ -3040,19 +3076,36 @@ impl Manager {
             run,
             RunReadModelOptions::terminal_summary(status, message.to_string()),
         )?;
-        let details = read_model.details;
+        let summary = read_model
+            .run_summary
+            .as_ref()
+            .context("terminal notification requires indexed run-summary evidence")?;
+        let details = &read_model.details;
+        let snapshot_run = &details.run;
+        let summary_status = summary
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .context("indexed run-summary status is required for terminal notification")?;
+        if summary_status != snapshot_run.status.as_str() {
+            bail!(
+                "indexed run-summary status {summary_status:?} does not match terminal snapshot status {:?}",
+                snapshot_run.status
+            );
+        }
+        let summary_path = artifact::Store::new(&snapshot_run.repo_path)
+            .output_path(&snapshot_run.id, "run-summary.json");
         let attention = OperatorAttention::new(self.state.clone());
         attention.worker_pane_terminal_rename(WorkerPaneTerminalRename {
-            run,
-            events: &details.events,
+            run: snapshot_run,
+            events: &read_model.semantic_events,
             slice_runs: &details.slice_runs,
         });
         attention.terminal_transition_notification(TerminalTransitionNotification {
-            run,
-            status,
+            run: snapshot_run,
+            status: snapshot_run.status,
             progress: details.progress.as_ref(),
             summary,
-            summary_path,
+            summary_path: &summary_path,
         });
         Ok(())
     }
@@ -3064,14 +3117,13 @@ impl Manager {
         status: RunStatus,
         message: &str,
     ) -> Result<()> {
-        let (summary, summary_path) =
-            self.write_terminal_run_summary_artifact(run, status, message)?;
+        let (_, summary_path) = self.write_terminal_run_summary_artifact(run, status, message)?;
         self.state.record_event(
             &run.id,
             workflow_events::TERMINAL_SUMMARY_WRITTEN,
             &workflow_events::TerminalSummaryWrittenPayload::new(&summary_path),
         )?;
-        self.notify_terminal_transition(run, status, message, &summary, &summary_path)
+        self.notify_terminal_transition(run, status, message)
     }
 
     fn terminal_summary_matches_intent(
@@ -3101,9 +3153,13 @@ impl Manager {
         }
         let store = artifact::Store::new(&run.repo_path);
         let summary_path = store.output_path(&run.id, "run-summary.json");
-        let (summary, summary_path) = if transition.summary_written {
+        let (_summary, summary_path) = if transition.summary_written {
             match artifact::read_json::<serde_json::Value>(&summary_path) {
                 Ok(summary) if Self::terminal_summary_matches_intent(&summary, run, transition) => {
+                    // Recovery may encounter a legacy summary artifact that predates
+                    // status-source indexing. Pin it before any notification advertises it.
+                    self.state
+                        .record_status_source_snapshot(&run.id, "run_summary", || &summary)?;
                     (summary, summary_path)
                 }
                 Ok(_) | Err(_) => self.write_terminal_run_summary_artifact(
@@ -3157,13 +3213,9 @@ impl Manager {
             .get_run(&run.id)?
             .ok_or_else(|| anyhow!("run {:?} disappeared while terminalizing", run.id))?;
         if !self.state.terminal_notification_bookkept(&run.id)? {
-            if let Err(err) = self.notify_terminal_transition(
-                &terminal_run,
-                transition.status,
-                &transition.error,
-                &summary,
-                &summary_path,
-            ) {
+            if let Err(err) =
+                self.notify_terminal_transition(&terminal_run, transition.status, &transition.error)
+            {
                 let incident = workflow_events::RunIncidentPayload::warning(
                     "terminal_notification_bookkeeping_failed",
                     format!("terminal notification bookkeeping failed: {err:#}"),
@@ -3251,6 +3303,7 @@ impl Manager {
         Ok(())
     }
 
+    #[cfg(test)]
     fn run_worktree_snapshots(&self, run: &Run) -> Vec<serde_json::Value> {
         let root = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
         discover_run_worktrees(&root)
@@ -3370,6 +3423,11 @@ impl Manager {
             DEFAULT_REPAIR_ATTEMPTS,
         )
         .with_snapshot_path(store.output_path(&run.id, "economics.json"));
+        let _economics_status = EconomicsStatusSnapshotGuard::new(
+            self.state.clone(),
+            run.id.clone(),
+            economics.clone(),
+        )?;
         let verification_cache = VerificationCommandCache::default();
         store.ensure_run_dirs(&run.id)?;
         let root_worktree = self.paths.repo_worktree_dir(&run.repo_id, &run.id);
@@ -3677,9 +3735,12 @@ impl Manager {
             .iter()
             .map(|slice| slice.slice_id.clone())
             .collect();
-        let publication_events = self.state.get_events(&run.id, 100_000).unwrap_or_default();
-        let recorded_publication_commit =
-            latest_completion_publication_commit(&publication_events).map(str::to_string);
+        let status_model = RunReadModelBuilder::new(&self.state)
+            .snapshot(&run.id, RunReadModelOptions::status(500))?;
+        let recorded_publication_commit = status_model
+            .completion_publication
+            .as_ref()
+            .map(|receipt| receipt.commit_sha.clone());
         let existing_publication = if gate.status == "passed" {
             existing_completion_publication(
                 &integration_store,
@@ -3726,18 +3787,17 @@ impl Manager {
         let worker_profile = worker_profile_evidence(runner.name(), &runner.metadata());
         let mut evidence_attestation = final_evidence_attestation(&gate);
         append_worker_evidence_attestation_basis(&mut evidence_attestation, &worker_profile);
-        let plan_revisions = self.plan_revisions_for_run(&run)?;
-        let worker_questions = self.state.list_worker_questions(&run.id)?;
-        let worker_attempts = self
-            .run_read_model(&run, RunReadModelOptions::status(0))?
-            .details
-            .worker_attempts;
-        let (mission_envelope, frontier_budget) = self.state.get_frontier_state(&run.id)?;
+        let snapshot_run = &status_model.details.run;
+        let plan_revisions = status_model.plan_revisions.clone();
+        let worker_questions = status_model.details.questions.clone();
+        let worker_attempts = status_model.details.worker_attempts.clone();
+        let mission_envelope = status_model.details.mission_envelope.clone();
+        let frontier_budget = status_model.details.frontier_budget.clone();
         let mut summary = ImplementationSummary {
-            run_id: run.id.clone(),
-            repo_path: run.repo_path.clone(),
-            integration_branch: run.integration_branch.clone(),
-            base_sha: run.base_sha.clone(),
+            run_id: snapshot_run.id.clone(),
+            repo_path: snapshot_run.repo_path.clone(),
+            integration_branch: snapshot_run.integration_branch.clone(),
+            base_sha: snapshot_run.base_sha.clone(),
             final_sha: String::new(),
             worker_profile,
             mission_envelope,
@@ -3769,10 +3829,11 @@ impl Manager {
                     &receipt,
                 )?;
                 summary.final_sha = receipt.commit_sha.clone();
-                if !completion_publication_event_exists(
-                    &self.state.get_events(&run.id, 500).unwrap_or_default(),
-                    &receipt.commit_sha,
-                ) {
+                if status_model
+                    .completion_publication
+                    .as_ref()
+                    .is_none_or(|recorded| recorded.commit_sha != receipt.commit_sha)
+                {
                     self.state.record_event(
                         &run.id,
                         "completion_publication_committed",
@@ -3819,6 +3880,8 @@ impl Manager {
         artifact::write_json(store.output_path(&run.id, "final-report.json"), &summary)?;
         self.state
             .record_event(&run.id, workflow_events::IMPLEMENTATION_SUMMARY, &summary)?;
+        self.state
+            .record_status_source_snapshot(&run.id, "final_report", || &summary)?;
 
         if gate.status != "passed" {
             if gate_needs_operator(&gate) {
@@ -4455,6 +4518,16 @@ impl Manager {
             }
         };
 
+        let generated_slice_generation = generated_slice
+            .provenance()
+            .ok_or_else(|| {
+                anyhow!(
+                    "generated slice {:?} lost durable provenance while applying proposal {}",
+                    generated_id,
+                    proposal.id
+                )
+            })?
+            .generation;
         let mut queue_after = selected_slice_ids(&run.selected_slice_id);
         let already_selected = queue_after.iter().any(|id| id == &generated_id);
         let mut appended = false;
@@ -4507,6 +4580,7 @@ impl Manager {
             }
         };
         decision.generated_slice_id = generated_id.clone();
+        decision.generated_slice_generation = generated_slice_generation;
         decision.generated_slice_commit = after_sha.clone();
         decision.apply_after_checkpoint_id = checkpoint_id(checkpoint, "after", &after_sha);
         decision.queue_after = final_queue.clone();
@@ -4520,6 +4594,7 @@ impl Manager {
                 "proposal_id": proposal.id,
                 "slice_id": generated_id,
                 "parent_slice_id": proposal.source.slice_id,
+                "generation": generated_slice_generation,
                 "checkpoint": checkpoint,
                 "commit_sha": after_sha,
                 "queue_before": decision.queue_before,
@@ -7817,28 +7892,6 @@ fn latest_cancel_reason(events: &[crate::domain::Event]) -> String {
         .unwrap_or_default()
 }
 
-fn primary_failure_for_terminal_summary(
-    message: &str,
-    slice_runs: &[SliceRun],
-    events: &[crate::domain::Event],
-) -> String {
-    if !message.trim().is_empty() {
-        return message.to_string();
-    }
-    slice_runs
-        .iter()
-        .find(|slice_run| !slice_run.last_error.trim().is_empty())
-        .map(|slice_run| slice_run.last_error.clone())
-        .or_else(|| {
-            events
-                .iter()
-                .rev()
-                .find(|event| event.typ == workflow_events::RUN_ERROR)
-                .map(|event| workflow_events::RunErrorPayload::from_value(&event.payload).error)
-        })
-        .unwrap_or_default()
-}
-
 fn frontier_auto_accept_gate_allows(
     envelope: &MissionEnvelope,
     classification: &FrontierClassification,
@@ -7993,19 +8046,6 @@ fn selected_verify_profiles(slices: &[Slice]) -> Vec<String> {
         }
     }
     profiles
-}
-
-fn terminal_next_commands(run: &Run, status: RunStatus) -> Vec<String> {
-    match status {
-        RunStatus::Completed => vec![format!("khazad-doom handoff --run {}", run.id)],
-        RunStatus::Failed | RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => {
-            vec![
-                format!("khazad-doom inspect --run {}", run.id),
-                format!("khazad-doom resume --run {}", run.id),
-            ]
-        }
-        RunStatus::Pending | RunStatus::Running => Vec::new(),
-    }
 }
 
 fn discover_run_worktrees(root: &Path) -> Result<Vec<PathBuf>> {
@@ -8373,21 +8413,6 @@ fn existing_completion_publication(
         .into());
     }
     Ok(None)
-}
-
-fn latest_completion_publication_commit(events: &[crate::domain::Event]) -> Option<&str> {
-    events.iter().rev().find_map(|event| {
-        (event.typ == "completion_publication_committed")
-            .then(|| event.payload["commit_sha"].as_str())
-            .flatten()
-    })
-}
-
-fn completion_publication_event_exists(events: &[crate::domain::Event], commit_sha: &str) -> bool {
-    events.iter().any(|event| {
-        event.typ == "completion_publication_committed"
-            && event.payload["commit_sha"].as_str() == Some(commit_sha)
-    })
 }
 
 fn slice_closed_by_run_or_absent(store: &artifact::Store, slice_id: &str, run_id: &str) -> bool {
@@ -10420,7 +10445,7 @@ mod tests {
         assert!(!store.slice_path("slice-001-followup").exists());
 
         let model =
-            RunReadModelBuilder::new(&state).snapshot(&run, RunReadModelOptions::status(20))?;
+            RunReadModelBuilder::new(&state).snapshot(&run.id, RunReadModelOptions::status(20))?;
         let feed_text = model
             .details
             .feed
@@ -10509,8 +10534,8 @@ mod tests {
                 .count(),
             1
         );
-        let model =
-            RunReadModelBuilder::new(&state).snapshot(&after, RunReadModelOptions::status(20))?;
+        let model = RunReadModelBuilder::new(&state)
+            .snapshot(&after.id, RunReadModelOptions::status(20))?;
         let feed = model.details.feed.as_ref().expect("feed projected");
         let attention_text = feed
             .attention
@@ -10692,7 +10717,14 @@ mod tests {
         init_git_repo(repo.path())?;
         let store = ArtifactStore::new(repo.path());
         store.ensure_layout()?;
-        let parent = slice("slice-001");
+        let mut parent = slice("slice-001");
+        parent.set_provenance(SliceProvenance {
+            parent_slice_id: "root-slice".to_string(),
+            origin_proposal_id: "parent-proposal".to_string(),
+            generation: 2,
+            created_by: "operator".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        });
         store.write_slice(&parent, true)?;
         gitutil::commit_all(repo.path(), "workflow fixture")?;
 
@@ -10707,6 +10739,7 @@ mod tests {
         state.insert_run(&run)?;
         let mut envelope = mission_envelope();
         envelope.autonomy_level = AutonomyLevel::Promote;
+        envelope.max_depth = 4;
         state.set_frontier_state(
             &run.id,
             Some(&envelope),
@@ -10737,6 +10770,7 @@ mod tests {
         let provenance = generated.provenance().expect("generated provenance");
         assert_eq!(provenance.created_by, "worker+daemon");
         assert_eq!(provenance.parent_slice_id, "slice-001");
+        assert_eq!(provenance.generation, 3);
         assert!(worker_layers.is_empty());
         assert_eq!(gate_slices.len(), 1);
         assert_eq!(gate_slices[0].id, parent.id);
@@ -10771,7 +10805,11 @@ mod tests {
         assert!(decision.applied);
         assert_eq!(decision.queue_after, vec!["slice-001".to_string()]);
         assert!(decision.apply_reason.contains("future run"));
+        assert_eq!(decision.generated_slice_generation, 3);
         assert!(!decision.generated_slice_commit.trim().is_empty());
+        let status =
+            RunReadModelBuilder::new(&state).snapshot(&run.id, RunReadModelOptions::status(10))?;
+        assert_eq!(status.details.generated_slices[0].generation, 3);
         let events = state.get_events(&run.id, 50)?;
         assert!(
             events
@@ -10931,7 +10969,7 @@ mod tests {
                 .any(|result| result.slice_id == "slice-001-followup")
         );
         let model = RunReadModelBuilder::new(&state)
-            .snapshot(&completed, RunReadModelOptions::status(20))?;
+            .snapshot(&completed.id, RunReadModelOptions::status(20))?;
         assert!(
             model
                 .details
@@ -12588,7 +12626,7 @@ mod tests {
         assert_eq!(stored_budget, Some(FrontierBudgetState::default()));
 
         let builder = RunReadModelBuilder::new(&state);
-        let model = builder.snapshot(&completed, RunReadModelOptions::status(20))?;
+        let model = builder.snapshot(&completed.id, RunReadModelOptions::status(20))?;
         assert_eq!(model.details.mission_envelope.as_ref(), Some(&envelope));
         assert_eq!(
             model.details.frontier_budget,
@@ -13590,11 +13628,14 @@ mod tests {
         )?;
         let manager = Manager::new(paths, state.clone());
 
+        state.update_run(&run.id, RunStatus::Blocked, "blocked once")?;
         manager.mark_progress(&run.id, "blocked", "", 0, "", "blocked once");
         manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked once")?;
-        manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked duplicate")?;
+        manager.write_terminal_run_summary(&run, RunStatus::Blocked, "blocked once")?;
+        state.update_run(&run.id, RunStatus::Completed, "completed later")?;
         manager.mark_progress(&run.id, "completed", "", 0, "", "completed later");
         manager.write_terminal_run_summary(&run, RunStatus::Completed, "completed later")?;
+        state.update_run(&run.id, RunStatus::Interrupted, "interrupted")?;
         manager.mark_progress(&run.id, "interrupted", "", 0, "", "interrupted");
         manager.write_terminal_run_summary(&run, RunStatus::Interrupted, "interrupted")?;
 
@@ -13784,6 +13825,13 @@ mod tests {
                 _ => {}
             }
 
+            state.prepare_run_terminal_transition(
+                &run.id,
+                status,
+                message,
+                progress_message,
+                "terminal read-model fixture",
+            )?;
             manager.write_terminal_run_summary(&run, status, message)?;
             state.update_run(&run.id, status, message)?;
             let terminal_run = state.get_run(&run.id)?.expect("terminal run");

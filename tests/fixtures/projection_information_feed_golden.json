@@ -6,6 +6,7 @@
     "Attention",
     "Commands",
     "Checks",
+    "Repair",
     "Economics"
   ],
   "forbidden_block_labels": [

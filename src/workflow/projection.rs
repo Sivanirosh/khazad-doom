@@ -3,35 +3,26 @@ use super::read_model::frontier_summary_from_records;
 use crate::domain::{
     FrontierBudgetState, FrontierSummary, GateCommandResult, GateResult, MissionEnvelope,
     RepairResult, ReplanProposal, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus,
-    SliceRun, SliceStatus, StatusFeed, StatusFeedBlock, StatusFeedLine, StatusFeedRole,
-    TerminalReason, WorkerAttemptProgress, WorkflowExitStates, frontier_classification_annotation,
+    SliceRun, SliceStatus, StatusAction, StatusAttentionItem, StatusFeed, StatusFeedBlock,
+    StatusFeedBlockKind, StatusFeedLine, StatusFeedRole, StatusLifecycleProjection,
+    StatusPhaseProjection, StatusWorkerActivityProjection, TerminalReason, WorkerAttemptProgress,
+    WorkflowExitStates, frontier_classification_annotation,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
-const FEED_VERSION: u64 = 1;
+const FEED_VERSION: u64 = 2;
 const WORKER_ITEMS: usize = 6;
 const LINE_WIDTH: usize = 96;
 
 const GATE_PANE_LINE_WIDTH: usize = 180;
 const GATE_PANE_TAIL_LINES: usize = 6;
 
-pub(crate) struct GatePaneProjection {
-    pub active: bool,
-    pub feed: StatusFeed,
-}
-
-pub(crate) fn project_gate_pane(details: &RunDetails, now: DateTime<Utc>) -> GatePaneProjection {
+pub(crate) fn project_gate_pane(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
     if let Some(progress) = gate_pane_active_progress(details) {
-        return GatePaneProjection {
-            active: true,
-            feed: active_gate_pane_feed(details, progress, now),
-        };
+        return active_gate_pane_feed(details, progress, now);
     }
-    GatePaneProjection {
-        active: false,
-        feed: idle_gate_pane_feed(details),
-    }
+    idle_gate_pane_feed(details)
 }
 
 fn active_gate_pane_feed(
@@ -134,11 +125,22 @@ fn active_gate_pane_feed(
         ));
     }
 
+    let lifecycle = lifecycle_projection(details);
+    let worker_activity = worker_activity_projection(details);
+    let gate = gate_phase_projection(details);
+    let repair = repair_phase_projection(details);
+    let actions = status_actions(&details.run.id, &operator_commands);
     StatusFeed {
-        feed_version: 1,
+        feed_version: FEED_VERSION,
         summary_line: "Khazad-Doom gate/repair activity painter (read-only)".to_string(),
+        lifecycle,
+        worker_activity,
+        gate,
+        repair,
         terminal_reason,
+        actions,
         operator_commands,
+        attention_items: Vec::new(),
         attention: Vec::new(),
         blocks,
     }
@@ -179,11 +181,22 @@ fn idle_gate_pane_feed(details: &RunDetails) -> StatusFeed {
         gate_pane_next_block(details, &operator_commands),
     ];
 
+    let lifecycle = lifecycle_projection(details);
+    let worker_activity = worker_activity_projection(details);
+    let gate = gate_phase_projection(details);
+    let repair = repair_phase_projection(details);
+    let actions = status_actions(&details.run.id, &operator_commands);
     StatusFeed {
-        feed_version: 1,
+        feed_version: FEED_VERSION,
         summary_line: "Khazad-Doom gate/repair status (idle)".to_string(),
+        lifecycle,
+        worker_activity,
+        gate,
+        repair,
         terminal_reason,
+        actions,
         operator_commands,
+        attention_items: Vec::new(),
         attention: Vec::new(),
         blocks,
     }
@@ -735,8 +748,10 @@ fn gate_pane_block(
     meta: impl Into<String>,
     lines: Vec<StatusFeedLine>,
 ) -> StatusFeedBlock {
+    let label = label.into();
     StatusFeedBlock {
-        label: label.into(),
+        kind: status_block_kind(&label),
+        label,
         meta: meta.into(),
         lines,
     }
@@ -758,8 +773,19 @@ pub fn project_waiting(repo: &str) -> StatusFeed {
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: format!("waiting for active run in {repo}"),
+        lifecycle: StatusLifecycleProjection {
+            state: "waiting".to_string(),
+            terminal: false,
+            successful: false,
+            exit_code: None,
+        },
+        worker_activity: StatusWorkerActivityProjection::default(),
+        gate: StatusPhaseProjection::default(),
+        repair: StatusPhaseProjection::default(),
         terminal_reason: None,
+        actions: Vec::new(),
         operator_commands: Vec::new(),
+        attention_items: Vec::new(),
         attention: Vec::new(),
         blocks: vec![
             block(
@@ -801,23 +827,330 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
         blocks.push(commands_block(&operator_commands));
     }
     blocks.push(checks_block(details, now));
+    blocks.extend(
+        super::project_gate_pane(details, now)
+            .blocks
+            .into_iter()
+            .filter(|block| block.kind == StatusFeedBlockKind::Repair),
+    );
     blocks.push(match &details.economics {
         Some(economics) => economics_block(details, economics),
-        None => economics_missing_block(),
+        None => economics_missing_block(details),
     });
     if !details.incidents.is_empty() {
         blocks.push(incidents_block(&details.incidents));
     }
 
+    let mut action_commands = operator_commands.clone();
+    for command in status_navigation_commands(&details.run.id) {
+        push_unique(&mut action_commands, command);
+    }
+    let actions = status_actions(&details.run.id, &action_commands);
+    let attention_items = typed_attention_items(details, &actions);
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: monitor_message(details),
+        lifecycle: lifecycle_projection(details),
+        worker_activity: worker_activity_projection(details),
+        gate: gate_phase_projection(details),
+        repair: repair_phase_projection(details),
         terminal_reason: details.primary_terminal_reason.clone(),
+        actions,
         operator_commands,
+        attention_items,
         attention,
         blocks,
     }
 }
+
+fn lifecycle_projection(details: &RunDetails) -> StatusLifecycleProjection {
+    let terminal = matches!(
+        details.run.status,
+        RunStatus::Completed
+            | RunStatus::Blocked
+            | RunStatus::Failed
+            | RunStatus::Cancelled
+            | RunStatus::Interrupted
+    );
+    let successful = details.run.status == RunStatus::Completed;
+    StatusLifecycleProjection {
+        state: details.run.status.as_str().to_string(),
+        terminal,
+        successful,
+        exit_code: terminal.then_some(if successful { 0 } else { 1 }),
+    }
+}
+
+fn worker_activity_projection(details: &RunDetails) -> StatusWorkerActivityProjection {
+    let Some(progress) = details.progress.as_ref() else {
+        return StatusWorkerActivityProjection {
+            state: if lifecycle_projection(details).terminal {
+                "terminal".to_string()
+            } else {
+                "idle".to_string()
+            },
+            ..StatusWorkerActivityProjection::default()
+        };
+    };
+    let lifecycle = lifecycle_projection(details);
+    let active = !lifecycle.terminal
+        && (progress.worker.is_some()
+            || matches!(
+                progress.phase.as_str(),
+                "worker_running"
+                    | "integration_gate"
+                    | "integration_repair"
+                    | "verification"
+                    | "repair"
+            ));
+    StatusWorkerActivityProjection {
+        state: if active {
+            "running".to_string()
+        } else if lifecycle.terminal {
+            "terminal".to_string()
+        } else {
+            "idle".to_string()
+        },
+        active,
+        phase: progress.phase.clone(),
+        slice_id: progress.slice_id.clone(),
+        attempt: progress.attempt,
+        launch_id: progress.worker.as_ref().and_then(|worker| worker.launch_id),
+        command: progress.command.clone(),
+        summary: progress.message.clone(),
+        updated_at: Some(progress.updated_at),
+    }
+}
+
+fn gate_phase_projection(details: &RunDetails) -> StatusPhaseProjection {
+    if let Some(progress) = details
+        .progress
+        .as_ref()
+        .filter(|progress| progress.phase == "integration_gate")
+    {
+        return StatusPhaseProjection {
+            state: "running".to_string(),
+            active: true,
+            summary: progress.message.clone(),
+            command: progress.command.clone(),
+            output_tail: progress.output_tail.clone(),
+            finding_count: 0,
+        };
+    }
+    let gate = gate_pane_latest_implementation_summary(details)
+        .and_then(|summary| summary.integration_gate)
+        .or_else(|| gate_pane_gate_result_from_economics(details));
+    match gate {
+        Some(gate) => StatusPhaseProjection {
+            state: gate.status,
+            active: false,
+            summary: gate.summary,
+            command: gate
+                .commands
+                .last()
+                .map(|command| command.command.clone())
+                .unwrap_or_default(),
+            output_tail: gate
+                .commands
+                .last()
+                .map(|command| command.output.clone())
+                .unwrap_or_default(),
+            finding_count: gate.findings.len(),
+        },
+        None => StatusPhaseProjection {
+            state: "not_run".to_string(),
+            ..StatusPhaseProjection::default()
+        },
+    }
+}
+
+fn repair_phase_projection(details: &RunDetails) -> StatusPhaseProjection {
+    if let Some(progress) = details
+        .progress
+        .as_ref()
+        .filter(|progress| progress.phase == "integration_repair")
+    {
+        return StatusPhaseProjection {
+            state: "running".to_string(),
+            active: true,
+            summary: progress.message.clone(),
+            command: progress.command.clone(),
+            output_tail: progress.output_tail.clone(),
+            finding_count: 0,
+        };
+    }
+    let repair = gate_pane_latest_implementation_summary(details)
+        .and_then(|summary| summary.integration_repair);
+    match repair {
+        Some(repair) => StatusPhaseProjection {
+            state: repair.status,
+            active: false,
+            summary: repair.summary,
+            command: String::new(),
+            output_tail: String::new(),
+            finding_count: repair.findings.len(),
+        },
+        None => StatusPhaseProjection {
+            state: "not_run".to_string(),
+            ..StatusPhaseProjection::default()
+        },
+    }
+}
+
+fn action_kind(command: &str) -> &'static str {
+    if command.starts_with("khazad-doom status ") {
+        "inspect_status"
+    } else if command.starts_with("khazad-doom monitor ") {
+        "monitor_run"
+    } else if command.starts_with("khazad-doom attend ") {
+        "attend_run"
+    } else if command.starts_with("khazad-doom answer ") {
+        "answer_question"
+    } else if command.starts_with("khazad-doom replan accept ") {
+        "accept_replan"
+    } else if command.starts_with("khazad-doom replan reject ") {
+        "reject_replan"
+    } else if command.starts_with("khazad-doom replan defer ") {
+        "defer_replan"
+    } else if command.starts_with("khazad-doom replan supersede ") {
+        "supersede_replan"
+    } else if command.starts_with("khazad-doom resume ") {
+        "resume_run"
+    } else if command.starts_with("khazad-doom handoff ") {
+        "handoff"
+    } else {
+        "operator_command"
+    }
+}
+
+fn action_authority(command: &str) -> (String, String) {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["khazad-doom", "answer", run_id, target_id, ..] => {
+            ((*run_id).to_string(), (*target_id).to_string())
+        }
+        ["khazad-doom", "replan", _, run_id, target_id, ..] => {
+            ((*run_id).to_string(), (*target_id).to_string())
+        }
+        _ => {
+            let run_id = parts
+                .windows(2)
+                .find(|pair| pair[0] == "--run")
+                .map(|pair| pair[1].to_string())
+                .unwrap_or_default();
+            (run_id, String::new())
+        }
+    }
+}
+
+fn action_id(command: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+    format!("action-{}", &digest[..12])
+}
+
+fn status_navigation_commands(run_id: &str) -> Vec<String> {
+    vec![
+        format!("khazad-doom status --run {run_id}"),
+        format!("khazad-doom monitor --run {run_id}"),
+        format!("khazad-doom attend --run {run_id}"),
+    ]
+}
+
+fn status_actions(current_run_id: &str, commands: &[String]) -> Vec<StatusAction> {
+    commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            let (run_id, target_id) = action_authority(command);
+            if !run_id.is_empty() && run_id != current_run_id {
+                return None;
+            }
+            Some(StatusAction {
+                id: action_id(command),
+                kind: action_kind(command).to_string(),
+                label: command.clone(),
+                command: command.clone(),
+                priority: 100u32.saturating_sub(index as u32),
+                run_id,
+                target_id,
+            })
+        })
+        .collect()
+}
+
+fn action_ids_for_commands(actions: &[StatusAction], commands: &[String]) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|action| commands.iter().any(|command| command == &action.command))
+        .map(|action| action.id.clone())
+        .collect()
+}
+
+fn typed_attention_items(
+    details: &RunDetails,
+    actions: &[StatusAction],
+) -> Vec<StatusAttentionItem> {
+    let mut items = Vec::new();
+    if let Some(reason) = details.primary_terminal_reason.as_ref()
+        && reason.operator_action_required
+    {
+        items.push(StatusAttentionItem {
+            id: "terminal-reason".to_string(),
+            kind: reason.kind.clone(),
+            priority: 100,
+            summary: reason.summary.clone(),
+            action_ids: action_ids_for_commands(actions, &reason.operator_commands),
+        });
+    }
+    for question in details
+        .questions
+        .iter()
+        .filter(|question| question.state == "pending")
+    {
+        let commands = vec![question_answer_command(question)];
+        items.push(StatusAttentionItem {
+            id: format!("question:{}", question.id),
+            kind: "worker_question".to_string(),
+            priority: 90,
+            summary: question.question.clone(),
+            action_ids: action_ids_for_commands(actions, &commands),
+        });
+    }
+    for proposal in details
+        .replan
+        .pending
+        .iter()
+        .filter(|proposal| proposal.state == crate::domain::ReplanProposalState::Pending)
+    {
+        items.push(StatusAttentionItem {
+            id: format!("replan:{}", proposal.id),
+            kind: "replan_decision".to_string(),
+            priority: 80,
+            summary: proposal.source.summary.clone(),
+            action_ids: action_ids_for_commands(actions, &proposal.decision_commands),
+        });
+    }
+    for incident in &details.incidents {
+        if matches!(incident.severity.as_str(), "error" | "warning") {
+            items.push(StatusAttentionItem {
+                id: format!("incident:{}", incident.event_id),
+                kind: incident.kind.clone(),
+                priority: if incident.severity == "error" { 70 } else { 60 },
+                summary: incident.message.clone(),
+                action_ids: Vec::new(),
+            });
+        }
+    }
+    items.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    items
+}
+
 fn replan_source_label(proposal: &crate::domain::ReplanProposal) -> String {
     let mut parts = vec![display_or_dash(&proposal.source.kind).to_string()];
     if !proposal.source.slice_id.trim().is_empty() {
@@ -1175,6 +1508,12 @@ fn operator_commands(
         for command in &reason.operator_commands {
             push_unique(&mut commands, command.clone());
         }
+    }
+    if details.run.status == RunStatus::Completed {
+        push_unique(
+            &mut commands,
+            format!("khazad-doom handoff --run {}", details.run.id),
+        );
     }
     commands
 }
@@ -1608,11 +1947,21 @@ fn dashboard_summary_suffix(summary: &str) -> String {
     }
 }
 
-fn economics_missing_block() -> StatusFeedBlock {
+fn economics_missing_block(details: &RunDetails) -> StatusFeedBlock {
+    let state = details
+        .snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == "economics")
+        .map(|source| source.state.as_str())
+        .unwrap_or("unavailable");
     block(
         "Economics",
-        "",
-        vec![line("not recorded yet", StatusFeedRole::Dim)],
+        state,
+        vec![line(
+            format!("source {state}; no indexed economics payload"),
+            StatusFeedRole::Dim,
+        )],
     )
 }
 
@@ -1718,6 +2067,26 @@ fn economics_block(details: &RunDetails, economics: &RunEconomics) -> StatusFeed
     }
     counters.push_str(&format!(" • fail-fast {}", economics.gate_fail_fast));
     let mut lines = vec![line(counters, StatusFeedRole::Info)];
+    if let Some(source) = details
+        .snapshot
+        .sources
+        .iter()
+        .find(|source| source.source == "economics")
+        && source.state != "fresh"
+    {
+        lines.push(line(
+            format!(
+                "source {}; indexed event {} vs snapshot {}",
+                source.state,
+                source
+                    .indexed_event_id
+                    .map(|event_id| event_id.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                details.snapshot.revision.max_event_id
+            ),
+            StatusFeedRole::Warning,
+        ));
+    }
     if economics.agent_calls.iter().any(|call| {
         call.worker_evidence_kind() == "deterministic_test_double_not_real_pi_worker_evidence"
     }) {
@@ -2179,13 +2548,31 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn status_block_kind(label: &str) -> StatusFeedBlockKind {
+    match label {
+        "Run" | "Handoff" | "Next" => StatusFeedBlockKind::Lifecycle,
+        "Mission" | "Frontier" | "Hint" => StatusFeedBlockKind::Mission,
+        "Workers" | "Activity" | "Gate activity" | "Repair activity" | "Tail" => {
+            StatusFeedBlockKind::WorkerActivity
+        }
+        "Attention" | "Incidents" => StatusFeedBlockKind::Attention,
+        "Checks" | "Gate" => StatusFeedBlockKind::Gate,
+        "Repair" => StatusFeedBlockKind::Repair,
+        "Economics" => StatusFeedBlockKind::Economics,
+        "Commands" => StatusFeedBlockKind::Commands,
+        _ => StatusFeedBlockKind::Unknown,
+    }
+}
+
 fn block(
     label: impl Into<String>,
     meta: impl Into<String>,
     lines: Vec<StatusFeedLine>,
 ) -> StatusFeedBlock {
+    let label = label.into();
     StatusFeedBlock {
-        label: label.into(),
+        kind: status_block_kind(&label),
+        label,
         meta: meta.into(),
         lines,
     }
@@ -2224,6 +2611,10 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            snapshot: Default::default(),
+            launch_intents: Vec::new(),
+            integration_merge_intents: Vec::new(),
+            terminalization: Default::default(),
             worker_profile: Default::default(),
             slice_runs: vec![SliceRun {
                 run_id: "kd-test".to_string(),
@@ -2249,13 +2640,14 @@ mod tests {
             feed: None,
         };
         let feed = project_run_at(&details, now);
-        assert_eq!(feed.feed_version, 1);
+        assert_eq!(feed.feed_version, 2);
         assert_eq!(feed.blocks[0].label, "Run");
         assert_eq!(feed.blocks[1].label, "Mission");
         assert_eq!(feed.blocks[2].label, "Workers");
         assert_eq!(feed.blocks[3].label, "Attention");
         assert_eq!(feed.blocks[4].label, "Checks");
-        assert_eq!(feed.blocks[5].label, "Economics");
+        assert_eq!(feed.blocks[5].label, "Repair");
+        assert_eq!(feed.blocks[6].label, "Economics");
         assert!(feed.blocks.iter().all(|block| block.label != "Commands"));
         assert!(feed.blocks.iter().all(|block| block.label != "Incidents"));
     }
@@ -2287,6 +2679,10 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            snapshot: Default::default(),
+            launch_intents: Vec::new(),
+            integration_merge_intents: Vec::new(),
+            terminalization: Default::default(),
             worker_profile: Default::default(),
             slice_runs: vec![
                 slice("AF-01", SliceStatus::Merged),
@@ -2362,6 +2758,10 @@ mod tests {
                 started_at: now - chrono::Duration::minutes(2),
                 updated_at: now,
             },
+            snapshot: Default::default(),
+            launch_intents: Vec::new(),
+            integration_merge_intents: Vec::new(),
+            terminalization: Default::default(),
             worker_profile: crate::domain::WorkerProfileEvidence {
                 agent: "pi".to_string(),
                 agent_profile: "implementer".to_string(),
@@ -2597,6 +2997,10 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            snapshot: Default::default(),
+            launch_intents: Vec::new(),
+            integration_merge_intents: Vec::new(),
+            terminalization: Default::default(),
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
             worker_attempts: Vec::new(),
@@ -2622,6 +3026,7 @@ mod tests {
                 operator_commands: vec![
                     "pi /login".to_string(),
                     "khazad-doom resume --run kd-test".to_string(),
+                    "khazad-doom resume --run kd-other".to_string(),
                 ],
             }),
             feed: None,
@@ -2629,7 +3034,7 @@ mod tests {
         let feed = project_run_at(&details, now);
         details.feed = Some(feed.clone());
 
-        assert_eq!(feed.feed_version, 1);
+        assert_eq!(feed.feed_version, 2);
         assert_eq!(
             feed.terminal_reason.as_ref().unwrap().kind,
             "agent_auth_required"
@@ -2664,6 +3069,85 @@ mod tests {
                 .any(|line| line.text.contains("event:7:run_incident"))
         );
         assert!(feed.blocks.iter().any(|block| block.label == "Commands"));
+        assert_eq!(feed.lifecycle.state, "blocked");
+        assert!(feed.lifecycle.terminal);
+        assert!(!feed.lifecycle.successful);
+        assert_eq!(feed.attention_items[0].priority, 100);
+        let resume = feed
+            .actions
+            .iter()
+            .find(|action| action.kind == "resume_run")
+            .expect("projected resume action");
+        assert_eq!(resume.run_id, "kd-test");
+        assert!(resume.target_id.is_empty());
+        assert!(feed.attention_items[0].action_ids.contains(&resume.id));
+        assert!(
+            feed.actions
+                .iter()
+                .all(|action| action.run_id.is_empty() || action.run_id == "kd-test"),
+            "event-derived commands must not authorize another run: {:?}",
+            feed.actions
+        );
+        assert_eq!(project_run_at(&details, now).actions, feed.actions);
+    }
+
+    #[test]
+    fn lifecycle_projection_covers_every_terminal_wire_state() {
+        let now = Utc::now();
+        for (status, terminal, successful, exit_code) in [
+            (RunStatus::Pending, false, false, None),
+            (RunStatus::Running, false, false, None),
+            (RunStatus::Completed, true, true, Some(0)),
+            (RunStatus::Blocked, true, false, Some(1)),
+            (RunStatus::Failed, true, false, Some(1)),
+            (RunStatus::Cancelled, true, false, Some(1)),
+            (RunStatus::Interrupted, true, false, Some(1)),
+        ] {
+            let details = RunDetails {
+                run: Run {
+                    id: format!("run-{status}"),
+                    repo_id: "repo".to_string(),
+                    repo_path: "/tmp/repo".to_string(),
+                    status,
+                    base_branch: "main".to_string(),
+                    base_sha: "base".to_string(),
+                    integration_branch: "integration".to_string(),
+                    selected_slice_id: String::new(),
+                    error: String::new(),
+                    started_at: now,
+                    updated_at: now,
+                },
+                snapshot: Default::default(),
+                launch_intents: Vec::new(),
+                integration_merge_intents: Vec::new(),
+                terminalization: Default::default(),
+                worker_profile: Default::default(),
+                slice_runs: Vec::new(),
+                worker_attempts: Vec::new(),
+                generated_slices: Vec::new(),
+                progress: None,
+                incidents: Vec::new(),
+                questions: Vec::new(),
+                replan: Default::default(),
+                mission_envelope: None,
+                frontier_budget: None,
+                frontier: Default::default(),
+                events: Vec::new(),
+                economics: None,
+                primary_terminal_reason: None,
+                feed: None,
+            };
+            let feed = project_run_at(&details, now);
+            assert_eq!(feed.lifecycle.state, status.as_str());
+            assert_eq!(feed.lifecycle.terminal, terminal, "{status}");
+            assert_eq!(feed.lifecycle.successful, successful, "{status}");
+            assert_eq!(feed.lifecycle.exit_code, exit_code, "{status}");
+            assert_eq!(
+                feed.actions.iter().any(|action| action.kind == "handoff"),
+                status == RunStatus::Completed,
+                "{status}"
+            );
+        }
     }
 
     #[test]
@@ -2713,6 +3197,7 @@ mod tests {
                 apply_status: "not_applicable".to_string(),
                 apply_reason: "rejected proposal is not applied".to_string(),
                 generated_slice_id: String::new(),
+                generated_slice_generation: 0,
                 generated_slice_commit: String::new(),
                 apply_before_checkpoint_id: String::new(),
                 apply_after_checkpoint_id: String::new(),
@@ -2740,6 +3225,10 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            snapshot: Default::default(),
+            launch_intents: Vec::new(),
+            integration_merge_intents: Vec::new(),
+            terminalization: Default::default(),
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
             worker_attempts: Vec::new(),
@@ -2787,5 +3276,19 @@ mod tests {
                 .contains("Proposed change: add_followup_slice:slice-1-followup")
         }));
         assert!(feed.blocks.iter().any(|block| block.label == "Commands"));
+        for kind in [
+            "accept_replan",
+            "reject_replan",
+            "defer_replan",
+            "supersede_replan",
+        ] {
+            let action = feed
+                .actions
+                .iter()
+                .find(|action| action.kind == kind)
+                .unwrap_or_else(|| panic!("missing action kind {kind}"));
+            assert_eq!(action.run_id, "kd-test");
+            assert_eq!(action.target_id, "rp-test-001");
+        }
     }
 }

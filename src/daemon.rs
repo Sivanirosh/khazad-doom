@@ -1,7 +1,9 @@
 use crate::artifact;
+#[cfg(test)]
+use crate::domain::Run;
 use crate::domain::{
-    BranchHandoff, ReplanProposalState, Run, RunDetails, RunInspection, RunStatus,
-    SliceWriteResult, WorkerQuestion, WorkerQuestionAnswerSource, WorkerQuestionRecommendation,
+    BranchHandoff, ReplanProposalState, RunDetails, RunInspection, RunStatus, SliceWriteResult,
+    WorkerQuestion, WorkerQuestionAnswerSource, WorkerQuestionRecommendation,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -272,9 +274,9 @@ impl Server {
         Ok(shutdown)
     }
 
-    fn run_details(&self, run: Run, events_limit: usize) -> Result<RunDetails> {
+    fn run_details(&self, run_id: &str, events_limit: usize) -> Result<RunDetails> {
         Ok(RunReadModelBuilder::new(&self.store)
-            .snapshot(&run, RunReadModelOptions::status(events_limit))?
+            .snapshot(run_id, RunReadModelOptions::status(events_limit))?
             .details)
     }
 
@@ -569,21 +571,19 @@ impl Server {
                     .transpose()?
                     .unwrap_or_default();
                 if !params.run_id.is_empty() {
-                    let run: Run = self
-                        .store
-                        .get_run(&params.run_id)?
-                        .ok_or_else(|| anyhow!("run {:?} not found", params.run_id))?;
-                    let details = self.run_details(run, params.events_limit)?;
+                    let details = self.run_details(&params.run_id, params.events_limit)?;
                     Ok(HandleOutcome::result(details)?)
                 } else if params.latest {
                     if params.repo_path.trim().is_empty() {
                         bail!("status latest requires repo_path");
                     }
-                    let details = self
-                        .store
-                        .latest_run_for_repo(&params.repo_path, params.active_only)?
-                        .map(|run| self.run_details(run, params.events_limit))
-                        .transpose()?;
+                    let details = RunReadModelBuilder::new(&self.store)
+                        .latest_snapshot(
+                            &params.repo_path,
+                            params.active_only,
+                            RunReadModelOptions::status(params.events_limit),
+                        )?
+                        .map(|model| model.details);
                     Ok(HandleOutcome::result(details)?)
                 } else {
                     let runs = self.store.latest_runs(params.limit)?;
@@ -933,6 +933,37 @@ mod tests {
     use crate::domain::{Event, ReplanProposalSource, ReplanProposedChange, SliceRun, SliceStatus};
     use crate::workflow::read_model::primary_terminal_reason;
     use chrono::Utc;
+
+    #[test]
+    fn status_rpc_surfaces_required_question_decode_failures() -> Result<()> {
+        let (_dir, server, store) = worker_question_test_server(60)?;
+        let question = store.insert_worker_question(
+            "q-malformed-status-rpc",
+            "run-fallback",
+            "slice-1",
+            1,
+            "choose?",
+            &["A".to_string(), "B".to_string()],
+            60,
+        )?;
+        rusqlite::Connection::open(server.paths.db_file())?.execute(
+            "UPDATE worker_questions SET options_json = '{not-json' WHERE id = ?1",
+            rusqlite::params![question.id],
+        )?;
+
+        let error = match server.handle(
+            "status",
+            Some(json!({"run_id": "run-fallback", "events_limit": 20})),
+        ) {
+            Ok(_) => panic!("status must not erase malformed required attention state"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("worker question options"),
+            "{error:#}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn replan_timeout_rpc_uses_the_transactional_decision_command() -> Result<()> {

@@ -1,0 +1,66 @@
+{
+  "run": {
+    "id": "kd-future",
+    "repo_id": "repo-future",
+    "repo_path": "/repo/future",
+    "status": "future_paused",
+    "base_branch": "main",
+    "base_sha": "base",
+    "integration_branch": "khazad/kd-future/integration",
+    "selected_slice_id": "slice-future",
+    "started_at": "2026-07-11T00:00:00Z",
+    "updated_at": "2026-07-11T00:00:01Z"
+  },
+  "slice_runs": [
+    {
+      "run_id": "kd-future",
+      "slice_id": "slice-future",
+      "status": "future_waiting",
+      "attempts": 1
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "run_id": "kd-future",
+      "type": "future_semantic_event",
+      "payload": {
+        "state": "future_event_state"
+      },
+      "created_at": "2026-07-11T00:00:01Z"
+    }
+  ],
+  "feed": {
+    "feed_version": 2,
+    "summary_line": "daemon projection fixture",
+    "lifecycle": {
+      "state": "future_paused",
+      "terminal": false,
+      "successful": false,
+      "exit_code": null
+    },
+    "blocks": [
+      {
+        "kind": "lifecycle",
+        "label": "Run",
+        "meta": "(future_paused)",
+        "lines": [
+          {
+            "text": "daemon owns this line",
+            "role": "info"
+          }
+        ]
+      },
+      {
+        "kind": "future_widget",
+        "label": "Future",
+        "lines": [
+          {
+            "text": "unknown kinds and roles remain paintable",
+            "role": "future_emphasis"
+          }
+        ]
+      }
+    ]
+  }
+}

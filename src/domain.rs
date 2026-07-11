@@ -1947,21 +1947,115 @@ pub struct TerminalReason {
     pub operator_commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusLifecycleProjection {
+    /// Stable daemon-owned lifecycle state. Unknown future values remain
+    /// paintable because clients make control decisions from the booleans.
+    pub state: String,
+    pub terminal: bool,
+    pub successful: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusWorkerActivityProjection {
+    pub state: String,
+    pub active: bool,
+    pub phase: String,
+    pub slice_id: String,
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<i64>,
+    pub command: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusPhaseProjection {
+    pub state: String,
+    pub active: bool,
+    pub summary: String,
+    pub command: String,
+    pub output_tail: String,
+    pub finding_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusAttentionItem {
+    pub id: String,
+    pub kind: String,
+    pub priority: u32,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusAction {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub command: String,
+    pub priority: u32,
+    pub run_id: String,
+    pub target_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusFeed {
     pub feed_version: u64,
     pub summary_line: String,
+    #[serde(default)]
+    pub lifecycle: StatusLifecycleProjection,
+    #[serde(default)]
+    pub worker_activity: StatusWorkerActivityProjection,
+    #[serde(default)]
+    pub gate: StatusPhaseProjection,
+    #[serde(default)]
+    pub repair: StatusPhaseProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<TerminalReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<StatusAction>,
+    /// Compatibility projection for older painters. New clients paint actions
+    /// and never derive commands from questions, replans, events, or status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention_items: Vec<StatusAttentionItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attention: Vec<StatusFeedLine>,
     pub blocks: Vec<StatusFeedBlock>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusFeedBlockKind {
+    Lifecycle,
+    Mission,
+    WorkerActivity,
+    Attention,
+    Gate,
+    Repair,
+    Economics,
+    Commands,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusFeedBlock {
+    #[serde(default)]
+    pub kind: StatusFeedBlockKind,
     pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub meta: String,
@@ -1985,6 +2079,8 @@ pub enum StatusFeedRole {
     Warning,
     Error,
     Attention,
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_status_feed_role() -> StatusFeedRole {
@@ -2298,6 +2394,8 @@ pub struct ReplanDecision {
     pub apply_reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generated_slice_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generated_slice_generation: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generated_slice_commit: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2417,6 +2515,8 @@ pub struct PlanRevisionDecisionSummary {
     pub apply_reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generated_slice_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generated_slice_generation: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generated_slice_commit: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2468,9 +2568,62 @@ pub struct GeneratedSliceRecord {
     pub applied_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusSnapshotRevision {
+    pub sqlite_data_version: i64,
+    pub max_event_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusSourceMetadata {
+    pub source: String,
+    /// `fresh`, `stale`, and `unavailable` are stable values; unknown future
+    /// values remain ordinary data for tolerant painters.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_event_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusSnapshotMetadata {
+    pub revision: StatusSnapshotRevision,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<StatusSourceMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StatusTerminalizationProjection {
+    pub state: String,
+    pub target_status: String,
+    pub summary_written: bool,
+    pub committed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub run: Run,
+    #[serde(default)]
+    pub snapshot: StatusSnapshotMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_intents: Vec<RunLaunchIntent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_merge_intents: Vec<IntegrationMergeIntent>,
+    #[serde(default)]
+    pub terminalization: StatusTerminalizationProjection,
     #[serde(default, skip_serializing_if = "WorkerProfileEvidence::is_empty")]
     pub worker_profile: WorkerProfileEvidence,
     pub slice_runs: Vec<SliceRun>,

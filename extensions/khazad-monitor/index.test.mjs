@@ -141,6 +141,20 @@ test('package ships the thin monitor bridge extension', async () => {
 	assert.match(pkg.scripts['check:extension'], /extensions\/khazad-monitor\/index\.js/);
 });
 
+test('monitor source cannot reintroduce raw status semantics', async () => {
+	const source = await readFile(new URL('./index.js', import.meta.url), 'utf8');
+	for (const forbidden of [
+		'TERMINAL_RUN_STATUSES',
+		'details?.run?.status',
+		'details.events',
+		'details.questions',
+		'details.replan',
+	]) {
+		assert.equal(source.includes(forbidden), false, `forbidden client semantic: ${forbidden}`);
+	}
+	assert.match(source, /feed\?\.lifecycle\?\.terminal/);
+});
+
 test('monitor bridge registers explicit bridge commands only', () => {
 	const { tools, commands, events } = registerExtension();
 
@@ -211,6 +225,35 @@ test('khazad attach renders only daemon feed projection text', async () => {
 		await new Promise((resolve) => server.close(resolve));
 		await rm(tempDir, { recursive: true, force: true });
 	}
+});
+
+test('node painter accepts unknowns in the full shared status response', async () => {
+	const { commands, events } = registerExtension();
+	const status = JSON.parse(
+		await readFile(new URL('../../tests/fixtures/status-response-parity.json', import.meta.url), 'utf8'),
+	);
+	const expected = (
+		await readFile(new URL('../../tests/fixtures/status-response-parity.txt', import.meta.url), 'utf8')
+	).trimEnd().split('\n');
+	const { calls, ctx } = fakeCtx();
+
+	assert.equal(status.run.status, 'future_paused');
+	assert.equal(status.slice_runs[0].status, 'future_waiting');
+	await withDaemonRequestServer(
+		(request) => {
+			if (request.method === 'status') return status;
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv({ KHAZAD_DAEMON_SOCKET: socketPath }, async () => {
+				await commands.get('khazad-attach').handler('kd-future', ctx);
+				await waitFor(() => calls.some((call) => call.type === 'widget' && call.lines));
+				const rendered = calls.find((call) => call.type === 'widget' && call.lines);
+				assert.deepEqual(rendered.lines.slice(1), expected);
+				await events.get('session_shutdown')({ reason: 'done' }, ctx);
+			});
+		},
+	);
 });
 
 test('khazad open delegates Herdr focus to the daemon CLI command', async () => {

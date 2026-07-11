@@ -1,11 +1,9 @@
-use super::cockpit::{
-    focus_default_agent_target, rename_default_agent_target, send_default_agent_message,
-};
+use super::cockpit::{rename_default_agent_target, send_default_agent_message};
 use super::events as workflow_events;
 use crate::artifact;
 use crate::domain::{
-    Event, ImplementationSummary, ReplanProposal, Run, RunProgress, RunStatus, SliceRun,
-    SliceStatus, TerminalNotificationRecord, WorkerQuestion, replan_decision_commands,
+    Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus, TerminalNotificationRecord,
+    WorkerQuestion,
 };
 use crate::state::Store as StateStore;
 use chrono::Utc;
@@ -20,17 +18,6 @@ const ATTENTION_DELIVERY_SURFACE: &str = "agent_send";
 #[derive(Clone)]
 pub(crate) struct OperatorAttention {
     state: StateStore,
-}
-
-#[allow(dead_code)]
-pub(crate) struct WorkerQuestionPending<'a> {
-    pub question: &'a WorkerQuestion,
-}
-
-#[allow(dead_code)]
-pub(crate) struct ReplanDecisionPending<'a> {
-    pub run: &'a Run,
-    pub proposal: &'a ReplanProposal,
 }
 
 pub(crate) struct TerminalTransitionNotification<'a> {
@@ -52,80 +39,6 @@ impl OperatorAttention {
         Self { state }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn worker_question_pending(&self, intent: WorkerQuestionPending<'_>) {
-        let question = intent.question;
-        let Ok(Some(run)) = self.state.get_run(&question.run_id) else {
-            return;
-        };
-        let Some(origin) = self.origin_target(&run) else {
-            return;
-        };
-        let payload = json!({
-            "schema_version": ATTENTION_PAYLOAD_SCHEMA_VERSION,
-            "kind": "worker_question_pending",
-            "run_id": question.run_id,
-            "slice_id": question.slice_id,
-            "attempt": question.attempt,
-            "question_id": question.id,
-            "question": question.question,
-            "options": question.options,
-            "timeout_seconds": question.timeout_seconds,
-            "deadline_at": worker_question_deadline(question),
-            "recommended_answer": question.recommended_answer,
-            "recommendation_rationale": question.recommendation_rationale,
-            "fallback_eligible": question.fallback_eligible,
-            "answer_command": worker_question_answer_command(question),
-            "source_of_truth": "daemon_worker_questions",
-        });
-        self.send_and_focus_attention(
-            &run,
-            &origin,
-            "worker_question_pending",
-            payload,
-            AttentionFailureContext {
-                source_of_truth: "daemon_worker_questions",
-                delivery_message: "worker question notification was not delivered",
-                focus_message: "worker question focus was not delivered",
-                payload_fields: json!({
-                    "question_id": question.id,
-                    "slice_id": question.slice_id,
-                }),
-            },
-        );
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn replan_decision_pending(&self, intent: ReplanDecisionPending<'_>) {
-        let Some(origin) = self.origin_target(intent.run) else {
-            return;
-        };
-        let commands = replan_decision_commands(&intent.run.id, &intent.proposal.id);
-        let payload = serde_json::to_value(workflow_events::ReplanNotificationPayload::new(
-            &intent.run.id,
-            &intent.proposal.id,
-            intent.proposal.source.clone(),
-            &intent.proposal.risk,
-            intent.proposal.proposed_changes.clone(),
-            commands,
-        ))
-        .unwrap_or(Value::Null);
-        self.send_and_focus_attention(
-            intent.run,
-            &origin,
-            "replan_decision_pending",
-            payload,
-            AttentionFailureContext {
-                source_of_truth: "daemon_replan_proposals",
-                delivery_message: "replan proposal notification was not delivered",
-                focus_message: "replan proposal focus was not delivered",
-                payload_fields: json!({
-                    "proposal_id": intent.proposal.id,
-                }),
-            },
-        );
-    }
-
     pub(crate) fn terminal_transition_notification(
         &self,
         intent: TerminalTransitionNotification<'_>,
@@ -135,26 +48,13 @@ impl OperatorAttention {
         }
         let store = artifact::Store::new(&intent.run.repo_path);
         let terminal_status = intent.status.as_str();
-        let transition_key = terminal_transition_key(intent.status, intent.progress);
+        let transition_key =
+            terminal_transition_key(intent.status, intent.progress, intent.run, intent.summary);
         if store.terminal_notification_exists(&intent.run.id, &transition_key) {
             return;
         }
         let created_at = Utc::now().to_rfc3339();
-        let final_report_path = store.output_path(&intent.run.id, "final-report.json");
-        let implementation_summary_path =
-            store.output_path(&intent.run.id, "implementation-summary.json");
-        let payload = terminal_feedback_payload(
-            intent.run,
-            intent.status,
-            intent.summary,
-            intent.summary_path,
-            final_report_path
-                .exists()
-                .then_some(final_report_path.as_path()),
-            implementation_summary_path
-                .exists()
-                .then_some(implementation_summary_path.as_path()),
-        );
+        let payload = terminal_feedback_payload(intent.summary, intent.summary_path);
         let origin = match store.read_origin_notification_target(&intent.run.id) {
             Ok(Some(origin)) if !origin.target.trim().is_empty() => origin,
             Ok(Some(_)) => {
@@ -334,79 +234,6 @@ impl OperatorAttention {
         }
     }
 
-    #[allow(dead_code)]
-    fn origin_target(&self, run: &Run) -> Option<crate::domain::OriginNotificationTarget> {
-        let store = artifact::Store::new(&run.repo_path);
-        match store.read_origin_notification_target(&run.id) {
-            Ok(Some(origin)) if !origin.target.trim().is_empty() => Some(origin),
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn send_and_focus_attention(
-        &self,
-        run: &Run,
-        origin: &crate::domain::OriginNotificationTarget,
-        kind: &str,
-        payload: Value,
-        context: AttentionFailureContext,
-    ) {
-        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-        match send_default_agent_message(&origin.target, &text) {
-            Ok(sent) => {
-                let event_payload = context.delivery_payload(
-                    kind,
-                    sent.adapter,
-                    sent.surface,
-                    origin.target_kind.clone(),
-                );
-                let _ = self.state.record_event(
-                    &run.id,
-                    workflow_events::ATTENTION_NOTIFICATION_SENT,
-                    &event_payload,
-                );
-            }
-            Err(err) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    workflow_events::RUN_INCIDENT,
-                    &context.failure_payload(
-                        "attention_notification_failed",
-                        "delivery_failed",
-                        format!("{}: {}", context.delivery_message, err.message),
-                    ),
-                );
-            }
-        }
-        match focus_default_agent_target(&origin.target) {
-            Ok(focused) => {
-                let event_payload = context.delivery_payload(
-                    kind,
-                    focused.adapter,
-                    focused.surface,
-                    origin.target_kind.clone(),
-                );
-                let _ = self.state.record_event(
-                    &run.id,
-                    workflow_events::ATTENTION_FOCUS_SENT,
-                    &event_payload,
-                );
-            }
-            Err(err) => {
-                let _ = self.state.record_event(
-                    &run.id,
-                    workflow_events::RUN_INCIDENT,
-                    &context.failure_payload(
-                        "attention_focus_failed",
-                        "focus_failed",
-                        format!("{}: {}", context.focus_message, err.message),
-                    ),
-                );
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn write_terminal_notification_record(
         &self,
@@ -470,73 +297,6 @@ impl OperatorAttention {
     }
 }
 
-#[allow(dead_code)]
-struct AttentionFailureContext {
-    source_of_truth: &'static str,
-    delivery_message: &'static str,
-    focus_message: &'static str,
-    payload_fields: Value,
-}
-
-#[allow(dead_code)]
-impl AttentionFailureContext {
-    fn delivery_payload(
-        &self,
-        kind: &str,
-        adapter: String,
-        surface: String,
-        target_kind: String,
-    ) -> workflow_events::AttentionDeliveryPayload {
-        workflow_events::AttentionDeliveryPayload {
-            kind: kind.to_string(),
-            question_id: self.payload_field("question_id"),
-            slice_id: self.payload_field("slice_id"),
-            proposal_id: self.payload_field("proposal_id"),
-            adapter,
-            surface,
-            target_kind,
-        }
-    }
-
-    fn failure_payload(
-        &self,
-        kind: &str,
-        visibility_kind: &str,
-        message: String,
-    ) -> workflow_events::RunIncidentPayload {
-        let mut payload = workflow_events::RunIncidentPayload::warning(kind, message)
-            .with_extra("visibility_kind", visibility_kind)
-            .with_extra("source_of_truth", self.source_of_truth);
-        for key in ["question_id", "slice_id", "proposal_id"] {
-            let value = self.payload_field(key);
-            if !value.trim().is_empty() {
-                payload = payload.with_extra(key, value);
-            }
-        }
-        payload
-    }
-
-    fn payload_field(&self, key: &str) -> String {
-        self.payload_fields
-            .get(key)
-            .and_then(|value| {
-                value
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| value.as_u64().map(|number| number.to_string()))
-            })
-            .unwrap_or_default()
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn worker_question_answer_command(question: &WorkerQuestion) -> String {
-    format!(
-        "khazad-doom answer {} {} <answer>",
-        question.run_id, question.id
-    )
-}
-
 pub(crate) fn worker_question_deadline(question: &WorkerQuestion) -> Option<String> {
     question.deadline_at.map(|deadline| deadline.to_rfc3339())
 }
@@ -548,41 +308,27 @@ fn terminal_feedback_status_supported(status: RunStatus) -> bool {
     )
 }
 
-fn terminal_transition_key(status: RunStatus, progress: Option<&RunProgress>) -> String {
-    let phase_started_at = progress
+fn terminal_transition_key(
+    status: RunStatus,
+    progress: Option<&RunProgress>,
+    run: &Run,
+    summary: &Value,
+) -> String {
+    let revision = progress
         .filter(|progress| progress.phase == status.as_str())
         .map(|progress| progress.phase_started_at.to_rfc3339())
-        .unwrap_or_else(|| Utc::now().to_rfc3339());
-    format!("terminal:{}:{}", status.as_str(), phase_started_at)
+        .or_else(|| {
+            summary
+                .pointer("/snapshot/revision/max_event_id")
+                .and_then(Value::as_i64)
+                .map(|event_id| format!("event-{event_id}"))
+        })
+        .unwrap_or_else(|| run.updated_at.to_rfc3339());
+    format!("terminal:{}:{revision}", status.as_str())
 }
 
-fn terminal_handoff_evidence(final_report_path: &Path) -> (String, String) {
-    let Ok(summary) = artifact::read_json::<ImplementationSummary>(final_report_path) else {
-        return (String::new(), String::new());
-    };
-    (summary.final_sha, summary.exit_states.handoff)
-}
-
-fn terminal_feedback_payload(
-    run: &Run,
-    status: RunStatus,
-    summary: &Value,
-    summary_path: &Path,
-    final_report_path: Option<&Path>,
-    implementation_summary_path: Option<&Path>,
-) -> Value {
-    let (final_sha, handoff_readiness) = final_report_path
-        .map(terminal_handoff_evidence)
-        .unwrap_or_default();
-    let evidence_artifacts = [
-        Some(summary_path),
-        final_report_path,
-        implementation_summary_path,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|path| path.to_string_lossy().to_string())
-    .collect::<Vec<_>>();
+fn terminal_feedback_payload(summary: &Value, summary_path: &Path) -> Value {
+    let evidence_artifacts = vec![summary_path.to_string_lossy().to_string()];
     let feed = summary.get("feed").cloned().unwrap_or(Value::Null);
     let feed_summary = feed
         .get("summary_line")
@@ -596,19 +342,20 @@ fn terminal_feedback_payload(
         });
     json!({
         "kind": "khazad_terminal_feedback",
-        "run_id": run.id,
-        "terminal_status": status.as_str(),
-        "repo_path": run.repo_path,
-        "integration_branch": run.integration_branch,
-        "selected_slice_id": run.selected_slice_id,
+        "run_id": summary.get("run_id").cloned().unwrap_or(Value::Null),
+        "terminal_status": summary.get("status").cloned().unwrap_or(Value::Null),
+        "repo_path": summary.get("repo_path").cloned().unwrap_or(Value::Null),
+        "integration_branch": summary.get("integration_branch").cloned().unwrap_or(Value::Null),
+        "selected_slice_id": summary.get("selected_slice_id").cloned().unwrap_or(Value::Null),
         "message": feed_summary,
         "feed_summary_line": feed_summary,
         "feed": feed,
         "primary_failure": summary.get("primary_failure").and_then(Value::as_str).unwrap_or_default(),
         "cancel_reason": summary.get("cancel_reason").and_then(Value::as_str).unwrap_or_default(),
-        "final_sha": final_sha,
-        "handoff_readiness": handoff_readiness,
+        "final_sha": "",
+        "handoff_readiness": "unavailable",
         "evidence_artifacts": evidence_artifacts,
+        "snapshot": summary.get("snapshot").cloned().unwrap_or(Value::Null),
         "next_commands": summary.get("next_commands").cloned().unwrap_or_else(|| json!([])),
     })
 }
@@ -617,9 +364,7 @@ fn terminal_feedback_payload(
 mod tests {
     use super::*;
     use crate::artifact::Store as ArtifactStore;
-    use crate::domain::{
-        OriginNotificationTarget, ReplanEvidenceLink, ReplanProposalSource, ReplanProposedChange,
-    };
+    use crate::domain::OriginNotificationTarget;
     use anyhow::Result;
     use std::fs;
     use std::time::Duration;
@@ -676,102 +421,6 @@ mod tests {
             }
         }
         Ok(records)
-    }
-
-    #[test]
-    fn attention_no_origin_noops_for_worker_question() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let (_home, state) = state_store()?;
-        let run = run_fixture(repo.path(), "kd-attention-no-origin");
-        state.insert_run(&run)?;
-        let question = state.insert_worker_question(
-            "q-no-origin",
-            &run.id,
-            "slice-001",
-            1,
-            "choose?",
-            &["a".to_string(), "b".to_string()],
-            0,
-        )?;
-
-        OperatorAttention::new(state.clone()).worker_question_pending(WorkerQuestionPending {
-            question: &question,
-        });
-
-        assert!(state.get_events(&run.id, 100)?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn attention_delivery_failures_are_warning_incidents_for_worker_question_and_replan()
-    -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let artifact_store = ArtifactStore::new(repo.path());
-        let (_home, state) = state_store()?;
-        let run = run_fixture(repo.path(), "kd-attention-failures");
-        state.insert_run(&run)?;
-        artifact_store.write_origin_notification_target(&run.id, &origin())?;
-        let question = state.insert_worker_question(
-            "q-delivery-failed",
-            &run.id,
-            "slice-001",
-            1,
-            "choose?",
-            &["a".to_string()],
-            30,
-        )?;
-        let proposal = state.create_replan_proposal(
-            &run.id,
-            "rp-delivery-failed",
-            ReplanProposalSource {
-                kind: "worker_finding".to_string(),
-                slice_id: "slice-001".to_string(),
-                phase: "slice_worker".to_string(),
-                attempt: 1,
-                summary: "needs operator review".to_string(),
-            },
-            vec!["finding-1".to_string()],
-            vec![ReplanEvidenceLink {
-                kind: "worker_output".to_string(),
-                path: "output.json".to_string(),
-                event_id: 0,
-                summary: "evidence".to_string(),
-            }],
-            vec![ReplanProposedChange {
-                kind: "follow_up_or_revision".to_string(),
-                target: "slice-001".to_string(),
-                summary: "revise scope".to_string(),
-            }],
-            "operator_review_required",
-        )?;
-        let attention = OperatorAttention::new(state.clone());
-
-        attention.worker_question_pending(WorkerQuestionPending {
-            question: &question,
-        });
-        attention.replan_decision_pending(ReplanDecisionPending {
-            run: &run,
-            proposal: &proposal,
-        });
-
-        let events = state.get_events(&run.id, 100)?;
-        assert!(events.iter().any(|event| {
-            event.typ == "run_incident"
-                && event.payload["kind"] == "attention_notification_failed"
-                && event.payload["question_id"] == "q-delivery-failed"
-                && event.payload["source_of_truth"] == "daemon_worker_questions"
-        }));
-        assert!(events.iter().any(|event| {
-            event.typ == "run_incident"
-                && event.payload["kind"] == "attention_focus_failed"
-                && event.payload["proposal_id"] == "rp-delivery-failed"
-                && event.payload["source_of_truth"] == "daemon_replan_proposals"
-        }));
-        assert_eq!(
-            state.get_run(&run.id)?.expect("run").status,
-            RunStatus::Running
-        );
-        Ok(())
     }
 
     #[test]

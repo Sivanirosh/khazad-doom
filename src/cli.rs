@@ -1,9 +1,13 @@
 use crate::artifact;
 use crate::daemon::{Client, DaemonHealth, Server};
+#[cfg(test)]
+use crate::domain::RunDetails;
+#[cfg(test)]
+use crate::domain::RunStatus;
 use crate::domain::{
     AutonomyLevel, BranchHandoff, DecisionCommandOutcome, MissionEnvelope, ReplanEvidenceLink,
-    ReplanProposalSource, ReplanProposalState, ReplanProposedChange, RunDetails, RunInspection,
-    RunStatus, SliceValidationReport, SliceWriteResult, StatusFeed, StatusFeedRole,
+    ReplanProposalSource, ReplanProposalState, ReplanProposedChange, RunInspection,
+    SliceValidationReport, SliceWriteResult, StatusFeed, StatusFeedBlockKind, StatusFeedRole,
 };
 use crate::ipc::{
     AnswerQuestionParams, AnswerQuestionResult, CancelRunParams, CancelRunResult,
@@ -18,11 +22,12 @@ use crate::pi_contract::PiActivityFormatter;
 use crate::state::Store as StateStore;
 use crate::workflow::{
     CockpitOpenFocus, cockpit_mode_transport_arg, cockpit_workspace_label_for_run,
-    open_default_run_cockpit_for_operator, project_gate_pane, short_path,
+    open_default_run_cockpit_for_operator, short_path,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
@@ -38,6 +43,55 @@ struct RunStartOutput {
     pub repo_path: String,
     pub monitor_command: String,
     pub run_monitor_command: String,
+}
+
+/// Client-side status DTO for painters and operator actions. It decodes only
+/// daemon-owned feed semantics and stable run identity while retaining the raw
+/// response for lossless JSON output. Closed storage enums remain strict in
+/// `RunDetails`; future raw wire values beside `feed` cannot block painting.
+#[derive(Debug, Clone)]
+struct StatusPainterResponse {
+    raw: Value,
+    run: StatusPainterRun,
+    feed: Option<StatusFeed>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StatusPainterProjection {
+    run: StatusPainterRun,
+    #[serde(default)]
+    feed: Option<StatusFeed>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StatusPainterRun {
+    id: String,
+    repo_path: String,
+}
+
+impl<'de> Deserialize<'de> for StatusPainterResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        let projection: StatusPainterProjection =
+            serde_json::from_value(raw.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            raw,
+            run: projection.run,
+            feed: projection.feed,
+        })
+    }
+}
+
+impl Serialize for StatusPainterResponse {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -806,7 +860,7 @@ fn run_status(paths: Paths, opts: RunStatusOptions) -> Result<()> {
         if opts.latest {
             bail!("status --latest cannot be combined with --run <run-id>");
         }
-        let details: RunDetails = client.call(
+        let details: StatusPainterResponse = client.call(
             "status",
             &StatusParams {
                 run_id: opts.run_id,
@@ -897,17 +951,13 @@ fn monitor_run(
         if once {
             return monitor_once_result(&details);
         }
-        if is_terminal_status(details.run.status) {
-            // closing the alternate screen discards the last frame, so
-            // repaint the final state onto the normal screen where it
-            // persists in scrollback
+        if let Some(result) = lifecycle_result(&details)? {
+            // Closing the alternate screen discards the last frame, so repaint
+            // the daemon-owned terminal projection onto normal scrollback.
             if guard.take().is_some() {
                 render_monitor_snapshot(Some(&details), None, false, false)?;
             }
-            return match details.run.status {
-                RunStatus::Completed => Ok(()),
-                _ => terminal_run_error(&details),
-            };
+            return result;
         }
         thread::sleep(interval);
     }
@@ -948,9 +998,8 @@ fn monitor_latest(
             }
             return Ok(());
         }
-        if details
-            .as_ref()
-            .is_some_and(|details| is_terminal_status(details.run.status))
+        if let Some(details) = details.as_ref()
+            && daemon_feed(details)?.lifecycle.terminal
         {
             attached_run_id = None;
         }
@@ -1032,7 +1081,49 @@ fn run_attend(
     }
 }
 
-fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> Result<()> {
+fn projected_actions<'a>(
+    details: &'a StatusPainterResponse,
+    kind: &str,
+) -> Result<Vec<&'a crate::domain::StatusAction>> {
+    let actions = daemon_feed(details)?
+        .actions
+        .iter()
+        .filter(|action| action.kind == kind)
+        .collect::<Vec<_>>();
+    if let Some(action) = actions
+        .iter()
+        .find(|action| action.run_id != details.run.id)
+    {
+        bail!(
+            "status projection contains cross-run action {:?}: expected run {:?}, got {:?}",
+            action.id,
+            details.run.id,
+            action.run_id
+        );
+    }
+    Ok(actions)
+}
+
+fn projected_action<'a>(
+    details: &'a StatusPainterResponse,
+    kind: &str,
+    target_id: &str,
+) -> Result<&'a crate::domain::StatusAction> {
+    projected_actions(details, kind)?
+        .into_iter()
+        .find(|action| action.target_id == target_id)
+        .with_context(|| {
+            format!(
+                "action {kind:?} for {target_id:?} is not authorized by the current daemon projection"
+            )
+        })
+}
+
+fn handle_attend_command(
+    client: &Client,
+    details: &StatusPainterResponse,
+    input: &str,
+) -> Result<()> {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
         return Ok(());
@@ -1048,19 +1139,15 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             if answer.trim().is_empty() {
                 bail!("usage: a <question-number> <answer>");
             }
-            let pending = details
-                .questions
-                .iter()
-                .filter(|question| question.state == "pending")
-                .collect::<Vec<_>>();
-            let question = pending
+            let actions = projected_actions(details, "answer_question")?;
+            let action = actions
                 .get(index.saturating_sub(1))
-                .ok_or_else(|| anyhow::anyhow!("pending question {index} not found"))?;
+                .ok_or_else(|| anyhow::anyhow!("projected question action {index} not found"))?;
             let result: AnswerQuestionResult = client.call(
                 "answerQuestion",
                 &AnswerQuestionParams {
-                    run_id: details.run.id.clone(),
-                    question_id: question.id.clone(),
+                    run_id: action.run_id.clone(),
+                    question_id: action.target_id.clone(),
                     answer,
                 },
             )?;
@@ -1074,11 +1161,12 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             if answer.trim().is_empty() {
                 bail!("usage: answer <question-id> <answer>");
             }
+            let action = projected_action(details, "answer_question", question_id)?;
             let result: AnswerQuestionResult = client.call(
                 "answerQuestion",
                 &AnswerQuestionParams {
-                    run_id: details.run.id.clone(),
-                    question_id: question_id.to_string(),
+                    run_id: action.run_id.clone(),
+                    question_id: action.target_id.clone(),
                     answer,
                 },
             )?;
@@ -1092,16 +1180,17 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             if reason.trim().is_empty() {
                 bail!("usage: accept|reject <proposal-id> <reason>");
             }
-            let decision = if command == "accept" {
-                "accepted"
+            let (kind, decision) = if command == "accept" {
+                ("accept_replan", "accepted")
             } else {
-                "rejected"
+                ("reject_replan", "rejected")
             };
+            let action = projected_action(details, kind, proposal_id)?;
             let result: DecideReplanProposalResult = client.call(
                 "decideReplanProposal",
                 &DecideReplanProposalParams {
-                    run_id: details.run.id.clone(),
-                    proposal_id: proposal_id.to_string(),
+                    run_id: action.run_id.clone(),
+                    proposal_id: action.target_id.clone(),
                     decision: decision.to_string(),
                     rationale: reason,
                     authorizer: String::new(),
@@ -1118,11 +1207,12 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
                 .context("usage: defer <proposal-id> <condition> --reason <reason>")?;
             let rest = parts.collect::<Vec<_>>().join(" ");
             let (condition, reason) = split_defer_condition_reason(&rest)?;
+            let action = projected_action(details, "defer_replan", proposal_id)?;
             let result: DecideReplanProposalResult = client.call(
                 "decideReplanProposal",
                 &DecideReplanProposalParams {
-                    run_id: details.run.id.clone(),
-                    proposal_id: proposal_id.to_string(),
+                    run_id: action.run_id.clone(),
+                    proposal_id: action.target_id.clone(),
                     decision: "deferred".to_string(),
                     rationale: reason,
                     authorizer: String::new(),
@@ -1134,10 +1224,14 @@ fn handle_attend_command(client: &Client, details: &RunDetails, input: &str) -> 
             require_decision_command_success("decide replan proposal", result.outcome)?;
         }
         "resume" => {
+            let action = projected_actions(details, "resume_run")?
+                .into_iter()
+                .next()
+                .context("resume is not authorized by the current daemon projection")?;
             let _: StartRunResult = client.call(
                 "resumeRun",
                 &ResumeRunParams {
-                    run_id: details.run.id.clone(),
+                    run_id: action.run_id.clone(),
                     agent: String::new(),
                     pi_bin: String::new(),
                     pi_args: Vec::new(),
@@ -1172,7 +1266,11 @@ fn split_defer_condition_reason(value: &str) -> Result<(String, String)> {
     Ok((condition, reason))
 }
 
-fn fetch_run_details(client: &Client, run_id: &str, events_limit: usize) -> Result<RunDetails> {
+fn fetch_run_details(
+    client: &Client,
+    run_id: &str,
+    events_limit: usize,
+) -> Result<StatusPainterResponse> {
     client.call(
         "status",
         &StatusParams {
@@ -1188,7 +1286,7 @@ fn fetch_latest_run(
     repo_path: &str,
     events_limit: usize,
     active_only: bool,
-) -> Result<Option<RunDetails>> {
+) -> Result<Option<StatusPainterResponse>> {
     client.call(
         "status",
         &StatusParams {
@@ -1201,11 +1299,18 @@ fn fetch_latest_run(
     )
 }
 
-fn open_or_focus_cockpit(paths: &Paths, details: &RunDetails) -> Result<CockpitOpenOutput> {
+fn open_or_focus_cockpit(
+    paths: &Paths,
+    details: &StatusPainterResponse,
+) -> Result<CockpitOpenOutput> {
     let run = &details.run;
     let workspace_label = cockpit_workspace_label_for_run(&run.id);
-    let operator_commands = cockpit_operator_commands(&run.id);
-    match open_default_run_cockpit_for_operator(run, &paths.root) {
+    let operator_commands = daemon_feed(details)?
+        .actions
+        .iter()
+        .map(|action| action.command.clone())
+        .collect();
+    match open_default_run_cockpit_for_operator(&run.id, &run.repo_path, &paths.root) {
         Ok(opened) => Ok(cockpit_open_success_output(run, opened, operator_commands)),
         Err(unavailable) => Ok(cockpit_unavailable_output(
             run,
@@ -1217,7 +1322,7 @@ fn open_or_focus_cockpit(paths: &Paths, details: &RunDetails) -> Result<CockpitO
 }
 
 fn cockpit_open_success_output(
-    run: &crate::domain::Run,
+    run: &StatusPainterRun,
     opened: CockpitOpenFocus,
     operator_commands: Vec<String>,
 ) -> CockpitOpenOutput {
@@ -1236,28 +1341,15 @@ fn cockpit_open_success_output(
     }
 }
 
-fn cockpit_operator_commands(run_id: &str) -> Vec<String> {
-    vec![
-        format!("khazad-doom monitor --run {}", shell_quote_arg(run_id)),
-        format!("khazad-doom watch --run {}", shell_quote_arg(run_id)),
-        format!("khazad-doom status --run {}", shell_quote_arg(run_id)),
-    ]
-}
-
-fn monitor_once_result(details: &RunDetails) -> Result<()> {
-    match details.run.status {
-        RunStatus::Failed | RunStatus::Blocked | RunStatus::Cancelled | RunStatus::Interrupted => {
-            terminal_run_error(details)
-        }
-        _ => Ok(()),
-    }
+fn monitor_once_result(details: &StatusPainterResponse) -> Result<()> {
+    lifecycle_result(details)?.unwrap_or(Ok(()))
 }
 
 fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
     let client = Client::new(paths);
     let interval = Duration::from_millis(interval_ms.max(100));
     loop {
-        let details: RunDetails = client.call(
+        let details: StatusPainterResponse = client.call(
             "status",
             &StatusParams {
                 run_id: run_id.clone(),
@@ -1266,14 +1358,10 @@ fn run_watch(paths: Paths, run_id: String, interval_ms: u64) -> Result<()> {
             },
         )?;
         print_watch_snapshot(&details);
-        match details.run.status {
-            RunStatus::Completed => return Ok(()),
-            RunStatus::Failed
-            | RunStatus::Blocked
-            | RunStatus::Cancelled
-            | RunStatus::Interrupted => return terminal_run_error(&details),
-            _ => thread::sleep(interval),
+        if let Some(result) = lifecycle_result(&details)? {
+            return result;
         }
+        thread::sleep(interval);
     }
 }
 
@@ -1325,25 +1413,43 @@ fn run_cockpit_paint_gate_activity(paths: Paths, run_id: String, interval_ms: u6
         first = false;
         paint_gate_activity_snapshot(&details, &mut out)?;
         out.flush()?;
-        if is_terminal_status(details.run.status) {
+        if daemon_feed(&details)?.lifecycle.terminal {
             return Ok(());
         }
         thread::sleep(interval);
     }
 }
 
-fn paint_gate_activity_snapshot(details: &RunDetails, out: &mut impl Write) -> Result<bool> {
+fn paint_gate_activity_snapshot(
+    details: &StatusPainterResponse,
+    out: &mut impl Write,
+) -> Result<bool> {
     paint_gate_activity_snapshot_at(details, chrono::Utc::now(), out)
 }
 
 fn paint_gate_activity_snapshot_at(
-    details: &RunDetails,
-    now: chrono::DateTime<chrono::Utc>,
+    details: &StatusPainterResponse,
+    _now: chrono::DateTime<chrono::Utc>,
     out: &mut impl Write,
 ) -> Result<bool> {
-    let projection = project_gate_pane(details, now);
-    render_feed_plain(out, &projection.feed)?;
-    Ok(projection.active)
+    let feed = daemon_feed(details)?;
+    writeln!(out, "{}", feed.summary_line)?;
+    for block in feed.blocks.iter().filter(|block| {
+        matches!(
+            block.kind,
+            StatusFeedBlockKind::Gate | StatusFeedBlockKind::Repair
+        )
+    }) {
+        if !block.meta.trim().is_empty() {
+            writeln!(out, "{} {}", block.label, block.meta)?;
+        } else {
+            writeln!(out, "{}", block.label)?;
+        }
+        for line in &block.lines {
+            writeln!(out, "  - {}", line.text)?;
+        }
+    }
+    Ok(feed.gate.active || feed.repair.active)
 }
 
 fn paint_worker_activity(
@@ -1895,18 +2001,14 @@ fn serve_daemon(paths: Paths) -> Result<()> {
     server.serve()
 }
 
-fn print_watch_snapshot(details: &RunDetails) {
+fn print_watch_snapshot(details: &StatusPainterResponse) {
     let mut out = io::stdout();
     println!("Run: {}", details.run.id);
-    println!("Status: {}", details.run.status);
-    if let Some(progress) = &details.progress {
-        println!("Phase: {}", progress_phase_label(progress));
-    }
-    match &details.feed {
-        Some(feed) => {
+    match daemon_feed(details) {
+        Ok(feed) => {
             let _ = render_feed_plain(&mut out, feed);
         }
-        None => println!("daemon status feed unavailable"),
+        Err(error) => println!("{error}"),
     }
     println!();
 }
@@ -1996,6 +2098,7 @@ fn monitor_role_code(role: StatusFeedRole) -> &'static str {
         StatusFeedRole::Warning => "33",
         StatusFeedRole::Error => "31",
         StatusFeedRole::Attention => "1;36",
+        StatusFeedRole::Unknown => "",
     }
 }
 
@@ -2102,7 +2205,7 @@ fn compose_live_frame(content: &str, style: MonitorStyle) -> String {
 }
 
 fn render_monitor_snapshot(
-    details: Option<&RunDetails>,
+    details: Option<&StatusPainterResponse>,
     waiting_repo: Option<&str>,
     clear_screen: bool,
     separator: bool,
@@ -2171,7 +2274,7 @@ fn render_waiting_monitor(out: &mut impl Write, style: MonitorStyle) -> Result<(
 
 fn render_run_monitor(
     out: &mut impl Write,
-    details: &RunDetails,
+    details: &StatusPainterResponse,
     style: MonitorStyle,
 ) -> Result<()> {
     match &details.feed {
@@ -2186,14 +2289,6 @@ fn render_run_monitor(
                 true,
             )
         }
-    }
-}
-
-fn progress_phase_label(progress: &crate::domain::RunProgress) -> String {
-    if progress.phase.trim().is_empty() {
-        "unknown".to_string()
-    } else {
-        progress.phase.clone()
     }
 }
 
@@ -2294,33 +2389,35 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn is_terminal_status(status: RunStatus) -> bool {
-    matches!(
-        status,
-        RunStatus::Completed
-            | RunStatus::Failed
-            | RunStatus::Blocked
-            | RunStatus::Cancelled
-            | RunStatus::Interrupted
-    )
+fn daemon_feed(details: &StatusPainterResponse) -> Result<&StatusFeed> {
+    details
+        .feed
+        .as_ref()
+        .context("daemon status projection is unavailable")
 }
 
-fn terminal_run_error(details: &RunDetails) -> Result<()> {
-    if let Some(reason) = &details.primary_terminal_reason {
+fn terminal_run_error(details: &StatusPainterResponse) -> Result<()> {
+    let feed = daemon_feed(details)?;
+    if let Some(reason) = &feed.terminal_reason {
         bail!(
             "run ended with status {}: {}",
-            details.run.status,
+            feed.lifecycle.state,
             reason.summary
         );
     }
-    if details.run.error.trim().is_empty() {
-        bail!("run ended with status {}", details.run.status);
+    bail!("run ended with status {}", feed.lifecycle.state)
+}
+
+fn lifecycle_result(details: &StatusPainterResponse) -> Result<Option<Result<()>>> {
+    let lifecycle = &daemon_feed(details)?.lifecycle;
+    if !lifecycle.terminal {
+        return Ok(None);
     }
-    bail!(
-        "run ended with status {}: {}",
-        details.run.status,
-        details.run.error
-    )
+    if lifecycle.successful {
+        Ok(Some(Ok(())))
+    } else {
+        Ok(Some(terminal_run_error(details)))
+    }
 }
 
 fn stdout_is_terminal() -> bool {
@@ -2329,7 +2426,7 @@ fn stdout_is_terminal() -> bool {
 
 fn wait_run(client: &Client, run_id: &str) -> Result<()> {
     loop {
-        let details: RunDetails = client.call(
+        let details: StatusPainterResponse = client.call(
             "status",
             &StatusParams {
                 run_id: run_id.to_string(),
@@ -2338,19 +2435,15 @@ fn wait_run(client: &Client, run_id: &str) -> Result<()> {
             },
         )?;
         print_json(&details)?;
-        match details.run.status {
-            RunStatus::Completed => return Ok(()),
-            RunStatus::Failed
-            | RunStatus::Blocked
-            | RunStatus::Cancelled
-            | RunStatus::Interrupted => return terminal_run_error(&details),
-            _ => thread::sleep(Duration::from_secs(2)),
+        if let Some(result) = lifecycle_result(&details)? {
+            return result;
         }
+        thread::sleep(Duration::from_secs(2));
     }
 }
 
 fn cockpit_unavailable_output(
-    run: &crate::domain::Run,
+    run: &StatusPainterRun,
     workspace_label: String,
     message: String,
     operator_commands: Vec<String>,
@@ -2539,6 +2632,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_source_cannot_reintroduce_raw_status_semantics() {
+        let source = include_str!("cli.rs");
+        let forbidden = [
+            ["details", ".run", ".status"].concat(),
+            ["details", ".primary_terminal_reason"].concat(),
+            ["details", ".questions"].concat(),
+            ["details", ".replan"].concat(),
+            ["details", ".events"].concat(),
+            ["project", "_gate_pane"].concat(),
+        ];
+        for forbidden in forbidden {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden client semantic: {forbidden}"
+            );
+        }
+        assert!(source.contains("daemon_feed(details)?.lifecycle"));
+        assert!(source.contains("projected_action(details"));
+    }
+
+    #[test]
+    fn painter_rejects_cross_run_typed_actions() {
+        let mut feed = generic_monitor_feed();
+        feed.actions.push(crate::domain::StatusAction {
+            id: "cross-run-resume".to_string(),
+            kind: "resume_run".to_string(),
+            label: "resume other run".to_string(),
+            command: "khazad-doom resume --run kd-other".to_string(),
+            priority: 100,
+            run_id: "kd-other".to_string(),
+            target_id: String::new(),
+        });
+        let details = test_run_details(TestRunDetailsOptions {
+            feed: Some(feed),
+            ..Default::default()
+        });
+
+        let error = projected_actions(&details, "resume_run")
+            .expect_err("cross-run action must not authorize a mutation");
+        assert!(format!("{error:#}").contains("cross-run action"));
+    }
+
+    #[test]
+    fn rust_plain_painter_accepts_unknowns_in_the_full_status_response() -> Result<()> {
+        let fixture = include_str!("../tests/fixtures/status-response-parity.json");
+        let raw: Value = serde_json::from_str(fixture)?;
+        let details: StatusPainterResponse = serde_json::from_str(fixture)?;
+        assert!(
+            serde_json::from_str::<RunDetails>(fixture).is_err(),
+            "strict daemon/storage decoding must continue rejecting future raw enums"
+        );
+        assert_eq!(serde_json::to_value(&details)?, raw);
+        assert_eq!(details.run.id, "kd-future");
+        assert_eq!(details.run.repo_path, "/repo/future");
+        assert_eq!(details.raw["run"]["status"], "future_paused");
+        let feed = daemon_feed(&details)?;
+        assert_eq!(
+            feed.blocks[1].kind,
+            crate::domain::StatusFeedBlockKind::Unknown
+        );
+        assert_eq!(feed.blocks[1].lines[0].role, StatusFeedRole::Unknown);
+        let mut rendered = Vec::new();
+        render_feed_plain(&mut rendered, feed)?;
+        assert_eq!(
+            String::from_utf8(rendered).unwrap(),
+            include_str!("../tests/fixtures/status-response-parity.txt")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_activity_painter_follows_file_growth_until_exit() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let stdout_path = temp.path().join("worker.stdout.ndjson");
@@ -2595,16 +2759,28 @@ mod tests {
         let mut details = test_run_details(TestRunDetailsOptions {
             status: RunStatus::Running,
             feed: Some(StatusFeed {
-                feed_version: 1,
+                feed_version: 2,
                 summary_line: "daemon feed summary".to_string(),
+                lifecycle: crate::domain::StatusLifecycleProjection {
+                    state: "running".to_string(),
+                    terminal: false,
+                    successful: false,
+                    exit_code: None,
+                },
+                worker_activity: Default::default(),
+                gate: Default::default(),
+                repair: Default::default(),
                 terminal_reason: None,
+                actions: Vec::new(),
                 operator_commands: vec!["khazad-doom answer kd-test q-1 <answer>".to_string()],
+                attention_items: Vec::new(),
                 attention: vec![crate::domain::StatusFeedLine {
                     text: long_attention.to_string(),
                     role: StatusFeedRole::Attention,
                 }],
                 blocks: vec![
                     crate::domain::StatusFeedBlock {
+                        kind: crate::domain::StatusFeedBlockKind::Lifecycle,
                         label: "Run".to_string(),
                         meta: "● running • kd-test".to_string(),
                         lines: vec![crate::domain::StatusFeedLine {
@@ -2613,6 +2789,7 @@ mod tests {
                         }],
                     },
                     crate::domain::StatusFeedBlock {
+                        kind: crate::domain::StatusFeedBlockKind::Attention,
                         label: "Attention".to_string(),
                         meta: String::new(),
                         lines: vec![crate::domain::StatusFeedLine {
@@ -2621,6 +2798,7 @@ mod tests {
                         }],
                     },
                     crate::domain::StatusFeedBlock {
+                        kind: crate::domain::StatusFeedBlockKind::Commands,
                         label: "Commands".to_string(),
                         meta: String::new(),
                         lines: vec![crate::domain::StatusFeedLine {
@@ -2632,7 +2810,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        details.run.error = "from run error not feed".to_string();
+        details.raw["run"]["error"] = serde_json::json!("from run error not feed");
 
         let mut out = Vec::new();
         let style = MonitorStyle {
@@ -2810,24 +2988,25 @@ mod tests {
     }
 
     #[test]
-    fn gate_activity_painter_renders_active_command_from_daemon_progress() -> Result<()> {
+    fn gate_activity_painter_renders_only_projected_active_command() -> Result<()> {
         let now = fixed_time();
         let details = test_run_details(TestRunDetailsOptions {
             status: RunStatus::Running,
             progress: Some(crate::domain::RunProgress {
                 run_id: "kd-test".to_string(),
-                phase: "integration_gate".to_string(),
+                phase: "raw progress must not be interpreted".to_string(),
                 slice_id: String::new(),
                 attempt: 0,
-                command: "cargo test gate --quiet".to_string(),
-                message: "running integration gate command".to_string(),
-                output_tail: "gate line 1\ngate line 2\n".to_string(),
+                command: "raw command must not be painted".to_string(),
+                message: "raw message must not be painted".to_string(),
+                output_tail: "raw tail must not be painted".to_string(),
                 phase_started_at: now - chrono::Duration::seconds(185),
                 updated_at: now - chrono::Duration::seconds(5),
                 worker: None,
                 parallel_layer: false,
                 parallel_slices: Vec::new(),
             }),
+            feed: Some(active_gate_feed()),
             ..Default::default()
         });
 
@@ -2841,7 +3020,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_pane_summary_idle_passed_uses_gate_scoped_golden() -> Result<()> {
+    fn idle_gate_passed_does_not_reinterpret_raw_events() -> Result<()> {
         let now = fixed_time();
         let details = test_run_details(TestRunDetailsOptions {
             status: RunStatus::Completed,
@@ -2880,14 +3059,14 @@ mod tests {
             &details,
             now,
             false,
-            include_str!("../tests/fixtures/gate_activity_idle_passed.golden.txt"),
+            "existing daemon feed/status summary\n",
         )?;
         assert_absent_generic_monitor_sections(&rendered);
         Ok(())
     }
 
     #[test]
-    fn gate_pane_summary_idle_failed_repairable_uses_daemon_gate_economics() -> Result<()> {
+    fn idle_gate_failed_does_not_reinterpret_raw_economics() -> Result<()> {
         let now = fixed_time();
         let mut economics = test_economics();
         economics
@@ -2920,14 +3099,14 @@ mod tests {
             &details,
             now,
             false,
-            include_str!("../tests/fixtures/gate_activity_idle_failed_repairable.golden.txt"),
+            "existing daemon feed/status summary\n",
         )?;
         assert_absent_generic_monitor_sections(&rendered);
         Ok(())
     }
 
     #[test]
-    fn gate_pane_summary_idle_no_gate_yet_uses_gate_scoped_golden() -> Result<()> {
+    fn idle_gate_without_result_paints_the_daemon_feed_verbatim() -> Result<()> {
         let now = fixed_time();
         let details = test_run_details(TestRunDetailsOptions {
             status: RunStatus::Running,
@@ -2941,14 +3120,14 @@ mod tests {
             &details,
             now,
             false,
-            include_str!("../tests/fixtures/gate_activity_idle_no_gate.golden.txt"),
+            "existing daemon feed/status summary\n",
         )?;
         assert_absent_generic_monitor_sections(&rendered);
         Ok(())
     }
 
     fn assert_gate_pane_golden(
-        details: &RunDetails,
+        details: &StatusPainterResponse,
         now: chrono::DateTime<chrono::Utc>,
         expected_active: bool,
         expected: &str,
@@ -2969,7 +3148,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            !rendered.contains("existing daemon feed/status summary"),
+            rendered.contains("existing daemon feed/status summary"),
             "{rendered}"
         );
     }
@@ -2994,9 +3173,9 @@ mod tests {
         }
     }
 
-    fn test_run_details(options: TestRunDetailsOptions) -> RunDetails {
+    fn test_run_details(options: TestRunDetailsOptions) -> StatusPainterResponse {
         let now = fixed_time();
-        RunDetails {
+        let details = RunDetails {
             run: crate::domain::Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
@@ -3010,6 +3189,10 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            snapshot: Default::default(),
+            launch_intents: Vec::new(),
+            integration_merge_intents: Vec::new(),
+            terminalization: Default::default(),
             worker_profile: Default::default(),
             slice_runs: Vec::new(),
             worker_attempts: Vec::new(),
@@ -3025,7 +3208,8 @@ mod tests {
             economics: options.economics,
             primary_terminal_reason: None,
             feed: options.feed,
-        }
+        };
+        serde_json::from_value(serde_json::to_value(details).unwrap()).unwrap()
     }
 
     fn test_economics() -> crate::domain::RunEconomics {
@@ -3062,14 +3246,55 @@ mod tests {
         }
     }
 
+    fn active_gate_feed() -> StatusFeed {
+        let mut feed = generic_monitor_feed();
+        feed.summary_line = "daemon-projected gate activity".to_string();
+        feed.gate = crate::domain::StatusPhaseProjection {
+            state: "running".to_string(),
+            active: true,
+            summary: "integration gate running".to_string(),
+            command: "cargo test gate --quiet".to_string(),
+            output_tail: "gate line 1\ngate line 2".to_string(),
+            finding_count: 0,
+        };
+        feed.blocks.push(crate::domain::StatusFeedBlock {
+            kind: crate::domain::StatusFeedBlockKind::Gate,
+            label: "Checks".to_string(),
+            meta: "running".to_string(),
+            lines: vec![
+                crate::domain::StatusFeedLine {
+                    text: "command cargo test gate --quiet".to_string(),
+                    role: StatusFeedRole::Dim,
+                },
+                crate::domain::StatusFeedLine {
+                    text: "tail gate line 1 | gate line 2".to_string(),
+                    role: StatusFeedRole::Info,
+                },
+            ],
+        });
+        feed
+    }
+
     fn generic_monitor_feed() -> StatusFeed {
         StatusFeed {
-            feed_version: 1,
+            feed_version: 2,
             summary_line: "existing daemon feed/status summary".to_string(),
+            lifecycle: crate::domain::StatusLifecycleProjection {
+                state: "running".to_string(),
+                terminal: false,
+                successful: false,
+                exit_code: None,
+            },
+            worker_activity: Default::default(),
+            gate: Default::default(),
+            repair: Default::default(),
             terminal_reason: None,
+            actions: Vec::new(),
             operator_commands: Vec::new(),
+            attention_items: Vec::new(),
             attention: Vec::new(),
             blocks: vec![crate::domain::StatusFeedBlock {
+                kind: crate::domain::StatusFeedBlockKind::WorkerActivity,
                 label: "Activity".to_string(),
                 meta: "(1 recent)".to_string(),
                 lines: vec![crate::domain::StatusFeedLine {

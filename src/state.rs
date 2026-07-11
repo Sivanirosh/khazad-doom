@@ -4,8 +4,8 @@ use crate::domain::{
     IntegrationMergeState, MissionEnvelope, ReplanDecision, ReplanEvidenceLink, ReplanProposal,
     ReplanProposalSource, ReplanProposalState, ReplanProposedChange, Run, RunLaunchAction,
     RunLaunchIntent, RunLaunchState, RunProgress, RunStatus, SliceRun, SliceStatus,
-    WorkerAttemptLedger, WorkerAttemptProgress, WorkerQuestion, WorkerQuestionAnswerSource,
-    WorkerQuestionRecommendation,
+    StatusSnapshotRevision, WorkerAttemptLedger, WorkerAttemptProgress, WorkerQuestion,
+    WorkerQuestionAnswerSource, WorkerQuestionRecommendation,
 };
 use crate::pi_contract;
 use anyhow::{Context, Result};
@@ -26,6 +26,45 @@ pub struct Repo {
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StatusSourceSnapshot {
+    pub(crate) source: String,
+    pub(crate) payload: serde_json::Value,
+    pub(crate) indexed_event_id: i64,
+    pub(crate) content_sha256: String,
+    pub(crate) observed_at: DateTime<Utc>,
+}
+
+/// Every authoritative input used by the status projection, captured from one
+/// SQLite read transaction. `events` is complete semantic history;
+/// `event_tail` is the independently bounded response payload.
+#[derive(Debug, Clone)]
+pub(crate) struct RunStateSnapshot {
+    pub(crate) revision: StatusSnapshotRevision,
+    pub(crate) run: Run,
+    pub(crate) slice_runs: Vec<SliceRun>,
+    pub(crate) worker_attempts: Vec<WorkerAttemptLedger>,
+    pub(crate) progress: Option<RunProgress>,
+    pub(crate) questions: Vec<WorkerQuestion>,
+    pub(crate) replan_proposals: Vec<ReplanProposal>,
+    pub(crate) mission_envelope: Option<MissionEnvelope>,
+    pub(crate) frontier_budget: Option<FrontierBudgetState>,
+    pub(crate) events: Vec<Event>,
+    pub(crate) event_tail: Vec<Event>,
+    pub(crate) terminal_transition: Option<TerminalTransition>,
+    pub(crate) launch_intents: Vec<RunLaunchIntent>,
+    pub(crate) merge_intents: Vec<IntegrationMergeIntent>,
+    pub(crate) status_sources: Vec<StatusSourceSnapshot>,
+}
+
+enum StatusSnapshotSelector<'a> {
+    RunId(&'a str),
+    LatestRepo {
+        repo_path: &'a str,
+        active_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +791,15 @@ impl Store {
                 notification_bookkept_at TEXT NOT NULL DEFAULT '',
                 cleanup_started_at TEXT NOT NULL DEFAULT '',
                 cleanup_completed_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS status_source_snapshots (
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                indexed_event_id INTEGER NOT NULL DEFAULT 0,
+                content_sha256 TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, source)
             );
             CREATE TABLE IF NOT EXISTS run_progress (
                 run_id TEXT PRIMARY KEY,
@@ -2662,27 +2710,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn list_worker_attempt_ledger_for_run(
-        &self,
-        run_id: &str,
-    ) -> Result<Vec<WorkerAttemptLedger>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT run_id, slice_id, launch_id, launch_ordinal, execution_epoch,
-                      worker_retry_ordinal, repair_ordinal, envelope_retry_ordinal, kind,
-                      state, branch, worktree, output_stem, created_at, launched_at,
-                      finished_at, failure_cause, worker_pid, worker_process_observed_at,
-                      worker_last_event_at, worker_last_event_kind,
-                      worker_last_semantic_progress_at, worker_last_semantic_progress_summary,
-                      worker_attempt_timeout_seconds, worker_no_output_warning_seconds
-               FROM worker_attempt_ledger
-               WHERE run_id=?1
-               ORDER BY launch_id ASC"#,
-        )?;
-        let rows = stmt.query_map(params![run_id], worker_attempt_ledger_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
     /// Retains a durable allocation after a crash but marks it unrecoverable;
     /// resume must allocate a fresh identity rather than reviving this row.
     #[allow(dead_code)]
@@ -3867,6 +3894,7 @@ impl Store {
                 run_for_apply.as_ref(),
             ),
             generated_slice_id: initial_replan_generated_slice_id(&existing, command.state),
+            generated_slice_generation: 0,
             generated_slice_commit: String::new(),
             apply_before_checkpoint_id: String::new(),
             apply_after_checkpoint_id: String::new(),
@@ -4457,6 +4485,227 @@ impl Store {
         Ok(progress)
     }
 
+    /// Persist a live external projection inside SQLite so status readers never
+    /// have to combine a transactional revision with an opportunistic file
+    /// read. The payload and its causal event frontier are one durable row.
+    pub(crate) fn record_status_source_snapshot<T, C>(
+        &self,
+        run_id: &str,
+        source: &str,
+        capture_payload: C,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        C: FnOnce() -> T,
+    {
+        self.record_status_source_snapshot_inner(run_id, source, capture_payload, || {})
+    }
+
+    #[cfg(test)]
+    fn record_status_source_snapshot_with_hook<T, C, H>(
+        &self,
+        run_id: &str,
+        source: &str,
+        capture_payload: C,
+        after_capture: H,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        C: FnOnce() -> T,
+        H: FnOnce(),
+    {
+        self.record_status_source_snapshot_inner(run_id, source, capture_payload, after_capture)
+    }
+
+    fn record_status_source_snapshot_inner<T, C, H>(
+        &self,
+        run_id: &str,
+        source: &str,
+        capture_payload: C,
+        after_capture: H,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        C: FnOnce() -> T,
+        H: FnOnce(),
+    {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_exists = tx
+            .query_row(
+                "SELECT 1 FROM runs WHERE id=?1",
+                params![run_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !run_exists {
+            anyhow::bail!("cannot index status source {source:?}: run {run_id:?} not found");
+        }
+        // Capture and serialize while the immediate transaction excludes event
+        // writers, then bind exactly that payload to the in-transaction frontier.
+        let payload_json = serde_json::to_string(&capture_payload())?;
+        let content_sha256 = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
+        after_capture();
+        let indexed_event_id = tx.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE run_id=?1",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.execute(
+            r#"INSERT INTO status_source_snapshots
+               (run_id, source, payload_json, indexed_event_id, content_sha256, observed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(run_id, source) DO UPDATE SET
+                 payload_json=excluded.payload_json,
+                 indexed_event_id=excluded.indexed_event_id,
+                 content_sha256=excluded.content_sha256,
+                 observed_at=excluded.observed_at"#,
+            params![
+                run_id,
+                source,
+                payload_json,
+                indexed_event_id,
+                content_sha256,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn status_snapshot(
+        &self,
+        run_id: &str,
+        events_limit: usize,
+    ) -> Result<Option<RunStateSnapshot>> {
+        self.status_snapshot_inner(StatusSnapshotSelector::RunId(run_id), events_limit, || {
+            Ok(())
+        })
+    }
+
+    pub(crate) fn latest_status_snapshot(
+        &self,
+        repo_path: &str,
+        active_only: bool,
+        events_limit: usize,
+    ) -> Result<Option<RunStateSnapshot>> {
+        self.status_snapshot_inner(
+            StatusSnapshotSelector::LatestRepo {
+                repo_path,
+                active_only,
+            },
+            events_limit,
+            || Ok(()),
+        )
+    }
+
+    #[cfg(test)]
+    fn status_snapshot_with_hook<F>(
+        &self,
+        run_id: &str,
+        events_limit: usize,
+        hook: F,
+    ) -> Result<Option<RunStateSnapshot>>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.status_snapshot_inner(StatusSnapshotSelector::RunId(run_id), events_limit, hook)
+    }
+
+    #[cfg(test)]
+    fn latest_status_snapshot_with_hook<F>(
+        &self,
+        repo_path: &str,
+        active_only: bool,
+        events_limit: usize,
+        hook: F,
+    ) -> Result<Option<RunStateSnapshot>>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.status_snapshot_inner(
+            StatusSnapshotSelector::LatestRepo {
+                repo_path,
+                active_only,
+            },
+            events_limit,
+            hook,
+        )
+    }
+
+    fn status_snapshot_inner<F>(
+        &self,
+        selector: StatusSnapshotSelector<'_>,
+        events_limit: usize,
+        hook: F,
+    ) -> Result<Option<RunStateSnapshot>>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // This lookup is intentionally the first table read: it establishes the
+        // snapshot root and prevents a separately fetched Run from authorizing
+        // a projection assembled from a newer revision.
+        let run = match selector {
+            StatusSnapshotSelector::RunId(run_id) => run_by_id(&tx, run_id)?,
+            StatusSnapshotSelector::LatestRepo {
+                repo_path,
+                active_only,
+            } => latest_run_for_repo_conn(&tx, repo_path, active_only)?,
+        };
+        let Some(run) = run else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let sqlite_data_version = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        hook()?;
+
+        let slice_runs = status_slice_runs(&tx, &run.id)?;
+        let worker_attempts = status_worker_attempts(&tx, &run.id)?;
+        let progress = status_progress(&tx, &run.id)?;
+        let questions = status_worker_questions(&tx, &run.id)?;
+        let replan_proposals = status_replan_proposals(&tx, &run.id)?;
+        let (mission_envelope, frontier_budget) = status_frontier_state(&tx, &run.id)?;
+        let events = status_events(&tx, &run.id)?;
+        let limit = if events_limit == 0 { 50 } else { events_limit };
+        let event_tail = events
+            .iter()
+            .skip(events.len().saturating_sub(limit))
+            .cloned()
+            .collect();
+        let max_event_id = events.last().map_or(0, |event| event.id);
+        let terminal_transition = status_terminal_transition(&tx, &run.id)?;
+        let launch_intents = status_run_launch_intents(&tx, &run.id)?;
+        let merge_intents = status_integration_merge_intents(&tx, &run.id)?;
+        let status_sources = status_source_snapshots(&tx, &run.id)?;
+        let revision = StatusSnapshotRevision {
+            sqlite_data_version,
+            max_event_id,
+            run_updated_at: Some(run.updated_at),
+            captured_at: Some(Utc::now()),
+        };
+        tx.commit()?;
+        Ok(Some(RunStateSnapshot {
+            revision,
+            run,
+            slice_runs,
+            worker_attempts,
+            progress,
+            questions,
+            replan_proposals,
+            mission_envelope,
+            frontier_budget,
+            events,
+            event_tail,
+            terminal_transition,
+            launch_intents,
+            merge_intents,
+            status_sources,
+        }))
+    }
+
     pub fn get_run(&self, id: &str) -> Result<Option<Run>> {
         let conn = self.conn()?;
         run_by_id(&conn, id)
@@ -4492,30 +4741,6 @@ impl Store {
         Ok(events)
     }
 
-    pub fn get_incident_events(&self, run_id: &str) -> Result<Vec<Event>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT id, run_id, type, payload_json, created_at
-               FROM events
-               WHERE run_id=?1
-                 AND type IN (
-                   'run_incident',
-                   'run_error',
-                   'run_resumed',
-                   'worktree_cleanup_error',
-                   'daemon_recovery_cleanup_error',
-                   'integration_repair_completed'
-                 )
-               ORDER BY id ASC"#,
-        )?;
-        let rows = stmt.query_map(params![run_id], event_tuple_from_row)?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(event_from_tuple(row?)?);
-        }
-        Ok(events)
-    }
-
     pub fn active_runs(&self) -> Result<Vec<Run>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -4532,41 +4757,6 @@ impl Store {
             runs.push(run_from_tuple(row?)?);
         }
         Ok(runs)
-    }
-
-    pub fn latest_run_for_repo(&self, repo_path: &str, active_only: bool) -> Result<Option<Run>> {
-        let conn = self.conn()?;
-        let sql = if active_only {
-            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
-                      selected_slice_id, error, started_at, updated_at
-               FROM runs
-               WHERE repo_path=?1 AND status IN (?2, ?3)
-               ORDER BY started_at DESC, id DESC
-               LIMIT 1"#
-        } else {
-            r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
-                      selected_slice_id, error, started_at, updated_at
-               FROM runs
-               WHERE repo_path=?1
-               ORDER BY started_at DESC, id DESC
-               LIMIT 1"#
-        };
-        let row = if active_only {
-            conn.query_row(
-                sql,
-                params![
-                    repo_path,
-                    RunStatus::Pending.as_str(),
-                    RunStatus::Running.as_str()
-                ],
-                run_tuple_from_row,
-            )
-            .optional()?
-        } else {
-            conn.query_row(sql, params![repo_path], run_tuple_from_row)
-                .optional()?
-        };
-        row.map(run_from_tuple).transpose()
     }
 
     pub fn latest_runs(&self, limit: usize) -> Result<Vec<Run>> {
@@ -5220,6 +5410,272 @@ fn run_by_id(conn: &Connection, id: &str) -> Result<Option<Run>> {
     .transpose()
 }
 
+fn latest_run_for_repo_conn(
+    conn: &Connection,
+    repo_path: &str,
+    active_only: bool,
+) -> Result<Option<Run>> {
+    let sql = if active_only {
+        r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                  selected_slice_id, error, started_at, updated_at
+           FROM runs
+           WHERE repo_path=?1 AND status IN (?2, ?3)
+           ORDER BY started_at DESC, id DESC
+           LIMIT 1"#
+    } else {
+        r#"SELECT id, repo_id, repo_path, status, base_branch, base_sha, integration_branch,
+                  selected_slice_id, error, started_at, updated_at
+           FROM runs
+           WHERE repo_path=?1
+           ORDER BY started_at DESC, id DESC
+           LIMIT 1"#
+    };
+    let row = if active_only {
+        conn.query_row(
+            sql,
+            params![
+                repo_path,
+                RunStatus::Pending.as_str(),
+                RunStatus::Running.as_str()
+            ],
+            run_tuple_from_row,
+        )
+        .optional()?
+    } else {
+        conn.query_row(sql, params![repo_path], run_tuple_from_row)
+            .optional()?
+    };
+    row.map(run_from_tuple).transpose()
+}
+
+fn status_slice_runs(conn: &Connection, run_id: &str) -> Result<Vec<SliceRun>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT run_id, slice_id, status, branch, commit_sha, attempts, last_error
+           FROM slice_runs WHERE run_id=?1 ORDER BY slice_id"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], slice_run_tuple_from_row)?;
+    rows.map(|row| slice_run_from_tuple(row?)).collect()
+}
+
+fn status_worker_attempts(conn: &Connection, run_id: &str) -> Result<Vec<WorkerAttemptLedger>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT run_id, slice_id, launch_id, launch_ordinal, execution_epoch,
+                  worker_retry_ordinal, repair_ordinal, envelope_retry_ordinal, kind,
+                  state, branch, worktree, output_stem, created_at, launched_at,
+                  finished_at, failure_cause, worker_pid, worker_process_observed_at,
+                  worker_last_event_at, worker_last_event_kind,
+                  worker_last_semantic_progress_at, worker_last_semantic_progress_summary,
+                  worker_attempt_timeout_seconds, worker_no_output_warning_seconds
+           FROM worker_attempt_ledger
+           WHERE run_id=?1
+           ORDER BY launch_id ASC"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], worker_attempt_ledger_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn status_progress(conn: &Connection, run_id: &str) -> Result<Option<RunProgress>> {
+    let row = conn
+        .query_row(
+            r#"SELECT run_id, phase, slice_id, attempt, command, message, output_tail,
+                      phase_started_at, updated_at, worker_attempt_started_at, worker_pid,
+                      worker_process_observed_at, worker_last_event_at, worker_last_event_kind,
+                      worker_last_semantic_progress_at, worker_last_semantic_progress_summary,
+                      worker_attempt_timeout_seconds, worker_no_output_warning_seconds
+               FROM run_progress WHERE run_id=?1"#,
+            params![run_id],
+            run_progress_tuple_from_row,
+        )
+        .optional()?;
+    let mut progress = row.map(run_progress_from_tuple).transpose()?;
+    if let Some(progress) = progress.as_mut()
+        && let Some(worker) = progress.worker.as_mut()
+    {
+        worker.launch_id = conn
+            .query_row(
+                r#"SELECT launch_id FROM worker_attempt_ledger
+                   WHERE run_id=?1 AND slice_id=?2 AND state='running'
+                     AND (
+                       (kind='integration-repair' AND repair_ordinal=?3)
+                       OR (kind<>'integration-repair' AND worker_retry_ordinal=?3)
+                     )
+                   ORDER BY launch_id DESC LIMIT 1"#,
+                params![run_id, &progress.slice_id, progress.attempt as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+    }
+    Ok(progress)
+}
+
+fn status_worker_questions(conn: &Connection, run_id: &str) -> Result<Vec<WorkerQuestion>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, run_id, slice_id, attempt, launch_id, question, options_json, timeout_seconds,
+                  state, asked_at, answered_at, answer, recommended_answer,
+                  recommendation_rationale, bounded_within_current_slice_or_mission_authority,
+                  reversible, fallback_eligible, deadline_at, answer_source
+           FROM worker_questions WHERE run_id=?1 ORDER BY asked_at ASC, id ASC"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], worker_question_from_row)?;
+    let mut questions = Vec::new();
+    for row in rows {
+        questions.push(row.with_context(|| {
+            format!("decode required worker question status row for run {run_id}")
+        })?);
+    }
+    Ok(questions)
+}
+
+fn status_replan_proposals(conn: &Connection, run_id: &str) -> Result<Vec<ReplanProposal>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, run_id, state, source_json, trigger_finding_ids_json,
+                  evidence_json, proposed_changes_json, risk, decision_json,
+                  frontier_classification_json, created_at, updated_at
+           FROM replan_proposals WHERE run_id=?1 ORDER BY created_at ASC, id ASC"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], replan_proposal_tuple_from_row)?;
+    let mut proposals = Vec::new();
+    for row in rows {
+        proposals.push(replan_proposal_from_tuple(row?)?);
+    }
+    Ok(proposals)
+}
+
+fn status_frontier_state(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<(Option<MissionEnvelope>, Option<FrontierBudgetState>)> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT mission_envelope_json, frontier_budget_json FROM runs WHERE id=?1",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((envelope_json, budget_json)) = row else {
+        anyhow::bail!("required status run {run_id:?} disappeared inside read transaction");
+    };
+    let mission_envelope = if envelope_json.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&envelope_json)
+                .with_context(|| format!("parse mission envelope for run {run_id}"))?,
+        )
+    };
+    let frontier_budget = if budget_json.trim().is_empty() {
+        mission_envelope
+            .as_ref()
+            .map(|_| FrontierBudgetState::default())
+    } else {
+        Some(
+            serde_json::from_str(&budget_json)
+                .with_context(|| format!("parse frontier budget for run {run_id}"))?,
+        )
+    };
+    Ok((mission_envelope, frontier_budget))
+}
+
+fn status_events(conn: &Connection, run_id: &str) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, run_id, type, payload_json, created_at
+           FROM events WHERE run_id=?1 ORDER BY id ASC"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], event_tuple_from_row)?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(event_from_tuple(row?)?);
+    }
+    Ok(events)
+}
+
+fn status_terminal_transition(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<TerminalTransition>> {
+    conn.query_row(
+        r#"SELECT status, error, progress_message, question_interruption_reason,
+                  summary_written_at, committed_at
+           FROM terminal_transitions WHERE run_id=?1"#,
+        params![run_id],
+        terminal_transition_tuple_from_row,
+    )
+    .optional()?
+    .map(terminal_transition_from_tuple)
+    .transpose()
+}
+
+fn status_run_launch_intents(conn: &Connection, run_id: &str) -> Result<Vec<RunLaunchIntent>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT run_id, execution_epoch, action, state, repo_id, integration_branch,
+                  integration_worktree, integration_resources_owned, prior_status, prior_error,
+                  primary_cause, compensation_error, created_at, updated_at
+           FROM run_launch_intents WHERE run_id=?1
+           ORDER BY execution_epoch ASC"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], run_launch_intent_tuple_from_row)?;
+    let mut intents = Vec::new();
+    for row in rows {
+        intents.push(run_launch_intent_from_tuple(row?)?);
+    }
+    Ok(intents)
+}
+
+fn status_integration_merge_intents(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<IntegrationMergeIntent>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT operation_id, run_id, kind, slice_id, attempt, launch_id,
+                  source_branch, source_commit, source_tree, expected_head,
+                  expected_result_tree, resulting_head, state, completion_json,
+                  primary_cause, abort_error, conflicted_files_json, created_at, updated_at
+           FROM integration_merge_intents WHERE run_id=?1
+           ORDER BY created_at, operation_id"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], integration_merge_intent_tuple_from_row)?;
+    let mut intents = Vec::new();
+    for row in rows {
+        intents.push(integration_merge_intent_from_tuple(row?)?);
+    }
+    Ok(intents)
+}
+
+fn status_source_snapshots(conn: &Connection, run_id: &str) -> Result<Vec<StatusSourceSnapshot>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT source, payload_json, indexed_event_id, content_sha256, observed_at
+           FROM status_source_snapshots WHERE run_id=?1 ORDER BY source"#,
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut snapshots = Vec::new();
+    for row in rows {
+        let (source, payload_json, indexed_event_id, content_sha256, observed_at) = row?;
+        let observed_sha256 = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
+        if observed_sha256 != content_sha256 {
+            anyhow::bail!(
+                "indexed status source {source:?} checksum mismatch: stored {content_sha256}, observed {observed_sha256}"
+            );
+        }
+        snapshots.push(StatusSourceSnapshot {
+            source: source.clone(),
+            payload: serde_json::from_str(&payload_json)
+                .with_context(|| format!("parse indexed status source payload {source:?}"))?,
+            indexed_event_id,
+            content_sha256,
+            observed_at: parse_time("status source observed_at", &observed_at)?,
+        });
+    }
+    Ok(snapshots)
+}
+
 fn run_from_tuple(row: RunTuple) -> Result<Run> {
     let (
         id,
@@ -5810,11 +6266,29 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
     let answered_at: String = row.get(10)?;
     let deadline_at: String = row.get(17)?;
     let answer_source: String = row.get(18)?;
-    let options = serde_json::from_str::<Vec<String>>(&options_json).unwrap_or_default();
+    let options = serde_json::from_str::<Vec<String>>(&options_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decode worker question options JSON: {error}"),
+            )),
+        )
+    })?;
     let attempt: i64 = row.get(3)?;
     let asked_at = DateTime::parse_from_rfc3339(&asked_at_text)
         .map(|time| time.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("decode worker question asked_at: {error}"),
+                )),
+            )
+        })?;
     let timeout_seconds = timeout_seconds.max(0) as u64;
     let deadline_at = if deadline_at.trim().is_empty() {
         if timeout_seconds == 0 {
@@ -5825,9 +6299,20 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
             ))
         }
     } else {
-        DateTime::parse_from_rfc3339(&deadline_at)
-            .map(|time| time.with_timezone(&Utc))
-            .ok()
+        Some(
+            DateTime::parse_from_rfc3339(&deadline_at)
+                .map(|time| time.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        17,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("decode worker question deadline_at: {error}"),
+                        )),
+                    )
+                })?,
+        )
     };
     Ok(WorkerQuestion {
         id: row.get(0)?,
@@ -5849,9 +6334,20 @@ fn worker_question_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerQ
         answered_at: if answered_at.trim().is_empty() {
             None
         } else {
-            DateTime::parse_from_rfc3339(&answered_at)
-                .map(|time| time.with_timezone(&Utc))
-                .ok()
+            Some(
+                DateTime::parse_from_rfc3339(&answered_at)
+                    .map(|time| time.with_timezone(&Utc))
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("decode worker question answered_at: {error}"),
+                            )),
+                        )
+                    })?,
+            )
         },
         answer: row.get(11)?,
         answer_source: WorkerQuestionAnswerSource::parse(&answer_source),
@@ -6469,7 +6965,8 @@ mod tests {
     }
 
     #[test]
-    fn latest_run_for_repo_is_deterministic_and_active_scoped() -> Result<()> {
+    fn latest_status_snapshot_lookup_is_deterministic_active_scoped_and_transactional() -> Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let store = Store::open(dir.path().join("state.sqlite"))?;
         let now = Utc::now();
@@ -6500,26 +6997,30 @@ mod tests {
         store.insert_run(&run("run-tie-b", repo_tie, RunStatus::Completed, now))?;
 
         let active = store
-            .latest_run_for_repo(repo_a, true)?
+            .latest_status_snapshot(repo_a, true, 50)?
             .expect("active run for repo_a");
-        assert_eq!(active.id, "run-active-b");
+        assert_eq!(active.run.id, "run-active-b");
 
         let latest = store
-            .latest_run_for_repo(repo_a, false)?
+            .latest_status_snapshot(repo_a, false, 50)?
             .expect("latest run for repo_a");
-        assert_eq!(latest.id, "run-completed-newer");
+        assert_eq!(latest.run.id, "run-completed-newer");
 
         let scoped = store
-            .latest_run_for_repo(repo_b, true)?
+            .latest_status_snapshot(repo_b, true, 50)?
             .expect("active run for repo_b");
-        assert_eq!(scoped.id, "run-other-repo");
+        assert_eq!(scoped.run.id, "run-other-repo");
 
         let tied = store
-            .latest_run_for_repo(repo_tie, false)?
+            .latest_status_snapshot(repo_tie, false, 50)?
             .expect("tie-broken historical run");
-        assert_eq!(tied.id, "run-tie-b");
+        assert_eq!(tied.run.id, "run-tie-b");
 
-        assert!(store.latest_run_for_repo("/tmp/missing", true)?.is_none());
+        assert!(
+            store
+                .latest_status_snapshot("/tmp/missing", true, 50)?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -9196,6 +9697,283 @@ mod tests {
         assert_eq!(activity.last_event_kind, "stderr");
         assert_eq!(activity.attempt_timeout_seconds, 30);
         assert_eq!(activity.no_output_warning_seconds, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_reads_one_sqlite_revision() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("state.sqlite");
+        let store = Store::open(&db_path)?;
+        let writer = Store::open(&db_path)?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-status-snapshot",
+            "/tmp/status-snapshot",
+            RunStatus::Running,
+            now,
+        ))?;
+        store.upsert_slice_run(&SliceRun {
+            run_id: "run-status-snapshot".to_string(),
+            slice_id: "slice-001".to_string(),
+            status: SliceStatus::Running,
+            branch: String::new(),
+            commit_sha: String::new(),
+            attempts: 1,
+            last_error: String::new(),
+        })?;
+
+        let snapshot = store
+            .status_snapshot_with_hook("run-status-snapshot", 20, || {
+                writer.update_run("run-status-snapshot", RunStatus::Completed, "")?;
+                writer.upsert_slice_run(&SliceRun {
+                    run_id: "run-status-snapshot".to_string(),
+                    slice_id: "slice-001".to_string(),
+                    status: SliceStatus::Merged,
+                    branch: "worker/slice-001".to_string(),
+                    commit_sha: "commit".to_string(),
+                    attempts: 1,
+                    last_error: String::new(),
+                })?;
+                writer.record_status_source_snapshot(
+                    "run-status-snapshot",
+                    "economics",
+                    || serde_json::json!({"repair_policy": "after-hook"}),
+                )?;
+                Ok(())
+            })?
+            .expect("status snapshot");
+
+        assert_eq!(snapshot.run.status, RunStatus::Running);
+        assert_eq!(snapshot.slice_runs[0].status, SliceStatus::Running);
+        assert!(snapshot.status_sources.is_empty());
+        assert!(snapshot.revision.max_event_id >= 0);
+        assert_eq!(
+            store
+                .get_run("run-status-snapshot")?
+                .expect("updated run")
+                .status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            store.get_slice_runs("run-status-snapshot")?[0].status,
+            SliceStatus::Merged
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_status_lookup_and_components_share_one_sqlite_revision() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("state.sqlite");
+        let store = Store::open(&db_path)?;
+        let writer = Store::open(&db_path)?;
+        let now = Utc::now();
+        let repo_path = "/tmp/latest-status-revision";
+        store.insert_run(&run(
+            "run-selected-before-hook",
+            repo_path,
+            RunStatus::Completed,
+            now,
+        ))?;
+
+        let snapshot = store
+            .latest_status_snapshot_with_hook(repo_path, false, 20, || {
+                writer.insert_run(&run(
+                    "run-inserted-during-hook",
+                    repo_path,
+                    RunStatus::Completed,
+                    now + ChronoDuration::seconds(1),
+                ))?;
+                Ok(())
+            })?
+            .expect("latest snapshot");
+        assert_eq!(snapshot.run.id, "run-selected-before-hook");
+
+        let next = store
+            .latest_status_snapshot(repo_path, false, 20)?
+            .expect("new latest snapshot");
+        assert_eq!(next.run.id, "run-inserted-during-hook");
+        Ok(())
+    }
+
+    #[test]
+    fn status_source_payload_and_event_frontier_are_captured_atomically() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("state.sqlite");
+        let store = Store::open(&db_path)?;
+        let writer = Store::open(&db_path)?;
+        let run = run(
+            "run-source-race",
+            "/tmp/source-race",
+            RunStatus::Running,
+            Utc::now(),
+        );
+        store.insert_run(&run)?;
+        store.record_event(&run.id, "before_capture", &serde_json::json!({}))?;
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut writer_thread = None;
+        store.record_status_source_snapshot_with_hook(
+            &run.id,
+            "economics",
+            || serde_json::json!({"repair_policy": "captured"}),
+            || {
+                let run_id = run.id.clone();
+                writer_thread = Some(std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    writer
+                        .record_event(&run_id, "after_capture", &serde_json::json!({}))
+                        .unwrap();
+                }));
+                started_rx.recv().unwrap();
+            },
+        )?;
+        writer_thread.expect("writer thread").join().unwrap();
+
+        let snapshot = store
+            .status_snapshot(&run.id, 20)?
+            .expect("status snapshot");
+        let source = snapshot
+            .status_sources
+            .iter()
+            .find(|source| source.source == "economics")
+            .expect("economics source");
+        assert_eq!(source.indexed_event_id, 1);
+        assert_eq!(snapshot.revision.max_event_id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_required_status_rows_fail_instead_of_becoming_empty_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("state.sqlite");
+        let store = Store::open(&db_path)?;
+        let now = Utc::now();
+        store.insert_run(&run(
+            "run-malformed-status",
+            "/tmp/malformed-status",
+            RunStatus::Running,
+            now,
+        ))?;
+        store.store_worker_token("run-malformed-status", "legacy-token")?;
+        store.insert_worker_question(
+            "q-malformed",
+            "run-malformed-status",
+            "slice-001",
+            1,
+            "Choose?",
+            &["A".to_string(), "B".to_string()],
+            60,
+        )?;
+        let conn = Connection::open(&db_path)?;
+        conn.execute(
+            "UPDATE worker_questions SET options_json = '{not-json' WHERE id = 'q-malformed'",
+            [],
+        )?;
+
+        let error = store
+            .status_snapshot("run-malformed-status", 20)
+            .expect_err("required question decode must fail");
+        assert!(
+            format!("{error:#}").contains("worker question options"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_keeps_complete_semantic_history_and_bounds_only_the_wire_tail() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path().join("state.sqlite"))?;
+        let run = run(
+            "run-bounded-tail",
+            "/tmp/bounded-tail",
+            RunStatus::Running,
+            Utc::now(),
+        );
+        store.insert_run(&run)?;
+        for index in 0..5 {
+            store.record_event(
+                &run.id,
+                if index == 0 { "run_error" } else { "noise" },
+                &serde_json::json!({"index": index, "error": "first failure"}),
+            )?;
+        }
+
+        let snapshot = store.status_snapshot(&run.id, 2)?.expect("status snapshot");
+        assert_eq!(snapshot.events.len(), 5);
+        assert_eq!(snapshot.event_tail.len(), 2);
+        assert_eq!(snapshot.event_tail[0].payload["index"], 3);
+        assert_eq!(snapshot.event_tail[1].payload["index"], 4);
+        assert_eq!(snapshot.revision.max_event_id, snapshot.events[4].id);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_indexed_status_source_fails_the_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("state.sqlite");
+        let store = Store::open(&db_path)?;
+        let run = run(
+            "run-malformed-source",
+            "/tmp/malformed-source",
+            RunStatus::Running,
+            Utc::now(),
+        );
+        store.insert_run(&run)?;
+        store.record_status_source_snapshot(
+            &run.id,
+            "economics",
+            || serde_json::json!({"repair_policy": "never"}),
+        )?;
+        let malformed = "{not-json";
+        let malformed_sha = format!("{:x}", Sha256::digest(malformed.as_bytes()));
+        Connection::open(&db_path)?.execute(
+            "UPDATE status_source_snapshots SET payload_json = ?1, content_sha256 = ?2 WHERE run_id = ?3",
+            params![malformed, malformed_sha, run.id],
+        )?;
+
+        let error = store
+            .status_snapshot(&run.id, 20)
+            .expect_err("malformed indexed source must fail");
+        assert!(
+            format!("{error:#}").contains("status source payload"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_status_source_checksum_mismatch_fails_the_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("state.sqlite");
+        let store = Store::open(&db_path)?;
+        let run = run(
+            "run-source-checksum",
+            "/tmp/source-checksum",
+            RunStatus::Running,
+            Utc::now(),
+        );
+        store.insert_run(&run)?;
+        store.record_status_source_snapshot(
+            &run.id,
+            "economics",
+            || serde_json::json!({"repair_policy": "never"}),
+        )?;
+        Connection::open(&db_path)?.execute(
+            "UPDATE status_source_snapshots SET payload_json = ?1 WHERE run_id = ?2",
+            params![r#"{"repair_policy":"always"}"#, run.id],
+        )?;
+
+        let error = store
+            .status_snapshot(&run.id, 20)
+            .expect_err("checksum mismatch must fail");
+        assert!(
+            format!("{error:#}").contains("checksum mismatch"),
+            "{error:#}"
+        );
         Ok(())
     }
 

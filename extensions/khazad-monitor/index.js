@@ -7,7 +7,6 @@ const path = require('node:path');
 
 const FEEDBACK_WIDGET_ID = 'khazad-doom';
 const FEEDBACK_POLL_MS = 2000;
-const TERMINAL_RUN_STATUSES = new Set(['blocked', 'completed', 'failed', 'cancelled', 'interrupted']);
 const KHAZAD_COMMAND_TIMEOUT_MS = 10000;
 
 function khazadMonitorExtension(pi) {
@@ -98,8 +97,7 @@ function createFeedbackAdapter() {
 			safeSetWidget(current.ctx, renderRunFeed(details));
 			const summary = details?.feed?.summary_line ? truncateLine(details.feed.summary_line, 80) : 'daemon feed unavailable';
 			safeSetStatus(current.ctx, `Khazad: ${summary}`);
-			const status = String(details?.run?.status || '').trim();
-			if (TERMINAL_RUN_STATUSES.has(status)) {
+			if (details?.feed?.lifecycle?.terminal === true) {
 				if (current.timer) clearInterval(current.timer);
 				current.timer = undefined;
 			}
@@ -234,17 +232,12 @@ function renderRunFeed(details) {
 	if (!feed) {
 		return [`Khazad-Doom ${runId}`, 'daemon status feed unavailable'];
 	}
-	const lines = [`Khazad-Doom ${runId}`, truncateLine(feed.summary_line || 'status feed')];
-	for (const item of feed.attention || []) {
-		lines.push(`! ${item.text || ''}`);
-	}
+	const lines = [`Khazad-Doom ${runId}`, feed.summary_line || 'status feed'];
 	for (const block of feed.blocks || []) {
-		if (lines.length >= 12) break;
-		const label = block.meta ? `${block.label}: ${block.meta}` : block.label;
-		lines.push(truncateLine(label));
+		const label = block.meta ? `${block.label} ${block.meta}` : block.label;
+		lines.push(label);
 		for (const line of block.lines || []) {
-			if (lines.length >= 12) break;
-			lines.push(truncateLine(`  ${line.text || ''}`));
+			lines.push(`  - ${line.text || ''}`);
 		}
 	}
 	return lines;

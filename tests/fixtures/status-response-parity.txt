@@ -1,0 +1,5 @@
+daemon projection fixture
+Run (future_paused)
+  - daemon owns this line
+Future
+  - unknown kinds and roles remain paintable

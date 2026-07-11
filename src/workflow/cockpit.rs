@@ -1,8 +1,8 @@
 use super::events as workflow_events;
+use super::read_model::{RunReadModelBuilder, RunReadModelOptions};
 use crate::artifact;
 use crate::domain::{
     AttentionNotificationRecord, CockpitMode, ReplanProposal, Run, WorkerQuestion,
-    replan_decision_commands,
 };
 use crate::state::Store as StateStore;
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,14 +40,18 @@ pub(crate) struct CockpitRunRequest {
 
 impl CockpitRunRequest {
     pub fn for_run(run: &Run, khazad_home: &Path) -> Self {
+        Self::for_run_identity(&run.id, &run.repo_path, khazad_home)
+    }
+
+    pub fn for_run_identity(run_id: &str, repo_path: &str, khazad_home: &Path) -> Self {
         let binary = crate::paths::khazad_child_binary();
         let binary = shell_quote(&binary.to_string_lossy());
-        let run_id = shell_quote(&run.id);
+        let quoted_run_id = shell_quote(run_id);
         Self {
-            repo_path: PathBuf::from(&run.repo_path),
+            repo_path: PathBuf::from(repo_path),
             khazad_home: khazad_home.to_path_buf(),
-            workspace_label: workspace_label_for_run(&run.id),
-            feed_command: format!("{binary} monitor --run {run_id} --interval-ms 1000"),
+            workspace_label: workspace_label_for_run(run_id),
+            feed_command: format!("{binary} monitor --run {quoted_run_id} --interval-ms 1000"),
         }
     }
 }
@@ -832,12 +836,13 @@ pub(crate) fn open_default_run_cockpit(
 }
 
 pub(crate) fn open_default_run_cockpit_for_operator(
-    run: &Run,
+    run_id: &str,
+    repo_path: &str,
     khazad_home: &Path,
 ) -> std::result::Result<CockpitOpenFocus, CockpitUnavailable> {
     let mode = CockpitMode::Herdr;
     let adapter = HerdrCockpitAdapter::discover(mode)?;
-    let request = CockpitRunRequest::for_run(run, khazad_home);
+    let request = CockpitRunRequest::for_run_identity(run_id, repo_path, khazad_home);
     Cockpit::new(mode, adapter)
         .open_or_focus_run(&request)
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
@@ -940,20 +945,58 @@ pub(crate) fn notify_origin_worker_question_attention(
     state: &StateStore,
     question: &WorkerQuestion,
 ) {
-    let Ok(Some(run)) = state.get_run(&question.run_id) else {
+    let details = match RunReadModelBuilder::new(state)
+        .snapshot(&question.run_id, RunReadModelOptions::status(50))
+    {
+        Ok(model) => model.details,
+        Err(error) => {
+            record_attention_projection_error(
+                state,
+                &question.run_id,
+                "worker_question_projection_failed",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let Some(question) = details
+        .questions
+        .iter()
+        .find(|candidate| candidate.id == question.id && candidate.state == "pending")
+    else {
         return;
     };
-    let attention_key = format!("worker-question:{}", question.id);
-    let answer_commands = vec![format!(
-        "khazad-doom answer {} {} <answer>",
-        question.run_id, question.id
-    )];
-    let status_commands = origin_attention_status_commands(&question.run_id);
+    let Some(feed) = details.feed.as_ref() else {
+        record_attention_projection_error(
+            state,
+            &question.run_id,
+            "worker_question_projection_missing",
+            "daemon status feed is unavailable",
+        );
+        return;
+    };
+    let answer_commands = feed
+        .actions
+        .iter()
+        .filter(|action| action.kind == "answer_question" && action.target_id == question.id)
+        .map(|action| action.command.clone())
+        .collect::<Vec<_>>();
+    if answer_commands.is_empty() {
+        record_attention_projection_error(
+            state,
+            &question.run_id,
+            "worker_question_action_missing",
+            "pending question has no projected answer action",
+        );
+        return;
+    }
+    let status_commands = projected_status_commands(feed);
     let operator_commands = answer_commands
         .iter()
         .chain(status_commands.iter())
         .cloned()
         .collect::<Vec<_>>();
+    let attention_key = format!("worker-question:{}", question.id);
     let payload = json!({
         "schema_version": ATTENTION_PAYLOAD_SCHEMA_VERSION,
         "kind": "worker_question_pending",
@@ -976,17 +1019,17 @@ pub(crate) fn notify_origin_worker_question_attention(
         "answer_commands": answer_commands,
         "status_commands": status_commands,
         "operator_commands": operator_commands,
-        "source_of_truth": "daemon_worker_questions",
+        "source_of_truth": "daemon_status_feed",
         "delivery_semantics": "visibility_only_no_auto_decision",
     });
     send_origin_attention(
         state,
         OriginAttentionRequest {
-            run: &run,
+            run: &details.run,
             attention_key: &attention_key,
             attention_kind: "worker_question_pending",
             payload,
-            source_of_truth: "daemon_worker_questions",
+            source_of_truth: "daemon_status_feed",
             question_id: &question.id,
             slice_id: &question.slice_id,
             proposal_id: "",
@@ -1001,16 +1044,65 @@ pub(crate) fn notify_origin_replan_attention(
     run: &Run,
     proposal: &ReplanProposal,
 ) {
-    let attention_key = format!("replan-proposal:{}", proposal.id);
-    let decision_commands = replan_decision_commands(&run.id, &proposal.id);
-    let status_commands = origin_attention_status_commands(&run.id);
+    let details =
+        match RunReadModelBuilder::new(state).snapshot(&run.id, RunReadModelOptions::status(50)) {
+            Ok(model) => model.details,
+            Err(error) => {
+                record_attention_projection_error(
+                    state,
+                    &run.id,
+                    "replan_projection_failed",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+    let Some(proposal) = details
+        .replan
+        .pending
+        .iter()
+        .find(|candidate| candidate.id == proposal.id)
+    else {
+        return;
+    };
+    let Some(feed) = details.feed.as_ref() else {
+        record_attention_projection_error(
+            state,
+            &run.id,
+            "replan_projection_missing",
+            "daemon status feed is unavailable",
+        );
+        return;
+    };
+    let decision_commands = feed
+        .actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind.as_str(),
+                "accept_replan" | "reject_replan" | "defer_replan" | "supersede_replan"
+            ) && action.target_id == proposal.id
+        })
+        .map(|action| action.command.clone())
+        .collect::<Vec<_>>();
+    if decision_commands.is_empty() {
+        record_attention_projection_error(
+            state,
+            &run.id,
+            "replan_action_missing",
+            "pending replan proposal has no projected decision action",
+        );
+        return;
+    }
+    let status_commands = projected_status_commands(feed);
     let operator_commands = decision_commands
         .iter()
         .chain(status_commands.iter())
         .cloned()
         .collect::<Vec<_>>();
+    let attention_key = format!("replan-proposal:{}", proposal.id);
     let mut payload = serde_json::to_value(workflow_events::ReplanNotificationPayload::new(
-        &run.id,
+        &details.run.id,
         &proposal.id,
         proposal.source.clone(),
         &proposal.risk,
@@ -1037,11 +1129,11 @@ pub(crate) fn notify_origin_replan_attention(
     send_origin_attention(
         state,
         OriginAttentionRequest {
-            run,
+            run: &details.run,
             attention_key: &attention_key,
             attention_kind: "replan_decision_pending",
             payload,
-            source_of_truth: "daemon_replan_proposals",
+            source_of_truth: "daemon_status_feed",
             question_id: "",
             slice_id: "",
             proposal_id: &proposal.id,
@@ -1302,12 +1394,26 @@ fn origin_attention_safe_segment(value: &str) -> String {
     }
 }
 
-fn origin_attention_status_commands(run_id: &str) -> Vec<String> {
-    vec![
-        format!("khazad-doom status --run {run_id}"),
-        format!("khazad-doom monitor --run {run_id}"),
-        format!("khazad-doom watch --run {run_id}"),
-    ]
+fn projected_status_commands(feed: &crate::domain::StatusFeed) -> Vec<String> {
+    feed.actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.kind.as_str(),
+                "inspect_status" | "monitor_run" | "attend_run"
+            )
+        })
+        .map(|action| action.command.clone())
+        .collect()
+}
+
+fn record_attention_projection_error(state: &StateStore, run_id: &str, kind: &str, message: &str) {
+    let _ = state.record_event(
+        run_id,
+        workflow_events::RUN_INCIDENT,
+        &workflow_events::RunIncidentPayload::error(kind, message)
+            .with_extra("source_of_truth", "daemon_status_feed"),
+    );
 }
 
 fn origin_attention_worker_question_deadline(question: &WorkerQuestion) -> Option<String> {
