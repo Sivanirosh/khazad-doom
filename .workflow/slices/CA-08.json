@@ -2,7 +2,9 @@
   "id": "CA-08",
   "title": "Typed contracts and authority consolidation",
   "goal": "Consolidate worker-wire conversion, event vocabulary, attention policy, selected-slice planning, and provenance/follow-up domain fields without adding generic registries or moving daemon-owned semantics into workers/renderers.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-08",
+  "closed_at": "2026-07-11T20:12:56.616087752Z",
   "depends_on": [
     "CA-07"
   ],
