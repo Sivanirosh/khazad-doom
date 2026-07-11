@@ -65,4 +65,5 @@
   - CA-07 bounded long-session runtime and reproducible soak: `b2fd314`; closure `2c8a891`.
   - CA-08 typed wires/events/provenance with legacy preservation: `b7d6a91`; closure `40c3cfc`.
   - CA-09 shared Rust/Node fixtures, complete Node 22 CI, and regression/soak closure: `1de3d67`; closure `82bdb04`.
-- Recorded the non-authoritative 19-open-slice ledger audit in `b8e3b8c`, separating historical implementation evidence from truthful acceptance/closure.
+- Recorded the non-authoritative 19-open-slice ledger audit in `b8e3b8c`, consolidated project memory in `2fdacc1`, and pushed the 31-commit release candidate to `origin/main`.
+- Deferred the `0.1.0` tag and selected the bounded LEDGER-01..04 reconciliation mission so historical acceptance, supersession, and negative-proof evidence can be dispositioned without falsifying old run states.

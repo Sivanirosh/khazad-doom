@@ -1,0 +1,57 @@
+{
+  "id": "LEDGER-01",
+  "title": "Historical slice lifecycle and attestation",
+  "goal": "Add the minimal daemon-owned repository lifecycle needed to reconcile historical slices truthfully: closed remains accepted work, retired means non-runnable superseded intent, and typed historical attestations preserve original terminal evidence while applying only after an ordinary successful reconciliation gate.",
+  "status": "open",
+  "areas": [
+    ".workflow/slices/LEDGER-01.json",
+    ".workflow/schema/slice.schema.json",
+    "src/domain.rs",
+    "src/artifact.rs",
+    "src/state.rs",
+    "src/ipc.rs",
+    "src/daemon.rs",
+    "src/cli.rs",
+    "src/workflow/manager.rs",
+    "src/workflow/frontier.rs",
+    "tests/daemon_integration.rs",
+    "tests/daemon/",
+    "tests/fixtures/",
+    "scripts/roadmap-truth-check",
+    "docs/design/ledger-reconciliation-mission-2026-07-11.md",
+    "docs/workflow-invariants.md",
+    "skills/khazad-doom/SKILL.md"
+  ],
+  "acceptance": [
+    "Repository Slice.status supports open, closed, and retired while the per-run SliceStatus enum remains unchanged. One shared repository-lifecycle policy makes only open records runnable; retired records are rendered as retired rather than accepted, are rejected on explicit execution, and are never dispatched by all-slice, dependency, resume, or frontier paths.",
+    "Retirement metadata is typed and strict: it records the successful retiring reconciliation run, RFC3339 timestamp, supersession rationale, committed evidence identities, and at least one closed replacement slice. Retired records contain no ordinary close metadata, never satisfy roadmap done/accepted/completed claims, and cannot be used as an acceptance synonym.",
+    "Historical closure attestation metadata is typed and strict: it records the successful attesting reconciliation run, attestation kind, cited historical run IDs with unchanged terminal run and slice states, pinned commit/evidence identities, rationale, limitations, and optional closed replacements. closed_by_run identifies the successful attesting run, never a failed historical run.",
+    "A narrow operator-authored reconciliation declaration names exact open targets and either accept_historically or retire_superseded disposition. Validation rejects duplicates, self-targeting, missing or already-terminal targets, unsafe evidence paths, stale or mismatched historical states, missing/unclosed replacements, and any declaration that would recast failed, blocked, or cancelled evidence as completed.",
+    "Run admission records the exact operator-committed declaration bytes and SHA-256 identity, including every target, disposition, evidence identity, rationale, limitation, and replacement, before any worker or side effect starts. Finalization, resume, repair, replan, recovery, and publication fail closed unless the declaration remains byte-identical; the worker cannot modify the declaration or its source path, and the pinned bytes/hash are included in the publication manifest and receipt.",
+    "The daemon applies a valid declaration only during completion finalization after the reconciliation slice passes its normal integration gate. Target records, typed attestation/retirement report collections, ordinary close records/reports, publication manifest, receipt, and crash-recovery journal are one exact atomic publication set; failed, blocked, cancelled, stale, or recovery-divergent runs change no targets.",
+    "Ordinary completed_slices contains only slices actually executed. Historically accepted targets and retired targets use separate typed report collections and remain absent from completed_slices; terminal historical run reports and slice-run states are never mutated or synthesized.",
+    "Closed and retired dependencies are non-runnable historical dependencies, but an open dependent may rely on retired intent only when retirement names closed replacements. Start, resume, explicit selection, dependency traversal, CLI summaries, frontier duplicate classification, schema validation, publication recovery, and roadmap truth have violation-detecting coverage for mixed open/closed/retired graphs.",
+    "Roadmap truth accepts an acceptance-bearing historical attestation only when the named completed reconciliation report lists the slice under historically_attested_slices with matching metadata. Retired records require an explicit superseded claim and replacement proof and never pass done, closed, accepted, complete, or completed claims.",
+    "Existing ordinary daemon closure, closed dependency behavior, publication pinning, receipt validation, compatibility decoding, and frontier authority remain unchanged. The implementation introduces no general administrative workflow engine, direct manual-close escape hatch, new autonomous disposition path, or status beyond open, closed, and retired."
+  ],
+  "must_ask_if": [
+    "The design would mark a historical failed, blocked, or cancelled run completed, insert an unexecuted historical target into completed_slices, or mutate an old run report.",
+    "A disposition could apply before a normal passed integration gate, outside exact daemon publication/recovery, from worker-authored evidence without operator authorization, or from declaration bytes that differ from the exact operator-committed admission identity.",
+    "Retired would be treated as accepted or roadmap-done, closed would cease to mean accepted historical work, or a retired dependency without a closed replacement would silently authorize downstream work.",
+    "The implementation requires a repository status beyond open, closed, and retired, a per-run SliceStatus change, or a general-purpose administrative workflow subsystem.",
+    "Ordinary closure checks, publication manifests, receipt/recovery identity, roadmap truth, or closed-dependency safety would be weakened."
+  ],
+  "verify": [
+    "cargo test artifact --quiet",
+    "cargo test frontier --quiet",
+    "cargo test historical_attestation --test daemon_integration --quiet",
+    "cargo test retired_slice --test daemon_integration --quiet",
+    "cargo test roadmap_truth --test daemon_integration --quiet",
+    "cargo run --quiet -- slices validate --repo .",
+    "scripts/roadmap-truth-check . docs/roadmap/auto-frontier/00-matrix.md",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "cargo fmt --all -- --check"
+  ],
+  "verify_profile": "full",
+  "verify_timeout_seconds": 1800
+}
