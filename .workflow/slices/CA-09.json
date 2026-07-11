@@ -2,7 +2,9 @@
   "id": "CA-09",
   "title": "Cross-language contract CI and closure",
   "goal": "Close the complexity-remediation program with shared Rust/Node IPC fixtures, shipped extension tests in CI, corrected AF-06/operator documentation, and full regression/soak evidence.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-09",
+  "closed_at": "2026-07-11T21:03:32.487467849Z",
   "depends_on": [
     "CA-08"
   ],
