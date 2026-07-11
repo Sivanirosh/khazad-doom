@@ -3191,3 +3191,289 @@ mod compatibility_tests {
         assert_eq!(encoded["followup_slice_draft"]["id"], "slice-next");
     }
 }
+
+#[cfg(test)]
+mod contract_fixture_tests {
+    use super::*;
+    use crate::state::Store as StateStore;
+    use crate::workflow::events::{EventKind, TerminalSummaryWrittenPayload, TypedEventPayload};
+    use crate::workflow::read_model::{RunReadModelBuilder, RunReadModelOptions};
+    use chrono::{Duration, TimeZone};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::path::PathBuf;
+
+    const FIXTURE_PATH: &str = "tests/fixtures/contracts/v1.json";
+
+    fn fixed_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0)
+            .single()
+            .expect("fixed fixture timestamp")
+    }
+
+    fn worker_result_wire() -> WorkerResultWire {
+        WorkerResultWire {
+            status: "complete".to_string(),
+            summary: "Shared worker contract fixture completed.".to_string(),
+            changed_files: vec!["src/domain.rs".to_string()],
+            tests_run: vec!["cargo test --all-targets".to_string()],
+            acceptance_status: vec![AcceptanceEvidence {
+                criterion: "Rust and Node consume one fixture.".to_string(),
+                status: "satisfied".to_string(),
+                evidence: FIXTURE_PATH.to_string(),
+            }],
+            ..WorkerResultWire::default()
+        }
+    }
+
+    fn repair_result_wire() -> RepairResultWire {
+        RepairResultWire {
+            status: "complete".to_string(),
+            summary: "Shared repair contract fixture completed.".to_string(),
+            changed_files: vec!["src/domain.rs".to_string()],
+            tests_run: vec!["cargo test --all-targets".to_string()],
+            ..RepairResultWire::default()
+        }
+    }
+
+    fn run_details(id: &str, status: RunStatus, summary: &str, with_action: bool) -> RunDetails {
+        let directory = tempfile::tempdir().expect("create fixture state directory");
+        let database = directory.path().join("state.db");
+        let state = StateStore::open(&database).expect("open fixture state");
+        let run = Run {
+            id: id.to_string(),
+            repo_id: "contract-repo".to_string(),
+            repo_path: "/repo/contract".to_string(),
+            status,
+            base_branch: "main".to_string(),
+            base_sha: "1111111111111111111111111111111111111111".to_string(),
+            integration_branch: format!("khazad/{id}/integration"),
+            selected_slice_id: "CA-09".to_string(),
+            error: if matches!(status, RunStatus::Blocked | RunStatus::Failed) {
+                summary.to_string()
+            } else {
+                String::new()
+            },
+            started_at: fixed_time(),
+            updated_at: fixed_time(),
+        };
+        state.insert_run(&run).expect("insert fixture run");
+        if with_action {
+            state
+                .insert_worker_question_with_launch_id_and_recommendation(
+                    "q-1",
+                    &run.id,
+                    "CA-09",
+                    2,
+                    None,
+                    "Choose the bounded contract action?",
+                    &["yes".to_string(), "no".to_string()],
+                    60,
+                    &WorkerQuestionRecommendation {
+                        recommended_answer: "yes".to_string(),
+                        rationale: "The fixture action stays inside CA-09.".to_string(),
+                        bounded_within_current_slice_or_mission_authority: true,
+                        reversible: true,
+                    },
+                )
+                .expect("insert fixture operator question");
+            let conn = rusqlite::Connection::open(&database).expect("open fixture timestamp patch");
+            conn.execute(
+                "UPDATE worker_questions SET asked_at=?1, deadline_at=?2 WHERE id='q-1'",
+                rusqlite::params![
+                    fixed_time().to_rfc3339(),
+                    (fixed_time() + Duration::seconds(60)).to_rfc3339()
+                ],
+            )
+            .expect("fix operator question timestamps");
+        }
+        let mut details = RunReadModelBuilder::new(&state)
+            .snapshot_at(&run.id, RunReadModelOptions::status(50), fixed_time())
+            .expect("build production status read model")
+            .details;
+        details.snapshot.revision.captured_at = Some(fixed_time());
+        for source in &mut details.snapshot.sources {
+            if source.observed_at.is_some() {
+                source.observed_at = Some(fixed_time());
+            }
+        }
+        details
+    }
+
+    fn terminal_summary() -> ImplementationSummary {
+        ImplementationSummary {
+            run_id: "contract-completed".to_string(),
+            repo_path: "/repo/contract".to_string(),
+            integration_branch: "khazad/contract-completed/integration".to_string(),
+            base_sha: "1111111111111111111111111111111111111111".to_string(),
+            final_sha: "2222222222222222222222222222222222222222".to_string(),
+            worker_profile: WorkerProfileEvidence::default(),
+            mission_envelope: None,
+            frontier_budget: None,
+            completed_slices: vec![worker_result_wire().into_domain(WorkerResultAuthority {
+                slice_id: "CA-09".to_string(),
+                attempt: 2,
+                launch_id: 42,
+            })],
+            checks: Vec::new(),
+            integration_repair: repair_result_wire().into_domain(RepairResultAuthority {
+                trigger: "integration_gate_failed".to_string(),
+                attempt: 1,
+                launch_id: 43,
+            }),
+            pre_repair_integration_gate: None,
+            integration_gate: GateResult {
+                status: "passed".to_string(),
+                summary: "All contract checks passed.".to_string(),
+                ..GateResult::default()
+            },
+            exit_states: WorkflowExitStates {
+                run: "completed".to_string(),
+                handoff: "ready".to_string(),
+                evidence: "attested".to_string(),
+                slices: vec![SliceExitState {
+                    slice_id: "CA-09".to_string(),
+                    worker: "complete".to_string(),
+                    daemon: "merged".to_string(),
+                }],
+            },
+            evidence_attestation: EvidenceAttestation {
+                status: "attested".to_string(),
+                attester: "daemon".to_string(),
+                worker_self_approved: false,
+                basis: vec!["integration_gate".to_string()],
+            },
+            economics: RunEconomics::default(),
+            plan_revisions: PlanRevisions::default(),
+            worker_questions: Vec::new(),
+            worker_attempts: Vec::new(),
+            created_at: fixed_time(),
+        }
+    }
+
+    fn fixtures() -> Value {
+        let typed_payload = TerminalSummaryWrittenPayload::new(
+            ".workflow/reports/contract-completed-implementation-summary.json",
+        );
+        let typed_event = Event {
+            id: 1,
+            run_id: "contract-completed".to_string(),
+            typ: TerminalSummaryWrittenPayload::event_kind()
+                .as_str()
+                .to_string(),
+            payload: serde_json::to_value(typed_payload).expect("serialize typed event payload"),
+            created_at: fixed_time(),
+        };
+        let legacy_event = Event {
+            id: 2,
+            run_id: "contract-completed".to_string(),
+            typ: "legacy_worker_note".to_string(),
+            payload: json!({"message": "legacy payload remains inspectable"}),
+            created_at: fixed_time(),
+        };
+        let status = run_details(
+            "contract-run",
+            RunStatus::Running,
+            "Run running — operator answer required",
+            true,
+        );
+        let operator_actions = status
+            .feed
+            .as_ref()
+            .expect("status fixture feed")
+            .actions
+            .clone();
+        let terminal_runs = [
+            (RunStatus::Blocked, "Run blocked — operator action required"),
+            (RunStatus::Failed, "Run failed — inspect evidence"),
+            (RunStatus::Completed, "Run completed — handoff ready"),
+            (RunStatus::Cancelled, "Run cancelled — no further work"),
+        ]
+        .into_iter()
+        .map(|(status, summary)| {
+            run_details(
+                &format!("contract-{}", status.as_str()),
+                status,
+                summary,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+
+        json!({
+            "schema_version": 1,
+            "status_read_model": status,
+            "operator_actions": operator_actions,
+            "worker_result": worker_result_wire(),
+            "repair_result": repair_result_wire(),
+            "events": {
+                "typed": typed_event,
+                "legacy": legacy_event,
+            },
+            "terminal_summary": terminal_summary(),
+            "terminal_runs": terminal_runs,
+        })
+    }
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH)
+    }
+
+    #[test]
+    fn shared_contract_fixture_matches_typed_rust_contracts() {
+        let encoded = fs::read_to_string(fixture_path()).expect("read shared contract fixture");
+        let actual: Value = serde_json::from_str(&encoded).expect("decode shared contract fixture");
+        assert_eq!(
+            actual,
+            fixtures(),
+            "regenerate with tests/fixtures/contracts/generate --write"
+        );
+
+        let _: RunDetails = serde_json::from_value(actual["status_read_model"].clone())
+            .expect("decode status read model");
+        let _: WorkerResultWire = serde_json::from_value(actual["worker_result"].clone())
+            .expect("decode worker wire result");
+        let _: RepairResultWire = serde_json::from_value(actual["repair_result"].clone())
+            .expect("decode repair wire result");
+        let typed: Event = serde_json::from_value(actual["events"]["typed"].clone())
+            .expect("decode typed event envelope");
+        assert_eq!(
+            EventKind::from(typed.typ.as_str()),
+            EventKind::TerminalSummaryWritten
+        );
+        let _: TerminalSummaryWrittenPayload =
+            serde_json::from_value(typed.payload).expect("decode typed event payload");
+        let legacy: Event = serde_json::from_value(actual["events"]["legacy"].clone())
+            .expect("decode legacy event envelope");
+        assert!(matches!(
+            EventKind::from(legacy.typ.as_str()),
+            EventKind::Unknown(_)
+        ));
+        let _: ImplementationSummary = serde_json::from_value(actual["terminal_summary"].clone())
+            .expect("decode terminal summary");
+        for terminal in actual["terminal_runs"]
+            .as_array()
+            .expect("terminal run fixture array")
+        {
+            let _: RunDetails =
+                serde_json::from_value(terminal.clone()).expect("decode terminal run status");
+        }
+    }
+
+    #[test]
+    fn contract_fixture_emit() {
+        let Some(output) = std::env::var_os("KHAZAD_CONTRACT_FIXTURE_OUTPUT").map(PathBuf::from)
+        else {
+            let encoded = fs::read_to_string(fixture_path()).expect("read shared contract fixture");
+            let actual: Value = serde_json::from_str(&encoded).expect("decode shared fixture");
+            assert_eq!(actual, fixtures());
+            return;
+        };
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).expect("create fixture output directory");
+        }
+        let mut encoded = serde_json::to_string_pretty(&fixtures()).expect("encode fixtures");
+        encoded.push('\n');
+        fs::write(output, encoded).expect("write shared contract fixture");
+    }
+}

@@ -1,9 +1,12 @@
-# CA-07 bounded-runtime soak evidence
+# CA-07 bounded-runtime and CA-09 closure soak evidence
 
-Date measured: 2026-07-11  
-Baseline policy: CA-06 fixed polling, per-observation writes, no raw spill  
-Final candidate: CA-07 working tree  
-Command: `scripts/soak-runtime --quick --output /tmp/ca07-final-soak-v3.json`
+Date measured: 2026-07-11
+
+Baseline policy: CA-06 fixed polling, per-observation writes, no raw spill
+
+Final candidate: CA-09 working tree after CA-07/CA-08 runtime and contract changes
+
+Command: `scripts/soak-runtime --quick --output /tmp/ca09-final-soak.json`
 
 ## Method
 
@@ -17,9 +20,9 @@ Measurements are process-local wall time and Linux `VmHWM`; SQLite bytes include
 
 | Workers | Wall ms | Peak RSS KiB | SQLite bytes | SQLite rows | State writes | Artifact bytes | Polls | Commands | Agent calls |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 204 | 14,516 | 159,744 | 1 | 132 | 0 | 3 | 0 | 1 |
-| 3 | 258 | 16,140 | 159,744 | 1 | 396 | 0 | 9 | 0 | 3 |
-| 10 | 763 | 20,800 | 159,744 | 1 | 1,320 | 0 | 72 | 0 | 10 |
+| 1 | 204 | 15,192 | 172,032 | 2 | 132 | 0 | 3 | 0 | 1 |
+| 3 | 258 | 17,492 | 172,032 | 2 | 396 | 0 | 9 | 0 | 3 |
+| 10 | 1,211 | 22,284 | 172,032 | 2 | 1,330 | 0 | 111 | 0 | 10 |
 
 Rows and allocated SQLite bytes remain flat because ordinary observations update one current progress projection. The write counter exposes amplification that file/row size cannot. Baseline artifact bytes are zero because complete raw worker output was not retained as explicit attempt evidence.
 
@@ -27,9 +30,9 @@ Rows and allocated SQLite bytes remain flat because ordinary observations update
 
 | Workers | Wall ms | Peak RSS KiB | SQLite bytes | SQLite rows | State writes | Artifact bytes | Polls | Commands | Agent calls |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 164 | 15,552 | 159,744 | 1 | 68 | 1,049,999 | 4 | 0 | 1 |
-| 3 | 225 | 16,740 | 159,744 | 1 | 204 | 3,149,997 | 12 | 0 | 3 |
-| 10 | 526 | 21,468 | 159,744 | 1 | 680 | 10,499,990 | 70 | 0 | 10 |
+| 1 | 166 | 15,496 | 172,032 | 2 | 67 | 1,050,044 | 4 | 0 | 1 |
+| 3 | 224 | 17,216 | 172,032 | 2 | 204 | 3,150,132 | 12 | 0 | 3 |
+| 10 | 777 | 21,868 | 172,032 | 2 | 680 | 10,500,440 | 90 | 0 | 10 |
 
 Artifact growth is intentional and approximately linear with complete raw output. The small excess over payload bytes is bounded metadata. In-memory diagnostic tails remain limited independently of artifact size. Total final observation bytes include generated line delimiters.
 
@@ -52,6 +55,6 @@ The quick final profile lowers poll backoff to 10/100 ms so it completes quickly
 
 ## Conclusion
 
-At 10 workers, activity updates fell from 1,320 to 680 (1.94x fewer), wall time fell from 763 ms to 526 ms, and polls remained bounded while complete raw bytes became append-only artifacts. Peak RSS rose by about 0.7 MiB for bounded tails and spill metadata; growth remains modest and explicit.
+At 10 workers in the CA-09 closure rerun, activity updates fell from 1,330 to 680 (1.96x fewer), wall time fell from 1,211 ms to 777 ms, and polls fell from 111 to 90 while complete raw bytes became append-only artifacts. Peak RSS was about 0.4 MiB lower in the final profile for this run; process-local RSS and timing remain observational rather than hard performance promises.
 
 The evidence supports byte/time coalescing, adaptive polling, bounded diagnostics, append-only spill, spooled Pi framing, and checkpointed economics. It does **not** justify a database pool, external telemetry service, or pub/sub broker.

@@ -131,7 +131,7 @@ khazad-doom run --slice slice-001 --envelope mission.json --autonomy off
 
 `mission.json` uses `.workflow/schema/mission-envelope.schema.json`. Its `allowed_areas` use the same literal-prefix area contract as slice `areas`: repo-relative prefixes only, no globs, parent traversal, absolute paths, leading/trailing whitespace, or leading `./`. Khazad-Doom persists the envelope and a zeroed frontier budget for the run, survives daemon restart/resume through SQLite state, and projects both into status/watch/monitor/report/handoff artifacts.
 
-AF-04 keeps autonomy record-only for authority but makes shadow observable. `autonomy_level: "off"` performs no frontier classification. `shadow` classifies pending typed `add_followup_slice` replan proposals at existing daemon replan checkpoints, persists tier/reason codes/envelope hash/budget snapshot/classified-at, and records `frontier_classified` events without deciding or mutating queues or `.workflow/slices`. `promote` and `run` are still recorded-not-active before AF-06 and are rendered/classified as shadow observations only; they do not auto-propose, auto-apply, auto-generate slices, or grant authority beyond selected Issue Slices.
+Autonomy is active only through the daemon-owned replan channel. `autonomy_level: "off"` performs no frontier classification. `shadow` classifies pending typed `add_followup_slice` proposals at existing replan checkpoints and records tier/reason codes, envelope hash, budget snapshot, timestamp, and events without deciding or mutating queues or slice files. With `promote` or `run`, only deterministic Tier-1 `add_followup_slice` proposals inside the recorded envelope and remaining depth/generation/promotion budgets may be accepted by `frontier_policy`; the durable decision identifies `authorizer: "envelope:<run-id>"` and the ordinary idempotent apply engine writes and commits the generated slice with provenance. `promote` leaves that slice for a future run. `run` appends it serially and executes it in the current run. Khazad-Doom never invents candidates: workers, repairs, or operators must first create a proposal. Unsupported changes, non-Tier-1 classifications, exhausted bounds, ambiguity, prior rejection/deferment, and envelope or `must_ask_if` violations remain pending, produce structured stop/attention evidence, and require an operator decision.
 
 ## What the gate enforces
 
@@ -228,7 +228,7 @@ Timeout fallback must never authorize scope expansion, destructive or irreversib
 
 ### Replan proposals
 
-Replan v1 is proposal-only. The daemon can persist pending proposals with source, findings, evidence links, proposed changes, risk, and exact decision commands, but it does not auto-apply queue/slice/verification/policy changes. Operators decide explicitly:
+Replan remains the sole proposal/decision/application channel. The daemon persists proposals with source, findings, evidence links, typed changes, risk, classifications, and exact decision commands. Operators explicitly decide all proposals except the narrow envelope-delegated Tier-1 `add_followup_slice` case described above; verification, policy, area, and other intent changes are never frontier-auto-accepted:
 
 ```bash
 khazad-doom replan accept <run-id> <proposal-id> --reason "..."
@@ -236,7 +236,7 @@ khazad-doom replan reject <run-id> <proposal-id> --reason "..."
 khazad-doom replan defer <run-id> <proposal-id> --until "condition" --reason "..."
 ```
 
-Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, and an empty `replan.auto_approvable` tier. The shared feed projection renders pending/decided proposals, shadow frontier annotations when present, and pauses resume/worker dispatch/repair at `awaiting_replan` while a pending proposal exists. Worker handoff JSON, final reports, implementation summaries, and branch handoffs include a `plan_revisions` queue-history section with `frontier` shadow metrics (candidate count, tier distribution, would-have-promoted outcomes, and operator agreement ratios) when classifications exist. Accepted proposals expose `authorized_paths` and `action_class`; worker prompts and daemon slice-area guards honor those grants for the source slice, while unresolved pending proposals still block `khazad-doom handoff` until the operator records an accept/reject/defer/supersede disposition.
+Status JSON includes `replan.pending`, `replan.history`, `replan.pending_attention_reason`, classifications, and the currently auto-approvable Tier-1 follow-up cases. The shared feed projection renders pending/decided proposals and frontier authority/stop details, then pauses at `awaiting_replan` whenever a proposal still needs an operator. Worker handoff JSON, final reports, implementation summaries, and branch handoffs include `plan_revisions` queue history plus frontier candidate, tier, promotion, budget, provenance, and operator-agreement evidence. Accepted proposals expose `authorized_paths` and `action_class`; worker prompts and daemon slice-area guards honor those grants for the source slice. Unresolved proposals still block handoff until an operator records accept/reject/defer/supersede, and generated-slice provenance remains derived from the durable proposal and decision records.
 
 ### The Pi package: skill and monitor bridge
 
@@ -294,7 +294,7 @@ To install only the skill without the monitor bridge extension, use Pi package f
 | `khazad-doom answer <run> <question> "text"` | Answer a pending worker question. |
 | `khazad-doom replan list <run>` | List durable replan proposals for a run. |
 | `khazad-doom replan propose <run> --change kind:target:summary ...` | Record a pending proposal without applying it. |
-| `khazad-doom replan accept\|reject\|defer\|supersede <run> <proposal> ...` | Record an explicit operator decision and rationale; v1 records `applied=false`. |
+| `khazad-doom replan accept\|reject\|defer\|supersede <run> <proposal> ...` | Record a durable operator decision and rationale; accepted follow-up proposals use the idempotent apply engine. |
 | `khazad-doom inspect --run <id>` | List run artifacts and a bounded daemon log tail. |
 | `khazad-doom inspect --repo . --latest` | Inspect the latest run for a repo, including terminal runs. |
 | `khazad-doom cancel --run <id>` | Request cancellation. |

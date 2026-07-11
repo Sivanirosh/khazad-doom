@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:---check}"
+case "$mode" in
+  --check|--write) ;;
+  *) echo "usage: tests/fixtures/contracts/generate [--check|--write]" >&2; exit 2 ;;
+esac
+
+repo="$(cd "$(dirname "$0")/../../.." && pwd)"
+fixture="$repo/tests/fixtures/contracts/v1.json"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+(
+  cd "$repo"
+  KHAZAD_CONTRACT_FIXTURE_OUTPUT="$tmp" \
+    cargo test contract_fixture_emit --quiet
+)
+
+if [[ "$mode" == "--write" ]]; then
+  cp "$tmp" "$fixture"
+  echo "wrote ${fixture#$repo/}"
+else
+  diff -u "$fixture" "$tmp"
+  echo "shared contract fixture is current: ${fixture#$repo/}"
+fi

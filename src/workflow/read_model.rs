@@ -1,5 +1,5 @@
 use super::events::{EventKind, RunErrorPayload};
-use super::projection::project_run;
+use super::projection::project_run_at;
 use crate::artifact::CompletionPublicationReceipt;
 use crate::domain::{
     Event, FrontierAuthorizerRecord, FrontierBudgetConsumption, FrontierBudgetState,
@@ -115,6 +115,29 @@ impl<'a> RunReadModelBuilder<'a> {
         snapshot: RunStateSnapshot,
         options: RunReadModelOptions,
     ) -> Result<RunReadModel> {
+        self.build_at(snapshot, options, chrono::Utc::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_at(
+        &self,
+        run_id: &str,
+        options: RunReadModelOptions,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RunReadModel> {
+        let snapshot = self
+            .state
+            .status_snapshot(run_id, options.events_limit())?
+            .with_context(|| format!("run {run_id:?} not found"))?;
+        self.build_at(snapshot, options, now)
+    }
+
+    fn build_at(
+        &self,
+        snapshot: RunStateSnapshot,
+        options: RunReadModelOptions,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RunReadModel> {
         let run = apply_terminal_override(
             &snapshot.run,
             snapshot.terminal_transition.as_ref(),
@@ -201,7 +224,7 @@ impl<'a> RunReadModelBuilder<'a> {
         // bounded `details.events` tail crosses the wire.
         let mut projection_details = details.clone();
         projection_details.events = semantic_events.clone();
-        details.feed = Some(project_run(&projection_details));
+        details.feed = Some(project_run_at(&projection_details, now));
         Ok(RunReadModel {
             details,
             plan_revisions,

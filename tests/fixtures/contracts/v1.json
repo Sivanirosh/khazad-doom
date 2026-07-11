@@ -1,0 +1,1800 @@
+{
+  "events": {
+    "legacy": {
+      "created_at": "2026-07-11T12:00:00Z",
+      "id": 2,
+      "payload": {
+        "message": "legacy payload remains inspectable"
+      },
+      "run_id": "contract-completed",
+      "type": "legacy_worker_note"
+    },
+    "typed": {
+      "created_at": "2026-07-11T12:00:00Z",
+      "id": 1,
+      "payload": {
+        "path": ".workflow/reports/contract-completed-implementation-summary.json"
+      },
+      "run_id": "contract-completed",
+      "type": "terminal_summary_written"
+    }
+  },
+  "operator_actions": [
+    {
+      "command": "khazad-doom answer contract-run q-1 <answer>",
+      "id": "action-21f8a7a1d2a9",
+      "kind": "answer_question",
+      "label": "khazad-doom answer contract-run q-1 <answer>",
+      "priority": 100,
+      "run_id": "contract-run",
+      "target_id": "q-1"
+    },
+    {
+      "command": "khazad-doom status --run contract-run",
+      "id": "action-e073499e1367",
+      "kind": "inspect_status",
+      "label": "khazad-doom status --run contract-run",
+      "priority": 99,
+      "run_id": "contract-run",
+      "target_id": ""
+    },
+    {
+      "command": "khazad-doom monitor --run contract-run",
+      "id": "action-2f3d96063586",
+      "kind": "monitor_run",
+      "label": "khazad-doom monitor --run contract-run",
+      "priority": 98,
+      "run_id": "contract-run",
+      "target_id": ""
+    },
+    {
+      "command": "khazad-doom attend --run contract-run",
+      "id": "action-6d41cc50841d",
+      "kind": "attend_run",
+      "label": "khazad-doom attend --run contract-run",
+      "priority": 97,
+      "run_id": "contract-run",
+      "target_id": ""
+    }
+  ],
+  "repair_result": {
+    "changed_files": [
+      "src/domain.rs"
+    ],
+    "status": "complete",
+    "summary": "Shared repair contract fixture completed.",
+    "tests_run": [
+      "cargo test --all-targets"
+    ]
+  },
+  "schema_version": 1,
+  "status_read_model": {
+    "events": [],
+    "feed": {
+      "actions": [
+        {
+          "command": "khazad-doom answer contract-run q-1 <answer>",
+          "id": "action-21f8a7a1d2a9",
+          "kind": "answer_question",
+          "label": "khazad-doom answer contract-run q-1 <answer>",
+          "priority": 100,
+          "run_id": "contract-run",
+          "target_id": "q-1"
+        },
+        {
+          "command": "khazad-doom status --run contract-run",
+          "id": "action-e073499e1367",
+          "kind": "inspect_status",
+          "label": "khazad-doom status --run contract-run",
+          "priority": 99,
+          "run_id": "contract-run",
+          "target_id": ""
+        },
+        {
+          "command": "khazad-doom monitor --run contract-run",
+          "id": "action-2f3d96063586",
+          "kind": "monitor_run",
+          "label": "khazad-doom monitor --run contract-run",
+          "priority": 98,
+          "run_id": "contract-run",
+          "target_id": ""
+        },
+        {
+          "command": "khazad-doom attend --run contract-run",
+          "id": "action-6d41cc50841d",
+          "kind": "attend_run",
+          "label": "khazad-doom attend --run contract-run",
+          "priority": 97,
+          "run_id": "contract-run",
+          "target_id": ""
+        }
+      ],
+      "attention": [
+        {
+          "role": "attention",
+          "text": "[operator] Pending question q-1 • slice=CA-09 • attempt=2"
+        },
+        {
+          "role": "attention",
+          "text": "Question: Choose the bounded contract action?"
+        },
+        {
+          "role": "attention",
+          "text": "Option 1: yes"
+        },
+        {
+          "role": "attention",
+          "text": "Option 2: no"
+        },
+        {
+          "role": "attention",
+          "text": "Eligible timeout fallback: yes"
+        },
+        {
+          "role": "attention",
+          "text": "Fallback rationale: The fixture action stays inside CA-09."
+        },
+        {
+          "role": "attention",
+          "text": "Answer command: khazad-doom answer contract-run q-1 <answer>"
+        },
+        {
+          "role": "attention",
+          "text": "Deadline: 2026-07-11T12:01:00+00:00 (remaining 1m00s)"
+        }
+      ],
+      "attention_items": [
+        {
+          "action_ids": [
+            "action-21f8a7a1d2a9"
+          ],
+          "id": "question:q-1",
+          "kind": "worker_question",
+          "priority": 90,
+          "summary": "Choose the bounded contract action?"
+        }
+      ],
+      "blocks": [
+        {
+          "kind": "lifecycle",
+          "label": "Run",
+          "lines": [
+            {
+              "role": "info",
+              "text": "phase unknown • elapsed 0s"
+            },
+            {
+              "role": "info",
+              "text": "run is running"
+            }
+          ],
+          "meta": "● running • contract-run"
+        },
+        {
+          "kind": "mission",
+          "label": "Mission",
+          "lines": [
+            {
+              "role": "dim",
+              "text": "no envelope (autonomy off)"
+            },
+            {
+              "role": "dim",
+              "text": "frontier authority inactive; legacy run behavior unchanged"
+            }
+          ],
+          "meta": "autonomy off"
+        },
+        {
+          "kind": "worker_activity",
+          "label": "Workers",
+          "lines": [
+            {
+              "role": "info",
+              "text": "☐ CA-09  pending"
+            }
+          ],
+          "meta": "(0 active / 1 total)"
+        },
+        {
+          "kind": "attention",
+          "label": "Attention",
+          "lines": [
+            {
+              "role": "attention",
+              "text": "[operator] Pending question q-1 • slice=CA-09 • attempt=2"
+            },
+            {
+              "role": "attention",
+              "text": "Question: Choose the bounded contract action?"
+            },
+            {
+              "role": "attention",
+              "text": "Option 1: yes"
+            },
+            {
+              "role": "attention",
+              "text": "Option 2: no"
+            },
+            {
+              "role": "attention",
+              "text": "Eligible timeout fallback: yes"
+            },
+            {
+              "role": "attention",
+              "text": "Fallback rationale: The fixture action stays inside CA-09."
+            },
+            {
+              "role": "attention",
+              "text": "Answer command: khazad-doom answer contract-run q-1 <answer>"
+            },
+            {
+              "role": "attention",
+              "text": "Deadline: 2026-07-11T12:01:00+00:00 (remaining 1m00s)"
+            }
+          ]
+        },
+        {
+          "kind": "commands",
+          "label": "Commands",
+          "lines": [
+            {
+              "role": "attention",
+              "text": "khazad-doom answer contract-run q-1 <answer>"
+            }
+          ]
+        },
+        {
+          "kind": "gate",
+          "label": "Checks",
+          "lines": [
+            {
+              "role": "dim",
+              "text": "gate not run yet"
+            },
+            {
+              "role": "dim",
+              "text": "repair unknown • waiting for gate result"
+            },
+            {
+              "role": "dim",
+              "text": "semantic unknown"
+            }
+          ],
+          "meta": "verify unknown"
+        },
+        {
+          "kind": "repair",
+          "label": "Repair",
+          "lines": [
+            {
+              "role": "dim",
+              "text": "State: waiting for gate result"
+            }
+          ],
+          "meta": "(unknown)"
+        },
+        {
+          "kind": "economics",
+          "label": "Economics",
+          "lines": [
+            {
+              "role": "dim",
+              "text": "source unavailable; no indexed economics payload"
+            }
+          ],
+          "meta": "unavailable"
+        }
+      ],
+      "feed_version": 2,
+      "gate": {
+        "active": false,
+        "command": "",
+        "finding_count": 0,
+        "output_tail": "",
+        "state": "not_run",
+        "summary": ""
+      },
+      "lifecycle": {
+        "state": "running",
+        "successful": false,
+        "terminal": false
+      },
+      "operator_commands": [
+        "khazad-doom answer contract-run q-1 <answer>"
+      ],
+      "repair": {
+        "active": false,
+        "command": "",
+        "finding_count": 0,
+        "output_tail": "",
+        "state": "not_run",
+        "summary": ""
+      },
+      "summary_line": "run is running",
+      "worker_activity": {
+        "active": false,
+        "attempt": 0,
+        "command": "",
+        "phase": "",
+        "slice_id": "",
+        "state": "idle",
+        "summary": ""
+      }
+    },
+    "questions": [
+      {
+        "asked_at": "2026-07-11T12:00:00Z",
+        "attempt": 2,
+        "bounded_within_current_slice_or_mission_authority": true,
+        "deadline_at": "2026-07-11T12:01:00Z",
+        "fallback_eligible": true,
+        "id": "q-1",
+        "options": [
+          "yes",
+          "no"
+        ],
+        "question": "Choose the bounded contract action?",
+        "recommendation_rationale": "The fixture action stays inside CA-09.",
+        "recommended_answer": "yes",
+        "reversible": true,
+        "run_id": "contract-run",
+        "slice_id": "CA-09",
+        "state": "pending",
+        "timeout_seconds": 60
+      }
+    ],
+    "replan": {
+      "auto_approvable": [],
+      "history": [],
+      "pending": [],
+      "pending_attention_reason": ""
+    },
+    "run": {
+      "base_branch": "main",
+      "base_sha": "1111111111111111111111111111111111111111",
+      "id": "contract-run",
+      "integration_branch": "khazad/contract-run/integration",
+      "repo_id": "contract-repo",
+      "repo_path": "/repo/contract",
+      "selected_slice_id": "CA-09",
+      "started_at": "2026-07-11T12:00:00Z",
+      "status": "running",
+      "updated_at": "2026-07-11T12:00:00Z"
+    },
+    "selected_slice_ids": [
+      "CA-09"
+    ],
+    "slice_runs": [],
+    "snapshot": {
+      "revision": {
+        "captured_at": "2026-07-11T12:00:00Z",
+        "max_event_id": 0,
+        "run_updated_at": "2026-07-11T12:00:00Z",
+        "sqlite_data_version": 2
+      },
+      "sources": [
+        {
+          "detail": "authoritative run state read from one SQLite transaction",
+          "indexed_event_id": 0,
+          "observed_at": "2026-07-11T12:00:00Z",
+          "source": "sqlite",
+          "state": "fresh"
+        },
+        {
+          "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+          "source": "economics",
+          "state": "unavailable"
+        },
+        {
+          "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+          "source": "slice_definitions",
+          "state": "unavailable"
+        },
+        {
+          "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+          "source": "git_integration_head",
+          "state": "unavailable"
+        },
+        {
+          "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+          "source": "final_report",
+          "state": "unavailable"
+        },
+        {
+          "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+          "source": "preflight",
+          "state": "unavailable"
+        },
+        {
+          "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+          "source": "run_summary",
+          "state": "unavailable"
+        }
+      ]
+    },
+    "terminalization": {
+      "committed": false,
+      "state": "",
+      "summary_written": false,
+      "target_status": ""
+    }
+  },
+  "terminal_runs": [
+    {
+      "events": [],
+      "feed": {
+        "actions": [
+          {
+            "command": "khazad-doom inspect --run contract-blocked",
+            "id": "action-aaac96fb0d49",
+            "kind": "operator_command",
+            "label": "khazad-doom inspect --run contract-blocked",
+            "priority": 100,
+            "run_id": "contract-blocked",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom resume --run contract-blocked",
+            "id": "action-9f057b27d843",
+            "kind": "resume_run",
+            "label": "khazad-doom resume --run contract-blocked",
+            "priority": 99,
+            "run_id": "contract-blocked",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom status --run contract-blocked",
+            "id": "action-6c54fae4efa7",
+            "kind": "inspect_status",
+            "label": "khazad-doom status --run contract-blocked",
+            "priority": 98,
+            "run_id": "contract-blocked",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom monitor --run contract-blocked",
+            "id": "action-5b2ac4fdfb0e",
+            "kind": "monitor_run",
+            "label": "khazad-doom monitor --run contract-blocked",
+            "priority": 97,
+            "run_id": "contract-blocked",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom attend --run contract-blocked",
+            "id": "action-c7a36c39556f",
+            "kind": "attend_run",
+            "label": "khazad-doom attend --run contract-blocked",
+            "priority": 96,
+            "run_id": "contract-blocked",
+            "target_id": ""
+          }
+        ],
+        "attention": [
+          {
+            "role": "attention",
+            "text": "[operator] Terminal reason: kind=blocked • retryable=true • operator_action_required=true"
+          },
+          {
+            "role": "attention",
+            "text": "Summary: Run blocked — operator action required"
+          },
+          {
+            "role": "attention",
+            "text": "Remediation: complete the listed operator action, then resume the run"
+          },
+          {
+            "role": "attention",
+            "text": "Disposition: blocked; handoff is not ready until the operator action is resolved"
+          }
+        ],
+        "attention_items": [
+          {
+            "action_ids": [
+              "action-aaac96fb0d49",
+              "action-9f057b27d843"
+            ],
+            "id": "terminal-reason",
+            "kind": "blocked",
+            "priority": 100,
+            "summary": "Run blocked — operator action required"
+          }
+        ],
+        "blocks": [
+          {
+            "kind": "lifecycle",
+            "label": "Run",
+            "lines": [
+              {
+                "role": "info",
+                "text": "phase blocked • elapsed 0s"
+              },
+              {
+                "role": "warning",
+                "text": "Run blocked — operator action required"
+              }
+            ],
+            "meta": "! blocked • contract-blocked"
+          },
+          {
+            "kind": "mission",
+            "label": "Mission",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "no envelope (autonomy off)"
+              },
+              {
+                "role": "dim",
+                "text": "frontier authority inactive; legacy run behavior unchanged"
+              }
+            ],
+            "meta": "autonomy off"
+          },
+          {
+            "kind": "worker_activity",
+            "label": "Workers",
+            "lines": [
+              {
+                "role": "info",
+                "text": "☐ CA-09  pending"
+              }
+            ],
+            "meta": "(0 active / 1 total)"
+          },
+          {
+            "kind": "attention",
+            "label": "Attention",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "[operator] Terminal reason: kind=blocked • retryable=true • operator_action_required=true"
+              },
+              {
+                "role": "attention",
+                "text": "Summary: Run blocked — operator action required"
+              },
+              {
+                "role": "attention",
+                "text": "Remediation: complete the listed operator action, then resume the run"
+              },
+              {
+                "role": "attention",
+                "text": "Disposition: blocked; handoff is not ready until the operator action is resolved"
+              }
+            ]
+          },
+          {
+            "kind": "commands",
+            "label": "Commands",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "khazad-doom inspect --run contract-blocked"
+              },
+              {
+                "role": "attention",
+                "text": "khazad-doom resume --run contract-blocked"
+              }
+            ]
+          },
+          {
+            "kind": "gate",
+            "label": "Checks",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "gate not run yet"
+              },
+              {
+                "role": "dim",
+                "text": "repair unknown • waiting for gate result"
+              },
+              {
+                "role": "dim",
+                "text": "semantic unknown"
+              }
+            ],
+            "meta": "verify unknown"
+          },
+          {
+            "kind": "repair",
+            "label": "Repair",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "State: waiting for gate result"
+              }
+            ],
+            "meta": "(unknown)"
+          },
+          {
+            "kind": "economics",
+            "label": "Economics",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "source unavailable; no indexed economics payload"
+              }
+            ],
+            "meta": "unavailable"
+          }
+        ],
+        "feed_version": 2,
+        "gate": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "lifecycle": {
+          "exit_code": 1,
+          "state": "blocked",
+          "successful": false,
+          "terminal": true
+        },
+        "operator_commands": [
+          "khazad-doom inspect --run contract-blocked",
+          "khazad-doom resume --run contract-blocked"
+        ],
+        "repair": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "summary_line": "Run blocked — operator action required",
+        "terminal_reason": {
+          "disposition": "blocked; handoff is not ready until the operator action is resolved",
+          "kind": "blocked",
+          "operator_action_required": true,
+          "operator_commands": [
+            "khazad-doom inspect --run contract-blocked",
+            "khazad-doom resume --run contract-blocked"
+          ],
+          "remediation": "complete the listed operator action, then resume the run",
+          "resolution_owner": "operator",
+          "retryable": true,
+          "summary": "Run blocked — operator action required"
+        },
+        "worker_activity": {
+          "active": false,
+          "attempt": 0,
+          "command": "",
+          "phase": "",
+          "slice_id": "",
+          "state": "terminal",
+          "summary": ""
+        }
+      },
+      "primary_terminal_reason": {
+        "disposition": "blocked; handoff is not ready until the operator action is resolved",
+        "kind": "blocked",
+        "operator_action_required": true,
+        "operator_commands": [
+          "khazad-doom inspect --run contract-blocked",
+          "khazad-doom resume --run contract-blocked"
+        ],
+        "remediation": "complete the listed operator action, then resume the run",
+        "resolution_owner": "operator",
+        "retryable": true,
+        "summary": "Run blocked — operator action required"
+      },
+      "replan": {
+        "auto_approvable": [],
+        "history": [],
+        "pending": [],
+        "pending_attention_reason": ""
+      },
+      "run": {
+        "base_branch": "main",
+        "base_sha": "1111111111111111111111111111111111111111",
+        "error": "Run blocked — operator action required",
+        "id": "contract-blocked",
+        "integration_branch": "khazad/contract-blocked/integration",
+        "repo_id": "contract-repo",
+        "repo_path": "/repo/contract",
+        "selected_slice_id": "CA-09",
+        "started_at": "2026-07-11T12:00:00Z",
+        "status": "blocked",
+        "updated_at": "2026-07-11T12:00:00Z"
+      },
+      "selected_slice_ids": [
+        "CA-09"
+      ],
+      "slice_runs": [],
+      "snapshot": {
+        "revision": {
+          "captured_at": "2026-07-11T12:00:00Z",
+          "max_event_id": 0,
+          "run_updated_at": "2026-07-11T12:00:00Z",
+          "sqlite_data_version": 2
+        },
+        "sources": [
+          {
+            "detail": "authoritative run state read from one SQLite transaction",
+            "indexed_event_id": 0,
+            "observed_at": "2026-07-11T12:00:00Z",
+            "source": "sqlite",
+            "state": "fresh"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "economics",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "slice_definitions",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "git_integration_head",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "final_report",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "preflight",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "run_summary",
+            "state": "unavailable"
+          }
+        ]
+      },
+      "terminalization": {
+        "committed": false,
+        "state": "",
+        "summary_written": false,
+        "target_status": ""
+      }
+    },
+    {
+      "events": [],
+      "feed": {
+        "actions": [
+          {
+            "command": "khazad-doom inspect --run contract-failed",
+            "id": "action-37ec9d983c4b",
+            "kind": "operator_command",
+            "label": "khazad-doom inspect --run contract-failed",
+            "priority": 100,
+            "run_id": "contract-failed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom resume --run contract-failed",
+            "id": "action-19614059ee1f",
+            "kind": "resume_run",
+            "label": "khazad-doom resume --run contract-failed",
+            "priority": 99,
+            "run_id": "contract-failed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom status --run contract-failed",
+            "id": "action-646b4cea3f46",
+            "kind": "inspect_status",
+            "label": "khazad-doom status --run contract-failed",
+            "priority": 98,
+            "run_id": "contract-failed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom monitor --run contract-failed",
+            "id": "action-2a7f4ed45576",
+            "kind": "monitor_run",
+            "label": "khazad-doom monitor --run contract-failed",
+            "priority": 97,
+            "run_id": "contract-failed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom attend --run contract-failed",
+            "id": "action-5c0776a68509",
+            "kind": "attend_run",
+            "label": "khazad-doom attend --run contract-failed",
+            "priority": 96,
+            "run_id": "contract-failed",
+            "target_id": ""
+          }
+        ],
+        "attention": [
+          {
+            "role": "attention",
+            "text": "[daemon] Terminal reason: kind=failed • retryable=true • operator_action_required=false"
+          },
+          {
+            "role": "attention",
+            "text": "Summary: Run failed — inspect evidence"
+          },
+          {
+            "role": "attention",
+            "text": "Remediation: inspect artifacts, fix the underlying failure, then resume the run"
+          },
+          {
+            "role": "attention",
+            "text": "Disposition: failed; handoff is not ready until the failure is resolved"
+          }
+        ],
+        "blocks": [
+          {
+            "kind": "lifecycle",
+            "label": "Run",
+            "lines": [
+              {
+                "role": "info",
+                "text": "phase failed • elapsed 0s"
+              },
+              {
+                "role": "error",
+                "text": "Run failed — inspect evidence"
+              }
+            ],
+            "meta": "✗ failed • contract-failed"
+          },
+          {
+            "kind": "mission",
+            "label": "Mission",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "no envelope (autonomy off)"
+              },
+              {
+                "role": "dim",
+                "text": "frontier authority inactive; legacy run behavior unchanged"
+              }
+            ],
+            "meta": "autonomy off"
+          },
+          {
+            "kind": "worker_activity",
+            "label": "Workers",
+            "lines": [
+              {
+                "role": "info",
+                "text": "☐ CA-09  pending"
+              }
+            ],
+            "meta": "(0 active / 1 total)"
+          },
+          {
+            "kind": "attention",
+            "label": "Attention",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "[daemon] Terminal reason: kind=failed • retryable=true • operator_action_required=false"
+              },
+              {
+                "role": "attention",
+                "text": "Summary: Run failed — inspect evidence"
+              },
+              {
+                "role": "attention",
+                "text": "Remediation: inspect artifacts, fix the underlying failure, then resume the run"
+              },
+              {
+                "role": "attention",
+                "text": "Disposition: failed; handoff is not ready until the failure is resolved"
+              }
+            ]
+          },
+          {
+            "kind": "commands",
+            "label": "Commands",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "khazad-doom inspect --run contract-failed"
+              },
+              {
+                "role": "attention",
+                "text": "khazad-doom resume --run contract-failed"
+              }
+            ]
+          },
+          {
+            "kind": "gate",
+            "label": "Checks",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "gate not run yet"
+              },
+              {
+                "role": "dim",
+                "text": "repair unknown • waiting for gate result"
+              },
+              {
+                "role": "dim",
+                "text": "semantic unknown"
+              }
+            ],
+            "meta": "verify unknown"
+          },
+          {
+            "kind": "repair",
+            "label": "Repair",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "State: waiting for gate result"
+              }
+            ],
+            "meta": "(unknown)"
+          },
+          {
+            "kind": "economics",
+            "label": "Economics",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "source unavailable; no indexed economics payload"
+              }
+            ],
+            "meta": "unavailable"
+          }
+        ],
+        "feed_version": 2,
+        "gate": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "lifecycle": {
+          "exit_code": 1,
+          "state": "failed",
+          "successful": false,
+          "terminal": true
+        },
+        "operator_commands": [
+          "khazad-doom inspect --run contract-failed",
+          "khazad-doom resume --run contract-failed"
+        ],
+        "repair": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "summary_line": "Run failed — inspect evidence",
+        "terminal_reason": {
+          "disposition": "failed; handoff is not ready until the failure is resolved",
+          "kind": "failed",
+          "operator_action_required": false,
+          "operator_commands": [
+            "khazad-doom inspect --run contract-failed",
+            "khazad-doom resume --run contract-failed"
+          ],
+          "remediation": "inspect artifacts, fix the underlying failure, then resume the run",
+          "resolution_owner": "daemon",
+          "retryable": true,
+          "summary": "Run failed — inspect evidence"
+        },
+        "worker_activity": {
+          "active": false,
+          "attempt": 0,
+          "command": "",
+          "phase": "",
+          "slice_id": "",
+          "state": "terminal",
+          "summary": ""
+        }
+      },
+      "primary_terminal_reason": {
+        "disposition": "failed; handoff is not ready until the failure is resolved",
+        "kind": "failed",
+        "operator_action_required": false,
+        "operator_commands": [
+          "khazad-doom inspect --run contract-failed",
+          "khazad-doom resume --run contract-failed"
+        ],
+        "remediation": "inspect artifacts, fix the underlying failure, then resume the run",
+        "resolution_owner": "daemon",
+        "retryable": true,
+        "summary": "Run failed — inspect evidence"
+      },
+      "replan": {
+        "auto_approvable": [],
+        "history": [],
+        "pending": [],
+        "pending_attention_reason": ""
+      },
+      "run": {
+        "base_branch": "main",
+        "base_sha": "1111111111111111111111111111111111111111",
+        "error": "Run failed — inspect evidence",
+        "id": "contract-failed",
+        "integration_branch": "khazad/contract-failed/integration",
+        "repo_id": "contract-repo",
+        "repo_path": "/repo/contract",
+        "selected_slice_id": "CA-09",
+        "started_at": "2026-07-11T12:00:00Z",
+        "status": "failed",
+        "updated_at": "2026-07-11T12:00:00Z"
+      },
+      "selected_slice_ids": [
+        "CA-09"
+      ],
+      "slice_runs": [],
+      "snapshot": {
+        "revision": {
+          "captured_at": "2026-07-11T12:00:00Z",
+          "max_event_id": 0,
+          "run_updated_at": "2026-07-11T12:00:00Z",
+          "sqlite_data_version": 2
+        },
+        "sources": [
+          {
+            "detail": "authoritative run state read from one SQLite transaction",
+            "indexed_event_id": 0,
+            "observed_at": "2026-07-11T12:00:00Z",
+            "source": "sqlite",
+            "state": "fresh"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "economics",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "slice_definitions",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "git_integration_head",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "final_report",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "preflight",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "run_summary",
+            "state": "unavailable"
+          }
+        ]
+      },
+      "terminalization": {
+        "committed": false,
+        "state": "",
+        "summary_written": false,
+        "target_status": ""
+      }
+    },
+    {
+      "events": [],
+      "feed": {
+        "actions": [
+          {
+            "command": "khazad-doom handoff --run contract-completed",
+            "id": "action-4238cdb1c956",
+            "kind": "handoff",
+            "label": "khazad-doom handoff --run contract-completed",
+            "priority": 100,
+            "run_id": "contract-completed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom status --run contract-completed",
+            "id": "action-184ffcc470c8",
+            "kind": "inspect_status",
+            "label": "khazad-doom status --run contract-completed",
+            "priority": 99,
+            "run_id": "contract-completed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom monitor --run contract-completed",
+            "id": "action-23a772161650",
+            "kind": "monitor_run",
+            "label": "khazad-doom monitor --run contract-completed",
+            "priority": 98,
+            "run_id": "contract-completed",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom attend --run contract-completed",
+            "id": "action-693ca6702a1a",
+            "kind": "attend_run",
+            "label": "khazad-doom attend --run contract-completed",
+            "priority": 97,
+            "run_id": "contract-completed",
+            "target_id": ""
+          }
+        ],
+        "blocks": [
+          {
+            "kind": "lifecycle",
+            "label": "Run",
+            "lines": [
+              {
+                "role": "info",
+                "text": "phase completed • elapsed 0s"
+              },
+              {
+                "role": "success",
+                "text": "run is completed"
+              }
+            ],
+            "meta": "✓ completed • contract-completed"
+          },
+          {
+            "kind": "mission",
+            "label": "Mission",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "no envelope (autonomy off)"
+              },
+              {
+                "role": "dim",
+                "text": "frontier authority inactive; legacy run behavior unchanged"
+              }
+            ],
+            "meta": "autonomy off"
+          },
+          {
+            "kind": "worker_activity",
+            "label": "Workers",
+            "lines": [
+              {
+                "role": "info",
+                "text": "☐ CA-09  pending"
+              }
+            ],
+            "meta": "(0 active / 1 total)"
+          },
+          {
+            "kind": "attention",
+            "label": "Attention",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "no operator attention"
+              }
+            ]
+          },
+          {
+            "kind": "commands",
+            "label": "Commands",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "khazad-doom handoff --run contract-completed"
+              }
+            ]
+          },
+          {
+            "kind": "gate",
+            "label": "Checks",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "gate not run yet"
+              },
+              {
+                "role": "dim",
+                "text": "repair unknown • waiting for gate result"
+              },
+              {
+                "role": "dim",
+                "text": "semantic unknown"
+              }
+            ],
+            "meta": "verify unknown"
+          },
+          {
+            "kind": "repair",
+            "label": "Repair",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "State: waiting for gate result"
+              }
+            ],
+            "meta": "(unknown)"
+          },
+          {
+            "kind": "economics",
+            "label": "Economics",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "source unavailable; no indexed economics payload"
+              }
+            ],
+            "meta": "unavailable"
+          }
+        ],
+        "feed_version": 2,
+        "gate": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "lifecycle": {
+          "exit_code": 0,
+          "state": "completed",
+          "successful": true,
+          "terminal": true
+        },
+        "operator_commands": [
+          "khazad-doom handoff --run contract-completed"
+        ],
+        "repair": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "summary_line": "run is completed",
+        "worker_activity": {
+          "active": false,
+          "attempt": 0,
+          "command": "",
+          "phase": "",
+          "slice_id": "",
+          "state": "terminal",
+          "summary": ""
+        }
+      },
+      "replan": {
+        "auto_approvable": [],
+        "history": [],
+        "pending": [],
+        "pending_attention_reason": ""
+      },
+      "run": {
+        "base_branch": "main",
+        "base_sha": "1111111111111111111111111111111111111111",
+        "id": "contract-completed",
+        "integration_branch": "khazad/contract-completed/integration",
+        "repo_id": "contract-repo",
+        "repo_path": "/repo/contract",
+        "selected_slice_id": "CA-09",
+        "started_at": "2026-07-11T12:00:00Z",
+        "status": "completed",
+        "updated_at": "2026-07-11T12:00:00Z"
+      },
+      "selected_slice_ids": [
+        "CA-09"
+      ],
+      "slice_runs": [],
+      "snapshot": {
+        "revision": {
+          "captured_at": "2026-07-11T12:00:00Z",
+          "max_event_id": 0,
+          "run_updated_at": "2026-07-11T12:00:00Z",
+          "sqlite_data_version": 2
+        },
+        "sources": [
+          {
+            "detail": "authoritative run state read from one SQLite transaction",
+            "indexed_event_id": 0,
+            "observed_at": "2026-07-11T12:00:00Z",
+            "source": "sqlite",
+            "state": "fresh"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "economics",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "slice_definitions",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "git_integration_head",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "final_report",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "preflight",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "run_summary",
+            "state": "unavailable"
+          }
+        ]
+      },
+      "terminalization": {
+        "committed": false,
+        "state": "",
+        "summary_written": false,
+        "target_status": ""
+      }
+    },
+    {
+      "events": [],
+      "feed": {
+        "actions": [
+          {
+            "command": "khazad-doom inspect --run contract-cancelled",
+            "id": "action-31bd77279d20",
+            "kind": "operator_command",
+            "label": "khazad-doom inspect --run contract-cancelled",
+            "priority": 100,
+            "run_id": "contract-cancelled",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom resume --run contract-cancelled",
+            "id": "action-b67c6fae03d5",
+            "kind": "resume_run",
+            "label": "khazad-doom resume --run contract-cancelled",
+            "priority": 99,
+            "run_id": "contract-cancelled",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom status --run contract-cancelled",
+            "id": "action-1457e8e63f61",
+            "kind": "inspect_status",
+            "label": "khazad-doom status --run contract-cancelled",
+            "priority": 98,
+            "run_id": "contract-cancelled",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom monitor --run contract-cancelled",
+            "id": "action-972e2063d080",
+            "kind": "monitor_run",
+            "label": "khazad-doom monitor --run contract-cancelled",
+            "priority": 97,
+            "run_id": "contract-cancelled",
+            "target_id": ""
+          },
+          {
+            "command": "khazad-doom attend --run contract-cancelled",
+            "id": "action-42df8056e0eb",
+            "kind": "attend_run",
+            "label": "khazad-doom attend --run contract-cancelled",
+            "priority": 96,
+            "run_id": "contract-cancelled",
+            "target_id": ""
+          }
+        ],
+        "attention": [
+          {
+            "role": "attention",
+            "text": "[operator] Terminal reason: kind=cancelled • retryable=true • operator_action_required=true"
+          },
+          {
+            "role": "attention",
+            "text": "Summary: run ended with status cancelled"
+          },
+          {
+            "role": "attention",
+            "text": "Remediation: complete the listed operator action, then resume the run"
+          },
+          {
+            "role": "attention",
+            "text": "Disposition: cancelled by request; handoff is not ready"
+          }
+        ],
+        "attention_items": [
+          {
+            "action_ids": [
+              "action-31bd77279d20",
+              "action-b67c6fae03d5"
+            ],
+            "id": "terminal-reason",
+            "kind": "cancelled",
+            "priority": 100,
+            "summary": "run ended with status cancelled"
+          }
+        ],
+        "blocks": [
+          {
+            "kind": "lifecycle",
+            "label": "Run",
+            "lines": [
+              {
+                "role": "info",
+                "text": "phase cancelled • elapsed 0s"
+              },
+              {
+                "role": "warning",
+                "text": "run is cancelled"
+              }
+            ],
+            "meta": "× cancelled • contract-cancelled"
+          },
+          {
+            "kind": "mission",
+            "label": "Mission",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "no envelope (autonomy off)"
+              },
+              {
+                "role": "dim",
+                "text": "frontier authority inactive; legacy run behavior unchanged"
+              }
+            ],
+            "meta": "autonomy off"
+          },
+          {
+            "kind": "worker_activity",
+            "label": "Workers",
+            "lines": [
+              {
+                "role": "info",
+                "text": "☐ CA-09  pending"
+              }
+            ],
+            "meta": "(0 active / 1 total)"
+          },
+          {
+            "kind": "attention",
+            "label": "Attention",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "[operator] Terminal reason: kind=cancelled • retryable=true • operator_action_required=true"
+              },
+              {
+                "role": "attention",
+                "text": "Summary: run ended with status cancelled"
+              },
+              {
+                "role": "attention",
+                "text": "Remediation: complete the listed operator action, then resume the run"
+              },
+              {
+                "role": "attention",
+                "text": "Disposition: cancelled by request; handoff is not ready"
+              }
+            ]
+          },
+          {
+            "kind": "commands",
+            "label": "Commands",
+            "lines": [
+              {
+                "role": "attention",
+                "text": "khazad-doom inspect --run contract-cancelled"
+              },
+              {
+                "role": "attention",
+                "text": "khazad-doom resume --run contract-cancelled"
+              }
+            ]
+          },
+          {
+            "kind": "gate",
+            "label": "Checks",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "gate not run yet"
+              },
+              {
+                "role": "dim",
+                "text": "repair unknown • waiting for gate result"
+              },
+              {
+                "role": "dim",
+                "text": "semantic unknown"
+              }
+            ],
+            "meta": "verify unknown"
+          },
+          {
+            "kind": "repair",
+            "label": "Repair",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "State: waiting for gate result"
+              }
+            ],
+            "meta": "(unknown)"
+          },
+          {
+            "kind": "economics",
+            "label": "Economics",
+            "lines": [
+              {
+                "role": "dim",
+                "text": "source unavailable; no indexed economics payload"
+              }
+            ],
+            "meta": "unavailable"
+          }
+        ],
+        "feed_version": 2,
+        "gate": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "lifecycle": {
+          "exit_code": 1,
+          "state": "cancelled",
+          "successful": false,
+          "terminal": true
+        },
+        "operator_commands": [
+          "khazad-doom inspect --run contract-cancelled",
+          "khazad-doom resume --run contract-cancelled"
+        ],
+        "repair": {
+          "active": false,
+          "command": "",
+          "finding_count": 0,
+          "output_tail": "",
+          "state": "not_run",
+          "summary": ""
+        },
+        "summary_line": "run is cancelled",
+        "terminal_reason": {
+          "disposition": "cancelled by request; handoff is not ready",
+          "kind": "cancelled",
+          "operator_action_required": true,
+          "operator_commands": [
+            "khazad-doom inspect --run contract-cancelled",
+            "khazad-doom resume --run contract-cancelled"
+          ],
+          "remediation": "complete the listed operator action, then resume the run",
+          "resolution_owner": "operator",
+          "retryable": true,
+          "summary": "run ended with status cancelled"
+        },
+        "worker_activity": {
+          "active": false,
+          "attempt": 0,
+          "command": "",
+          "phase": "",
+          "slice_id": "",
+          "state": "terminal",
+          "summary": ""
+        }
+      },
+      "primary_terminal_reason": {
+        "disposition": "cancelled by request; handoff is not ready",
+        "kind": "cancelled",
+        "operator_action_required": true,
+        "operator_commands": [
+          "khazad-doom inspect --run contract-cancelled",
+          "khazad-doom resume --run contract-cancelled"
+        ],
+        "remediation": "complete the listed operator action, then resume the run",
+        "resolution_owner": "operator",
+        "retryable": true,
+        "summary": "run ended with status cancelled"
+      },
+      "replan": {
+        "auto_approvable": [],
+        "history": [],
+        "pending": [],
+        "pending_attention_reason": ""
+      },
+      "run": {
+        "base_branch": "main",
+        "base_sha": "1111111111111111111111111111111111111111",
+        "id": "contract-cancelled",
+        "integration_branch": "khazad/contract-cancelled/integration",
+        "repo_id": "contract-repo",
+        "repo_path": "/repo/contract",
+        "selected_slice_id": "CA-09",
+        "started_at": "2026-07-11T12:00:00Z",
+        "status": "cancelled",
+        "updated_at": "2026-07-11T12:00:00Z"
+      },
+      "selected_slice_ids": [
+        "CA-09"
+      ],
+      "slice_runs": [],
+      "snapshot": {
+        "revision": {
+          "captured_at": "2026-07-11T12:00:00Z",
+          "max_event_id": 0,
+          "run_updated_at": "2026-07-11T12:00:00Z",
+          "sqlite_data_version": 2
+        },
+        "sources": [
+          {
+            "detail": "authoritative run state read from one SQLite transaction",
+            "indexed_event_id": 0,
+            "observed_at": "2026-07-11T12:00:00Z",
+            "source": "sqlite",
+            "state": "fresh"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "economics",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "slice_definitions",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "git_integration_head",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "final_report",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "preflight",
+            "state": "unavailable"
+          },
+          {
+            "detail": "source is not indexed in this SQLite snapshot; live reads are forbidden",
+            "source": "run_summary",
+            "state": "unavailable"
+          }
+        ]
+      },
+      "terminalization": {
+        "committed": false,
+        "state": "",
+        "summary_written": false,
+        "target_status": ""
+      }
+    }
+  ],
+  "terminal_summary": {
+    "base_sha": "1111111111111111111111111111111111111111",
+    "checks": [],
+    "completed_slices": [
+      {
+        "acceptance_status": [
+          {
+            "criterion": "Rust and Node consume one fixture.",
+            "evidence": "tests/fixtures/contracts/v1.json",
+            "status": "satisfied"
+          }
+        ],
+        "attempt": 2,
+        "changed_files": [
+          "src/domain.rs"
+        ],
+        "launch_id": 42,
+        "slice_id": "CA-09",
+        "status": "complete",
+        "summary": "Shared worker contract fixture completed.",
+        "tests_run": [
+          "cargo test --all-targets"
+        ]
+      }
+    ],
+    "created_at": "2026-07-11T12:00:00Z",
+    "economics": {
+      "agent_call_count": 0,
+      "cache_hits": 0,
+      "cache_misses": 0,
+      "command_execution_count": 0,
+      "duplicate_command_count": 0,
+      "gate_fail_fast": false,
+      "repair_attempts": 0,
+      "repair_max_attempts": 0,
+      "repair_policy": "",
+      "worker_max_attempts": 0
+    },
+    "evidence_attestation": {
+      "attester": "daemon",
+      "basis": [
+        "integration_gate"
+      ],
+      "status": "attested",
+      "worker_self_approved": false
+    },
+    "exit_states": {
+      "evidence": "attested",
+      "handoff": "ready",
+      "run": "completed",
+      "slices": [
+        {
+          "daemon": "merged",
+          "slice_id": "CA-09",
+          "worker": "complete"
+        }
+      ]
+    },
+    "final_sha": "2222222222222222222222222222222222222222",
+    "integration_branch": "khazad/contract-completed/integration",
+    "integration_gate": {
+      "status": "passed",
+      "summary": "All contract checks passed."
+    },
+    "integration_repair": {
+      "attempts": 1,
+      "changed_files": [
+        "src/domain.rs"
+      ],
+      "launch_id": 43,
+      "status": "complete",
+      "summary": "Shared repair contract fixture completed.",
+      "tests_run": [
+        "cargo test --all-targets"
+      ],
+      "trigger": "integration_gate_failed"
+    },
+    "plan_revisions": {
+      "accepted": [],
+      "deferred": [],
+      "pending": [],
+      "queue_summary": "",
+      "rejected": [],
+      "source_of_truth": "",
+      "superseded": [],
+      "unresolved_pending_blocks_handoff": false
+    },
+    "repo_path": "/repo/contract",
+    "run_id": "contract-completed"
+  },
+  "worker_result": {
+    "acceptance_status": [
+      {
+        "criterion": "Rust and Node consume one fixture.",
+        "evidence": "tests/fixtures/contracts/v1.json",
+        "status": "satisfied"
+      }
+    ],
+    "changed_files": [
+      "src/domain.rs"
+    ],
+    "status": "complete",
+    "summary": "Shared worker contract fixture completed.",
+    "tests_run": [
+      "cargo test --all-targets"
+    ]
+  }
+}

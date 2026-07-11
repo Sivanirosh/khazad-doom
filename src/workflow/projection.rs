@@ -769,10 +769,6 @@ fn gate_pane_line(text: impl Into<String>, role: StatusFeedRole) -> StatusFeedLi
     }
 }
 
-pub fn project_run(details: &RunDetails) -> StatusFeed {
-    project_run_at(details, Utc::now())
-}
-
 #[allow(dead_code)]
 pub fn project_waiting(repo: &str) -> StatusFeed {
     StatusFeed {
