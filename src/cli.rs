@@ -1802,6 +1802,7 @@ fn parse_replan_changes(values: &[String]) -> Result<Vec<ReplanProposedChange>> 
                 kind: kind.to_string(),
                 target: target.to_string(),
                 summary: summary.to_string(),
+                followup_slice_draft: None,
             })
         })
         .collect()
@@ -3189,6 +3190,7 @@ mod tests {
                 started_at: now,
                 updated_at: now,
             },
+            selected_slice_ids: vec!["slice-1".to_string()],
             snapshot: Default::default(),
             launch_intents: Vec::new(),
             integration_merge_intents: Vec::new(),

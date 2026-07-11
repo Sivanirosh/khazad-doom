@@ -1,7 +1,7 @@
 pub const WORKER_RESULT_SCHEMA: &str = r#"{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
-    "slice_id": {"type": "string"},
     "status": {"type": "string", "enum": ["complete", "blocked", "failed"]},
     "summary": {"type": "string"},
     "commit_sha": {"type": "string"},
@@ -75,11 +75,12 @@ pub const WORKER_RESULT_SCHEMA: &str = r#"{
     },
     "assumptions": {"type": "array", "items": {"type": "string"}}
   },
-  "required": ["slice_id", "status", "summary", "acceptance_status"]
+  "required": ["status", "summary", "acceptance_status"]
 }"#;
 
 pub const REPAIR_RESULT_SCHEMA: &str = r#"{
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "status": {"type": "string", "enum": ["no-op", "fixed", "blocked", "failed"]},
     "summary": {"type": "string"},
@@ -144,11 +145,81 @@ pub const REPAIR_RESULT_SCHEMA: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{RepairResult, ReplanProposedChange, WorkerResult};
+    use crate::domain::{
+        RepairResult, RepairResultAuthority, RepairResultWire, ReplanProposedChange, WorkerResult,
+        WorkerResultAuthority, WorkerResultWire,
+    };
     use serde_json::{Value, json};
 
     #[test]
-    fn worker_output_schema_accepts_candidate_followup_slices_without_breaking_legacy_outputs() {
+    fn worker_wire_golden_keeps_daemon_authority_out_of_the_pi_contract() {
+        let worker_schema: Value = serde_json::from_str(WORKER_RESULT_SCHEMA).unwrap();
+        assert_eq!(
+            worker_schema["required"],
+            json!(["status", "summary", "acceptance_status"])
+        );
+        assert_eq!(worker_schema["additionalProperties"], false);
+        assert!(worker_schema["properties"].get("slice_id").is_none());
+        let wire: WorkerResultWire = serde_json::from_value(json!({
+            "status": "complete",
+            "summary": "implemented",
+            "acceptance_status": [{
+                "criterion": "works",
+                "status": "satisfied",
+                "evidence": "cargo test wire"
+            }]
+        }))
+        .unwrap();
+        let result = wire.into_domain(WorkerResultAuthority {
+            slice_id: "CA-08".to_string(),
+            attempt: 3,
+            launch_id: 41,
+        });
+        assert_eq!(result.slice_id, "CA-08");
+        assert_eq!(result.attempt, 3);
+        assert_eq!(result.launch_id, 41);
+
+        let repair_schema: Value = serde_json::from_str(REPAIR_RESULT_SCHEMA).unwrap();
+        assert_eq!(repair_schema["additionalProperties"], false);
+        assert!(repair_schema["properties"].get("trigger").is_none());
+        assert!(repair_schema["properties"].get("attempts").is_none());
+        let repair: RepairResultWire = serde_json::from_value(json!({
+            "status": "fixed",
+            "summary": "repaired"
+        }))
+        .unwrap();
+        let repair = repair.into_domain(RepairResultAuthority {
+            trigger: "integration gate failed".to_string(),
+            attempt: 2,
+            launch_id: 43,
+        });
+        assert_eq!(repair.trigger, "integration gate failed");
+        assert_eq!(repair.attempts, 2);
+        assert_eq!(repair.launch_id, 43);
+
+        assert!(
+            serde_json::from_value::<WorkerResultWire>(json!({
+                "status": "complete",
+                "summary": "unexpected authority",
+                "acceptance_status": [],
+                "launch_id": 999
+            }))
+            .is_err(),
+            "worker wire decoder must reject fields outside the closed schema"
+        );
+        assert!(
+            serde_json::from_value::<RepairResultWire>(json!({
+                "status": "fixed",
+                "summary": "unexpected authority",
+                "launch_id": 999
+            }))
+            .is_err(),
+            "repair wire decoder must reject fields outside the closed schema"
+        );
+    }
+
+    #[test]
+    fn worker_output_schema_accepts_candidate_followup_slices() {
         let worker_schema: Value = serde_json::from_str(WORKER_RESULT_SCHEMA).unwrap();
         assert!(worker_schema["properties"]["candidate_followup_slices"].is_object());
         let repair_schema: Value = serde_json::from_str(REPAIR_RESULT_SCHEMA).unwrap();

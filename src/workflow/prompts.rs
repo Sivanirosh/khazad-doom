@@ -172,6 +172,7 @@ mod tests {
             title: "Test anti-waterfall prompt".to_string(),
             goal: "Support the intended behavior".to_string(),
             github_issue: String::new(),
+            provenance: None,
             status: "open".to_string(),
             closed_by_run: String::new(),
             closed_at: String::new(),

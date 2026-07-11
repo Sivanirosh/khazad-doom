@@ -44,6 +44,7 @@ pub(crate) struct StatusSourceSnapshot {
 pub(crate) struct RunStateSnapshot {
     pub(crate) revision: StatusSnapshotRevision,
     pub(crate) run: Run,
+    pub(crate) selected_slice_ids: Vec<String>,
     pub(crate) slice_runs: Vec<SliceRun>,
     pub(crate) worker_attempts: Vec<WorkerAttemptLedger>,
     pub(crate) progress: Option<RunProgress>,
@@ -611,8 +612,7 @@ impl ProgressReporter {
             output_tail,
         )?;
         if record_event {
-            self.store
-                .record_event(&self.run_id, "progress", &progress)?;
+            self.store.record_workflow_event(&self.run_id, &progress)?;
         }
         Ok(progress)
     }
@@ -661,6 +661,14 @@ impl Store {
                 execution_epoch INTEGER NOT NULL DEFAULT 1,
                 started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_selected_slices (
+                run_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                slice_id TEXT NOT NULL,
+                PRIMARY KEY (run_id, position),
+                UNIQUE (run_id, slice_id),
+                FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
             );
             CREATE TRIGGER IF NOT EXISTS runs_one_active_repo_insert
             BEFORE INSERT ON runs
@@ -1071,6 +1079,7 @@ impl Store {
             "cleanup_completed_at",
             "cleanup_completed_at TEXT NOT NULL DEFAULT ''",
         )?;
+        migrate_run_selected_slices(&conn)?;
         Ok(())
     }
 
@@ -1133,8 +1142,7 @@ impl Store {
         insert_event_tx(
             &tx,
             &run.id,
-            "run_launch_prepared",
-            &intent,
+            &crate::workflow::events::WorkflowEvent::run_launch_prepared(intent.clone()),
             &run.updated_at.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1241,8 +1249,7 @@ impl Store {
         insert_event_tx(
             &tx,
             run_id,
-            "run_launch_prepared",
-            &intent,
+            &crate::workflow::events::WorkflowEvent::run_launch_prepared(intent.clone()),
             &now.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1320,8 +1327,9 @@ impl Store {
         insert_event_tx(
             &tx,
             run_id,
-            "run_launch_integration_resources_created",
-            &intent,
+            &crate::workflow::events::WorkflowEvent::run_launch_integration_resources_created(
+                intent.clone(),
+            ),
             &now.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1386,12 +1394,10 @@ impl Store {
         insert_event_tx(
             &tx,
             run_id,
-            match target {
-                RunLaunchState::Activated => "run_launch_activated",
-                RunLaunchState::Completed => "run_launch_completed",
-                _ => "run_launch_transitioned",
-            },
-            &transitioned,
+            &crate::workflow::events::WorkflowEvent::run_launch_transitioned(
+                target,
+                transitioned.clone(),
+            ),
             &now,
         )?;
         tx.commit()?;
@@ -1464,7 +1470,12 @@ impl Store {
         intent.primary_cause = primary_cause.to_string();
         intent.compensation_error = compensation_error.to_string();
         intent.updated_at = now;
-        insert_event_tx(&tx, run_id, "run_launch_failed", &intent, &now.to_rfc3339())?;
+        insert_event_tx(
+            &tx,
+            run_id,
+            &crate::workflow::events::WorkflowEvent::run_launch_failed(intent.clone()),
+            &now.to_rfc3339(),
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -1520,12 +1531,10 @@ impl Store {
         insert_event_tx(
             &tx,
             run_id,
-            if target == RunLaunchState::Compensated {
-                "run_launch_compensated"
-            } else {
-                "run_launch_compensation_failed"
-            },
-            &intent,
+            &crate::workflow::events::WorkflowEvent::run_launch_compensation(
+                target == RunLaunchState::Compensated,
+                intent.clone(),
+            ),
             &now.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1616,8 +1625,9 @@ impl Store {
                     insert_event_tx(
                         &tx,
                         &intent.run_id,
-                        "integration_merge_reprepared",
-                        &existing,
+                        &crate::workflow::events::WorkflowEvent::integration_merge_reprepared(
+                            existing.clone(),
+                        ),
                         &now.to_rfc3339(),
                     )?;
                     IntegrationMergePrepareOutcome::Prepared
@@ -1663,8 +1673,7 @@ impl Store {
         insert_event_tx(
             &tx,
             &intent.run_id,
-            "integration_merge_prepared",
-            intent,
+            &crate::workflow::events::WorkflowEvent::integration_merge_prepared(intent.clone()),
             &intent.created_at.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1721,8 +1730,7 @@ impl Store {
         insert_event_tx(
             &tx,
             &intent.run_id,
-            "integration_merge_applied",
-            &intent,
+            &crate::workflow::events::WorkflowEvent::integration_merge_applied(intent.clone()),
             &now.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1818,8 +1826,7 @@ impl Store {
         insert_event_tx(
             &tx,
             &intent.run_id,
-            "integration_merge_reconciled",
-            &intent,
+            &crate::workflow::events::WorkflowEvent::integration_merge_reconciled(intent.clone()),
             &now.to_rfc3339(),
         )?;
         tx.commit()?;
@@ -1998,15 +2005,16 @@ impl Store {
                 now,
             ],
         )?;
-        let intent_payload = serde_json::to_string(&serde_json::json!({
-            "status": status,
-            "error": error,
-            "progress_message": progress_message,
-            "question_interruption_reason": question_interruption_reason,
-        }))?;
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'terminal_transition_intended', ?2, ?3)",
-            params![run_id, intent_payload, now],
+        insert_typed_event_tx(
+            &tx,
+            run_id,
+            &crate::workflow::events::TerminalTransitionIntendedPayload {
+                status,
+                error: error.to_string(),
+                progress_message: progress_message.to_string(),
+                question_interruption_reason: question_interruption_reason.to_string(),
+            },
+            &now,
         )?;
 
         let pending_questions = {
@@ -2032,16 +2040,19 @@ impl Store {
             params![now, question_interruption_reason, run_id],
         )?;
         for (question_id, slice_id, attempt) in &pending_questions {
-            let payload = serde_json::to_string(&serde_json::json!({
-                "question_id": question_id,
-                "slice_id": slice_id,
-                "attempt": attempt,
-                "reason": question_interruption_reason,
-                "terminal_status": status,
-            }))?;
-            tx.execute(
-                "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_question_interrupted', ?2, ?3)",
-                params![run_id, payload, now],
+            insert_typed_event_tx(
+                &tx,
+                run_id,
+                &crate::workflow::events::WorkerQuestionInterruptedPayload {
+                    question_id: question_id.clone(),
+                    slice_id: slice_id.clone(),
+                    attempt: *attempt,
+                    launch_id: None,
+                    active_attempt: None,
+                    reason: question_interruption_reason.to_string(),
+                    terminal_status: Some(status),
+                },
+                &now,
             )?;
         }
         let interrupted_slice_status = match status {
@@ -2111,12 +2122,14 @@ impl Store {
         row.map(terminal_transition_from_tuple).transpose()
     }
 
-    pub(crate) fn mark_terminal_summary_written<T: Serialize>(
+    pub(crate) fn mark_terminal_summary_written<T>(
         &self,
         run_id: &str,
-        event_type: &str,
         event_payload: &T,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        T: Serialize + crate::workflow::events::TypedEventPayload,
+    {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let transition = tx
@@ -2145,25 +2158,19 @@ impl Store {
             "UPDATE terminal_transitions SET summary_written_at=?1 WHERE run_id=?2",
             params![now, run_id],
         )?;
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                run_id,
-                event_type,
-                serde_json::to_string(event_payload)?,
-                now
-            ],
-        )?;
+        insert_typed_event_tx(&tx, run_id, event_payload, &now)?;
         tx.commit()?;
         Ok(true)
     }
 
-    pub(crate) fn commit_terminal_transition<T: Serialize>(
+    pub(crate) fn commit_terminal_transition<T>(
         &self,
         run_id: &str,
-        event_type: &str,
         event_payload: &T,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        T: Serialize + crate::workflow::events::TypedEventPayload,
+    {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let transition = tx
@@ -2236,15 +2243,14 @@ impl Store {
             params![launch_state.as_str(), &transition.error, &now, run_id,],
         )?;
         if launch_changed == 1 {
-            insert_event_tx(
+            insert_typed_event_tx(
                 &tx,
                 run_id,
-                "run_launch_interrupted",
-                &serde_json::json!({
-                    "state": launch_state,
-                    "terminal_status": transition.status,
-                    "primary_cause": transition.error,
-                }),
+                &crate::workflow::events::RunLaunchInterruptedPayload {
+                    state: launch_state,
+                    terminal_status: transition.status,
+                    primary_cause: transition.error.clone(),
+                },
                 &now,
             )?;
         }
@@ -2252,15 +2258,7 @@ impl Store {
         if take_terminal_transition_fault(TerminalTransitionFaultStage::BeforeTerminalEvent) {
             anyhow::bail!("injected terminal state/event commit failure");
         }
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                run_id,
-                event_type,
-                serde_json::to_string(event_payload)?,
-                now
-            ],
-        )?;
+        insert_typed_event_tx(&tx, run_id, event_payload, &now)?;
         tx.execute(
             "UPDATE terminal_transitions SET committed_at=?1 WHERE run_id=?2",
             params![now, run_id],
@@ -2416,12 +2414,14 @@ impl Store {
         Ok(true)
     }
 
-    pub(crate) fn mark_terminal_cleanup_completed<T: Serialize>(
+    pub(crate) fn mark_terminal_cleanup_completed<T>(
         &self,
         run_id: &str,
-        event_type: &str,
         event_payload: &T,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        T: Serialize + crate::workflow::events::TypedEventPayload,
+    {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (cleanup_started_at, cleanup_completed_at): (String, String) = tx
@@ -2444,15 +2444,7 @@ impl Store {
             "UPDATE terminal_transitions SET cleanup_completed_at=?1 WHERE run_id=?2",
             params![now, run_id],
         )?;
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                run_id,
-                event_type,
-                serde_json::to_string(event_payload)?,
-                now
-            ],
-        )?;
+        insert_typed_event_tx(&tx, run_id, event_payload, &now)?;
         tx.commit()?;
         Ok(true)
     }
@@ -2586,21 +2578,22 @@ impl Store {
                 params![run_id, slice_id, branch, worker_retry_ordinal as i64],
             )?;
         }
-        let payload = serde_json::json!({
-            "launch_id": launch_id,
-            "slice_id": slice_id,
-            "launch_ordinal": next_ordinal,
-            "execution_epoch": execution_epoch,
-            "worker_retry_ordinal": worker_retry_ordinal,
-            "repair_ordinal": repair_ordinal,
-            "envelope_retry_ordinal": envelope_retry_ordinal,
-            "kind": kind,
-            "state": "allocated",
-            "output_stem": &output_stem,
-        });
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_allocated', ?2, ?3)",
-            params![run_id, serde_json::to_string(&payload)?, now.to_rfc3339()],
+        insert_typed_event_tx(
+            &tx,
+            run_id,
+            &crate::workflow::events::WorkerAttemptAllocatedPayload {
+                launch_id,
+                slice_id: slice_id.to_string(),
+                launch_ordinal: next_ordinal as usize,
+                execution_epoch,
+                worker_retry_ordinal,
+                repair_ordinal,
+                envelope_retry_ordinal,
+                kind: kind.to_string(),
+                state: "allocated".to_string(),
+                output_stem: output_stem.clone(),
+            },
+            &now.to_rfc3339(),
         )?;
         tx.commit()?;
         Ok(WorkerAttemptLedger {
@@ -2639,9 +2632,14 @@ impl Store {
             "UPDATE worker_attempt_ledger SET state='running', launched_at=?1 WHERE launch_id=?2 AND state='allocated'",
             params![now, launch_id],
         )?;
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_launched', ?2, ?3)",
-            params![run_id, serde_json::to_string(&serde_json::json!({"launch_id": launch_id, "slice_id": slice_id}))?, now],
+        insert_typed_event_tx(
+            &tx,
+            &run_id,
+            &crate::workflow::events::WorkerAttemptLaunchedPayload {
+                launch_id,
+                slice_id,
+            },
+            &now,
         )?;
         tx.commit()?;
         Ok(())
@@ -2679,9 +2677,16 @@ impl Store {
             "UPDATE worker_attempt_ledger SET state=?1, finished_at=?2, failure_cause=?3 WHERE launch_id=?4",
             params![state, now, failure_cause, launch_id],
         )?;
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_finished', ?2, ?3)",
-            params![run_id, serde_json::to_string(&serde_json::json!({"launch_id": launch_id, "slice_id": slice_id, "state": state, "failure_cause": failure_cause}))?, now],
+        insert_typed_event_tx(
+            &tx,
+            &run_id,
+            &crate::workflow::events::WorkerAttemptFinishedPayload {
+                launch_id,
+                slice_id,
+                state: state.to_string(),
+                failure_cause: failure_cause.to_string(),
+            },
+            &now,
         )?;
         tx.commit()?;
         Ok(())
@@ -2807,16 +2812,19 @@ impl Store {
                 params![now, reason, question_id],
             )?;
             if interrupted == 1 {
-                let payload = serde_json::to_string(&serde_json::json!({
-                    "question_id": question_id,
-                    "slice_id": slice_id,
-                    "attempt": stale_attempt,
-                    "active_attempt": attempt,
-                    "reason": "superseded_by_worker_attempt"
-                }))?;
-                tx.execute(
-                    "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_question_interrupted', ?2, ?3)",
-                    params![run_id, payload, now],
+                insert_typed_event_tx(
+                    &tx,
+                    run_id,
+                    &crate::workflow::events::WorkerQuestionInterruptedPayload {
+                        question_id,
+                        slice_id: slice_id.to_string(),
+                        attempt: stale_attempt,
+                        launch_id: None,
+                        active_attempt: Some(attempt),
+                        reason: "superseded_by_worker_attempt".to_string(),
+                        terminal_status: None,
+                    },
+                    &now,
                 )?;
             }
         }
@@ -2878,14 +2886,43 @@ impl Store {
         Ok(pending.is_some())
     }
 
-    pub fn record_event<T: Serialize>(&self, run_id: &str, typ: &str, payload: &T) -> Result<()> {
+    pub fn record_workflow_event<T>(&self, run_id: &str, payload: &T) -> Result<()>
+    where
+        T: Serialize + crate::workflow::events::TypedEventPayload,
+    {
+        self.record_event_kind(run_id, T::event_kind(), payload)
+    }
+
+    pub fn record_typed_workflow_event<T: Serialize>(
+        &self,
+        run_id: &str,
+        event: &crate::workflow::events::WorkflowEvent<T>,
+    ) -> Result<()> {
+        self.record_event_kind(run_id, event.kind().clone(), event.payload())
+    }
+
+    fn record_event_kind<T: Serialize>(
+        &self,
+        run_id: &str,
+        kind: crate::workflow::events::EventKind,
+        payload: &T,
+    ) -> Result<()> {
         let payload_json = serde_json::to_string(payload)?;
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, typ, payload_json, Utc::now().to_rfc3339()],
+            params![run_id, kind.as_str(), payload_json, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn record_event<T: Serialize>(&self, run_id: &str, typ: &str, payload: &T) -> Result<()> {
+        self.record_event_kind(
+            run_id,
+            crate::workflow::events::EventKind::from(typ),
+            payload,
+        )
     }
 
     #[allow(dead_code)] // Legacy ordinal-only worker-question compatibility.
@@ -3048,7 +3085,7 @@ impl Store {
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
-    pub fn open_active_worker_question_with_recommendation<T, F>(
+    pub fn open_active_worker_question_with_recommendation(
         &self,
         id: &str,
         run_id: &str,
@@ -3058,14 +3095,8 @@ impl Store {
         options: &[String],
         timeout_seconds: u64,
         recommendation: &WorkerQuestionRecommendation,
-        asked_event_type: &str,
-        asked_event: F,
         progress_message: &str,
-    ) -> Result<WorkerQuestion>
-    where
-        T: Serialize,
-        F: FnOnce(&WorkerQuestion) -> Result<T>,
-    {
+    ) -> Result<WorkerQuestion> {
         self.open_active_worker_question_with_launch_id_and_recommendation(
             id,
             run_id,
@@ -3076,14 +3107,12 @@ impl Store {
             options,
             timeout_seconds,
             recommendation,
-            asked_event_type,
-            asked_event,
             progress_message,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn open_active_worker_question_with_launch_id_and_recommendation<T, F>(
+    pub fn open_active_worker_question_with_launch_id_and_recommendation(
         &self,
         id: &str,
         run_id: &str,
@@ -3094,14 +3123,8 @@ impl Store {
         options: &[String],
         timeout_seconds: u64,
         recommendation: &WorkerQuestionRecommendation,
-        asked_event_type: &str,
-        asked_event: F,
         progress_message: &str,
-    ) -> Result<WorkerQuestion>
-    where
-        T: Serialize,
-        F: FnOnce(&WorkerQuestion) -> Result<T>,
-    {
+    ) -> Result<WorkerQuestion> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !active_worker_attempt_with_launch_id(&tx, run_id, slice_id, attempt, launch_id)? {
@@ -3135,12 +3158,16 @@ impl Store {
             timeout_seconds,
             recommendation,
         )?;
-        let payload_json = serde_json::to_string(&asked_event(&question)?)?;
+        let event = crate::workflow::events::WorkerQuestionAskedPayload::from_question(
+            &question,
+            question.deadline_at.map(|deadline| deadline.to_rfc3339()),
+        );
+        #[cfg(test)]
+        if take_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend) {
+            anyhow::bail!("injected worker question event append failure");
+        }
         let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, asked_event_type, payload_json, now],
-        )?;
+        insert_typed_event_tx(&tx, run_id, &event, &now)?;
         project_awaiting_operator_progress(&tx, run_id, slice_id, attempt, progress_message, &now)?;
         tx.commit()?;
         Ok(question)
@@ -3220,16 +3247,19 @@ impl Store {
             params![now, reason, question_id, run_id],
         )?;
         if updated == 1 {
-            let payload = serde_json::to_string(&serde_json::json!({
-                "question_id": existing.id,
-                "slice_id": existing.slice_id,
-                "attempt": existing.attempt,
-                "launch_id": existing.launch_id,
-                "reason": reason
-            }))?;
-            tx.execute(
-                "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_question_interrupted', ?2, ?3)",
-                params![run_id, payload, now],
+            insert_typed_event_tx(
+                &tx,
+                run_id,
+                &crate::workflow::events::WorkerQuestionInterruptedPayload {
+                    question_id: existing.id,
+                    slice_id: existing.slice_id,
+                    attempt: existing.attempt,
+                    launch_id: existing.launch_id,
+                    active_attempt: None,
+                    reason: reason.to_string(),
+                    terminal_status: None,
+                },
+                &now,
             )?;
         }
         let question = worker_question_by_id(&tx, question_id, Some(run_id))?
@@ -3353,15 +3383,7 @@ impl Store {
                 {
                     anyhow::bail!("injected decision event append failure");
                 }
-                tx.execute(
-                    "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        run_id,
-                        crate::workflow::events::WORKER_QUESTION_ANSWERED,
-                        serde_json::to_string(&payload)?,
-                        &now_text,
-                    ],
-                )?;
+                insert_typed_event_tx(&tx, run_id, &payload, &now_text)?;
                 let question = worker_question_by_id(&tx, question_id, Some(run_id))?
                     .ok_or_else(|| anyhow::anyhow!("question disappeared after answer"))?;
                 tx.commit()?;
@@ -3432,23 +3454,22 @@ impl Store {
                            WHERE id=?3 AND run_id=?4 AND state='pending'"#,
                         params![&now_text, reason, question_id, run_id],
                     )?;
-                    let payload = serde_json::json!({
-                        "question_id": existing.id,
-                        "slice_id": existing.slice_id,
-                        "attempt": existing.attempt,
-                        "launch_id": existing.launch_id,
-                        "reason": reason,
-                    });
+                    let payload = crate::workflow::events::WorkerQuestionInterruptedPayload {
+                        question_id: existing.id.clone(),
+                        slice_id: existing.slice_id.clone(),
+                        attempt: existing.attempt,
+                        launch_id: existing.launch_id,
+                        active_attempt: None,
+                        reason: reason.to_string(),
+                        terminal_status: None,
+                    };
                     #[cfg(test)]
                     if take_decision_transaction_fault(
                         DecisionTransactionFaultStage::BeforeEventAppend,
                     ) {
                         anyhow::bail!("injected decision event append failure");
                     }
-                    tx.execute(
-                        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_question_interrupted', ?2, ?3)",
-                        params![run_id, serde_json::to_string(&payload)?, &now_text],
-                    )?;
+                    insert_typed_event_tx(&tx, run_id, &payload, &now_text)?;
                     let question = worker_question_by_id(&tx, question_id, Some(run_id))?
                         .ok_or_else(|| {
                             anyhow::anyhow!("question disappeared after interruption")
@@ -3516,15 +3537,7 @@ impl Store {
                     ) {
                         anyhow::bail!("injected decision event append failure");
                     }
-                    tx.execute(
-                        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            run_id,
-                            crate::workflow::events::WORKER_QUESTION_ANSWERED,
-                            serde_json::to_string(&payload)?,
-                            &now_text,
-                        ],
-                    )?;
+                    insert_typed_event_tx(&tx, run_id, &payload, &now_text)?;
                 } else {
                     let resolution_command = worker_question_timeout_command_json(
                         expected_launch_id,
@@ -3563,15 +3576,7 @@ impl Store {
                     ) {
                         anyhow::bail!("injected decision event append failure");
                     }
-                    tx.execute(
-                        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            run_id,
-                            crate::workflow::events::RUN_INCIDENT,
-                            serde_json::to_string(&incident)?,
-                            &now_text,
-                        ],
-                    )?;
+                    insert_typed_event_tx(&tx, run_id, &incident, &now_text)?;
                 }
                 let question = worker_question_by_id(&tx, question_id, Some(run_id))?
                     .ok_or_else(|| anyhow::anyhow!("question disappeared after resolution"))?;
@@ -3951,15 +3956,7 @@ impl Store {
         if take_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend) {
             anyhow::bail!("injected decision event append failure");
         }
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                run_id,
-                crate::workflow::events::REPLAN_PROPOSAL_DECIDED,
-                serde_json::to_string(&payload)?,
-                &now_text,
-            ],
-        )?;
+        insert_typed_event_tx(&tx, run_id, &payload, &now_text)?;
         if let Some((auto_accept, record)) = command.auto_accept.as_ref().and_then(|auto_accept| {
             auto_accept
                 .record
@@ -3979,24 +3976,8 @@ impl Store {
             ) {
                 anyhow::bail!("injected supplemental decision event append failure");
             }
-            tx.execute(
-                "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    run_id,
-                    crate::workflow::events::FRONTIER_CLASSIFIED,
-                    serde_json::to_string(&classification_record)?,
-                    &now_text,
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    run_id,
-                    crate::workflow::events::FRONTIER_AUTO_ACCEPT_RECORDED,
-                    serde_json::to_string(&auto_accept_record)?,
-                    &now_text,
-                ],
-            )?;
+            insert_typed_event_tx(&tx, run_id, &classification_record, &now_text)?;
+            insert_typed_event_tx(&tx, run_id, &auto_accept_record, &now_text)?;
         }
         tx.commit()?;
         Ok(ReplanDecisionTransition {
@@ -4141,12 +4122,48 @@ impl Store {
             })
     }
 
-    pub fn update_run_selected_slices(&self, run_id: &str, selected_slice_id: &str) -> Result<Run> {
+    pub fn get_run_selected_slices(&self, run_id: &str) -> Result<Vec<String>> {
         let conn = self.conn()?;
-        conn.execute(
-            "UPDATE runs SET selected_slice_id=?1, updated_at=?2 WHERE id=?3",
-            params![selected_slice_id, Utc::now().to_rfc3339(), run_id],
+        let mut stmt = conn.prepare(
+            "SELECT slice_id FROM run_selected_slices WHERE run_id=?1 ORDER BY position",
         )?;
+        let selected = stmt
+            .query_map(params![run_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !selected.is_empty() {
+            return Ok(selected);
+        }
+        let legacy = conn
+            .query_row(
+                "SELECT selected_slice_id FROM runs WHERE id=?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        legacy
+            .map(|value| decode_legacy_selected_slices(&value))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub fn update_run_selected_slices(
+        &self,
+        run_id: &str,
+        selected_slice_ids: &[String],
+    ) -> Result<Run> {
+        validate_selected_slices(selected_slice_ids)?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE runs SET selected_slice_id=?1, updated_at=?2 WHERE id=?3",
+            params![
+                selected_slice_ids.join(","),
+                Utc::now().to_rfc3339(),
+                run_id
+            ],
+        )?;
+        replace_run_selected_slices(&tx, run_id, selected_slice_ids)?;
+        tx.commit()?;
         self.get_run(run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id:?} disappeared after queue update"))
     }
@@ -4662,6 +4679,7 @@ impl Store {
         let sqlite_data_version = tx.query_row("PRAGMA data_version", [], |row| row.get(0))?;
         hook()?;
 
+        let selected_slice_ids = status_selected_slices(&tx, &run.id)?;
         let slice_runs = status_slice_runs(&tx, &run.id)?;
         let worker_attempts = status_worker_attempts(&tx, &run.id)?;
         let progress = status_progress(&tx, &run.id)?;
@@ -4690,6 +4708,7 @@ impl Store {
         Ok(Some(RunStateSnapshot {
             revision,
             run,
+            selected_slice_ids,
             slice_runs,
             worker_attempts,
             progress,
@@ -4809,16 +4828,17 @@ fn interrupt_active_worker_attempts(
                WHERE launch_id=?3 AND state IN ('allocated', 'running')"#,
             params![now, reason, launch_id],
         )?;
-        let payload = serde_json::json!({
-            "launch_id": launch_id,
-            "slice_id": slice_id,
-            "reason": reason,
-            "prior_state": prior_state,
-            "terminal_status": terminal_status,
-        });
-        tx.execute(
-            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, 'worker_attempt_interrupted', ?2, ?3)",
-            params![run_id, serde_json::to_string(&payload)?, now],
+        insert_typed_event_tx(
+            tx,
+            run_id,
+            &crate::workflow::events::WorkerAttemptInterruptedPayload {
+                launch_id: *launch_id,
+                slice_id: slice_id.clone(),
+                reason: reason.to_string(),
+                prior_state: prior_state.clone(),
+                terminal_status,
+            },
+            &now,
         )?;
     }
     Ok(active_attempts.len())
@@ -4860,6 +4880,8 @@ fn insert_run_tx(
             run.updated_at.to_rfc3339(),
         ],
     )?;
+    let selected_slice_ids = decode_legacy_selected_slices(&run.selected_slice_id)?;
+    replace_run_selected_slices(conn, &run.id, &selected_slice_ids)?;
     Ok(())
 }
 
@@ -4919,15 +4941,35 @@ fn insert_run_launch_intent_tx(conn: &Connection, intent: &RunLaunchIntent) -> R
 fn insert_event_tx<T: Serialize>(
     conn: &Connection,
     run_id: &str,
-    event_type: &str,
-    payload: &T,
+    event: &crate::workflow::events::WorkflowEvent<T>,
     created_at: &str,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![
             run_id,
-            event_type,
+            event.kind().as_str(),
+            serde_json::to_string(event.payload())?,
+            created_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_typed_event_tx<T>(
+    conn: &Connection,
+    run_id: &str,
+    payload: &T,
+    created_at: &str,
+) -> Result<()>
+where
+    T: Serialize + crate::workflow::events::TypedEventPayload,
+{
+    conn.execute(
+        "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            run_id,
+            T::event_kind().as_str(),
             serde_json::to_string(payload)?,
             created_at
         ],
@@ -5086,14 +5128,13 @@ fn apply_integration_merge_completion_tx(
                 last_error: String::new(),
             };
             upsert_slice_run_tx(conn, &slice_run)?;
-            insert_event_tx(
+            insert_typed_event_tx(
                 conn,
                 &intent.run_id,
-                "slice_merged",
-                &serde_json::json!({
-                    "slice_id": intent.slice_id,
-                    "commit_sha": commit_sha,
-                }),
+                &crate::workflow::events::SliceMergedPayload {
+                    slice_id: intent.slice_id.clone(),
+                    commit_sha: commit_sha.to_string(),
+                },
                 now,
             )?;
         }
@@ -5128,31 +5169,87 @@ fn apply_integration_merge_completion_tx(
                    WHERE launch_id=?2 AND state IN ('running', 'interrupted')"#,
                 params![now, launch_id],
             )?;
-            insert_event_tx(
+            insert_typed_event_tx(
                 conn,
                 &intent.run_id,
-                "worker_attempt_finished",
-                &serde_json::json!({
-                    "launch_id": launch_id,
-                    "slice_id": slice_id,
-                    "state": "succeeded",
-                    "failure_cause": "",
-                }),
+                &crate::workflow::events::WorkerAttemptFinishedPayload {
+                    launch_id: *launch_id,
+                    slice_id: slice_id.clone(),
+                    state: "succeeded".to_string(),
+                    failure_cause: String::new(),
+                },
                 now,
             )?;
-            insert_event_tx(
+            insert_typed_event_tx(
                 conn,
                 &intent.run_id,
-                "integration_repair_completed",
-                &serde_json::json!({
-                    "status": status,
-                    "summary": summary,
-                    "launch_id": launch_id,
-                }),
+                &crate::workflow::events::IntegrationRepairCompletedPayload::new(
+                    status, summary, *launch_id,
+                ),
                 now,
             )?;
         }
     }
+    Ok(())
+}
+
+fn decode_legacy_selected_slices(value: &str) -> Result<Vec<String>> {
+    let mut selected = Vec::new();
+    for slice_id in value.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        if !selected.iter().any(|existing| existing == slice_id) {
+            selected.push(slice_id.to_string());
+        }
+    }
+    validate_selected_slices(&selected)?;
+    Ok(selected)
+}
+
+fn validate_selected_slices(selected_slice_ids: &[String]) -> Result<()> {
+    for slice_id in selected_slice_ids {
+        if !crate::artifact::is_safe_slice_id(slice_id) {
+            anyhow::bail!("unsafe selected slice id {slice_id:?}");
+        }
+    }
+    Ok(())
+}
+
+fn replace_run_selected_slices(
+    conn: &Connection,
+    run_id: &str,
+    selected_slice_ids: &[String],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM run_selected_slices WHERE run_id=?1",
+        params![run_id],
+    )?;
+    for (position, slice_id) in selected_slice_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO run_selected_slices (run_id, position, slice_id) VALUES (?1, ?2, ?3)",
+            params![run_id, position as i64, slice_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_run_selected_slices(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            r#"SELECT id, selected_slice_id FROM runs
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM run_selected_slices WHERE run_id=runs.id
+               )"#,
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    for (run_id, legacy) in rows {
+        let selected = decode_legacy_selected_slices(&legacy)?;
+        replace_run_selected_slices(&tx, &run_id, &selected)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -5446,6 +5543,23 @@ fn latest_run_for_repo_conn(
             .optional()?
     };
     row.map(run_from_tuple).transpose()
+}
+
+fn status_selected_slices(conn: &Connection, run_id: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT slice_id FROM run_selected_slices WHERE run_id=?1 ORDER BY position")?;
+    let selected = stmt
+        .query_map(params![run_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !selected.is_empty() {
+        return Ok(selected);
+    }
+    let legacy = conn.query_row(
+        "SELECT selected_slice_id FROM runs WHERE id=?1",
+        params![run_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    decode_legacy_selected_slices(&legacy)
 }
 
 fn status_slice_runs(conn: &Connection, run_id: &str) -> Result<Vec<SliceRun>> {
@@ -6519,6 +6633,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_event_migration_preserves_unknown_kind_and_payload() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("state.sqlite3");
+        let store = Store::open(&db)?;
+        let run = run("legacy-event-run", "/repo", RunStatus::Running, Utc::now());
+        store.insert_run(&run)?;
+        store.conn()?.execute(
+            "INSERT INTO events (run_id, type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &run.id,
+                "future_legacy_event",
+                r#"{"legacy":true,"detail":"preserve me"}"#,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        drop(store);
+
+        let reopened = Store::open(&db)?;
+        let event = reopened.get_events(&run.id, 10)?.pop().unwrap();
+        assert_eq!(event.typ, "future_legacy_event");
+        assert_eq!(event.payload["legacy"], true);
+        assert_eq!(
+            crate::workflow::events::EventKind::from(event.typ.as_str()),
+            crate::workflow::events::EventKind::Unknown("future_legacy_event".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_slice_plan_migrates_legacy_comma_storage_idempotently() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("state.sqlite3");
+        let conn = Connection::open(&db)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE runs (
+                id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                base_branch TEXT NOT NULL,
+                base_sha TEXT NOT NULL,
+                integration_branch TEXT NOT NULL,
+                selected_slice_id TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO runs (
+                id, repo_id, repo_path, status, base_branch, base_sha,
+                integration_branch, selected_slice_id, error, started_at, updated_at
+            ) VALUES (
+                'legacy-run', 'repo-1', '/repo', 'completed', 'main', 'abc',
+                'khazad/legacy/integration', ' slice-001,slice-002,slice-001 ,, ', '',
+                '2026-07-11T00:00:00Z', '2026-07-11T00:00:00Z'
+            );
+            "#,
+        )?;
+        drop(conn);
+
+        let store = Store::open(&db)?;
+        assert_eq!(
+            store.get_run_selected_slices("legacy-run")?,
+            vec!["slice-001".to_string(), "slice-002".to_string()],
+            "legacy whitespace, empty entries, and duplicates migrate into an ordered unique relation"
+        );
+        drop(store);
+        let reopened = Store::open(&db)?;
+        assert_eq!(
+            reopened.get_run_selected_slices("legacy-run")?,
+            vec!["slice-001".to_string(), "slice-002".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_slice_plan_round_trips_and_rejects_unsafe_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("state.sqlite3");
+        let store = Store::open(&db)?;
+        let run = run("typed-plan-run", "/repo", RunStatus::Running, Utc::now());
+        store.insert_run(&run)?;
+        let selected = vec!["slice-001".to_string(), "slice-002".to_string()];
+        store.update_run_selected_slices(&run.id, &selected)?;
+        assert_eq!(store.get_run_selected_slices(&run.id)?, selected);
+
+        let unsafe_ids = vec!["../outside".to_string()];
+        assert!(
+            store
+                .update_run_selected_slices(&run.id, &unsafe_ids)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe selected slice id")
+        );
+        assert_eq!(store.get_run_selected_slices(&run.id)?, selected);
+
+        drop(store);
+        let reopened = Store::open(&db)?;
+        assert_eq!(reopened.get_run_selected_slices(&run.id)?, selected);
+        Ok(())
+    }
+
     fn merge_intent(
         run_id: &str,
         operation_id: &str,
@@ -6572,8 +6789,6 @@ mod tests {
             options,
             timeout_seconds,
             recommendation,
-            "worker_question_asked",
-            |question| Ok(serde_json::json!({ "question_id": question.id })),
             "awaiting operator answer",
         )
     }
@@ -7048,6 +7263,7 @@ mod tests {
             kind: "add_followup_slice".to_string(),
             target: "slice-001-followup".to_string(),
             summary: "capture the out-of-area work separately".to_string(),
+            followup_slice_draft: None,
         }];
 
         let pending = store.create_replan_proposal(
@@ -7198,6 +7414,7 @@ mod tests {
                 kind: "add_followup_slice".to_string(),
                 target: "slice-followup".to_string(),
                 summary: "capture follow-up".to_string(),
+                followup_slice_draft: None,
             }],
             "operator_review",
         )?;
@@ -7252,6 +7469,7 @@ mod tests {
                 kind: "add_followup_slice".to_string(),
                 target: "slice-followup".to_string(),
                 summary: "capture follow-up".to_string(),
+                followup_slice_draft: None,
             }],
             "operator_review",
         )?;
@@ -7647,6 +7865,7 @@ mod tests {
                 kind: "add_followup_slice".to_string(),
                 target: "slice-001-followup".to_string(),
                 summary: "capture follow-up work".to_string(),
+                followup_slice_draft: None,
             }],
             "operator_review",
         )?;
@@ -8000,8 +8219,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             60,
             &WorkerQuestionRecommendation::default(),
-            "worker_question_asked",
-            |question| Ok(serde_json::json!({ "question_id": question.id })),
             "awaiting operator answer",
         )?;
         store.finish_worker_attempt(launch.launch_id, "interrupted", "worker exited")?;
@@ -8536,6 +8753,7 @@ mod tests {
             reversible: true,
         };
 
+        inject_decision_transaction_fault(DecisionTransactionFaultStage::BeforeEventAppend);
         let failed = store.open_active_worker_question_with_recommendation(
             "q-failed",
             "run-open",
@@ -8545,8 +8763,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             60,
             &recommendation,
-            "worker_question_asked",
-            |_| -> Result<serde_json::Value> { anyhow::bail!("injected event failure") },
             "awaiting operator answer",
         );
         assert!(failed.is_err());
@@ -8566,13 +8782,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             60,
             &recommendation,
-            "worker_question_asked",
-            |question| {
-                Ok(serde_json::json!({
-                    "question_id": question.id,
-                    "deadline_at": question.deadline_at
-                }))
-            },
             "awaiting operator answer",
         )?;
         assert_eq!(opened.state, "pending");
@@ -9025,15 +9234,13 @@ mod tests {
         )?;
         store.mark_terminal_summary_written(
             "run-terminal-transaction",
-            "terminal_summary_written",
-            &serde_json::json!({"path": "/tmp/run-summary.json"}),
+            &crate::workflow::events::TerminalSummaryWrittenPayload::new("/tmp/run-summary.json"),
         )?;
 
         inject_terminal_transition_fault(TerminalTransitionFaultStage::BeforeTerminalEvent);
         let failed = store.commit_terminal_transition(
             "run-terminal-transaction",
-            "run_error",
-            &serde_json::json!({"error": "integration gate failed"}),
+            &crate::workflow::events::RunErrorPayload::new("integration gate failed"),
         );
         assert!(failed.is_err());
         assert_eq!(
@@ -9059,8 +9266,7 @@ mod tests {
 
         assert!(store.commit_terminal_transition(
             "run-terminal-transaction",
-            "run_error",
-            &serde_json::json!({"error": "integration gate failed"}),
+            &crate::workflow::events::RunErrorPayload::new("integration gate failed"),
         )?);
         assert_eq!(
             store

@@ -1530,7 +1530,6 @@ impl Runner for FakeRunner {
         emit_runner_event(&events, RunnerEvent::finished(None, Some(0)));
         Ok(ResultData {
             output: Some(json!({
-                "slice_id": handoff.slice.id,
                 "status": "complete",
                 "summary": "fake runner completed deterministic test-double slice implementation; not real Pi worker implementation evidence",
                 "commit_sha": sha,
@@ -2429,7 +2428,6 @@ mod tests {
                 "schema_version": 1,
                 "source": "khazad_worker_submit_worker_result_v1",
                 "result": {
-                    "slice_id": "slice-001",
                     "status": "complete",
                     "summary": "done",
                     "acceptance_status": []
@@ -2440,7 +2438,7 @@ mod tests {
 
         let data = parse_pi_tui_worker_result_artifact(&artifacts).unwrap();
         let output = data.output.unwrap();
-        assert_eq!(output["slice_id"], "slice-001");
+        assert!(output.get("slice_id").is_none());
         assert_eq!(output["status"], "complete");
     }
 }

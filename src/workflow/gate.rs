@@ -1559,6 +1559,7 @@ mod tests {
             title: format!("Title {id}"),
             goal: "Goal".to_string(),
             github_issue: String::new(),
+            provenance: None,
             status: crate::domain::SLICE_STATUS_OPEN.to_string(),
             closed_by_run: String::new(),
             closed_at: String::new(),

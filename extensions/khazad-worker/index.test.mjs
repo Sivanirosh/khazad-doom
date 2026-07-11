@@ -40,7 +40,6 @@ async function withEnv(vars, fn) {
 
 function validWorkerResult(overrides = {}) {
 	return {
-		slice_id: 'TUI-PROOF-01',
 		status: 'complete',
 		summary: 'Native Pi TUI proof submitted through extension artifact channel.',
 		changed_files: [],
@@ -60,6 +59,48 @@ test('worker extension registers ask_operator and submit_worker_result tools', (
 	const tools = registeredTools();
 	assert.ok(tools.has('ask_operator'));
 	assert.ok(tools.has('submit_worker_result'));
+});
+
+test('submit_worker_result contract keeps daemon-owned slice identity out of worker input', async () => {
+	const tool = registeredTools().get('submit_worker_result');
+	assert.deepEqual(tool.parameters.required, ['status', 'summary', 'acceptance_status']);
+	assert.equal(tool.parameters.properties.slice_id, undefined);
+	assert.ok(tool.parameters.properties.candidate_followup_slices);
+
+	const candidate = {
+		id: 'CA-08-FOLLOWUP',
+		title: 'Follow-up',
+		goal: 'Preserve a worker-authored follow-up proposal.',
+		areas: ['src/domain.rs'],
+		acceptance: ['Proposal remains explicit.'],
+		verify: ['cargo test wire'],
+		verify_profile: 'rust-unit',
+		depends_on: ['CA-08'],
+		must_ask_if: [],
+		rationale: 'Discovered within the authorized intent.',
+	};
+	const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'khazad-worker-wire-'));
+	const resultPath = path.join(tmp, 'result.json');
+	await withEnv(
+		{
+			KHAZAD_WORKER_RESULT_PATH: resultPath,
+			KHAZAD_RUN_ID: 'kd-wire-run',
+			KHAZAD_SLICE_ID: 'CA-08',
+			KHAZAD_ATTEMPT: '3',
+		},
+		async () => {
+			const result = await tool.execute(
+				'call-wire',
+				validWorkerResult({ candidate_followup_slices: [candidate] }),
+			);
+			assert.equal(result.terminate, true);
+			const artifact = JSON.parse(await fs.readFile(resultPath, 'utf8'));
+			assert.equal(artifact.slice_id, 'CA-08');
+			assert.equal(artifact.attempt, 3);
+			assert.equal(artifact.result.slice_id, undefined);
+			assert.deepEqual(artifact.result.candidate_followup_slices, [candidate]);
+		},
+	);
 });
 
 test('submit_worker_result reports unavailable when result path is missing', async () => {
@@ -101,7 +142,7 @@ test('submit_worker_result writes a terminating artifact without reading termina
 	);
 });
 
-test('submit_worker_result rejects invalid worker JSON and slice mismatches without writing', async () => {
+test('submit_worker_result rejects invalid and out-of-contract worker JSON without writing', async () => {
 	const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'khazad-worker-invalid-'));
 	const resultPath = path.join(tmp, 'result.json');
 	const tool = registeredTools().get('submit_worker_result');
@@ -116,10 +157,10 @@ test('submit_worker_result rejects invalid worker JSON and slice mismatches with
 			assert.equal(invalid.terminate, undefined);
 			assert.match(invalid.details.error, /status/);
 
-			const mismatch = await tool.execute('call-4', validWorkerResult({ slice_id: 'OTHER' }));
-			assert.equal(mismatch.details.written, false);
-			assert.equal(mismatch.terminate, undefined);
-			assert.match(mismatch.details.error, /slice_id/);
+			const outOfContract = await tool.execute('call-4', validWorkerResult({ slice_id: 'OTHER' }));
+			assert.equal(outOfContract.details.written, false);
+			assert.equal(outOfContract.terminate, undefined);
+			assert.match(outOfContract.details.error, /not part of the worker result contract/);
 
 			await assert.rejects(fs.access(resultPath));
 		},

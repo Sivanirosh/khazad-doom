@@ -152,14 +152,14 @@ A replan proposal should be recorded as a daemon-owned artifact/event with a sta
 }
 ```
 
-For `kind: "add_followup_slice"`, `followup_slice_draft` is optional for legacy prose-only proposals but required for daemon-created worker/repair candidate drafts. The typed payload is durable proposal evidence only; it is not applied to `.workflow/slices/` or queued until an explicit operator-authorized apply path validates and promotes it.
+For `kind: "add_followup_slice"`, `followup_slice_draft` is optional for legacy prose-only proposals but required for daemon-created worker/repair candidate drafts. It is an explicit domain field, not data hidden in the human-readable `summary`; legacy marker-encoded summaries are decoded losslessly and rewritten in the explicit shape. Generated slice `provenance` is likewise explicit rather than hidden in `github_issue`. The typed payload is durable proposal evidence only; it is not applied to `.workflow/slices/` or queued until an explicit operator-authorized apply path validates and promotes it. Promotion validates the generated ID with the same safe-ID and dependency-graph rules as authored slices.
 
 Accepted revision records add:
 
 - operator identity/source (`cli`, future TUI, or explicit daemon operator action);
 - decision rationale;
 - applied patch/diff summary;
-- before/after queue snapshot hash;
+- ordered before/after queue snapshots from the normalized StateStore selected-slice relation, plus their hashes (`runs.selected_slice_id` is retained only as a legacy projection);
 - `applied_at`;
 - checkpoint id before application;
 - checkpoint id after application.

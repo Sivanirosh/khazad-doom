@@ -11,6 +11,20 @@ const TERMINAL_RUN_STATUSES = new Set(['blocked', 'completed', 'failed', 'cancel
 const SUBMIT_WORKER_RESULT_SOURCE = 'khazad_worker_submit_worker_result_v1';
 const WORKER_RESULT_STATUSES = new Set(['complete', 'blocked', 'failed']);
 const ACCEPTANCE_EVIDENCE_STATUSES = new Set(['satisfied', 'blocked', 'failed']);
+const WORKER_RESULT_FIELDS = new Set([
+	'status',
+	'summary',
+	'commit_sha',
+	'commit_message',
+	'changed_files',
+	'public_interfaces_changed',
+	'tests_run',
+	'acceptance_status',
+	'findings',
+	'finding_dispositions',
+	'candidate_followup_slices',
+	'assumptions',
+]);
 const CUSTOM_ANSWER_CHOICE = 'Type a custom answer…';
 
 function khazadWorkerExtension(pi) {
@@ -348,7 +362,6 @@ function registerSubmitWorkerResultTool(pi) {
 		parameters: {
 			type: 'object',
 			properties: {
-				slice_id: { type: 'string' },
 				status: { type: 'string', enum: ['complete', 'blocked', 'failed'] },
 				summary: { type: 'string' },
 				commit_sha: { type: 'string' },
@@ -371,9 +384,29 @@ function registerSubmitWorkerResultTool(pi) {
 				},
 				findings: { type: 'array', items: { type: 'object' } },
 				finding_dispositions: { type: 'array', items: { type: 'object' } },
+				candidate_followup_slices: {
+					type: 'array',
+					items: {
+						type: 'object',
+						additionalProperties: false,
+						properties: {
+							id: { type: 'string' },
+							title: { type: 'string' },
+							goal: { type: 'string' },
+							areas: { type: 'array', items: { type: 'string' } },
+							acceptance: { type: 'array', items: { type: 'string' } },
+							verify: { type: 'array', items: { type: 'string' } },
+							verify_profile: { type: 'string' },
+							depends_on: { type: 'array', items: { type: 'string' } },
+							must_ask_if: { type: 'array', items: { type: 'string' } },
+							rationale: { type: 'string' },
+						},
+						required: ['id', 'title', 'goal', 'areas', 'acceptance', 'verify', 'verify_profile', 'depends_on', 'must_ask_if', 'rationale'],
+					},
+				},
 				assumptions: { type: 'array', items: { type: 'string' } },
 			},
-			required: ['slice_id', 'status', 'summary', 'acceptance_status'],
+			required: ['status', 'summary', 'acceptance_status'],
 			additionalProperties: false,
 		},
 		async execute(_toolCallId, input) {
@@ -394,30 +427,19 @@ function registerSubmitWorkerResultTool(pi) {
 			}
 
 			const envSliceId = process.env.KHAZAD_SLICE_ID || '';
-			if (envSliceId && input.slice_id !== envSliceId) {
-				return toolResult(
-					`submit_worker_result rejected worker result: slice_id ${JSON.stringify(input.slice_id)} does not match KHAZAD_SLICE_ID ${JSON.stringify(envSliceId)}.`,
-					{
-						available: true,
-						written: false,
-						error: 'slice_id does not match KHAZAD_SLICE_ID',
-					},
-				);
-			}
-
 			const attempt = Number.parseInt(process.env.KHAZAD_ATTEMPT || '0', 10);
 			const artifact = {
 				schema_version: 1,
 				source: SUBMIT_WORKER_RESULT_SOURCE,
 				submitted_at: new Date().toISOString(),
 				run_id: process.env.KHAZAD_RUN_ID || '',
-				slice_id: input.slice_id,
+				slice_id: envSliceId,
 				attempt: Number.isFinite(attempt) ? attempt : 0,
 				result: input,
 			};
 			writeJsonAtomic(resultPath, artifact);
 			return {
-				content: [{ type: 'text', text: `Submitted Khazad-Doom worker result for ${input.slice_id}.` }],
+				content: [{ type: 'text', text: `Submitted Khazad-Doom worker result for ${envSliceId || 'the assigned slice'}.` }],
 				details: {
 					available: true,
 					written: true,
@@ -432,7 +454,10 @@ function registerSubmitWorkerResultTool(pi) {
 
 function validateWorkerResult(result) {
 	if (!result || typeof result !== 'object' || Array.isArray(result)) return 'result must be an object';
-	for (const key of ['slice_id', 'status', 'summary']) {
+	for (const key of Object.keys(result)) {
+		if (!WORKER_RESULT_FIELDS.has(key)) return `${key} is not part of the worker result contract`;
+	}
+	for (const key of ['status', 'summary']) {
 		if (typeof result[key] !== 'string' || result[key].trim() === '') return `${key} must be a non-empty string`;
 	}
 	if (!WORKER_RESULT_STATUSES.has(result.status)) return 'status must be one of complete, blocked, failed';
@@ -458,7 +483,7 @@ function validateWorkerResult(result) {
 			return `acceptance_status[${index}].status must be one of satisfied, blocked, failed`;
 		}
 	}
-	for (const key of ['findings', 'finding_dispositions']) {
+	for (const key of ['findings', 'finding_dispositions', 'candidate_followup_slices']) {
 		if (result[key] !== undefined && !Array.isArray(result[key])) return `${key} must be an array when present`;
 	}
 	return '';

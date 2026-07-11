@@ -5509,7 +5509,6 @@ else:
     if slice_id == "slice-001":
         time.sleep(4)
         emit({
-            "slice_id": slice_id,
             "status": "failed",
             "summary": "intentional parallel worker failure",
         })
@@ -5585,7 +5584,6 @@ if attempt == 2:
     sys.exit(0)
 sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 result = {
-    "slice_id": slice_id,
     "status": "complete",
     "summary": "valid retry after invalid worker output",
     "commit_sha": sha,
@@ -5657,7 +5655,6 @@ criterion = handoff["slice"]["acceptance"][0]
 
 if attempt == 1 and slice_id == "missing-acceptance":
     result = {
-        "slice_id": slice_id,
         "status": "complete",
         "summary": "implementation complete with mismatched evidence",
         "commit_sha": sha,
@@ -5670,7 +5667,6 @@ if attempt == 1 and slice_id == "missing-acceptance":
     }
 elif attempt == 1 and slice_id == "missing-action":
     result = {
-        "slice_id": slice_id,
         "status": "complete",
         "summary": "implementation complete with malformed finding",
         "commit_sha": sha,
@@ -5687,7 +5683,6 @@ elif attempt == 1 and slice_id == "missing-action":
     }
 else:
     result = {
-        "slice_id": slice_id,
         "status": "complete",
         "summary": "valid envelope for the existing implementation commit",
         "commit_sha": sha,
@@ -5806,7 +5801,6 @@ subprocess.run(
 )
 sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 result = {
-    "slice_id": slice_id,
     "status": "complete",
     "summary": "quiet fake pi completed deterministic slice implementation",
     "commit_sha": sha,
@@ -5922,7 +5916,6 @@ question_text = f"Which operator answer should {slice_id} use on attempt {attemp
 
 if mode == "unavailable":
     emit({
-        "slice_id": slice_id,
         "status": "blocked",
         "summary": "ask_operator unavailable fallback blocked the worker",
         "findings": [{
@@ -5956,7 +5949,6 @@ try:
     result = daemon_call("workerAskOpen" if mode == "same_pane" else "workerAsk", params)
 except Exception as exc:
     emit({
-        "slice_id": slice_id,
         "status": "blocked",
         "summary": "ask_operator unavailable fallback blocked the worker",
         "findings": [{
@@ -5973,7 +5965,6 @@ if mode == "same_pane":
 
 if result.get("timed_out"):
     emit({
-        "slice_id": slice_id,
         "status": "blocked",
         "summary": "ask_operator timed out and worker blocked for operator intent",
         "findings": [{
@@ -5995,7 +5986,6 @@ subprocess.run(
 )
 sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 emit({
-    "slice_id": slice_id,
     "status": "complete",
     "summary": f"operator answered {answer}",
     "commit_sha": sha,

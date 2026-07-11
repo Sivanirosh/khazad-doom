@@ -1,12 +1,13 @@
-use super::events::{IMPLEMENTATION_SUMMARY, ImplementationSummaryPayload, RUN_STARTED};
+use super::attention::{actions_for_commands, project_attention_policy};
+use super::events::{EventKind, ImplementationSummaryPayload};
 use super::read_model::frontier_summary_from_records;
 use crate::domain::{
     FrontierBudgetState, FrontierSummary, GateCommandResult, GateResult, MissionEnvelope,
     RepairResult, ReplanProposal, RunDetails, RunEconomics, RunIncident, RunProgress, RunStatus,
-    SliceRun, SliceStatus, StatusAction, StatusAttentionItem, StatusFeed, StatusFeedBlock,
-    StatusFeedBlockKind, StatusFeedLine, StatusFeedRole, StatusLifecycleProjection,
-    StatusPhaseProjection, StatusWorkerActivityProjection, TerminalReason, WorkerAttemptProgress,
-    WorkflowExitStates, frontier_classification_annotation,
+    SliceRun, SliceStatus, StatusFeed, StatusFeedBlock, StatusFeedBlockKind, StatusFeedLine,
+    StatusFeedRole, StatusLifecycleProjection, StatusPhaseProjection,
+    StatusWorkerActivityProjection, TerminalReason, WorkerAttemptProgress, WorkflowExitStates,
+    frontier_classification_annotation,
 };
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -129,7 +130,7 @@ fn active_gate_pane_feed(
     let worker_activity = worker_activity_projection(details);
     let gate = gate_phase_projection(details);
     let repair = repair_phase_projection(details);
-    let actions = status_actions(&details.run.id, &operator_commands);
+    let actions = actions_for_commands(&details.run.id, &operator_commands);
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: "Khazad-Doom gate/repair activity painter (read-only)".to_string(),
@@ -185,7 +186,7 @@ fn idle_gate_pane_feed(details: &RunDetails) -> StatusFeed {
     let worker_activity = worker_activity_projection(details);
     let gate = gate_phase_projection(details);
     let repair = repair_phase_projection(details);
-    let actions = status_actions(&details.run.id, &operator_commands);
+    let actions = actions_for_commands(&details.run.id, &operator_commands);
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: "Khazad-Doom gate/repair status (idle)".to_string(),
@@ -395,7 +396,7 @@ fn gate_pane_latest_implementation_summary(
         .events
         .iter()
         .rev()
-        .find(|event| event.typ == IMPLEMENTATION_SUMMARY)
+        .find(|event| EventKind::from(event.typ.as_str()) == EventKind::ImplementationSummary)
         .map(|event| ImplementationSummaryPayload::from_value(&event.payload))
 }
 
@@ -468,7 +469,7 @@ fn gate_pane_verification_profile(
         return profile.to_string();
     }
     for event in details.events.iter().rev() {
-        if event.typ != RUN_STARTED {
+        if EventKind::from(event.typ.as_str()) != EventKind::RunStarted {
             continue;
         }
         let payload = super::events::RunStartedPayload::from_value(&event.payload);
@@ -816,10 +817,9 @@ pub fn project_waiting(repo: &str) -> StatusFeed {
 }
 
 pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
-    let question_commands = pending_question_commands(details);
-    let replan_commands = pending_replan_commands(details);
+    let policy = project_attention_policy(details);
     let attention = dashboard_attention(details, now);
-    let operator_commands = operator_commands(details, &question_commands, &replan_commands);
+    let operator_commands = policy.operator_commands;
 
     let frontier = frontier_summary_for_details(details);
     let mut blocks = vec![run_block(details, now), mission_block(details)];
@@ -845,12 +845,8 @@ pub fn project_run_at(details: &RunDetails, now: DateTime<Utc>) -> StatusFeed {
         blocks.push(incidents_block(&details.incidents));
     }
 
-    let mut action_commands = operator_commands.clone();
-    for command in status_navigation_commands(&details.run.id) {
-        push_unique(&mut action_commands, command);
-    }
-    let actions = status_actions(&details.run.id, &action_commands);
-    let attention_items = typed_attention_items(details, &actions);
+    let actions = policy.actions;
+    let attention_items = policy.attention_items;
     StatusFeed {
         feed_version: FEED_VERSION,
         summary_line: monitor_message(details),
@@ -1001,160 +997,6 @@ fn repair_phase_projection(details: &RunDetails) -> StatusPhaseProjection {
     }
 }
 
-fn action_kind(command: &str) -> &'static str {
-    if command.starts_with("khazad-doom status ") {
-        "inspect_status"
-    } else if command.starts_with("khazad-doom monitor ") {
-        "monitor_run"
-    } else if command.starts_with("khazad-doom attend ") {
-        "attend_run"
-    } else if command.starts_with("khazad-doom answer ") {
-        "answer_question"
-    } else if command.starts_with("khazad-doom replan accept ") {
-        "accept_replan"
-    } else if command.starts_with("khazad-doom replan reject ") {
-        "reject_replan"
-    } else if command.starts_with("khazad-doom replan defer ") {
-        "defer_replan"
-    } else if command.starts_with("khazad-doom replan supersede ") {
-        "supersede_replan"
-    } else if command.starts_with("khazad-doom resume ") {
-        "resume_run"
-    } else if command.starts_with("khazad-doom handoff ") {
-        "handoff"
-    } else {
-        "operator_command"
-    }
-}
-
-fn action_authority(command: &str) -> (String, String) {
-    let parts = command.split_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["khazad-doom", "answer", run_id, target_id, ..] => {
-            ((*run_id).to_string(), (*target_id).to_string())
-        }
-        ["khazad-doom", "replan", _, run_id, target_id, ..] => {
-            ((*run_id).to_string(), (*target_id).to_string())
-        }
-        _ => {
-            let run_id = parts
-                .windows(2)
-                .find(|pair| pair[0] == "--run")
-                .map(|pair| pair[1].to_string())
-                .unwrap_or_default();
-            (run_id, String::new())
-        }
-    }
-}
-
-fn action_id(command: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
-    format!("action-{}", &digest[..12])
-}
-
-fn status_navigation_commands(run_id: &str) -> Vec<String> {
-    vec![
-        format!("khazad-doom status --run {run_id}"),
-        format!("khazad-doom monitor --run {run_id}"),
-        format!("khazad-doom attend --run {run_id}"),
-    ]
-}
-
-fn status_actions(current_run_id: &str, commands: &[String]) -> Vec<StatusAction> {
-    commands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            let (run_id, target_id) = action_authority(command);
-            if !run_id.is_empty() && run_id != current_run_id {
-                return None;
-            }
-            Some(StatusAction {
-                id: action_id(command),
-                kind: action_kind(command).to_string(),
-                label: command.clone(),
-                command: command.clone(),
-                priority: 100u32.saturating_sub(index as u32),
-                run_id,
-                target_id,
-            })
-        })
-        .collect()
-}
-
-fn action_ids_for_commands(actions: &[StatusAction], commands: &[String]) -> Vec<String> {
-    actions
-        .iter()
-        .filter(|action| commands.iter().any(|command| command == &action.command))
-        .map(|action| action.id.clone())
-        .collect()
-}
-
-fn typed_attention_items(
-    details: &RunDetails,
-    actions: &[StatusAction],
-) -> Vec<StatusAttentionItem> {
-    let mut items = Vec::new();
-    if let Some(reason) = details.primary_terminal_reason.as_ref()
-        && reason.operator_action_required
-    {
-        items.push(StatusAttentionItem {
-            id: "terminal-reason".to_string(),
-            kind: reason.kind.clone(),
-            priority: 100,
-            summary: reason.summary.clone(),
-            action_ids: action_ids_for_commands(actions, &reason.operator_commands),
-        });
-    }
-    for question in details
-        .questions
-        .iter()
-        .filter(|question| question.state == "pending")
-    {
-        let commands = vec![question_answer_command(question)];
-        items.push(StatusAttentionItem {
-            id: format!("question:{}", question.id),
-            kind: "worker_question".to_string(),
-            priority: 90,
-            summary: question.question.clone(),
-            action_ids: action_ids_for_commands(actions, &commands),
-        });
-    }
-    for proposal in details
-        .replan
-        .pending
-        .iter()
-        .filter(|proposal| proposal.state == crate::domain::ReplanProposalState::Pending)
-    {
-        items.push(StatusAttentionItem {
-            id: format!("replan:{}", proposal.id),
-            kind: "replan_decision".to_string(),
-            priority: 80,
-            summary: proposal.source.summary.clone(),
-            action_ids: action_ids_for_commands(actions, &proposal.decision_commands),
-        });
-    }
-    for incident in &details.incidents {
-        if matches!(incident.severity.as_str(), "error" | "warning") {
-            items.push(StatusAttentionItem {
-                id: format!("incident:{}", incident.event_id),
-                kind: incident.kind.clone(),
-                priority: if incident.severity == "error" { 70 } else { 60 },
-                summary: incident.message.clone(),
-                action_ids: Vec::new(),
-            });
-        }
-    }
-    items.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    items
-}
-
 fn replan_source_label(proposal: &crate::domain::ReplanProposal) -> String {
     let mut parts = vec![display_or_dash(&proposal.source.kind).to_string()];
     if !proposal.source.slice_id.trim().is_empty() {
@@ -1174,15 +1016,6 @@ fn question_answer_command(question: &crate::domain::WorkerQuestion) -> String {
         "khazad-doom answer {} {} <answer>",
         question.run_id, question.id
     )
-}
-
-fn pending_question_commands(details: &RunDetails) -> Vec<String> {
-    details
-        .questions
-        .iter()
-        .filter(|question| question.state == "pending")
-        .map(question_answer_command)
-        .collect()
 }
 
 fn pending_question_attention(details: &RunDetails, now: DateTime<Utc>) -> Vec<StatusFeedLine> {
@@ -1256,15 +1089,6 @@ fn question_deadline_label(question: &crate::domain::WorkerQuestion, now: DateTi
         )
     };
     format!("Deadline: {} ({remaining})", deadline.to_rfc3339())
-}
-
-fn pending_replan_commands(details: &RunDetails) -> Vec<String> {
-    details
-        .replan
-        .pending
-        .iter()
-        .flat_map(|proposal| proposal.decision_commands.clone())
-        .collect()
 }
 
 fn replan_attention(details: &RunDetails) -> Vec<StatusFeedLine> {
@@ -1494,32 +1318,6 @@ fn proposed_change_feed_text(change: &crate::domain::ReplanProposedChange) -> St
         change.target,
         change.summary_text()
     )
-}
-
-fn operator_commands(
-    details: &RunDetails,
-    question_commands: &[String],
-    replan_commands: &[String],
-) -> Vec<String> {
-    let mut commands = Vec::new();
-    for command in replan_commands {
-        push_unique(&mut commands, command.clone());
-    }
-    for command in question_commands {
-        push_unique(&mut commands, command.clone());
-    }
-    if let Some(reason) = &details.primary_terminal_reason {
-        for command in &reason.operator_commands {
-            push_unique(&mut commands, command.clone());
-        }
-    }
-    if details.run.status == RunStatus::Completed {
-        push_unique(
-            &mut commands,
-            format!("khazad-doom handoff --run {}", details.run.id),
-        );
-    }
-    commands
 }
 
 fn commands_block(commands: &[String]) -> StatusFeedBlock {
@@ -1969,11 +1767,6 @@ fn economics_missing_block(details: &RunDetails) -> StatusFeedBlock {
     )
 }
 
-fn push_unique(values: &mut Vec<String>, value: String) {
-    if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
-        values.push(value);
-    }
-}
 fn run_block(details: &RunDetails, now: DateTime<Utc>) -> StatusFeedBlock {
     let progress = details.progress.as_ref();
     let phase = progress
@@ -2194,14 +1987,11 @@ fn selected_slice_items(details: &RunDetails) -> Vec<SliceRun> {
         return details.slice_runs.clone();
     }
     details
-        .run
-        .selected_slice_id
-        .split(',')
-        .map(str::trim)
-        .filter(|slice_id| !slice_id.is_empty())
+        .selected_slice_ids
+        .iter()
         .map(|slice_id| SliceRun {
             run_id: details.run.id.clone(),
-            slice_id: slice_id.to_string(),
+            slice_id: slice_id.clone(),
             status: SliceStatus::Pending,
             branch: String::new(),
             commit_sha: String::new(),
@@ -2281,7 +2071,11 @@ fn monitor_slice_label(details: &RunDetails) -> String {
         let slice_run = &details.slice_runs[0];
         return format!("{} ({})", slice_run.slice_id, slice_run.status);
     }
-    display_or_dash(&details.run.selected_slice_id).to_string()
+    if details.selected_slice_ids.is_empty() {
+        "-".to_string()
+    } else {
+        details.selected_slice_ids.join(",")
+    }
 }
 
 fn progress_phase_label(progress: &RunProgress) -> String {
@@ -2602,6 +2396,7 @@ mod tests {
     fn dashboard_v2_projection_has_versioned_compact_blocks_and_raw_safe_roles() {
         let now = Utc::now();
         let details = RunDetails {
+            selected_slice_ids: vec!["slice-1".to_string()],
             run: Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
@@ -2670,6 +2465,7 @@ mod tests {
         };
         // The running slice sits past the WORKER_ITEMS cutoff in storage order.
         let details = RunDetails {
+            selected_slice_ids: Vec::new(),
             run: Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
@@ -2749,6 +2545,7 @@ mod tests {
             "implementer: provider=openai-codex model=gpt-5.5 reasoning=xhigh mode=fast"
                 .to_string();
         let mut details = RunDetails {
+            selected_slice_ids: vec!["slice-1".to_string()],
             run: Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
@@ -2988,6 +2785,7 @@ mod tests {
     fn terminal_reason_projection_carries_reason_and_operator_commands() {
         let now = Utc::now();
         let mut details = RunDetails {
+            selected_slice_ids: vec!["slice-1".to_string()],
             run: Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),
@@ -3108,6 +2906,7 @@ mod tests {
             (RunStatus::Interrupted, true, false, Some(1)),
         ] {
             let details = RunDetails {
+                selected_slice_ids: Vec::new(),
                 run: Run {
                     id: format!("run-{status}"),
                     repo_id: "repo".to_string(),
@@ -3174,6 +2973,7 @@ mod tests {
                 kind: "add_followup_slice".to_string(),
                 target: "slice-1-followup".to_string(),
                 summary: "repair needs out-of-area files".to_string(),
+                followup_slice_draft: None,
             }],
             risk: "intent_affecting".to_string(),
             operator_decision: None,
@@ -3216,6 +3016,7 @@ mod tests {
             ..pending.clone()
         };
         let details = RunDetails {
+            selected_slice_ids: vec!["slice-1".to_string()],
             run: Run {
                 id: "kd-test".to_string(),
                 repo_id: "repo".to_string(),

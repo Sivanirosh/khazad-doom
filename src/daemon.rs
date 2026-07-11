@@ -335,9 +335,8 @@ impl Server {
             params.launch_id,
             &params.token,
         )? {
-            self.store.record_event(
+            self.store.record_workflow_event(
                 &params.run_id,
-                workflow_events::RUN_INCIDENT,
                 &workflow_events::RunIncidentPayload::error(
                     "worker_question_token_rejected",
                     "workerAsk rejected because the worker token did not match the launch",
@@ -372,13 +371,6 @@ impl Server {
                 &params.options,
                 timeout_seconds,
                 &recommendation,
-                workflow_events::WORKER_QUESTION_ASKED,
-                |question| {
-                    Ok(workflow_events::WorkerQuestionAskedPayload::from_question(
-                        question,
-                        worker_question_deadline(question),
-                    ))
-                },
                 &format!("awaiting operator answer: {}", params.question),
             )?;
 
@@ -398,9 +390,8 @@ impl Server {
             params.launch_id,
             &params.token,
         )? {
-            self.store.record_event(
+            self.store.record_workflow_event(
                 &params.run_id,
-                workflow_events::RUN_INCIDENT,
                 &workflow_events::RunIncidentPayload::error(
                     "worker_question_token_rejected",
                     "workerQuestionTimeout rejected because the worker token did not match the launch",
@@ -483,9 +474,8 @@ impl Server {
                     "khazad-doom: failed to resolve worker question {} at its deadline: {error:#}",
                     question.id
                 );
-                let _ = server.store.record_event(
+                let _ = server.store.record_workflow_event(
                     &question.run_id,
-                    workflow_events::RUN_INCIDENT,
                     &workflow_events::RunIncidentPayload::error(
                         "worker_question_deadline_resolution_failed",
                         format!(
@@ -731,17 +721,9 @@ impl Server {
                     &params.risk,
                 )?;
                 let proposal = enrich_replan_proposal(&params.run_id, proposal);
-                self.store.record_event(
+                self.store.record_workflow_event(
                     &params.run_id,
-                    "replan_proposal_created",
-                    &json!({
-                        "proposal_id": proposal.id,
-                        "state": proposal.state,
-                        "risk": proposal.risk,
-                        "source": proposal.source,
-                        "proposed_changes": proposal.proposed_changes,
-                        "decision_commands": proposal.decision_commands,
-                    }),
+                    &workflow_events::ReplanProposalCreatedPayload::from_proposal(&proposal),
                 )?;
                 self.manager
                     .notify_replan_attention(&params.run_id, &proposal);
@@ -981,6 +963,7 @@ mod tests {
                 kind: "mark_duplicate".to_string(),
                 target: "slice-1-followup".to_string(),
                 summary: "timeout fixture".to_string(),
+                followup_slice_draft: None,
             }],
             "operator_review",
         )?;

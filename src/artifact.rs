@@ -1939,7 +1939,7 @@ fn contains_line(text: &str, wanted: &str) -> bool {
     text.lines().any(|line| line.trim() == wanted)
 }
 
-fn is_safe_slice_id(id: &str) -> bool {
+pub(crate) fn is_safe_slice_id(id: &str) -> bool {
     let mut chars = id.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -2045,6 +2045,7 @@ mod tests {
             title: "Title".to_string(),
             goal: "Goal".to_string(),
             github_issue: String::new(),
+            provenance: None,
             status: crate::domain::SLICE_STATUS_OPEN.to_string(),
             closed_by_run: String::new(),
             closed_at: String::new(),

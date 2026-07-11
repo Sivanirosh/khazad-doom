@@ -2,8 +2,8 @@ use super::cockpit::{rename_default_agent_target, send_default_agent_message};
 use super::events as workflow_events;
 use crate::artifact;
 use crate::domain::{
-    Event, Run, RunProgress, RunStatus, SliceRun, SliceStatus, TerminalNotificationRecord,
-    WorkerQuestion,
+    Event, Run, RunDetails, RunProgress, RunStatus, SliceRun, SliceStatus, StatusAction,
+    StatusAttentionItem, TerminalNotificationRecord, WorkerQuestion,
 };
 use crate::state::Store as StateStore;
 use chrono::Utc;
@@ -14,6 +14,348 @@ use std::path::Path;
 const ATTENTION_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const ATTENTION_DELIVERY_ADAPTER: &str = "herdr";
 const ATTENTION_DELIVERY_SURFACE: &str = "agent_send";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionActionKind {
+    InspectStatus,
+    MonitorRun,
+    AttendRun,
+    AnswerQuestion,
+    AcceptReplan,
+    RejectReplan,
+    DeferReplan,
+    SupersedeReplan,
+    ResumeRun,
+    Handoff,
+    OperatorCommand,
+}
+
+impl AttentionActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InspectStatus => "inspect_status",
+            Self::MonitorRun => "monitor_run",
+            Self::AttendRun => "attend_run",
+            Self::AnswerQuestion => "answer_question",
+            Self::AcceptReplan => "accept_replan",
+            Self::RejectReplan => "reject_replan",
+            Self::DeferReplan => "defer_replan",
+            Self::SupersedeReplan => "supersede_replan",
+            Self::ResumeRun => "resume_run",
+            Self::Handoff => "handoff",
+            Self::OperatorCommand => "operator_command",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionIntentKind {
+    TerminalTransition,
+    WorkerQuestion,
+    ReplanDecision,
+    Incident,
+}
+
+impl AttentionIntentKind {
+    fn as_str(self, fallback: &str) -> &str {
+        match self {
+            Self::TerminalTransition | Self::Incident => fallback,
+            Self::WorkerQuestion => "worker_question",
+            Self::ReplanDecision => "replan_decision",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttentionIntent {
+    id: String,
+    kind: AttentionIntentKind,
+    kind_detail: String,
+    priority: u32,
+    summary: String,
+    commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AttentionPolicyProjection {
+    pub(crate) operator_commands: Vec<String>,
+    pub(crate) actions: Vec<StatusAction>,
+    pub(crate) attention_items: Vec<StatusAttentionItem>,
+}
+
+pub(crate) fn project_attention_policy(details: &RunDetails) -> AttentionPolicyProjection {
+    let mut operator_commands = Vec::new();
+    for proposal in &details.replan.pending {
+        for command in &proposal.decision_commands {
+            push_unique(&mut operator_commands, command.clone());
+        }
+    }
+    for question in details
+        .questions
+        .iter()
+        .filter(|question| question.state == "pending")
+    {
+        push_unique(
+            &mut operator_commands,
+            format!(
+                "khazad-doom answer {} {} <answer>",
+                question.run_id, question.id
+            ),
+        );
+    }
+    if let Some(reason) = &details.primary_terminal_reason {
+        for command in &reason.operator_commands {
+            push_unique(&mut operator_commands, command.clone());
+        }
+    }
+    if details.run.status == RunStatus::Completed {
+        push_unique(
+            &mut operator_commands,
+            format!("khazad-doom handoff --run {}", details.run.id),
+        );
+    }
+
+    let mut action_commands = operator_commands.clone();
+    for command in status_navigation_commands(&details.run.id) {
+        push_unique(&mut action_commands, command);
+    }
+    let actions = actions_for_commands(&details.run.id, &action_commands);
+    let intents = attention_intents(details);
+    let mut attention_items = intents
+        .into_iter()
+        .map(|intent| StatusAttentionItem {
+            id: intent.id,
+            kind: intent.kind.as_str(&intent.kind_detail).to_string(),
+            priority: intent.priority,
+            summary: intent.summary,
+            action_ids: action_ids_for_commands(&actions, &intent.commands),
+        })
+        .collect::<Vec<_>>();
+    attention_items.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    AttentionPolicyProjection {
+        operator_commands,
+        actions,
+        attention_items,
+    }
+}
+
+fn attention_intents(details: &RunDetails) -> Vec<AttentionIntent> {
+    let mut intents = Vec::new();
+    if let Some(reason) = details.primary_terminal_reason.as_ref()
+        && reason.operator_action_required
+    {
+        intents.push(AttentionIntent {
+            id: "terminal-reason".to_string(),
+            kind: AttentionIntentKind::TerminalTransition,
+            kind_detail: reason.kind.clone(),
+            priority: 100,
+            summary: reason.summary.clone(),
+            commands: reason.operator_commands.clone(),
+        });
+    }
+    for question in details
+        .questions
+        .iter()
+        .filter(|question| question.state == "pending")
+    {
+        intents.push(AttentionIntent {
+            id: format!("question:{}", question.id),
+            kind: AttentionIntentKind::WorkerQuestion,
+            kind_detail: String::new(),
+            priority: 90,
+            summary: question.question.clone(),
+            commands: vec![format!(
+                "khazad-doom answer {} {} <answer>",
+                question.run_id, question.id
+            )],
+        });
+    }
+    for proposal in details
+        .replan
+        .pending
+        .iter()
+        .filter(|proposal| proposal.state == crate::domain::ReplanProposalState::Pending)
+    {
+        intents.push(AttentionIntent {
+            id: format!("replan:{}", proposal.id),
+            kind: AttentionIntentKind::ReplanDecision,
+            kind_detail: String::new(),
+            priority: 80,
+            summary: proposal.source.summary.clone(),
+            commands: proposal.decision_commands.clone(),
+        });
+    }
+    for incident in &details.incidents {
+        if matches!(incident.severity.as_str(), "error" | "warning") {
+            intents.push(AttentionIntent {
+                id: format!("incident:{}", incident.event_id),
+                kind: AttentionIntentKind::Incident,
+                kind_detail: incident.kind.clone(),
+                priority: if incident.severity == "error" { 70 } else { 60 },
+                summary: incident.message.clone(),
+                commands: Vec::new(),
+            });
+        }
+    }
+    intents
+}
+
+pub(crate) fn actions_for_commands(current_run_id: &str, commands: &[String]) -> Vec<StatusAction> {
+    commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            let (run_id, target_id) = action_authority(command);
+            if !run_id.is_empty() && run_id != current_run_id {
+                return None;
+            }
+            Some(StatusAction {
+                id: action_id(command),
+                kind: action_kind(command).as_str().to_string(),
+                label: command.clone(),
+                command: command.clone(),
+                priority: 100u32.saturating_sub(index as u32),
+                run_id,
+                target_id,
+            })
+        })
+        .collect()
+}
+
+fn action_kind(command: &str) -> AttentionActionKind {
+    if command.starts_with("khazad-doom status ") {
+        AttentionActionKind::InspectStatus
+    } else if command.starts_with("khazad-doom monitor ") {
+        AttentionActionKind::MonitorRun
+    } else if command.starts_with("khazad-doom attend ") {
+        AttentionActionKind::AttendRun
+    } else if command.starts_with("khazad-doom answer ") {
+        AttentionActionKind::AnswerQuestion
+    } else if command.starts_with("khazad-doom replan accept ") {
+        AttentionActionKind::AcceptReplan
+    } else if command.starts_with("khazad-doom replan reject ") {
+        AttentionActionKind::RejectReplan
+    } else if command.starts_with("khazad-doom replan defer ") {
+        AttentionActionKind::DeferReplan
+    } else if command.starts_with("khazad-doom replan supersede ") {
+        AttentionActionKind::SupersedeReplan
+    } else if command.starts_with("khazad-doom resume ") {
+        AttentionActionKind::ResumeRun
+    } else if command.starts_with("khazad-doom handoff ") {
+        AttentionActionKind::Handoff
+    } else {
+        AttentionActionKind::OperatorCommand
+    }
+}
+
+fn action_authority(command: &str) -> (String, String) {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["khazad-doom", "answer", run_id, target_id, ..]
+        | ["khazad-doom", "replan", _, run_id, target_id, ..] => {
+            ((*run_id).to_string(), (*target_id).to_string())
+        }
+        _ => {
+            let run_id = parts
+                .windows(2)
+                .find(|pair| pair[0] == "--run")
+                .map(|pair| pair[1].to_string())
+                .unwrap_or_default();
+            (run_id, String::new())
+        }
+    }
+}
+
+fn action_id(command: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+    format!("action-{}", &digest[..12])
+}
+
+fn status_navigation_commands(run_id: &str) -> Vec<String> {
+    vec![
+        format!("khazad-doom status --run {run_id}"),
+        format!("khazad-doom monitor --run {run_id}"),
+        format!("khazad-doom attend --run {run_id}"),
+    ]
+}
+
+fn action_ids_for_commands(actions: &[StatusAction], commands: &[String]) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|action| commands.iter().any(|command| command == &action.command))
+        .map(|action| action.id.clone())
+        .collect()
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneHygieneIntent {
+    pane_id: String,
+    slice_id: String,
+    launch_id: Option<i64>,
+    launch_stem: String,
+    status: SliceStatus,
+    label: String,
+}
+
+fn pane_hygiene_intents(events: &[Event], slice_runs: &[SliceRun]) -> Vec<PaneHygieneIntent> {
+    let statuses = slice_runs
+        .iter()
+        .map(|slice| (slice.slice_id.as_str(), slice.status))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    events
+        .iter()
+        .filter(|event| {
+            workflow_events::EventKind::from(event.typ.as_str())
+                == workflow_events::EventKind::CockpitWorkerReady
+        })
+        .map(|event| workflow_events::CockpitWorkerReadyPayload::from_value(&event.payload))
+        .filter_map(|event| {
+            if event.pane_id.is_empty()
+                || event.slice_id.is_empty()
+                || !seen.insert(event.pane_id.clone())
+            {
+                return None;
+            }
+            let status = statuses
+                .get(event.slice_id.as_str())
+                .copied()
+                .unwrap_or(SliceStatus::Pending);
+            let marker = match status {
+                SliceStatus::Merged => "✓",
+                SliceStatus::Blocked | SliceStatus::Failed | SliceStatus::Cancelled => "✗",
+                SliceStatus::Interrupted => "!",
+                _ => "◐",
+            };
+            let label = match event.launch_id.filter(|launch_id| *launch_id > 0) {
+                Some(launch_id) => {
+                    format!("{marker} {} launch {launch_id} {status}", event.slice_id)
+                }
+                None => format!("{marker} {} {status}", event.slice_id),
+            };
+            Some(PaneHygieneIntent {
+                pane_id: event.pane_id,
+                slice_id: event.slice_id,
+                launch_id: event.launch_id,
+                launch_stem: event.launch_stem,
+                status,
+                label,
+            })
+        })
+        .collect()
+}
 
 #[derive(Clone)]
 pub(crate) struct OperatorAttention {
@@ -69,13 +411,14 @@ impl OperatorAttention {
                     payload,
                     created_at,
                 );
-                let _ = self.state.record_event(
+                let _ = self.state.record_typed_workflow_event(
                     &intent.run.id,
-                    workflow_events::TERMINAL_NOTIFICATION_SKIPPED,
-                    &workflow_events::TerminalNotificationPayload::skipped(
-                        terminal_status,
-                        &transition_key,
-                        "missing_origin_target",
+                    &workflow_events::WorkflowEvent::terminal_notification_skipped(
+                        workflow_events::TerminalNotificationPayload::skipped(
+                            terminal_status,
+                            &transition_key,
+                            "missing_origin_target",
+                        ),
                     ),
                 );
                 return;
@@ -130,15 +473,16 @@ impl OperatorAttention {
                     payload,
                     created_at,
                 );
-                let _ = self.state.record_event(
+                let _ = self.state.record_typed_workflow_event(
                     &intent.run.id,
-                    workflow_events::TERMINAL_NOTIFICATION_SENT,
-                    &workflow_events::TerminalNotificationPayload::sent(
-                        terminal_status,
-                        &transition_key,
-                        sent.adapter,
-                        sent.surface,
-                        origin.target_kind,
+                    &workflow_events::WorkflowEvent::terminal_notification_sent(
+                        workflow_events::TerminalNotificationPayload::sent(
+                            terminal_status,
+                            &transition_key,
+                            sent.adapter,
+                            sent.surface,
+                            origin.target_kind,
+                        ),
                     ),
                 );
             }
@@ -166,66 +510,38 @@ impl OperatorAttention {
     }
 
     pub(crate) fn worker_pane_terminal_rename(&self, intent: WorkerPaneTerminalRename<'_>) {
-        let statuses = intent
-            .slice_runs
-            .iter()
-            .map(|slice| (slice.slice_id.as_str(), slice.status))
-            .collect::<BTreeMap<_, _>>();
-        let mut seen = BTreeSet::new();
-        for event in intent
-            .events
-            .iter()
-            .filter(|event| event.typ == workflow_events::COCKPIT_WORKER_READY)
-            .map(|event| workflow_events::CockpitWorkerReadyPayload::from_value(&event.payload))
-        {
-            let pane_id = event.pane_id.as_str();
-            let slice_id = event.slice_id.as_str();
-            if pane_id.is_empty() || slice_id.is_empty() || !seen.insert(pane_id.to_string()) {
-                continue;
-            }
-            let status = statuses
-                .get(slice_id)
-                .copied()
-                .unwrap_or(SliceStatus::Pending);
-            let marker = match status {
-                SliceStatus::Merged => "✓",
-                SliceStatus::Blocked | SliceStatus::Failed | SliceStatus::Cancelled => "✗",
-                SliceStatus::Interrupted => "!",
-                _ => "◐",
-            };
-            let label = match event.launch_id.filter(|launch_id| *launch_id > 0) {
-                Some(launch_id) => format!("{marker} {slice_id} launch {launch_id} {status}"),
-                None => format!("{marker} {slice_id} {status}"),
-            };
+        for pane in pane_hygiene_intents(intent.events, intent.slice_runs) {
+            let pane_id = pane.pane_id.as_str();
+            let slice_id = pane.slice_id.as_str();
+            let status = pane.status;
+            let label = pane.label;
             match rename_default_agent_target(pane_id, &label) {
                 Ok(renamed) => {
-                    let _ = self.state.record_event(
+                    let _ = self.state.record_workflow_event(
                         &intent.run.id,
-                        "cockpit_worker_renamed",
-                        &json!({
-                            "pane_id": pane_id,
-                            "slice_id": slice_id,
-                            "launch_id": event.launch_id,
-                            "launch_stem": event.launch_stem,
-                            "status": status,
-                            "label": label,
-                            "adapter": renamed.adapter,
-                            "surface": renamed.surface,
-                        }),
+                        &workflow_events::CockpitWorkerRenamedPayload {
+                            pane_id: pane_id.to_string(),
+                            slice_id: slice_id.to_string(),
+                            launch_id: pane.launch_id,
+                            launch_stem: pane.launch_stem,
+                            status: status.to_string(),
+                            label,
+                            adapter: renamed.adapter,
+                            surface: renamed.surface,
+                        },
                     );
                 }
                 Err(err) => {
-                    let _ = self.state.record_event(
+                    let _ = self.state.record_workflow_event(
                         &intent.run.id,
-                        workflow_events::RUN_INCIDENT,
                         &workflow_events::RunIncidentPayload::warning(
                             "cockpit_worker_rename_failed",
                             format!("worker pane rename failed for {slice_id}: {}", err.message),
                         )
                         .with_extra("pane_id", pane_id)
                         .with_extra("slice_id", slice_id)
-                        .with_extra("launch_id", event.launch_id)
-                        .with_extra("launch_stem", &event.launch_stem)
+                        .with_extra("launch_id", pane.launch_id)
+                        .with_extra("launch_stem", &pane.launch_stem)
                         .with_extra("label", &label)
                         .with_extra("source_of_truth", "daemon_terminal_summary"),
                     );
@@ -282,9 +598,8 @@ impl OperatorAttention {
         failure_kind: &str,
         message: &str,
     ) {
-        let _ = self.state.record_event(
+        let _ = self.state.record_workflow_event(
             &run.id,
-            workflow_events::RUN_INCIDENT,
             &workflow_events::RunIncidentPayload::warning(
                 "terminal_notification_failed",
                 format!("terminal notification for {terminal_status} was not delivered: {message}"),
@@ -368,6 +683,30 @@ mod tests {
     use anyhow::Result;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn attention_action_parity_preserves_kind_authority_and_stable_ids() {
+        let commands = vec![
+            "khazad-doom answer run-1 question-1 <answer>".to_string(),
+            "khazad-doom replan accept run-1 proposal-1 --rationale <text>".to_string(),
+            "khazad-doom status --run run-1".to_string(),
+            "khazad-doom answer other-run question-2 <answer>".to_string(),
+        ];
+        let actions = actions_for_commands("run-1", &commands);
+        assert_eq!(actions.len(), 3, "cross-run action must fail closed");
+        assert_eq!(actions[0].kind, "answer_question");
+        assert_eq!(actions[0].run_id, "run-1");
+        assert_eq!(actions[0].target_id, "question-1");
+        assert_eq!(actions[1].kind, "accept_replan");
+        assert_eq!(actions[1].target_id, "proposal-1");
+        assert_eq!(actions[2].kind, "inspect_status");
+        assert_eq!(actions[2].run_id, "run-1");
+        assert_eq!(
+            actions_for_commands("run-1", &commands)[0].id,
+            actions[0].id,
+            "the same daemon command must retain one stable action identity"
+        );
+    }
 
     fn state_store() -> Result<(tempfile::TempDir, StateStore)> {
         let home = tempfile::tempdir()?;

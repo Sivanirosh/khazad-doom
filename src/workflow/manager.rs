@@ -39,11 +39,12 @@ use crate::domain::{
     FrontierClassification, GateResult, Handoff, HandoffActionResult, HandoffDiagnostics,
     ImplementationSummary, IntegrationMergeCompletion, IntegrationMergeIntent,
     IntegrationMergeKind, IntegrationMergeState, MergeConflictReport, MissionEnvelope,
-    OriginNotificationTarget, PlanRevisions, RepairResult, ReplanDecision, ReplanEvidenceLink,
-    ReplanProposal, ReplanProposalSource, ReplanProposedChange, Run, RunCheckpoint, RunInspection,
-    RunLaunchIntent, RunStatus, Slice, SliceExitState, SliceProvenance, SliceRun, SliceStatus,
-    SliceValidationReport, SliceWriteResult, WorkerAttemptLedger, WorkerProfileEvidence,
-    WorkerQuestion, WorkerResult, WorkflowConfig, WorkflowExitStates, is_open_status,
+    OriginNotificationTarget, PlanRevisions, RepairResult, RepairResultAuthority, RepairResultWire,
+    ReplanDecision, ReplanEvidenceLink, ReplanProposal, ReplanProposalSource, ReplanProposedChange,
+    Run, RunCheckpoint, RunInspection, RunLaunchIntent, RunStatus, Slice, SliceExitState,
+    SliceProvenance, SliceRun, SliceStatus, SliceValidationReport, SliceWriteResult,
+    WorkerAttemptLedger, WorkerProfileEvidence, WorkerQuestion, WorkerResult,
+    WorkerResultAuthority, WorkerResultWire, WorkflowConfig, WorkflowExitStates, is_open_status,
     replan_decision_commands,
 };
 use crate::gitutil;
@@ -774,9 +775,8 @@ impl Manager {
             )
         };
         self.mark_progress(&run.id, "awaiting_replan", "", 0, "replan", &message);
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            "replan_checkpoint_blocked",
             &workflow_events::ReplanCheckpointBlockedPayload::new(
                 pending.iter().map(|proposal| proposal.id.clone()).collect(),
                 checkpoint,
@@ -1028,9 +1028,8 @@ impl Manager {
         classification: &FrontierClassification,
         record_only: bool,
     ) -> Result<()> {
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            workflow_events::FRONTIER_CLASSIFIED,
             &workflow_events::FrontierClassifiedPayload::new(
                 &proposal.id,
                 checkpoint,
@@ -1054,23 +1053,25 @@ impl Manager {
             .as_ref()
             .map(|classification| classification.tier.as_str())
             .unwrap_or("");
-        let event_type = if matches!(tier, "tier_3" | "stop") {
-            "frontier_auto_accept_stopped"
+        let kind = if matches!(tier, "tier_3" | "stop") {
+            workflow_events::EventKind::FrontierAutoAcceptStopped
         } else {
-            "frontier_auto_accept_skipped"
+            workflow_events::EventKind::FrontierAutoAcceptSkipped
         };
-        self.state.record_event(
-            &run.id,
-            event_type,
-            &json!({
-                "proposal_id": proposal.id,
-                "checkpoint": checkpoint,
-                "reason": reason,
-                "tier": tier,
-                "reason_codes": reason_codes,
-                "state": proposal.state,
-            }),
-        )
+        let payload = workflow_events::FrontierAutoAcceptDispositionPayload::new(
+            proposal,
+            checkpoint,
+            reason,
+            tier,
+            reason_codes.to_vec(),
+        );
+        let event = match kind {
+            workflow_events::EventKind::FrontierAutoAcceptStopped => {
+                workflow_events::WorkflowEvent::frontier_auto_accept_stopped(payload)
+            }
+            _ => workflow_events::WorkflowEvent::frontier_auto_accept_skipped(payload),
+        };
+        self.state.record_typed_workflow_event(&run.id, &event)
     }
 
     fn frontier_slice_graph_for_path(
@@ -1303,9 +1304,8 @@ impl Manager {
         match open_default_run_cockpit(run, mode, &self.paths.root) {
             Ok(CockpitLaunch::Opened(opened)) => {
                 let effective_mode = opened.mode;
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    workflow_events::COCKPIT_READY,
                     &workflow_events::CockpitReadyPayload {
                         adapter: opened.adapter,
                         mode: effective_mode.as_str().to_string(),
@@ -1319,9 +1319,8 @@ impl Manager {
             }
             Ok(CockpitLaunch::SkippedDirect) => Ok(CockpitMode::Direct),
             Err(unavailable) => {
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    workflow_events::RUN_INCIDENT,
                     &workflow_events::RunIncidentPayload::warning(
                         "cockpit_unavailable",
                         unavailable.message,
@@ -1446,9 +1445,8 @@ impl Manager {
             );
             result = self
                 .state
-                .record_event(
+                .record_workflow_event(
                     &context.run_id,
-                    "worker_attempt_timeout",
                     &workflow_events::WorkerAttemptTimeoutPayload::new(
                         &context.phase,
                         &context.slice_id,
@@ -1732,26 +1730,27 @@ impl Manager {
             }
         };
         self.state
-            .record_event(
+            .record_workflow_event(
                 &run.id,
-                workflow_events::COCKPIT_WORKER_READY,
-                &json!({
-                    "adapter": opened.adapter,
-                    "mode": opened.mode.as_str(),
-                    "workspace": opened.workspace_label,
-                    "pane": opened.pane_label,
-                    "pane_id": opened.pane_id,
-                    "slice_id": context.slice_id.clone(),
-                    "attempt": context.attempt,
-                    "launch_id": context.launch_id,
-                    "launch_stem": context.launch_stem,
-                    "launch_identity": context.cockpit_launch_identity(),
-                    "source_of_truth": "kd_artifact_files",
-                    "layout_planner": "cockpit_layout_v2",
-                    "worker_slot_name": opened.slot_name,
-                    "worker_slot_index": opened.slot_index,
-                    "worker_region": opened.slot_region,
-                }),
+                &workflow_events::CockpitWorkerReadyPayload {
+                    adapter: opened.adapter,
+                    mode: opened.mode.as_str().to_string(),
+                    workspace: opened.workspace_label,
+                    pane: opened.pane_label,
+                    pane_id: opened.pane_id,
+                    slice_id: context.slice_id.clone(),
+                    attempt: context.attempt,
+                    launch_id: context.launch_id,
+                    launch_stem: context.launch_stem.clone().unwrap_or_default(),
+                    launch_identity: context.cockpit_launch_identity(),
+                    terminal_id: String::new(),
+                    agent_name: String::new(),
+                    layout_planner: "cockpit_layout_v2".to_string(),
+                    worker_slot_name: opened.slot_name,
+                    worker_slot_index: opened.slot_index,
+                    worker_region: opened.slot_region,
+                    source_of_truth: "kd_artifact_files".to_string(),
+                },
             )
             .map_err(CockpitWorkerJobError::Worker)?;
         let pid = match wait_for_pi_wrapper_launch(&artifacts, Duration::from_secs(5), &events) {
@@ -1839,28 +1838,27 @@ impl Manager {
             }
         };
         self.state
-            .record_event(
+            .record_workflow_event(
                 &run.id,
-                workflow_events::COCKPIT_WORKER_READY,
-                &json!({
-                    "adapter": opened.adapter.clone(),
-                    "mode": opened.mode.as_str(),
-                    "workspace": opened.workspace_label.clone(),
-                    "pane": opened.pane_label.clone(),
-                    "pane_id": opened.pane_id.clone(),
-                    "terminal_id": opened.terminal_id.clone(),
-                    "agent_name": opened.agent_name.clone(),
-                    "slice_id": context.slice_id.clone(),
-                    "attempt": context.attempt,
-                    "launch_id": context.launch_id,
-                    "launch_stem": context.launch_stem,
-                    "launch_identity": context.cockpit_launch_identity(),
-                    "source_of_truth": "kd_tui_result_artifact",
-                    "layout_planner": "cockpit_layout_v2",
-                    "worker_slot_name": opened.slot_name.clone(),
-                    "worker_slot_index": opened.slot_index,
-                    "worker_region": opened.slot_region.clone(),
-                }),
+                &workflow_events::CockpitWorkerReadyPayload {
+                    adapter: opened.adapter.clone(),
+                    mode: opened.mode.as_str().to_string(),
+                    workspace: opened.workspace_label.clone(),
+                    pane: opened.pane_label.clone(),
+                    pane_id: opened.pane_id.clone(),
+                    terminal_id: opened.terminal_id.clone(),
+                    agent_name: opened.agent_name.clone(),
+                    slice_id: context.slice_id.clone(),
+                    attempt: context.attempt,
+                    launch_id: context.launch_id,
+                    launch_stem: context.launch_stem.clone().unwrap_or_default(),
+                    launch_identity: context.cockpit_launch_identity(),
+                    layout_planner: "cockpit_layout_v2".to_string(),
+                    worker_slot_name: opened.slot_name.clone(),
+                    worker_slot_index: opened.slot_index,
+                    worker_region: opened.slot_region.clone(),
+                    source_of_truth: "kd_tui_result_artifact".to_string(),
+                },
             )
             .map_err(CockpitWorkerJobError::Worker)?;
         if let Some(sink) = &events {
@@ -1877,9 +1875,8 @@ impl Manager {
         mode: CockpitMode,
         message: &str,
     ) -> Result<()> {
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            workflow_events::RUN_INCIDENT,
             &workflow_events::RunIncidentPayload::warning("cockpit_worker_fallback", message)
                 .with_extra("adapter", "herdr")
                 .with_extra("mode", mode.as_str())
@@ -1901,9 +1898,8 @@ impl Manager {
         warnings: &[crate::pi_contract::PiContractWarning],
     ) {
         for warning in warnings {
-            let _ = self.state.record_event(
+            let _ = self.state.record_workflow_event(
                 &context.run_id,
-                workflow_events::RUN_INCIDENT,
                 &workflow_events::RunIncidentPayload::warning(&warning.kind, &warning.message)
                     .with_extra("phase", &context.phase)
                     .with_extra("slice_id", &context.slice_id)
@@ -1929,9 +1925,8 @@ impl Manager {
         context: AgentLaunchIncidentContext<'_>,
         failure: &RunnerLaunchFailure,
     ) -> Result<()> {
-        self.state.record_event(
+        self.state.record_workflow_event(
             &context.run.id,
-            workflow_events::RUN_INCIDENT,
             &workflow_events::RunIncidentPayload::error(&failure.failure_kind, &failure.summary)
                 .with_failure_kind(&failure.failure_kind)
                 .with_extra("phase", context.phase)
@@ -2039,6 +2034,7 @@ impl Manager {
             title: draft.title,
             goal: draft.goal,
             github_issue: draft.github_issue,
+            provenance: None,
             status: crate::domain::SLICE_STATUS_OPEN.to_string(),
             closed_by_run: String::new(),
             closed_at: String::new(),
@@ -2073,6 +2069,7 @@ impl Manager {
             title: issue.title.clone(),
             goal: first_meaningful_paragraph(&issue.body).unwrap_or_else(|| issue.title.clone()),
             github_issue: issue.url,
+            provenance: None,
             status: crate::domain::SLICE_STATUS_OPEN.to_string(),
             closed_by_run: String::new(),
             closed_at: String::new(),
@@ -2245,15 +2242,14 @@ impl Manager {
                 origin_notification_target_from_start(&opts.origin_notification_target)
             {
                 let path = run_store.write_origin_notification_target(&run.id, &origin)?;
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    "origin_notification_target_recorded",
-                    &json!({
-                        "path": path,
-                        "target_kind": origin.target_kind,
-                        "delivery_adapter": origin.delivery_adapter,
-                        "delivery_surface": origin.delivery_surface,
-                    }),
+                    &workflow_events::OriginNotificationTargetRecordedPayload {
+                        path: path.to_string_lossy().to_string(),
+                        target_kind: origin.target_kind,
+                        delivery_adapter: origin.delivery_adapter,
+                        delivery_surface: origin.delivery_surface,
+                    },
                 )?;
             }
             let runner_metadata = runner.metadata();
@@ -2304,9 +2300,8 @@ impl Manager {
             run.updated_at = Utc::now();
             let verify_profiles = selected_verify_profiles(&selected_slices);
             let verify_profile = verify_profiles.join(", ");
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                workflow_events::RUN_STARTED,
                 &workflow_events::RunStartedPayload::new(
                     &run,
                     selected_ids.clone(),
@@ -2326,15 +2321,14 @@ impl Manager {
                 ),
             )?;
             if let Some(envelope) = mission_envelope.as_ref() {
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    "mission_envelope_recorded",
-                    &json!({
-                        "mission_envelope": envelope,
-                        "frontier_budget": frontier_budget,
-                        "autonomy_effective": envelope.autonomy_level.as_str(),
-                        "authority": autonomy_authority_label(envelope.autonomy_level),
-                    }),
+                    &workflow_events::MissionEnvelopeRecordedPayload {
+                        mission_envelope: envelope.clone(),
+                        frontier_budget: frontier_budget.clone(),
+                        autonomy_effective: envelope.autonomy_level.as_str().to_string(),
+                        authority: autonomy_authority_label(envelope.autonomy_level).to_string(),
+                    },
                 )?;
             }
             self.mark_progress(&run.id, "started", "", 0, "", "run accepted by daemon");
@@ -2420,9 +2414,8 @@ impl Manager {
             .get_run(run_id)?
             .ok_or_else(|| anyhow!("run {run_id:?} not found"))?;
         let active = self.active.cancel(run_id);
-        self.state.record_event(
+        self.state.record_workflow_event(
             run_id,
-            workflow_events::RUN_CANCEL_REQUESTED,
             &workflow_events::RunCancelRequestedPayload::new(reason, active),
         )?;
         if !active && matches!(run.status, RunStatus::Running | RunStatus::Pending) {
@@ -2489,12 +2482,7 @@ impl Manager {
         let store = artifact::Store::new(&run.repo_path);
         let _last_checkpoint = store.read_checkpoint(&run.id).ok();
         let all_slices = store.load_slices()?;
-        let requested: Vec<String> = run
-            .selected_slice_id
-            .split(',')
-            .filter(|id| !id.trim().is_empty())
-            .map(str::to_string)
-            .collect();
+        let requested = self.state.get_run_selected_slices(&run.id)?;
         let requested_set: BTreeSet<_> = requested.iter().cloned().collect();
         let known_slice_ids: BTreeSet<_> =
             all_slices.iter().map(|slice| slice.id.clone()).collect();
@@ -2658,15 +2646,14 @@ impl Manager {
             run.status = RunStatus::Running;
             run.error.clear();
             run.updated_at = Utc::now();
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                "run_resumed",
-                &json!({
-                    "execution_epoch": launch_intent.execution_epoch,
-                    "remaining_slices": remaining.iter().map(|slice| slice.id.clone()).collect::<Vec<_>>(),
-                    "native_pi_tui_worker": native_pi_tui_worker,
-                    "experimental_pi_tui_worker": native_pi_tui_worker,
-                }),
+                &workflow_events::RunResumedPayload {
+                    execution_epoch: launch_intent.execution_epoch,
+                    remaining_slices: remaining.iter().map(|slice| slice.id.clone()).collect(),
+                    native_pi_tui_worker,
+                    experimental_pi_tui_worker: native_pi_tui_worker,
+                },
             )?;
             self.mark_progress(&run.id, "resumed", "", 0, "", "run resumed by daemon");
             Ok(cockpit_mode)
@@ -2814,13 +2801,12 @@ impl Manager {
                     )
                 },
             );
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                "daemon_recovery_started",
-                &json!({
-                    "reason": reason,
-                    "launch_intent": incomplete_launches.get(&run.id),
-                }),
+                &workflow_events::DaemonRecoveryStartedPayload {
+                    reason: reason.clone(),
+                    launch_intent: incomplete_launches.get(&run.id).cloned(),
+                },
             )?;
             let interrupted_questions = self.state.prepare_run_terminal_transition(
                 &run.id,
@@ -2835,16 +2821,20 @@ impl Manager {
                 .ok_or_else(|| anyhow!("run {:?} lost its durable recovery intent", run.id))?;
             self.terminalize_or_reconcile(run, &transition)?;
             if interrupted_questions > 0 {
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    "worker_questions_interrupted",
-                    &json!({ "count": interrupted_questions, "reason": reason }),
+                    &workflow_events::WorkerQuestionsInterruptedPayload {
+                        count: interrupted_questions,
+                        reason: reason.clone(),
+                    },
                 )?;
             }
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                "daemon_recovery_completed",
-                &json!({ "status": RunStatus::Interrupted, "reason": reason }),
+                &workflow_events::DaemonRecoveryCompletedPayload {
+                    status: RunStatus::Interrupted,
+                    reason,
+                },
             )?;
             recovered_run_ids.insert(run.id.clone());
         }
@@ -3258,9 +3248,8 @@ impl Manager {
         message: &str,
     ) -> Result<()> {
         let (_, summary_path) = self.write_terminal_run_summary_artifact(run, status, message)?;
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            workflow_events::TERMINAL_SUMMARY_WRITTEN,
             &workflow_events::TerminalSummaryWrittenPayload::new(&summary_path),
         )?;
         self.notify_terminal_transition(run, status, message)
@@ -3314,7 +3303,6 @@ impl Manager {
         if !transition.summary_written {
             self.state.mark_terminal_summary_written(
                 &run.id,
-                workflow_events::TERMINAL_SUMMARY_WRITTEN,
                 &workflow_events::TerminalSummaryWrittenPayload::new(&summary_path),
             )?;
         }
@@ -3322,21 +3310,18 @@ impl Manager {
             RunStatus::Completed => {
                 self.state.commit_terminal_transition(
                     &run.id,
-                    workflow_events::RUN_COMPLETED,
                     &workflow_events::RunCompletedPayload::new(&run.id),
                 )?;
             }
             RunStatus::Cancelled => {
                 self.state.commit_terminal_transition(
                     &run.id,
-                    workflow_events::RUN_CANCELLED,
                     &workflow_events::RunCancelledPayload::new(&transition.error),
                 )?;
             }
             RunStatus::Blocked | RunStatus::Failed | RunStatus::Interrupted => {
                 self.state.commit_terminal_transition(
                     &run.id,
-                    workflow_events::RUN_ERROR,
                     &workflow_events::RunErrorPayload::new(&transition.error),
                 )?;
             }
@@ -3360,10 +3345,7 @@ impl Manager {
                     "terminal_notification_bookkeeping_failed",
                     format!("terminal notification bookkeeping failed: {err:#}"),
                 );
-                if let Err(record_err) =
-                    self.state
-                        .record_event(&run.id, workflow_events::RUN_INCIDENT, &incident)
-                {
+                if let Err(record_err) = self.state.record_workflow_event(&run.id, &incident) {
                     eprintln!(
                         "khazad-doom: could not record non-authoritative terminal notification incident for {}: {record_err:#}",
                         run.id
@@ -3377,10 +3359,11 @@ impl Manager {
             #[cfg(test)]
             if take_terminalization_fault(TerminalizationFaultStage::Cleanup) {
                 let cleanup_error = "injected terminal cleanup failure";
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    "worktree_cleanup_error",
-                    &workflow_events::RunErrorPayload::new(cleanup_error),
+                    &workflow_events::WorktreeCleanupErrorPayload {
+                        error: cleanup_error.to_string(),
+                    },
                 )?;
                 return Ok(());
             }
@@ -3389,8 +3372,9 @@ impl Manager {
                     Ok(()) => {
                         if let Err(err) = self.state.mark_terminal_cleanup_completed(
                             &run.id,
-                            workflow_events::WORKTREES_CLEANED,
-                            &workflow_events::RunCompletedPayload::new(&run.id),
+                            &workflow_events::WorktreesCleanedPayload {
+                                run_id: run.id.clone(),
+                            },
                         ) {
                             eprintln!(
                                 "khazad-doom: could not record non-authoritative worktree cleanup for {}: {err:#}",
@@ -3400,10 +3384,11 @@ impl Manager {
                     }
                     Err(err) => {
                         let cleanup_error = err.to_string();
-                        if let Err(record_err) = self.state.record_event(
+                        if let Err(record_err) = self.state.record_workflow_event(
                             &run.id,
-                            "worktree_cleanup_error",
-                            &workflow_events::RunErrorPayload::new(&cleanup_error),
+                            &workflow_events::WorktreeCleanupErrorPayload {
+                                error: cleanup_error.clone(),
+                            },
                         ) {
                             eprintln!(
                                 "khazad-doom: could not record non-authoritative worktree cleanup failure for {}: {record_err:#}",
@@ -3417,17 +3402,13 @@ impl Manager {
                     "unowned_launch_resources_retained",
                     "retained integration path and branch because fresh-launch resource ownership was not durably recorded",
                 );
-                self.state.mark_terminal_cleanup_completed(
-                    &run.id,
-                    workflow_events::RUN_INCIDENT,
-                    &incident,
-                )?;
+                self.state
+                    .mark_terminal_cleanup_completed(&run.id, &incident)?;
             }
             if let Err(err) = self.compensate_incomplete_launch_resources(&terminal_run) {
                 let compensation_error = format!("launch resource compensation failed: {err:#}");
-                if let Err(record_err) = self.state.record_event(
+                if let Err(record_err) = self.state.record_workflow_event(
                     &run.id,
-                    workflow_events::RUN_INCIDENT,
                     &workflow_events::RunIncidentPayload::warning(
                         "launch_compensation_state_error",
                         &compensation_error,
@@ -3915,9 +3896,8 @@ impl Manager {
                 &Utc::now().to_rfc3339(),
             );
             for incident in &closure_report.incidents {
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    workflow_events::RUN_INCIDENT,
                     &workflow_events::RunIncidentPayload::warning(
                         &incident.kind,
                         &incident.message,
@@ -3987,11 +3967,7 @@ impl Manager {
                     .as_ref()
                     .is_none_or(|recorded| recorded.commit_sha != receipt.commit_sha)
                 {
-                    self.state.record_event(
-                        &run.id,
-                        "completion_publication_committed",
-                        &receipt,
-                    )?;
+                    self.state.record_workflow_event(&run.id, &receipt)?;
                 }
             } else {
                 integration_store
@@ -4022,8 +3998,7 @@ impl Manager {
                     &receipt,
                 )?;
                 summary.final_sha = receipt.commit_sha.clone();
-                self.state
-                    .record_event(&run.id, "completion_publication_committed", &receipt)?;
+                self.state.record_workflow_event(&run.id, &receipt)?;
             }
         }
         artifact::write_json(
@@ -4031,8 +4006,7 @@ impl Manager {
             &summary,
         )?;
         artifact::write_json(store.output_path(&run.id, "final-report.json"), &summary)?;
-        self.state
-            .record_event(&run.id, workflow_events::IMPLEMENTATION_SUMMARY, &summary)?;
+        self.state.record_workflow_event(&run.id, &summary)?;
         self.state
             .record_status_source_snapshot(&run.id, "final_report", || &summary)?;
 
@@ -4060,8 +4034,7 @@ impl Manager {
         }
         let path = store.output_path(run_id, "integration-gate.cancelled.json");
         artifact::write_json(&path, gate)?;
-        self.state
-            .record_event(run_id, "integration_gate_cancelled", gate)?;
+        self.state.record_workflow_event(run_id, gate)?;
         if gate.failure_kind == "verification_restoration_failed"
             || gate
                 .commands
@@ -4132,15 +4105,17 @@ impl Manager {
         )?;
         setup_phase.finish();
         if setup.status == "passed" {
-            self.state.record_event(
+            self.state.record_typed_workflow_event(
                 &run.id,
-                "worktree_setup_completed",
-                &json!({
-                    "slice_id": slice_id,
-                    "attempt": attempt,
-                    "worktree": worktree.to_string_lossy(),
-                    "summary": setup.summary,
-                }),
+                &workflow_events::WorkflowEvent::worktree_setup_completed(
+                    workflow_events::WorktreeSetupPayload {
+                        slice_id: slice_id.to_string(),
+                        attempt,
+                        worktree: worktree.to_string_lossy().to_string(),
+                        summary: setup.summary,
+                        ..Default::default()
+                    },
+                ),
             )?;
             return Ok(());
         }
@@ -4158,16 +4133,18 @@ impl Manager {
         };
         artifact::write_json(store.output_path(&run.id, &artifact_name), &setup)?;
         let blocked_summary = worktree_setup_blocked_summary(slice_id, attempt, &setup);
-        self.state.record_event(
+        self.state.record_typed_workflow_event(
             &run.id,
-            "worktree_setup_failed",
-            &json!({
-                "slice_id": slice_id,
-                "attempt": attempt,
-                "worktree": worktree.to_string_lossy(),
-                "artifact": artifact_name,
-                "setup": &setup,
-            }),
+            &workflow_events::WorkflowEvent::worktree_setup_failed(
+                workflow_events::WorktreeSetupPayload {
+                    slice_id: slice_id.to_string(),
+                    attempt,
+                    worktree: worktree.to_string_lossy().to_string(),
+                    artifact: artifact_name,
+                    setup: Some(setup),
+                    ..Default::default()
+                },
+            ),
         )?;
         Err(BlockedError::new(blocked_summary).into())
     }
@@ -4206,10 +4183,11 @@ impl Manager {
             ctx.runner.name(),
             &format!("parallel worker layer running: {}", batch_ids.join(", ")),
         );
-        self.state.record_event(
+        self.state.record_typed_workflow_event(
             &ctx.run.id,
-            workflow_events::PARALLEL_LAYER_STARTED,
-            &workflow_events::ParallelLayerPayload::started(batch_ids.clone()),
+            &workflow_events::WorkflowEvent::parallel_layer_started(
+                workflow_events::ParallelLayerPayload::started(batch_ids.clone()),
+            ),
         )?;
 
         let batch_cancel = CancellationToken::new();
@@ -4286,13 +4264,14 @@ impl Manager {
                 parent_cancelled,
             )?;
             let summary = parallel_layer_failure_summary(&outcomes);
-            self.state.record_event(
+            self.state.record_typed_workflow_event(
                 &ctx.run.id,
-                workflow_events::PARALLEL_LAYER_FAILED,
-                &workflow_events::ParallelLayerPayload::failed(
-                    batch_ids.clone(),
-                    outcomes,
-                    &summary,
+                &workflow_events::WorkflowEvent::parallel_layer_failed(
+                    workflow_events::ParallelLayerPayload::failed(
+                        batch_ids.clone(),
+                        outcomes,
+                        &summary,
+                    ),
                 ),
             )?;
             if parallel_results_any_blocked(&results) {
@@ -4305,10 +4284,11 @@ impl Manager {
         }
 
         let outcomes = parallel_layer_success_outcomes(&results);
-        self.state.record_event(
+        self.state.record_typed_workflow_event(
             &ctx.run.id,
-            workflow_events::PARALLEL_LAYER_COMPLETED,
-            &workflow_events::ParallelLayerPayload::completed(batch_ids, outcomes),
+            &workflow_events::WorkflowEvent::parallel_layer_completed(
+                workflow_events::ParallelLayerPayload::completed(batch_ids, outcomes),
+            ),
         )?;
         results.into_values().collect()
     }
@@ -4463,7 +4443,7 @@ impl Manager {
         completed_ids: &BTreeSet<String>,
         integration_worktree: &Path,
     ) -> Result<VecDeque<Vec<Slice>>> {
-        let selected_ids = selected_slice_ids(&run.selected_slice_id);
+        let selected_ids = self.state.get_run_selected_slices(&run.id)?;
         let missing_from_gate = selected_ids
             .iter()
             .any(|id| !gate_slices.iter().any(|slice| slice.id == *id));
@@ -4590,7 +4570,7 @@ impl Manager {
                 .replace_replan_decision(&run.id, &proposal.id, &decision)?;
             return Ok(false);
         }
-        let before_queue = selected_slice_ids(&run.selected_slice_id);
+        let before_queue = self.state.get_run_selected_slices(&run.id)?;
         let before_sha = gitutil::head_sha(integration_worktree).unwrap_or_default();
         if decision.queue_before.is_empty() {
             decision.queue_before = before_queue.clone();
@@ -4607,18 +4587,17 @@ impl Manager {
         decision.generated_slice_id = generated_id.clone();
         self.state
             .replace_replan_decision(&run.id, &proposal.id, &decision)?;
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            "replan_apply_started",
-            &json!({
-                "proposal_id": proposal.id,
-                "slice_id": generated_id,
-                "checkpoint": checkpoint,
-                "queue_before": before_queue,
-                "queue_before_hash": decision.queue_before_hash,
-                "integration_head": before_sha,
-                "apply_mode": mode.as_str(),
-            }),
+            &workflow_events::ReplanApplyStartedPayload {
+                proposal_id: proposal.id.clone(),
+                slice_id: generated_id.clone(),
+                checkpoint: checkpoint.to_string(),
+                queue_before: before_queue.clone(),
+                queue_before_hash: decision.queue_before_hash.clone(),
+                integration_head: before_sha.clone(),
+                apply_mode: mode.as_str().to_string(),
+            },
         )?;
 
         let apply_result = self.ensure_generated_slice_committed(
@@ -4637,16 +4616,19 @@ impl Manager {
                 decision.apply_reason = err.to_string();
                 self.state
                     .replace_replan_decision(&run.id, &proposal.id, &decision)?;
-                self.state.record_event(
+                self.state.record_typed_workflow_event(
                     &run.id,
-                    "replan_apply_refused",
-                    &json!({
-                        "proposal_id": proposal.id,
-                        "slice_id": generated_id,
-                        "checkpoint": checkpoint,
-                        "reason": decision.apply_reason,
-                        "remediation": "supersede with a valid follow-up proposal or start a new run",
-                    }),
+                    &workflow_events::WorkflowEvent::replan_apply_refused(
+                        workflow_events::ReplanApplyFailurePayload {
+                            proposal_id: proposal.id.clone(),
+                            slice_id: generated_id.clone(),
+                            checkpoint: checkpoint.to_string(),
+                            reason: decision.apply_reason.clone(),
+                            remediation:
+                                "supersede with a valid follow-up proposal or start a new run"
+                                    .to_string(),
+                        },
+                    ),
                 )?;
                 return Ok(false);
             }
@@ -4657,16 +4639,17 @@ impl Manager {
                 decision.apply_reason = err.to_string();
                 self.state
                     .replace_replan_decision(&run.id, &proposal.id, &decision)?;
-                self.state.record_event(
+                self.state.record_typed_workflow_event(
                     &run.id,
-                    "replan_apply_incomplete",
-                    &json!({
-                        "proposal_id": proposal.id,
-                        "slice_id": generated_id,
-                        "checkpoint": checkpoint,
-                        "reason": decision.apply_reason,
-                        "remediation": format!("khazad-doom resume {}", run.id),
-                    }),
+                    &workflow_events::WorkflowEvent::replan_apply_incomplete(
+                        workflow_events::ReplanApplyFailurePayload {
+                            proposal_id: proposal.id.clone(),
+                            slice_id: generated_id.clone(),
+                            checkpoint: checkpoint.to_string(),
+                            reason: decision.apply_reason.clone(),
+                            remediation: format!("khazad-doom resume {}", run.id),
+                        },
+                    ),
                 )?;
                 return Err(BlockedError::new(format!(
                     "replan_apply_incomplete for proposal {}: {}; resume will retry idempotent apply before any generated slice worker launches",
@@ -4686,7 +4669,7 @@ impl Manager {
                 )
             })?
             .generation;
-        let mut queue_after = selected_slice_ids(&run.selected_slice_id);
+        let mut queue_after = before_queue.clone();
         let already_selected = queue_after.iter().any(|id| id == &generated_id);
         let mut appended = false;
         let mut worker_enqueued = false;
@@ -4695,7 +4678,7 @@ impl Manager {
                 queue_after.push(generated_id.clone());
                 let updated = self
                     .state
-                    .update_run_selected_slices(&run.id, &queue_after.join(","))?;
+                    .update_run_selected_slices(&run.id, &queue_after)?;
                 run.selected_slice_id = updated.selected_slice_id;
                 appended = true;
             }
@@ -4724,7 +4707,7 @@ impl Manager {
             }
         }
         let after_sha = gitutil::head_sha(integration_worktree).unwrap_or_default();
-        let final_queue = selected_slice_ids(&run.selected_slice_id);
+        let final_queue = self.state.get_run_selected_slices(&run.id)?;
         decision.applied = true;
         decision.applied_at = Some(Utc::now());
         decision.apply_status = "applied".to_string();
@@ -4745,25 +4728,24 @@ impl Manager {
         decision.queue_after_hash = queue_snapshot_hash(&final_queue);
         self.state
             .replace_replan_decision(&run.id, &proposal.id, &decision)?;
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            "frontier_slice_promoted",
-            &json!({
-                "proposal_id": proposal.id,
-                "slice_id": generated_id,
-                "parent_slice_id": proposal.source.slice_id,
-                "generation": generated_slice_generation,
-                "checkpoint": checkpoint,
-                "commit_sha": after_sha,
-                "queue_before": decision.queue_before,
-                "queue_before_hash": decision.queue_before_hash,
-                "queue_after": final_queue,
-                "queue_after_hash": decision.queue_after_hash,
-                "appended": appended,
-                "serial_append": mode == FollowupApplyMode::AppendAndRun,
-                "worker_enqueued": worker_enqueued,
-                "apply_mode": mode.as_str(),
-            }),
+            &workflow_events::FrontierSlicePromotedPayload {
+                proposal_id: proposal.id.clone(),
+                slice_id: generated_id,
+                parent_slice_id: proposal.source.slice_id.clone(),
+                generation: generated_slice_generation,
+                checkpoint: checkpoint.to_string(),
+                commit_sha: after_sha,
+                queue_before: decision.queue_before.clone(),
+                queue_before_hash: decision.queue_before_hash.clone(),
+                queue_after: final_queue,
+                queue_after_hash: decision.queue_after_hash.clone(),
+                appended,
+                serial_append: mode == FollowupApplyMode::AppendAndRun,
+                worker_enqueued,
+                apply_mode: mode.as_str().to_string(),
+            },
         )?;
         Ok(true)
     }
@@ -4876,8 +4858,7 @@ impl Manager {
             updated_at: Utc::now(),
         };
         artifact::Store::new(&run.repo_path).write_checkpoint(&checkpoint)?;
-        self.state
-            .record_event(&run.id, workflow_events::CHECKPOINT_WRITTEN, &checkpoint)?;
+        self.state.record_workflow_event(&run.id, &checkpoint)?;
         Ok(())
     }
 
@@ -4948,9 +4929,8 @@ impl Manager {
                         .finish_worker_attempt(ledger.launch_id, "failed", &err.to_string());
                 return Err(err);
             }
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                workflow_events::SLICE_STARTED,
                 &workflow_events::SliceStartedPayload::new(&slice.id),
             )?;
             let worker_worktree = PathBuf::from(&ledger.worktree);
@@ -5552,19 +5532,21 @@ impl Manager {
             if let Some(index) = matching_disposition {
                 result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
             }
-            self.state.record_event(
+            self.state.record_typed_workflow_event(
                 &run.id,
-                "candidate_followup_slice_replan_proposal_created",
-                &json!({
-                    "source": "worker",
-                    "slice_id": slice.id,
-                    "attempt": attempt,
-                    "draft_index": draft_index,
-                    "draft_id": draft.id,
-                    "proposal_id": proposal.id,
-                    "output_path": output_path,
-                    "summary": followup_slice_draft_summary(draft),
-                }),
+                &workflow_events::WorkflowEvent::candidate_followup_created(
+                    workflow_events::ReplanProposalEvidencePayload {
+                        source: "worker".to_string(),
+                        slice_id: slice.id.clone(),
+                        attempt,
+                        draft_index: Some(draft_index),
+                        draft_id: draft.id.clone(),
+                        proposal_id: proposal.id.clone(),
+                        output_path: output_path.to_string_lossy().to_string(),
+                        summary: followup_slice_draft_summary(draft),
+                        ..Default::default()
+                    },
+                ),
             )?;
             validation_slices.push(draft.to_slice());
             self.notify_attention_for_replan(run, &proposal);
@@ -5647,18 +5629,20 @@ impl Manager {
             if let Some(index) = matching_disposition {
                 result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
             }
-            self.state.record_event(
+            self.state.record_typed_workflow_event(
                 &run.id,
-                "candidate_followup_slice_replan_proposal_created",
-                &json!({
-                    "source": "integration_repair",
-                    "attempt": attempt,
-                    "draft_index": draft_index,
-                    "draft_id": draft.id,
-                    "proposal_id": proposal.id,
-                    "output_path": output_path,
-                    "summary": followup_slice_draft_summary(draft),
-                }),
+                &workflow_events::WorkflowEvent::candidate_followup_created(
+                    workflow_events::ReplanProposalEvidencePayload {
+                        source: "integration_repair".to_string(),
+                        attempt,
+                        draft_index: Some(draft_index),
+                        draft_id: draft.id.clone(),
+                        proposal_id: proposal.id.clone(),
+                        output_path: output_path.to_string_lossy().to_string(),
+                        summary: followup_slice_draft_summary(draft),
+                        ..Default::default()
+                    },
+                ),
             )?;
             validation_slices.push(draft.to_slice());
             self.notify_attention_for_replan(run, &proposal);
@@ -5708,22 +5692,25 @@ impl Manager {
                         .filter(|file| !file.trim().is_empty())
                         .unwrap_or_else(|| slice.id.clone()),
                     summary: result.finding_dispositions[index].rationale.clone(),
+                    followup_slice_draft: None,
                 }],
                 "operator_review_required_for_worker_finding",
             )?;
             result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
-            self.state.record_event(
+            self.state.record_typed_workflow_event(
                 &run.id,
-                "finding_replan_proposal_created",
-                &json!({
-                    "source": "worker",
-                    "slice_id": slice.id,
-                    "attempt": attempt,
-                    "finding_id": finding_id,
-                    "proposal_id": proposal.id,
-                    "output_path": output_path,
-                    "summary": summary,
-                }),
+                &workflow_events::WorkflowEvent::finding_replan_created(
+                    workflow_events::ReplanProposalEvidencePayload {
+                        source: "worker".to_string(),
+                        slice_id: slice.id.clone(),
+                        attempt,
+                        finding_id,
+                        proposal_id: proposal.id.clone(),
+                        output_path: output_path.to_string_lossy().to_string(),
+                        summary,
+                        ..Default::default()
+                    },
+                ),
             )?;
             self.notify_attention_for_replan(run, &proposal);
         }
@@ -5771,21 +5758,24 @@ impl Manager {
                         .filter(|file| !file.trim().is_empty())
                         .unwrap_or_else(|| "integration".to_string()),
                     summary: result.finding_dispositions[index].rationale.clone(),
+                    followup_slice_draft: None,
                 }],
                 "operator_review_required_for_repair_finding",
             )?;
             result.finding_dispositions[index].replan_proposal_id = proposal.id.clone();
-            self.state.record_event(
+            self.state.record_typed_workflow_event(
                 &run.id,
-                "finding_replan_proposal_created",
-                &json!({
-                    "source": "integration_repair",
-                    "attempt": attempt,
-                    "finding_id": finding_id,
-                    "proposal_id": proposal.id,
-                    "output_path": output_path,
-                    "summary": summary,
-                }),
+                &workflow_events::WorkflowEvent::finding_replan_created(
+                    workflow_events::ReplanProposalEvidencePayload {
+                        source: "integration_repair".to_string(),
+                        attempt,
+                        finding_id,
+                        proposal_id: proposal.id.clone(),
+                        output_path: output_path.to_string_lossy().to_string(),
+                        summary,
+                        ..Default::default()
+                    },
+                ),
             )?;
             self.notify_attention_for_replan(run, &proposal);
         }
@@ -5830,30 +5820,32 @@ impl Manager {
                     "Apply repair revision {repair_head} on top of {repair_base} only if operator approves paths: {}",
                     unauthorized.join(", ")
                 ),
+                followup_slice_draft: None,
             }],
             "out_of_authority_repair_requires_operator_approval",
         )?;
-        self.state.record_event(
+        self.state.record_typed_workflow_event(
             &run.id,
-            "repair_authority_proposal_created",
-            &json!({
-                "proposal_id": proposal.id,
-                "attempt": attempt,
-                "repair_base": repair_base,
-                "repair_head": repair_head,
-                "unauthorized_paths": unauthorized,
-                "repair_output_path": output_path,
-                "policy": "repair revisions outside slice areas or workflow policy require operator approval before application",
-            }),
+            &workflow_events::WorkflowEvent::repair_authority_created(
+                workflow_events::ReplanProposalEvidencePayload {
+                    attempt,
+                    proposal_id: proposal.id.clone(),
+                    repair_output_path: output_path.to_string_lossy().to_string(),
+                    repair_base: repair_base.to_string(),
+                    repair_head: repair_head.to_string(),
+                    unauthorized_paths: unauthorized.to_vec(),
+                    policy: "repair revisions outside slice areas or workflow policy require operator approval before application".to_string(),
+                    ..Default::default()
+                },
+            ),
         )?;
         self.notify_attention_for_replan(run, &proposal);
         Ok(proposal.id)
     }
 
     fn record_worker_attempt_failure(&self, record: WorkerAttemptFailureRecord<'_>) -> Result<()> {
-        self.state.record_event(
+        self.state.record_workflow_event(
             &record.run.id,
-            workflow_events::WORKER_ATTEMPT_FAILURE,
             &workflow_events::WorkerAttemptFailurePayload {
                 slice_id: record.slice.id.clone(),
                 attempt: record.attempt,
@@ -5929,21 +5921,20 @@ impl Manager {
             "created_at": Utc::now(),
         });
         artifact::write_json(&invalid_output_path, &diagnostic)?;
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            "invalid_worker_output",
-            &json!({
-                "slice_id": slice.id,
-                "attempt": attempt,
-                "envelope_retry": envelope_retry,
-                "parse_error": bounded_text(error, 4_000),
-                "artifact_path": invalid_output_path,
-                "expected_output_path": expected_output_path,
-                "raw_invalid_payload": bounded_text(&raw_payload_text, 4_000),
-                "stdout_tail": bounded_text(&transcript.stdout_tail, 4_000),
-                "stderr_tail": bounded_text(&transcript.stderr_tail, 4_000),
-                "assistant_tail": bounded_text(&transcript.assistant_tail, 4_000),
-            }),
+            &workflow_events::InvalidWorkerOutputPayload {
+                slice_id: slice.id.clone(),
+                attempt,
+                envelope_retry,
+                parse_error: bounded_text(error, 4_000),
+                artifact_path: invalid_output_path.to_string_lossy().to_string(),
+                expected_output_path: expected_output_path.to_string_lossy().to_string(),
+                raw_invalid_payload: bounded_text(&raw_payload_text, 4_000),
+                stdout_tail: bounded_text(&transcript.stdout_tail, 4_000),
+                stderr_tail: bounded_text(&transcript.stderr_tail, 4_000),
+                assistant_tail: bounded_text(&transcript.assistant_tail, 4_000),
+            },
         )?;
         self.record_worker_attempt_failure(WorkerAttemptFailureRecord {
             run,
@@ -6156,9 +6147,8 @@ impl Manager {
                 if request.cancel.is_cancelled() {
                     return Err(CancelledError::new("run cancelled").into());
                 }
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    "worker_error",
                     &workflow_events::WorkerErrorPayload {
                         slice_id: slice.id.clone(),
                         attempt,
@@ -6224,31 +6214,37 @@ impl Manager {
             )?;
             return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
         };
-        let worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
-            Ok(value) => value,
-            Err(err) => {
-                *request.last_failure = format!("worker JSON did not match result model: {err}");
-                remember_attempt_failure(
-                    request.primary_failure,
-                    request.secondary_failures,
-                    request.last_failure,
-                );
-                let invalid_artifact = self.record_invalid_worker_output_attempt(
-                    run,
-                    slice,
+        let worker_result: WorkerResult =
+            match serde_json::from_value::<WorkerResultWire>(output.clone()) {
+                Ok(value) => value.into_domain(WorkerResultAuthority {
+                    slice_id: slice.id.clone(),
                     attempt,
-                    0,
-                    request.last_failure,
-                    request.worker_worktree,
-                    request.output_path,
-                    "envelope_retry_pending",
-                    "none",
-                    Some(output),
-                    RunnerTranscript::default(),
-                )?;
-                return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
-            }
-        };
+                    launch_id: request.launch_id,
+                }),
+                Err(err) => {
+                    *request.last_failure =
+                        format!("worker JSON did not match result model: {err}");
+                    remember_attempt_failure(
+                        request.primary_failure,
+                        request.secondary_failures,
+                        request.last_failure,
+                    );
+                    let invalid_artifact = self.record_invalid_worker_output_attempt(
+                        run,
+                        slice,
+                        attempt,
+                        0,
+                        request.last_failure,
+                        request.worker_worktree,
+                        request.output_path,
+                        "envelope_retry_pending",
+                        "none",
+                        Some(output),
+                        RunnerTranscript::default(),
+                    )?;
+                    return self.finish_invalid_worker_output_or_reemit(request, &invalid_artifact);
+                }
+            };
         if let Err(err) = validate_worker_result(&worker_result, slice) {
             *request.last_failure = format!("worker JSON failed validation: {err}");
             remember_attempt_failure(
@@ -6427,30 +6423,35 @@ impl Manager {
                 )?;
                 return Ok(None);
             };
-            let mut worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
-                Ok(value) => value,
-                Err(err) => {
-                    self.record_invalid_worker_output_attempt(
-                        request.run,
-                        request.slice,
-                        request.attempt,
-                        repair_attempt,
-                        &format!("slice repair JSON did not match result model: {err}"),
-                        &repair_worktree,
-                        &launch.output_path,
-                        "slice_repair_exhausted",
-                        "slice_repair_failed",
-                        Some(output),
-                        RunnerTranscript::default(),
-                    )?;
-                    self.state.finish_worker_attempt(
-                        launch.ledger.launch_id,
-                        "failed",
-                        &format!("slice repair JSON did not match result model: {err}"),
-                    )?;
-                    return Ok(None);
-                }
-            };
+            let mut worker_result: WorkerResult =
+                match serde_json::from_value::<WorkerResultWire>(output.clone()) {
+                    Ok(value) => value.into_domain(WorkerResultAuthority {
+                        slice_id: request.slice.id.clone(),
+                        attempt: request.attempt,
+                        launch_id: launch.ledger.launch_id,
+                    }),
+                    Err(err) => {
+                        self.record_invalid_worker_output_attempt(
+                            request.run,
+                            request.slice,
+                            request.attempt,
+                            repair_attempt,
+                            &format!("slice repair JSON did not match result model: {err}"),
+                            &repair_worktree,
+                            &launch.output_path,
+                            "slice_repair_exhausted",
+                            "slice_repair_failed",
+                            Some(output),
+                            RunnerTranscript::default(),
+                        )?;
+                        self.state.finish_worker_attempt(
+                            launch.ledger.launch_id,
+                            "failed",
+                            &format!("slice repair JSON did not match result model: {err}"),
+                        )?;
+                        return Ok(None);
+                    }
+                };
             if let Err(err) = validate_worker_result(&worker_result, request.slice) {
                 self.record_invalid_worker_output_attempt(
                     request.run,
@@ -6557,19 +6558,18 @@ impl Manager {
                     attempts: request.attempt,
                     last_error: String::new(),
                 })?;
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &request.run.id,
-                    "slice_repair_completed",
-                    &json!({
-                        "slice_id": request.slice.id,
-                        "attempt": request.attempt,
-                        "repair_attempt": repair_attempt,
-                        "status": "fixed",
-                        "trigger_failure_kind": request.check.failure_kind,
-                        "launch_id": launch.ledger.launch_id,
-                        "check_path": repair_check_path,
-                        "output_path": launch.output_path,
-                    }),
+                    &workflow_events::SliceRepairCompletedPayload {
+                        slice_id: request.slice.id.clone(),
+                        attempt: request.attempt,
+                        repair_attempt,
+                        status: "fixed".to_string(),
+                        trigger_failure_kind: request.check.failure_kind.clone(),
+                        launch_id: launch.ledger.launch_id,
+                        check_path: repair_check_path.to_string_lossy().to_string(),
+                        output_path: launch.output_path.to_string_lossy().to_string(),
+                    },
                 )?;
                 self.state
                     .finish_worker_attempt(launch.ledger.launch_id, "succeeded", "")?;
@@ -6808,33 +6808,42 @@ impl Manager {
                 )?;
                 continue;
             };
-            let worker_result: WorkerResult = match serde_json::from_value(output.clone()) {
-                Ok(value) => value,
-                Err(err) => {
-                    last_failure =
-                        format!("worker envelope JSON did not match result model: {err}");
-                    remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
-                    self.state.finish_worker_attempt(
-                        launch.ledger.launch_id,
-                        "failed",
-                        &last_failure,
-                    )?;
-                    last_artifact = self.record_invalid_worker_output_attempt(
-                        run,
-                        slice,
+            let worker_result: WorkerResult =
+                match serde_json::from_value::<WorkerResultWire>(output.clone()) {
+                    Ok(value) => value.into_domain(WorkerResultAuthority {
+                        slice_id: slice.id.clone(),
                         attempt,
-                        envelope_retry,
-                        &last_failure,
-                        &retry_worktree,
-                        &launch.output_path,
-                        retry_disposition,
-                        "none",
-                        Some(output),
-                        RunnerTranscript::default(),
-                    )?;
-                    continue;
-                }
-            };
+                        launch_id: launch.ledger.launch_id,
+                    }),
+                    Err(err) => {
+                        last_failure =
+                            format!("worker envelope JSON did not match result model: {err}");
+                        remember_attempt_failure(
+                            primary_failure,
+                            secondary_failures,
+                            &last_failure,
+                        );
+                        self.state.finish_worker_attempt(
+                            launch.ledger.launch_id,
+                            "failed",
+                            &last_failure,
+                        )?;
+                        last_artifact = self.record_invalid_worker_output_attempt(
+                            run,
+                            slice,
+                            attempt,
+                            envelope_retry,
+                            &last_failure,
+                            &retry_worktree,
+                            &launch.output_path,
+                            retry_disposition,
+                            "none",
+                            Some(output),
+                            RunnerTranscript::default(),
+                        )?;
+                        continue;
+                    }
+                };
             if let Err(err) = validate_worker_result(&worker_result, slice) {
                 last_failure = format!("worker envelope JSON failed validation: {err}");
                 remember_attempt_failure(primary_failure, secondary_failures, &last_failure);
@@ -6859,18 +6868,17 @@ impl Manager {
                 continue;
             }
             artifact::write_json(&launch.output_path, &worker_result)?;
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                workflow_events::WORKER_ENVELOPE_RETRY_SUCCEEDED,
-                &json!({
-                    "slice_id": slice.id,
-                    "attempt": attempt,
-                    "launch_id": launch.ledger.launch_id,
-                    "envelope_retry": envelope_retry,
-                    "output_path": launch.output_path,
-                    "previous_invalid_output": last_artifact,
-                    "disposition": "valid_envelope_reemitted_existing_worker_head",
-                }),
+                &workflow_events::WorkerEnvelopeRetrySucceededPayload {
+                    slice_id: slice.id.clone(),
+                    attempt,
+                    launch_id: launch.ledger.launch_id,
+                    envelope_retry,
+                    output_path: launch.output_path.to_string_lossy().to_string(),
+                    previous_invalid_output: last_artifact.to_string_lossy().to_string(),
+                    disposition: "valid_envelope_reemitted_existing_worker_head".to_string(),
+                },
             )?;
             return Ok(Some(ValidWorkerAttempt {
                 result: worker_result,
@@ -7073,8 +7081,13 @@ impl Manager {
                     .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
                 continue;
             };
-            let mut result: RepairResult = match serde_json::from_value(output) {
-                Ok(value) => value,
+            let mut result: RepairResult = match serde_json::from_value::<RepairResultWire>(output)
+            {
+                Ok(value) => value.into_domain(RepairResultAuthority {
+                    trigger: context.trigger.to_string(),
+                    attempt,
+                    launch_id: launch.ledger.launch_id,
+                }),
                 Err(err) => {
                     last_error = err.to_string();
                     self.state.finish_worker_attempt(
@@ -7091,8 +7104,6 @@ impl Manager {
                     .finish_worker_attempt(launch.ledger.launch_id, "failed", &last_error)?;
                 continue;
             }
-            result.trigger = context.trigger.to_string();
-            result.attempts = attempt;
             let created_candidate_proposal = self
                 .create_repair_candidate_followup_slice_proposals(
                     run,
@@ -7248,9 +7259,8 @@ impl Manager {
                 artifact::write_json(&launch.output_path, &result)?;
                 self.state
                     .finish_worker_attempt(launch.ledger.launch_id, "succeeded", "")?;
-                self.state.record_event(
+                self.state.record_workflow_event(
                     &run.id,
-                    workflow_events::INTEGRATION_REPAIR_COMPLETED,
                     &workflow_events::IntegrationRepairCompletedPayload::new(
                         &result.status,
                         &result.summary,
@@ -7706,8 +7716,7 @@ impl Manager {
                 .output_path(&run.id, &format!("{}.merge-conflict.json", slice.id)),
             &report,
         )?;
-        self.state
-            .record_event(&run.id, "slice_merge_conflict", &report)?;
+        self.state.record_workflow_event(&run.id, &report)?;
         Ok(report)
     }
 
@@ -7749,9 +7758,8 @@ impl Manager {
                     errors.join("; ")
                 );
             }
-            self.state.record_event(
+            self.state.record_workflow_event(
                 &run.id,
-                workflow_events::RUN_INCIDENT,
                 &workflow_events::RunIncidentPayload::warning(
                     "publication_recovery_worktree_retained",
                     format!(
@@ -7769,9 +7777,8 @@ impl Manager {
             )
         })?;
         let _ = gitutil::worktree_prune(&run.repo_path);
-        self.state.record_event(
+        self.state.record_workflow_event(
             &run.id,
-            workflow_events::RUN_INCIDENT,
             &workflow_events::RunIncidentPayload::warning(
                 "stale_worktree_removed_before_resume",
                 format!(
@@ -8075,7 +8082,10 @@ fn latest_cancel_reason(events: &[crate::domain::Event]) -> String {
     events
         .iter()
         .rev()
-        .find(|event| event.typ == workflow_events::RUN_CANCEL_REQUESTED)
+        .find(|event| {
+            workflow_events::EventKind::from(event.typ.as_str())
+                == workflow_events::EventKind::RunCancelRequested
+        })
         .map(|event| workflow_events::RunCancelRequestedPayload::from_value(&event.payload).reason)
         .unwrap_or_default()
 }
@@ -9144,15 +9154,6 @@ fn is_apply_refusal(err: &anyhow::Error) -> bool {
     err.to_string().contains("apply_refused:")
 }
 
-fn selected_slice_ids(selected_slice_id: &str) -> Vec<String> {
-    selected_slice_id
-        .split(',')
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 fn integration_merge_operation_id(
     run_id: &str,
     kind: IntegrationMergeKind,
@@ -9702,9 +9703,9 @@ mod tests {
         RunReadModelBuilder, RunReadModelOptions, StartOptions, VerificationCommandCache,
         WorkerAttemptContext, check_failure_needs_operator, existing_completion_publication,
         inject_integration_merge_fault, inject_run_launch_fault, queue_snapshot_hash,
-        repair_authority_violations, selected_slice_ids, should_run_integration_repair,
-        validate_followup_slice_draft, validate_mission_envelope, validate_repair_result,
-        validate_worker_result, worker_attempt_retry_disposition,
+        repair_authority_violations, should_run_integration_repair, validate_followup_slice_draft,
+        validate_mission_envelope, validate_repair_result, validate_worker_result,
+        worker_attempt_retry_disposition,
     };
     use crate::agent::{
         CancellationToken, Job, PiRunner, ResultData, Runner, RunnerEvent, RunnerEventSink,
@@ -9748,6 +9749,7 @@ mod tests {
             title: format!("Title {id}"),
             goal: "Goal".to_string(),
             github_issue: String::new(),
+            provenance: None,
             status: crate::domain::SLICE_STATUS_OPEN.to_string(),
             closed_by_run: String::new(),
             closed_at: String::new(),
@@ -10068,8 +10070,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             60,
             &WorkerQuestionRecommendation::default(),
-            "worker_question_asked",
-            |question| Ok(json!({ "question_id": question.id })),
             "awaiting operator answer",
         )?;
         let manager = Manager::new(paths, state);
@@ -10586,8 +10586,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             60,
             &WorkerQuestionRecommendation::default(),
-            "worker_question_asked",
-            |question| Ok(json!({ "question_id": question.id })),
             "awaiting operator answer",
         )?;
         state.finish_worker_attempt(first.launch_id, "interrupted", "superseded")?;
@@ -12071,7 +12069,8 @@ mod tests {
         assert_eq!(run.selected_slice_id, "slice-001,slice-001-followup");
         assert_eq!(layers.len(), 1);
         assert_eq!(
-            selected_slice_ids(&run.selected_slice_id)
+            state
+                .get_run_selected_slices(&run.id)?
                 .into_iter()
                 .filter(|id| id == "slice-001-followup")
                 .count(),
@@ -12130,6 +12129,7 @@ mod tests {
             started_at: Utc::now(),
             updated_at: Utc::now(),
         };
+        manager.state.insert_run(&run)?;
         let mut gate_slices = vec![parent];
         let completed_ids =
             BTreeSet::from(["slice-001".to_string(), "slice-001-followup".to_string()]);
@@ -12230,6 +12230,7 @@ mod tests {
                 kind: "queue_revision".to_string(),
                 target: "slice-001".to_string(),
                 summary: "not a follow-up draft".to_string(),
+                followup_slice_draft: None,
             }],
             "operator_review",
         )?;
@@ -14333,6 +14334,7 @@ mod tests {
                             kind: "scope".to_string(),
                             target: "src/workflow/read_model.rs".to_string(),
                             summary: "grant read-model follow-up".to_string(),
+                            followup_slice_draft: None,
                         }],
                         "operator_review",
                     )?;
@@ -14955,8 +14957,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             60,
             &recommendation,
-            "worker_question_asked",
-            |question| Ok(json!({ "question_id": question.id })),
             "awaiting operator answer",
         )?;
         state.decide_worker_question_command(
@@ -14977,8 +14977,6 @@ mod tests {
             &["A".to_string(), "B".to_string()],
             1,
             &recommendation,
-            "worker_question_asked",
-            |question| Ok(json!({ "question_id": question.id })),
             "awaiting operator answer",
         )?;
         thread::sleep(Duration::from_millis(1_100));
@@ -18009,7 +18007,6 @@ mod tests {
                     gitutil::run(&job.cwd, &["commit", "-m", "invalid envelope scope work"])?;
                     Ok(ResultData {
                         output: Some(json!({
-                            "slice_id": handoff.slice.id,
                             "summary": "missing status forces envelope retry"
                         })),
                         usage: Usage::default(),
@@ -18068,7 +18065,6 @@ mod tests {
                 gitutil::run(&job.cwd, &["commit", "-m", "initial malformed attempt"])?;
                 return Ok(ResultData {
                     output: Some(json!({
-                        "slice_id": handoff.slice.id,
                         "summary": "missing status forces first envelope retry"
                     })),
                     usage: Usage::default(),
@@ -18083,7 +18079,6 @@ mod tests {
                     gitutil::run(&job.cwd, &["commit", "-m", "first retained retry"])?;
                     Ok(ResultData {
                         output: Some(json!({
-                            "slice_id": handoff.slice.id,
                             "summary": "still missing status"
                         })),
                         usage: Usage::default(),
@@ -18141,7 +18136,7 @@ mod tests {
                 gitutil::run(&job.cwd, &["commit", "-m", &format!("invalid {call}")])?;
             }
             Ok(ResultData {
-                output: Some(json!({"slice_id": "slice-001", "summary": "still invalid"})),
+                output: Some(json!({"summary": "still invalid"})),
                 usage: Usage::default(),
                 contract_warnings: Vec::new(),
             })
@@ -18155,7 +18150,6 @@ mod tests {
     fn valid_worker_output(handoff: &Handoff, cwd: &Path) -> Result<Value> {
         let sha = gitutil::head_sha(cwd)?;
         Ok(json!({
-            "slice_id": handoff.slice.id,
             "status": "complete",
             "summary": "worker output valid for current head",
             "commit_sha": sha,
@@ -18200,7 +18194,6 @@ mod tests {
             let sha = gitutil::head_sha(&job.cwd)?;
             Ok(ResultData {
                 output: Some(json!({
-                    "slice_id": handoff.slice.id,
                     "status": "complete",
                     "summary": "appended shared file",
                     "commit_sha": sha,
@@ -18251,7 +18244,6 @@ mod tests {
             let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
                 output: Some(json!({
-                    "slice_id": handoff.slice.id,
                     "status": "complete",
                     "summary": "implemented",
                     "commit_sha": sha,
@@ -18299,7 +18291,6 @@ mod tests {
             )?;
             let sha = gitutil::head_sha(&job.cwd)?;
             let mut output = json!({
-                "slice_id": handoff.slice.id,
                 "status": "complete",
                 "summary": "implemented with bounded follow-up" ,
                 "commit_sha": sha,
@@ -18354,7 +18345,6 @@ mod tests {
             )?;
             let sha = gitutil::head_sha(&job.cwd)?;
             let mut output = json!({
-                "slice_id": handoff.slice.id,
                 "status": "complete",
                 "summary": "implemented with two bounded follow-ups" ,
                 "commit_sha": sha,
@@ -18465,7 +18455,6 @@ mod tests {
             let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
                 output: Some(json!({
-                    "slice_id": handoff.slice.id,
                     "status": "complete",
                     "summary": "implemented with plan revision history",
                     "commit_sha": sha,
@@ -18509,6 +18498,7 @@ mod tests {
                 kind: "queue_revision".to_string(),
                 target: slice_id.to_string(),
                 summary: format!("{label} proposed queue change"),
+                followup_slice_draft: None,
             }],
             "intent_affecting",
         )
@@ -18552,7 +18542,6 @@ mod tests {
             let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
                 output: Some(json!({
-                    "slice_id": handoff.slice.id,
                     "status": "complete",
                     "summary": "implemented with local tool side effect",
                     "commit_sha": sha,
@@ -18603,7 +18592,6 @@ mod tests {
             let acceptance_status = acceptance_status_json(&handoff.slice);
             Ok(ResultData {
                 output: Some(json!({
-                    "slice_id": handoff.slice.id,
                     "status": "complete",
                     "summary": "implemented conflicting shared file",
                     "commit_sha": sha,

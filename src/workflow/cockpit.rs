@@ -1165,9 +1165,8 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
         Ok(Some(origin)) if !origin.target.trim().is_empty() => origin,
         Ok(_) => return,
         Err(err) => {
-            let _ = state.record_event(
+            let _ = state.record_workflow_event(
                 &request.run.id,
-                workflow_events::RUN_INCIDENT,
                 &origin_attention_failure_payload(
                     &request,
                     "attention_notification_failed",
@@ -1205,25 +1204,25 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
     match send_default_agent_message(&origin.target, &text) {
         Ok(sent) => {
             send_status = "sent";
-            let _ = state.record_event(
+            let _ = state.record_typed_workflow_event(
                 &request.run.id,
-                workflow_events::ATTENTION_NOTIFICATION_SENT,
-                &workflow_events::AttentionDeliveryPayload {
-                    kind: request.attention_kind.to_string(),
-                    question_id: request.question_id.to_string(),
-                    slice_id: request.slice_id.to_string(),
-                    proposal_id: request.proposal_id.to_string(),
-                    adapter: sent.adapter,
-                    surface: sent.surface,
-                    target_kind: origin.target_kind.clone(),
-                },
+                &workflow_events::WorkflowEvent::attention_notification_sent(
+                    workflow_events::AttentionDeliveryPayload {
+                        kind: request.attention_kind.to_string(),
+                        question_id: request.question_id.to_string(),
+                        slice_id: request.slice_id.to_string(),
+                        proposal_id: request.proposal_id.to_string(),
+                        adapter: sent.adapter,
+                        surface: sent.surface,
+                        target_kind: origin.target_kind.clone(),
+                    },
+                ),
             );
         }
         Err(err) => {
             errors.push(format!("send: {}", err.message));
-            let _ = state.record_event(
+            let _ = state.record_workflow_event(
                 &request.run.id,
-                workflow_events::RUN_INCIDENT,
                 &origin_attention_failure_payload(
                     &request,
                     "attention_notification_failed",
@@ -1236,25 +1235,25 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
     match focus_default_agent_target(&origin.target) {
         Ok(focused) => {
             focus_status = "sent";
-            let _ = state.record_event(
+            let _ = state.record_typed_workflow_event(
                 &request.run.id,
-                workflow_events::ATTENTION_FOCUS_SENT,
-                &workflow_events::AttentionDeliveryPayload {
-                    kind: request.attention_kind.to_string(),
-                    question_id: request.question_id.to_string(),
-                    slice_id: request.slice_id.to_string(),
-                    proposal_id: request.proposal_id.to_string(),
-                    adapter: focused.adapter,
-                    surface: focused.surface,
-                    target_kind: origin.target_kind.clone(),
-                },
+                &workflow_events::WorkflowEvent::attention_focus_sent(
+                    workflow_events::AttentionDeliveryPayload {
+                        kind: request.attention_kind.to_string(),
+                        question_id: request.question_id.to_string(),
+                        slice_id: request.slice_id.to_string(),
+                        proposal_id: request.proposal_id.to_string(),
+                        adapter: focused.adapter,
+                        surface: focused.surface,
+                        target_kind: origin.target_kind.clone(),
+                    },
+                ),
             );
         }
         Err(err) => {
             errors.push(format!("focus: {}", err.message));
-            let _ = state.record_event(
+            let _ = state.record_workflow_event(
                 &request.run.id,
-                workflow_events::RUN_INCIDENT,
                 &origin_attention_failure_payload(
                     &request,
                     "attention_focus_failed",
@@ -1316,9 +1315,8 @@ fn write_origin_attention_record(
     };
     let path = origin_attention_record_path(store, &request.run.id, request.attention_key);
     if let Err(err) = artifact::write_json(path, &record) {
-        let _ = state.record_event(
+        let _ = state.record_workflow_event(
             &request.run.id,
-            workflow_events::RUN_INCIDENT,
             &origin_attention_failure_payload(
                 request,
                 "attention_notification_record_failed",
@@ -1408,9 +1406,8 @@ fn projected_status_commands(feed: &crate::domain::StatusFeed) -> Vec<String> {
 }
 
 fn record_attention_projection_error(state: &StateStore, run_id: &str, kind: &str, message: &str) {
-    let _ = state.record_event(
+    let _ = state.record_workflow_event(
         run_id,
-        workflow_events::RUN_INCIDENT,
         &workflow_events::RunIncidentPayload::error(kind, message)
             .with_extra("source_of_truth", "daemon_status_feed"),
     );
@@ -2466,6 +2463,7 @@ mod tests {
                 kind: "follow_up_or_revision".to_string(),
                 target: "slice-001".to_string(),
                 summary: "revise scope".to_string(),
+                followup_slice_draft: None,
             }],
             "operator_review_required",
         )

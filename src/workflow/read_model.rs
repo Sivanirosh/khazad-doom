@@ -1,4 +1,4 @@
-use super::events::RunErrorPayload;
+use super::events::{EventKind, RunErrorPayload};
 use super::projection::project_run;
 use crate::artifact::CompletionPublicationReceipt;
 use crate::domain::{
@@ -146,6 +146,7 @@ impl<'a> RunReadModelBuilder<'a> {
                 committed: transition.committed,
             })
             .unwrap_or_default();
+        let selected_slice_ids = snapshot.selected_slice_ids;
         let slice_runs = snapshot.slice_runs;
         let worker_attempts = worker_attempt_history(snapshot.worker_attempts, &run, &slice_runs);
         let mut progress = snapshot.progress;
@@ -158,6 +159,7 @@ impl<'a> RunReadModelBuilder<'a> {
         let replan = replan_status_from_proposals(&run_id, proposals.clone());
         let plan_revisions = plan_revisions_from_proposals(
             &run,
+            &selected_slice_ids,
             snapshot.mission_envelope.as_ref(),
             snapshot.frontier_budget.as_ref(),
             proposals,
@@ -173,6 +175,7 @@ impl<'a> RunReadModelBuilder<'a> {
             options.include_run_summary_evidence(),
         );
         let mut details = RunDetails {
+            selected_slice_ids,
             snapshot: metadata,
             launch_intents: snapshot.launch_intents,
             integration_merge_intents: snapshot.merge_intents,
@@ -218,6 +221,7 @@ impl<'a> RunReadModelBuilder<'a> {
             generated_slices_from_proposals(&snapshot.replan_proposals, &snapshot.slice_runs);
         plan_revisions_from_proposals(
             &snapshot.run,
+            &snapshot.selected_slice_ids,
             snapshot.mission_envelope.as_ref(),
             snapshot.frontier_budget.as_ref(),
             snapshot.replan_proposals,
@@ -588,7 +592,7 @@ fn terminal_reason_source(
 
 fn terminal_incident_event(events: &[Event]) -> Option<&Event> {
     events.iter().rev().find(|event| {
-        event.typ == "run_incident"
+        EventKind::from(event.typ.as_str()) == EventKind::RunIncident
             && (event.payload.get("failure_kind").is_some()
                 || event.payload.get("operator_action_required").is_some()
                 || payload_string(&event.payload, "severity") == Some("error".to_string()))
@@ -596,7 +600,10 @@ fn terminal_incident_event(events: &[Event]) -> Option<&Event> {
 }
 
 fn terminal_run_error_event(events: &[Event]) -> Option<&Event> {
-    events.iter().rev().find(|event| event.typ == "run_error")
+    events
+        .iter()
+        .rev()
+        .find(|event| EventKind::from(event.typ.as_str()) == EventKind::RunError)
 }
 
 fn terminal_reason_from_event(
@@ -605,11 +612,12 @@ fn terminal_reason_from_event(
     include_run_summary_evidence: bool,
 ) -> TerminalReasonSource {
     let payload = &event.payload;
+    let event_kind = EventKind::from(event.typ.as_str());
     let kind = payload_string(payload, "failure_kind")
         .or_else(|| payload_string(payload, "kind"))
-        .unwrap_or_else(|| match event.typ.as_str() {
-            "run_error" => run.status.as_str().to_string(),
-            other => other.to_string(),
+        .unwrap_or_else(|| match &event_kind {
+            EventKind::RunError => run.status.as_str().to_string(),
+            _ => event_kind.as_str().to_string(),
         });
     let operator_action_required = payload
         .get("operator_action_required")
@@ -620,7 +628,7 @@ fn terminal_reason_from_event(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or_else(|| default_retryable(run.status));
     let decoded_run_error =
-        (event.typ == "run_error").then(|| RunErrorPayload::from_value(payload));
+        (event_kind == EventKind::RunError).then(|| RunErrorPayload::from_value(payload));
     let summary = payload_string(payload, "message")
         .or_else(|| payload_string(payload, "error"))
         .or_else(|| payload_string(payload, "summary"))
@@ -793,28 +801,29 @@ fn run_incidents_from_events(events: &[Event]) -> Vec<RunIncident> {
         .iter()
         .filter_map(|event| {
             let payload = &event.payload;
-            let (severity, kind, message) = match event.typ.as_str() {
-                "run_incident" => (
+            let event_kind = EventKind::from(event.typ.as_str());
+            let (severity, kind, message) = match event_kind {
+                EventKind::RunIncident => (
                     payload_text(payload, "severity", "warning"),
                     payload_text(payload, "kind", "run_incident"),
                     payload_text(payload, "message", "incident recorded"),
                 ),
-                "run_error" => (
+                EventKind::RunError => (
                     "error".to_string(),
                     "run_error".to_string(),
                     payload_text(payload, "error", "run failed"),
                 ),
-                "run_resumed" => (
+                EventKind::RunResumed => (
                     "warning".to_string(),
                     "run_resumed".to_string(),
                     "run resumed after a terminal/interrupted state".to_string(),
                 ),
-                "worktree_cleanup_error" | "daemon_recovery_cleanup_error" => (
+                EventKind::WorktreeCleanupError | EventKind::DaemonRecoveryCleanupError => (
                     "warning".to_string(),
                     event.typ.clone(),
                     payload_text(payload, "error", "worktree cleanup reported an error"),
                 ),
-                "integration_repair_completed" => (
+                EventKind::IntegrationRepairCompleted => (
                     "warning".to_string(),
                     "integration_repair_completed".to_string(),
                     [
@@ -1006,7 +1015,9 @@ fn completion_publication(events: &[Event]) -> Result<Option<CompletionPublicati
     events
         .iter()
         .rev()
-        .find(|event| event.typ == "completion_publication_committed")
+        .find(|event| {
+            EventKind::from(event.typ.as_str()) == EventKind::CompletionPublicationCommitted
+        })
         .map(|event| {
             serde_json::from_value(event.payload.clone())
                 .context("decode durable completion publication receipt from status snapshot")
@@ -1090,9 +1101,9 @@ fn is_worker_layer_phase(phase: &str) -> bool {
 
 fn current_parallel_layer_from_events(events: &[Event]) -> Option<Vec<String>> {
     for event in events.iter().rev() {
-        match event.typ.as_str() {
-            "parallel_layer_completed" | "parallel_layer_failed" => return None,
-            "parallel_layer_started" => {
+        match EventKind::from(event.typ.as_str()) {
+            EventKind::ParallelLayerCompleted | EventKind::ParallelLayerFailed => return None,
+            EventKind::ParallelLayerStarted => {
                 let slices = event
                     .payload
                     .get("slices")
@@ -1124,6 +1135,7 @@ fn is_parallel_layer_slice_status(status: SliceStatus) -> bool {
 
 pub(crate) fn plan_revisions_from_proposals(
     run: &Run,
+    selected_slice_ids: &[String],
     mission_envelope: Option<&MissionEnvelope>,
     frontier_budget: Option<&FrontierBudgetState>,
     proposals: Vec<ReplanProposal>,
@@ -1146,16 +1158,16 @@ pub(crate) fn plan_revisions_from_proposals(
     );
     let mut plan = PlanRevisions {
         source_of_truth: "daemon_replan_proposals".to_string(),
-        queue_summary: if run.selected_slice_id.trim().is_empty() {
+        queue_summary: if selected_slice_ids.is_empty() {
             "selected slices: <none>".to_string()
         } else {
-            format!("selected slices: {}", run.selected_slice_id)
+            format!("selected slices: {}", selected_slice_ids.join(","))
         },
         frontier,
         ..PlanRevisions::default()
     };
     for proposal in proposals {
-        let record = plan_revision_record(run, proposal)?;
+        let record = plan_revision_record(selected_slice_ids, proposal)?;
         match record.state.as_str() {
             "pending" => plan.pending.push(record),
             "accepted" => plan.accepted.push(record),
@@ -1633,7 +1645,10 @@ fn frontier_operator_outcome(proposal: &ReplanProposal) -> String {
     }
 }
 
-fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevisionRecord> {
+fn plan_revision_record(
+    selected_slice_ids: &[String],
+    proposal: ReplanProposal,
+) -> Result<PlanRevisionRecord> {
     let state = proposal.state.as_str().to_string();
     let after = plan_revision_after_summary(&proposal);
     let decision = proposal
@@ -1653,7 +1668,7 @@ fn plan_revision_record(run: &Run, proposal: ReplanProposal) -> Result<PlanRevis
         action_class: plan_revision_action_class(&proposal),
         risk: proposal.risk.clone(),
         frontier_classification: proposal.frontier_classification.clone(),
-        before_queue_or_slice_summary: plan_revision_before_summary(run, &proposal),
+        before_queue_or_slice_summary: plan_revision_before_summary(selected_slice_ids, &proposal),
         after_queue_or_slice_summary: after,
         decision_commands: proposal.decision_commands.clone(),
         decision,
@@ -1772,11 +1787,14 @@ fn plan_revision_decision_summary(
     })
 }
 
-fn plan_revision_before_summary(run: &Run, proposal: &ReplanProposal) -> String {
-    let queue = if run.selected_slice_id.trim().is_empty() {
-        "<none>"
+fn plan_revision_before_summary(
+    selected_slice_ids: &[String],
+    proposal: &ReplanProposal,
+) -> String {
+    let queue = if selected_slice_ids.is_empty() {
+        "<none>".to_string()
     } else {
-        run.selected_slice_id.as_str()
+        selected_slice_ids.join(",")
     };
     format!(
         "queue before proposal {}: {}; proposed changes: {}",
@@ -1984,6 +2002,7 @@ mod worker_attempt_history_tests {
                         kind: "followup_slice".to_string(),
                         target: String::new(),
                         summary: "legacy generated slice".to_string(),
+                        followup_slice_draft: None,
                     }],
                     "low",
                 )
