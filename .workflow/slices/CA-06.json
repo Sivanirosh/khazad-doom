@@ -2,7 +2,9 @@
   "id": "CA-06",
   "title": "Transactional status snapshot and semantic projection",
   "goal": "Build one coherent daemon-owned run snapshot and move lifecycle, gate, attention, and operator-action interpretation fully behind the server projection boundary.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-06",
+  "closed_at": "2026-07-11T13:29:42.667553171Z",
   "depends_on": [
     "CA-05"
   ],
