@@ -2,7 +2,9 @@
   "id": "CA-03",
   "title": "Append-only worker attempt ledger",
   "goal": "Separate immutable worker-attempt identity from retry budget and execution epoch so resume and retry can never overwrite evidence, branches, artifacts, or activity records.",
-  "status": "open",
+  "status": "closed",
+  "closed_by_run": "manual-pi-session-20260711-ca-03",
+  "closed_at": "2026-07-11T06:47:15.930842920Z",
   "depends_on": [
     "CA-02"
   ],
