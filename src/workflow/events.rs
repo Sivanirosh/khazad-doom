@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// Retained for decoding and projecting historical runs; new attention delivery never requests focus.
 pub(crate) const ATTENTION_FOCUS_SENT: &str = "attention_focus_sent";
 pub(crate) const ATTENTION_NOTIFICATION_SENT: &str = "attention_notification_sent";
 pub(crate) const CHECKPOINT_WRITTEN: &str = "checkpoint_written";
@@ -40,6 +41,7 @@ pub(crate) const WORKER_ENVELOPE_RETRY_SUCCEEDED: &str = "worker_envelope_retry_
 pub(crate) const WORKER_QUESTION_ANSWERED: &str = "worker_question_answered";
 pub(crate) const WORKER_QUESTION_ASKED: &str = "worker_question_asked";
 pub(crate) const WORKTREES_CLEANED: &str = "worktrees_cleaned";
+// Retained for decoding and projecting historical runs; new attention delivery never requests focus.
 pub(crate) const ATTENTION_FOCUS_FAILED: &str = "attention_focus_failed";
 pub(crate) const ATTENTION_NOTIFICATION_FAILED: &str = "attention_notification_failed";
 pub(crate) const ATTENTION_NOTIFICATION_RECORD_FAILED: &str =
@@ -575,13 +577,6 @@ impl WorkflowEvent<AttentionDeliveryPayload> {
     pub(crate) fn attention_notification_sent(payload: AttentionDeliveryPayload) -> Self {
         Self {
             kind: EventKind::AttentionNotificationSent,
-            payload,
-        }
-    }
-
-    pub(crate) fn attention_focus_sent(payload: AttentionDeliveryPayload) -> Self {
-        Self {
-            kind: EventKind::AttentionFocusSent,
             payload,
         }
     }
@@ -1950,6 +1945,19 @@ mod tests {
     fn typed_event_vocabulary_preserves_legacy_and_unknown_kinds() {
         assert_eq!(EventKind::from(RUN_ERROR), EventKind::RunError);
         assert_eq!(EventKind::RunError.as_str(), RUN_ERROR);
+        assert_eq!(
+            EventKind::from(ATTENTION_FOCUS_SENT),
+            EventKind::AttentionFocusSent
+        );
+        assert_eq!(EventKind::AttentionFocusSent.as_str(), ATTENTION_FOCUS_SENT);
+        assert_eq!(
+            EventKind::from(ATTENTION_FOCUS_FAILED),
+            EventKind::AttentionFocusFailed
+        );
+        assert_eq!(
+            EventKind::AttentionFocusFailed.as_str(),
+            ATTENTION_FOCUS_FAILED
+        );
         assert_eq!(
             EventKind::from("future_event_kind"),
             EventKind::Unknown("future_event_kind".to_string())

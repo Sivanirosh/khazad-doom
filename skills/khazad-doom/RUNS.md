@@ -18,7 +18,7 @@ Use the slice rules in [`SLICES.md`](SLICES.md) whenever initialization, contrac
 
 ## 2. Choose the pit of success
 
-Ordinary real runs omit `--cockpit`. The repository policy then applies; with the default `auto` policy, KD opens or focuses Herdr when usable and falls back to direct daemon execution when it is not.
+Ordinary real runs omit `--cockpit`. The repository policy then applies; with the default `auto` policy, KD creates or reuses a Herdr workspace in the background when usable and falls back to direct daemon execution when it is not. Run start, resume, worker placement, and attention delivery never switch the operator's current Herdr workspace; use explicit `khazad-doom cockpit open` when focus is wanted.
 
 Explicit execution overrides belong to these named exceptions:
 
@@ -72,4 +72,4 @@ After a successful background resume, use the same compact handoff with `khazad-
 
 ## Optional origin feedback
 
-The initial `run` command accepts `--origin-notification-target <target>` when a concrete target was supplied. Terminal and attention messages sent through that target are inert visibility evidence; delivery failure does not change run status, verification, merge, or handoff readiness.
+The initial `run` command accepts `--origin-notification-target <target>` when a concrete target was supplied. Terminal and attention messages sent through that target are inert visibility evidence and never request Herdr focus; delivery failure does not change run status, verification, merge, or handoff readiness.

@@ -431,14 +431,6 @@ pub(crate) struct CockpitAgentMessageSent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CockpitAgentFocused {
-    pub adapter: String,
-    pub mode: CockpitMode,
-    pub target: String,
-    pub surface: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CockpitAgentRenamed {
     pub adapter: String,
     pub mode: CockpitMode,
@@ -501,10 +493,14 @@ pub(crate) fn worker_activity_pane_command(
 
 pub(crate) trait CockpitAdapter {
     fn name(&self) -> &'static str;
-    fn open_or_focus_run_workspace(
-        &self,
-        request: &CockpitRunRequest,
-    ) -> Result<CockpitWorkspaceRef>;
+    fn ensure_run_workspace(&self, request: &CockpitRunRequest) -> Result<CockpitWorkspaceRef>;
+
+    fn focus_run_workspace(&self, _workspace: &CockpitWorkspaceRef) -> Result<()> {
+        bail!(
+            "{} adapter does not support explicit workspace focus",
+            self.name()
+        )
+    }
     fn create_read_only_pane(
         &self,
         workspace: &CockpitWorkspaceRef,
@@ -596,10 +592,6 @@ pub(crate) trait CockpitAdapter {
         bail!("{} adapter does not support agent messages", self.name())
     }
 
-    fn focus_agent(&self, _target: &str) -> Result<()> {
-        bail!("{} adapter does not support agent focus", self.name())
-    }
-
     fn rename_agent(&self, _target: &str, _name: &str) -> Result<()> {
         bail!("{} adapter does not support agent rename", self.name())
     }
@@ -652,7 +644,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
         if self.mode == CockpitMode::Direct {
             return Ok(CockpitLaunch::SkippedDirect);
         }
-        let workspace = self.adapter.open_or_focus_run_workspace(request)?;
+        let workspace = self.adapter.ensure_run_workspace(request)?;
         let pane_labels = self.create_run_panes(&workspace, request)?;
         Ok(CockpitLaunch::Opened(CockpitOpened {
             adapter: self.adapter.name().to_string(),
@@ -666,8 +658,9 @@ impl<A: CockpitAdapter> Cockpit<A> {
         if self.mode == CockpitMode::Direct {
             bail!("cockpit direct mode does not open a Herdr workspace");
         }
-        let workspace = self.adapter.open_or_focus_run_workspace(request)?;
+        let workspace = self.adapter.ensure_run_workspace(request)?;
         if workspace.existed {
+            self.adapter.focus_run_workspace(&workspace)?;
             return Ok(CockpitOpenFocus {
                 adapter: self.adapter.name().to_string(),
                 mode: self.mode,
@@ -678,6 +671,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
             });
         }
         let pane_labels = self.create_run_panes(&workspace, request)?;
+        self.adapter.focus_run_workspace(&workspace)?;
         Ok(CockpitOpenFocus {
             adapter: self.adapter.name().to_string(),
             mode: self.mode,
@@ -700,7 +694,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
         let _layout_guard = herdr_layout_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
+        let workspace = self.adapter.ensure_run_workspace(run_request)?;
         let inspection = self.adapter.inspect_layout(&workspace)?;
         let plan = CockpitLayoutPlanner.plan(inspection.worker_slot_count() + 1)?;
         let dashboard = self.dashboard_pane_request(run_request);
@@ -750,7 +744,7 @@ impl<A: CockpitAdapter> Cockpit<A> {
         let _layout_guard = herdr_layout_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let workspace = self.adapter.open_or_focus_run_workspace(run_request)?;
+        let workspace = self.adapter.ensure_run_workspace(run_request)?;
         let inspection = self.adapter.inspect_layout(&workspace)?;
         let plan = CockpitLayoutPlanner.plan(inspection.worker_slot_count() + 1)?;
         let dashboard = self.dashboard_pane_request(run_request);
@@ -785,19 +779,6 @@ impl<A: CockpitAdapter> Cockpit<A> {
             mode: self.mode,
             target: target.to_string(),
             surface: "herdr agent send".to_string(),
-        })
-    }
-
-    pub fn focus_agent(&self, target: &str) -> Result<CockpitAgentFocused> {
-        if self.mode == CockpitMode::Direct {
-            bail!("cockpit direct mode does not focus Herdr agents");
-        }
-        self.adapter.focus_agent(target)?;
-        Ok(CockpitAgentFocused {
-            adapter: self.adapter.name().to_string(),
-            mode: self.mode,
-            target: target.to_string(),
-            surface: "herdr agent focus".to_string(),
         })
     }
 
@@ -919,28 +900,6 @@ pub(crate) fn send_default_agent_message(
         .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
 }
 
-pub(crate) fn focus_default_agent_target(
-    target: &str,
-) -> std::result::Result<CockpitAgentFocused, CockpitUnavailable> {
-    let mode = CockpitMode::Herdr;
-    #[cfg(test)]
-    if std::env::var("KHAZAD_UNIT_TEST_TERMINAL_FEEDBACK")
-        .ok()
-        .as_deref()
-        != Some("1")
-    {
-        return Err(CockpitUnavailable::new(
-            mode,
-            "herdr",
-            "Herdr agent focus is disabled in unit tests",
-        ));
-    }
-    let adapter = HerdrCockpitAdapter::discover(mode)?;
-    Cockpit::new(mode, adapter)
-        .focus_agent(target)
-        .map_err(|err| CockpitUnavailable::new(mode, "herdr", err.to_string()))
-}
-
 pub(crate) fn notify_origin_worker_question_attention(
     state: &StateStore,
     question: &WorkerQuestion,
@@ -1034,7 +993,6 @@ pub(crate) fn notify_origin_worker_question_attention(
             slice_id: &question.slice_id,
             proposal_id: "",
             delivery_message: "worker question notification was not delivered",
-            focus_message: "worker question focus was not delivered",
         },
     );
 }
@@ -1138,7 +1096,6 @@ pub(crate) fn notify_origin_replan_attention(
             slice_id: "",
             proposal_id: &proposal.id,
             delivery_message: "replan proposal notification was not delivered",
-            focus_message: "replan proposal focus was not delivered",
         },
     );
 }
@@ -1153,7 +1110,6 @@ struct OriginAttentionRequest<'a> {
     slice_id: &'a str,
     proposal_id: &'a str,
     delivery_message: &'static str,
-    focus_message: &'static str,
 }
 
 fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>) {
@@ -1188,7 +1144,6 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
         &request,
         "pending",
         "pending",
-        "pending",
         "",
         request.payload.clone(),
         created_at.clone(),
@@ -1199,7 +1154,6 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
     let text = serde_json::to_string_pretty(&request.payload)
         .unwrap_or_else(|_| request.payload.to_string());
     let mut send_status = "failed";
-    let mut focus_status = "failed";
     let mut errors = Vec::new();
     match send_default_agent_message(&origin.target, &text) {
         Ok(sent) => {
@@ -1232,42 +1186,7 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
             );
         }
     }
-    match focus_default_agent_target(&origin.target) {
-        Ok(focused) => {
-            focus_status = "sent";
-            let _ = state.record_typed_workflow_event(
-                &request.run.id,
-                &workflow_events::WorkflowEvent::attention_focus_sent(
-                    workflow_events::AttentionDeliveryPayload {
-                        kind: request.attention_kind.to_string(),
-                        question_id: request.question_id.to_string(),
-                        slice_id: request.slice_id.to_string(),
-                        proposal_id: request.proposal_id.to_string(),
-                        adapter: focused.adapter,
-                        surface: focused.surface,
-                        target_kind: origin.target_kind.clone(),
-                    },
-                ),
-            );
-        }
-        Err(err) => {
-            errors.push(format!("focus: {}", err.message));
-            let _ = state.record_workflow_event(
-                &request.run.id,
-                &origin_attention_failure_payload(
-                    &request,
-                    "attention_focus_failed",
-                    "focus_failed",
-                    format!("{}: {}", request.focus_message, err.message),
-                ),
-            );
-        }
-    }
-    let delivery_status = match (send_status, focus_status) {
-        ("sent", "sent") => "sent",
-        ("failed", "failed") => "failed",
-        _ => "partial",
-    };
+    let delivery_status = send_status;
     write_origin_attention_record(
         state,
         &store,
@@ -1275,7 +1194,6 @@ fn send_origin_attention(state: &StateStore, request: OriginAttentionRequest<'_>
         &request,
         delivery_status,
         send_status,
-        focus_status,
         &errors.join("; "),
         request.payload.clone(),
         created_at,
@@ -1290,7 +1208,6 @@ fn write_origin_attention_record(
     request: &OriginAttentionRequest<'_>,
     delivery_status: &str,
     send_status: &str,
-    focus_status: &str,
     error: &str,
     payload: Value,
     created_at: String,
@@ -1302,7 +1219,7 @@ fn write_origin_attention_record(
         attention_kind: request.attention_kind.to_string(),
         delivery_status: delivery_status.to_string(),
         send_status: send_status.to_string(),
-        focus_status: focus_status.to_string(),
+        focus_status: "not_requested".to_string(),
         question_id: request.question_id.to_string(),
         slice_id: request.slice_id.to_string(),
         proposal_id: request.proposal_id.to_string(),
@@ -1906,10 +1823,7 @@ impl CockpitAdapter for HerdrCockpitAdapter {
         "herdr"
     }
 
-    fn open_or_focus_run_workspace(
-        &self,
-        request: &CockpitRunRequest,
-    ) -> Result<CockpitWorkspaceRef> {
+    fn ensure_run_workspace(&self, request: &CockpitRunRequest) -> Result<CockpitWorkspaceRef> {
         let list = self.run_json(&["workspace".to_string(), "list".to_string()])?;
         if let Some(existing) = list
             .pointer("/result/workspaces")
@@ -1925,11 +1839,6 @@ impl CockpitAdapter for HerdrCockpitAdapter {
                 .get("workspace_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("herdr workspace list item omitted workspace_id"))?;
-            self.run_json(&[
-                "workspace".to_string(),
-                "focus".to_string(),
-                workspace_id.to_string(),
-            ])?;
             return Ok(CockpitWorkspaceRef {
                 id: workspace_id.to_string(),
                 anchor_pane: None,
@@ -1947,7 +1856,7 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             request.workspace_label.clone(),
             "--env".to_string(),
             env_arg,
-            "--focus".to_string(),
+            "--no-focus".to_string(),
         ])?;
         let workspace_id = created
             .pointer("/result/workspace/workspace_id")
@@ -1964,6 +1873,15 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             }),
             existed: false,
         })
+    }
+
+    fn focus_run_workspace(&self, workspace: &CockpitWorkspaceRef) -> Result<()> {
+        self.run_json(&[
+            "workspace".to_string(),
+            "focus".to_string(),
+            workspace.id.clone(),
+        ])?;
+        Ok(())
     }
 
     fn create_read_only_pane(
@@ -2174,11 +2092,6 @@ impl CockpitAdapter for HerdrCockpitAdapter {
             target.to_string(),
             text.to_string(),
         ])?;
-        Ok(())
-    }
-
-    fn focus_agent(&self, target: &str) -> Result<()> {
-        self.run_command(&["agent".to_string(), "focus".to_string(), target.to_string()])?;
         Ok(())
     }
 
@@ -2474,10 +2387,7 @@ mod tests {
             "fake-herdr"
         }
 
-        fn open_or_focus_run_workspace(
-            &self,
-            request: &CockpitRunRequest,
-        ) -> Result<CockpitWorkspaceRef> {
+        fn ensure_run_workspace(&self, request: &CockpitRunRequest) -> Result<CockpitWorkspaceRef> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2489,6 +2399,14 @@ mod tests {
                 }),
                 existed: self.workspace_existed,
             })
+        }
+
+        fn focus_run_workspace(&self, workspace: &CockpitWorkspaceRef) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("workspace_focus:{}", workspace.id));
+            Ok(())
         }
 
         fn create_read_only_pane(
@@ -2755,6 +2673,15 @@ mod tests {
         assert_eq!(records[0].attention_key, "worker-question:q-1");
         assert_eq!(records[1].attention_key, "worker-question:q-2");
         assert_eq!(records[0].origin_target, "agent-1");
+        assert!(
+            records
+                .iter()
+                .all(|record| record.focus_status == "not_requested")
+        );
+        assert!(state.get_events(&run.id, 100)?.iter().all(|event| {
+            event.typ != workflow_events::ATTENTION_FOCUS_SENT
+                && event.typ != workflow_events::ATTENTION_FOCUS_FAILED
+        }));
         assert_eq!(
             records[0].payload["answer_commands"][0],
             "khazad-doom answer kd-attention-worker-question q-1 <answer>"
@@ -2816,6 +2743,15 @@ mod tests {
             records[0].payload["delivery_semantics"],
             "visibility_only_no_auto_decision"
         );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.focus_status == "not_requested")
+        );
+        assert!(state.get_events(&run.id, 100)?.iter().all(|event| {
+            event.typ != workflow_events::ATTENTION_FOCUS_SENT
+                && event.typ != workflow_events::ATTENTION_FOCUS_FAILED
+        }));
         Ok(())
     }
 
@@ -2895,6 +2831,125 @@ mod tests {
         assert_eq!(
             plan.worker_slots[3].split.as_ref().unwrap().direction,
             CockpitLayoutDirection::Down
+        );
+    }
+
+    fn fake_herdr_workspace_adapter(existing: bool) -> (tempfile::TempDir, HerdrCockpitAdapter) {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("fake-herdr-workspace-state.json");
+        let script_path = dir.path().join("herdr-workspace");
+        fs::write(
+            &state_path,
+            serde_json::json!({
+                "calls": [],
+                "existing": existing,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state_path_json = serde_json::to_string(&state_path.to_string_lossy()).unwrap();
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+STATE = pathlib.Path({state_path_json})
+state = json.loads(STATE.read_text())
+args = sys.argv[1:]
+state["calls"].append(args)
+STATE.write_text(json.dumps(state))
+
+def ok(result):
+    print(json.dumps({{"result": result}}))
+    sys.exit(0)
+
+if args[:2] == ["workspace", "list"]:
+    workspaces = []
+    if state["existing"]:
+        workspaces.append({{"workspace_id": "w1", "label": "Khazad-Doom kd-test"}})
+    ok({{"workspaces": workspaces}})
+
+if args[:2] == ["workspace", "focus"]:
+    ok({{"workspace": {{"workspace_id": args[2]}}}})
+
+if args[:2] == ["workspace", "create"]:
+    ok({{
+        "workspace": {{"workspace_id": "w1"}},
+        "root_pane": {{"pane_id": "w1:p1"}},
+    }})
+
+print(json.dumps({{"error": {{"code": "unsupported", "message": "unsupported command"}}}}))
+sys.exit(1)
+"#
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        (dir, HerdrCockpitAdapter { bin: script_path })
+    }
+
+    fn fake_herdr_workspace_calls(dir: &tempfile::TempDir) -> Vec<Vec<String>> {
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("fake-herdr-workspace-state.json")).unwrap(),
+        )
+        .unwrap();
+        serde_json::from_value(value["calls"].clone()).unwrap()
+    }
+
+    fn test_run_request() -> CockpitRunRequest {
+        CockpitRunRequest {
+            repo_path: PathBuf::from("/repo"),
+            khazad_home: PathBuf::from("/khazad-home"),
+            workspace_label: workspace_label_for_run("kd-test"),
+            feed_command: "khazad-doom monitor --run kd-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn automatic_workspace_reuse_does_not_focus_herdr() {
+        let (dir, adapter) = fake_herdr_workspace_adapter(true);
+
+        let workspace = adapter.ensure_run_workspace(&test_run_request()).unwrap();
+
+        assert!(workspace.existed);
+        assert_eq!(
+            fake_herdr_workspace_calls(&dir),
+            vec![vec!["workspace".to_string(), "list".to_string()]]
+        );
+    }
+
+    #[test]
+    fn automatic_workspace_creation_requests_no_focus() {
+        let (dir, adapter) = fake_herdr_workspace_adapter(false);
+
+        let workspace = adapter.ensure_run_workspace(&test_run_request()).unwrap();
+
+        assert!(!workspace.existed);
+        let calls = fake_herdr_workspace_calls(&dir);
+        let create = &calls[1];
+        assert!(create.iter().any(|arg| arg == "--no-focus"));
+        assert!(create.iter().all(|arg| arg != "--focus"));
+    }
+
+    #[test]
+    fn explicit_workspace_open_uses_herdr_focus_command() {
+        let (dir, adapter) = fake_herdr_workspace_adapter(true);
+        let workspace = adapter.ensure_run_workspace(&test_run_request()).unwrap();
+
+        adapter.focus_run_workspace(&workspace).unwrap();
+
+        assert_eq!(
+            fake_herdr_workspace_calls(&dir),
+            vec![
+                vec!["workspace".to_string(), "list".to_string()],
+                vec![
+                    "workspace".to_string(),
+                    "focus".to_string(),
+                    "w1".to_string(),
+                ],
+            ]
         );
     }
 
@@ -3215,12 +3270,7 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
     #[test]
     fn cockpit_open_or_focus_existing_workspace_does_not_create_duplicate_panes() {
         let adapter = FakeCockpitAdapter::existing_workspace();
-        let request = CockpitRunRequest {
-            repo_path: PathBuf::from("/repo"),
-            khazad_home: PathBuf::from("/khazad-home"),
-            workspace_label: workspace_label_for_run("kd-test"),
-            feed_command: "khazad-doom monitor --run kd-test".to_string(),
-        };
+        let request = test_run_request();
 
         let opened = Cockpit::new(CockpitMode::Herdr, adapter.clone())
             .open_or_focus_run(&request)
@@ -3228,7 +3278,33 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
 
         assert_eq!(opened.action, "focused_existing");
         assert!(opened.pane_labels.is_empty());
-        assert_eq!(adapter.calls(), vec!["workspace:Khazad-Doom kd-test"]);
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                "workspace:Khazad-Doom kd-test".to_string(),
+                "workspace_focus:workspace-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cockpit_open_new_workspace_focuses_only_after_layout_is_ready() {
+        let adapter = FakeCockpitAdapter::default();
+
+        let opened = Cockpit::new(CockpitMode::Herdr, adapter.clone())
+            .open_or_focus_run(&test_run_request())
+            .unwrap();
+
+        assert_eq!(opened.action, "opened");
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                "workspace:Khazad-Doom kd-test".to_string(),
+                "layout:inspect".to_string(),
+                "layout:dashboard:Dashboard:right:0.68".to_string(),
+                "workspace_focus:workspace-1".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3301,6 +3377,11 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
         assert!(calls.iter().any(|call| call.starts_with(
             "layout:worker-slot:worker-1:worker-1: Worker kd-run/SLICE-1 attempt 2:/bin/sh wrapper.sh"
         )));
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.starts_with("workspace_focus:"))
+        );
     }
 
     #[test]
@@ -3399,6 +3480,11 @@ fail("unsupported", "unsupported fake herdr command: " + " ".join(args))
             "layout:tui-worker-slot:worker-1:worker-1: Worker kd-run/SLICE-1 attempt 2"
         )));
         assert!(calls.iter().all(|call| !call.contains("Operator")));
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.starts_with("workspace_focus:"))
+        );
     }
 
     #[test]
