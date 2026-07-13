@@ -90,7 +90,7 @@ function khazadWorkerExtension(pi) {
 				params.reversible = input.reversible === true;
 			}
 			if (canPromptInWorkerPane(ctx?.ui, params.options)) {
-				return askOperatorInWorkerPane(socket, params, ctx.ui);
+				return askOperatorInWorkerPane(socket, params, ctx.ui, pi.events);
 			}
 			try {
 				return await askOperatorViaDaemonWait(socket, params);
@@ -139,7 +139,7 @@ async function askOperatorViaDaemonWait(socket, params) {
 	);
 }
 
-async function askOperatorInWorkerPane(socket, params, ui) {
+async function askOperatorInWorkerPane(socket, params, ui, events) {
 	let opened;
 	try {
 		opened = await daemonCall(socket, 'workerAskOpen', params);
@@ -154,46 +154,67 @@ async function askOperatorInWorkerPane(socket, params, ui) {
 		id: questionId,
 		timeout_seconds: Number(opened.timeout_seconds || params.timeout_seconds || 0),
 	};
-	if (questionDeadlineElapsed(question)) {
-		return closeWorkerQuestionWithoutAnswer(
-			socket,
-			params,
-			questionId,
-			'Operator question deadline elapsed',
-		);
-	}
-	let answer;
+	return withHerdrBlockedStatus(events, async () => {
+		if (questionDeadlineElapsed(question)) {
+			return closeWorkerQuestionWithoutAnswer(
+				socket,
+				params,
+				questionId,
+				'Operator question deadline elapsed',
+			);
+		}
+		let answer;
+		try {
+			answer = await promptWorkerPaneForAnswer(ui, question);
+		} catch (error) {
+			return closeWorkerQuestionWithoutAnswer(
+				socket,
+				params,
+				questionId,
+				`Pi operator prompt failed: ${error?.message || error}`,
+				{ error: String(error?.message || error) },
+			);
+		}
+		const trimmed = answer === undefined ? '' : String(answer).trim();
+		if (!trimmed) {
+			return closeWorkerQuestionWithoutAnswer(socket, params, questionId, 'No operator answer was submitted');
+		}
+		try {
+			const recorded = await daemonCall(socket, 'answerQuestion', {
+				run_id: params.run_id,
+				question_id: questionId,
+				answer: trimmed,
+			});
+			return completedQuestionToolResult(recorded?.question, questionId, 'worker_pane');
+		} catch (error) {
+			const durable = await readDurableWorkerQuestion(socket, params.run_id, questionId);
+			if (durable) return completedQuestionToolResult(durable, questionId, 'worker_pane');
+			return toolResult(`Operator answer could not be recorded: ${error?.message || error}; proceed per the blocked contract.`, {
+				available: true,
+				answer: '',
+				question_id: questionId,
+				error: String(error?.message || error),
+			});
+		}
+	});
+}
+
+async function withHerdrBlockedStatus(events, fn) {
+	emitHerdrBlockedStatus(events, true, 'Khazad-Doom awaiting operator answer');
 	try {
-		answer = await promptWorkerPaneForAnswer(ui, question);
-	} catch (error) {
-		return closeWorkerQuestionWithoutAnswer(
-			socket,
-			params,
-			questionId,
-			`Pi operator prompt failed: ${error?.message || error}`,
-			{ error: String(error?.message || error) },
-		);
+		return await fn();
+	} finally {
+		emitHerdrBlockedStatus(events, false);
 	}
-	const trimmed = answer === undefined ? '' : String(answer).trim();
-	if (!trimmed) {
-		return closeWorkerQuestionWithoutAnswer(socket, params, questionId, 'No operator answer was submitted');
-	}
+}
+
+function emitHerdrBlockedStatus(events, active, label) {
 	try {
-		const recorded = await daemonCall(socket, 'answerQuestion', {
-			run_id: params.run_id,
-			question_id: questionId,
-			answer: trimmed,
-		});
-		return completedQuestionToolResult(recorded?.question, questionId, 'worker_pane');
-	} catch (error) {
-		const durable = await readDurableWorkerQuestion(socket, params.run_id, questionId);
-		if (durable) return completedQuestionToolResult(durable, questionId, 'worker_pane');
-		return toolResult(`Operator answer could not be recorded: ${error?.message || error}; proceed per the blocked contract.`, {
-			available: true,
-			answer: '',
-			question_id: questionId,
-			error: String(error?.message || error),
-		});
+		if (typeof events?.emit === 'function') {
+			events.emit('herdr:blocked', { active, ...(label ? { label } : {}) });
+		}
+	} catch {
+		// Herdr status is an optional observability projection and must not affect the question.
 	}
 }
 

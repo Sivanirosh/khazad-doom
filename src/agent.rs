@@ -2138,11 +2138,9 @@ mod tests {
                 .unwrap()
                 .contains("Use the submit_worker_result tool as your final action")
         );
-        assert!(
-            std::fs::read_to_string(&artifacts.extension_index_path)
-                .unwrap()
-                .contains("submit_worker_result")
-        );
+        let embedded_extension = std::fs::read_to_string(&artifacts.extension_index_path).unwrap();
+        assert!(embedded_extension.contains("submit_worker_result"));
+        assert!(embedded_extension.contains("herdr:blocked"));
     }
 
     #[test]

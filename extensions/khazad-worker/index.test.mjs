@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const khazadWorkerExtension = require('./index.js');
 
-function registeredTools() {
+function registeredTools({ events } = {}) {
 	const tools = new Map();
 	khazadWorkerExtension({
 		registerTool(tool) {
@@ -17,6 +17,7 @@ function registeredTools() {
 		},
 		registerCommand() {},
 		on() {},
+		...(events ? { events } : {}),
 	});
 	return tools;
 }
@@ -218,6 +219,81 @@ test('ask_operator reports unavailable when the daemon closes without a response
 	}
 });
 
+test('ask_operator marks its Herdr agent blocked until the worker question is answered', async () => {
+	let agentStatus = 'running';
+	const statusEvents = [];
+	const events = {
+		emit(name, payload) {
+			if (name !== 'herdr:blocked') return;
+			agentStatus = payload.active ? 'blocked' : 'running';
+			statusEvents.push({ ...payload, status: agentStatus });
+		},
+	};
+	const tool = registeredTools({ events }).get('ask_operator');
+	let answerPrompt;
+	const answerPending = new Promise((resolve) => {
+		answerPrompt = resolve;
+	});
+	let promptStarted;
+	const promptVisible = new Promise((resolve) => {
+		promptStarted = resolve;
+	});
+
+	await withDaemonServer(
+		(request) => {
+			if (request.method === 'workerAskOpen') {
+				return { question_id: 'q-status', state: 'pending', timeout_seconds: 30 };
+			}
+			if (request.method === 'answerQuestion') {
+				return { question: { id: 'q-status', state: 'answered', answer: 'A' } };
+			}
+			throw new Error(`unexpected method ${request.method}`);
+		},
+		async (socketPath) => {
+			await withEnv(
+				{
+					KHAZAD_DAEMON_SOCKET: socketPath,
+					KHAZAD_RUN_ID: 'kd-run',
+					KHAZAD_SLICE_ID: 'TUI-PROOF-01',
+					KHAZAD_WORKER_TOKEN: 'secret-token',
+				},
+				async () => {
+					const execution = tool.execute(
+						'call-status',
+						{ question: 'Choose?', options: ['A', 'B'] },
+						undefined,
+						undefined,
+						{
+							ui: {
+								async select() {
+									promptStarted();
+									return answerPending;
+								},
+							},
+						},
+					);
+
+					await promptVisible;
+					assert.equal(agentStatus, 'blocked');
+					assert.deepEqual(statusEvents, [
+						{
+							active: true,
+							label: 'Khazad-Doom awaiting operator answer',
+							status: 'blocked',
+						},
+					]);
+
+					answerPrompt('A');
+					const result = await execution;
+					assert.equal(result.details.answer, 'A');
+					assert.equal(agentStatus, 'running');
+					assert.deepEqual(statusEvents.map((event) => event.active), [true, false]);
+				},
+			);
+		},
+	);
+});
+
 test('ask_operator prompts in the worker Pi pane and records the answer through daemon state', async () => {
 	const tool = registeredTools().get('ask_operator');
 	const requests = [];
@@ -281,8 +357,15 @@ test('ask_operator prompts in the worker Pi pane and records the answer through 
 	assert.deepEqual(calls[0].opts, { timeout: 3000 });
 });
 
-test('ask_operator closes the daemon question when the worker-pane prompt is cancelled', async () => {
-	const tool = registeredTools().get('ask_operator');
+test('ask_operator closes the daemon question and releases Herdr blocked status when the worker-pane prompt is cancelled', async () => {
+	const statusEvents = [];
+	const tool = registeredTools({
+		events: {
+			emit(name, payload) {
+				if (name === 'herdr:blocked') statusEvents.push(payload.active);
+			},
+		},
+	}).get('ask_operator');
 	const requests = [];
 	await withDaemonServer(
 		(request) => {
@@ -326,6 +409,7 @@ test('ask_operator closes the daemon question when the worker-pane prompt is can
 	);
 
 	assert.deepEqual(requests.map((request) => request.method), ['workerAskOpen', 'workerQuestionTimeout']);
+	assert.deepEqual(statusEvents, [true, false]);
 });
 
 test('ask_operator closes the daemon question when the worker-pane select prompt rejects', async () => {
