@@ -3421,7 +3421,7 @@ fn untracked_slice_metadata_blocks_completion_with_integrity_incident_black_box(
     )?;
     assert!(!monitor.status.success());
     let monitor = String::from_utf8(monitor.stdout)?;
-    assert!(monitor.contains("Incidents"));
+    assert!(monitor.contains("INCIDENTS"));
     assert!(monitor.contains("slice_close_missing"));
     let latest_status = kd_ok(
         &bin,
@@ -3678,14 +3678,12 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
         ],
     )?;
     let monitored_once = String::from_utf8(monitored_once.stdout)?;
-    assert!(monitored_once.contains("Khazad-Doom Monitor"));
+    assert!(monitored_once.contains("● RUNNING"));
     assert!(monitored_once.contains(&run_id));
-    assert!(monitored_once.contains("Workers"));
-    assert!(monitored_once.contains("Run ● running"));
+    assert!(monitored_once.contains("WORKERS"));
     assert!(monitored_once.contains("phase worker_verify"));
     assert!(monitored_once.contains("slice-001"));
-    assert!(monitored_once.contains("Checks"));
-    assert!(monitored_once.contains("elapsed"));
+    assert!(monitored_once.contains("CHECKS"));
     assert!(monitored_once.contains("tail started-progress"));
 
     wait_for_status(&bin, home.path(), &run_id, "completed")?;
@@ -3696,7 +3694,7 @@ fn status_and_watch_expose_live_progress_for_long_verification() -> TestResult {
     )?;
     let monitored_completed = String::from_utf8(monitored_completed.stdout)?;
     assert!(monitored_completed.contains(&run_id));
-    assert!(monitored_completed.contains("Run ✓ completed"));
+    assert!(monitored_completed.contains("✓ COMPLETED"));
 
     let watched = kd_ok(
         &bin,
@@ -4058,7 +4056,8 @@ fn replan_status_projection_and_restart_preserve_pending_proposal_black_box() ->
     let monitored = String::from_utf8(monitored.stdout)?;
     assert!(monitored.contains("Pending replan rp-pending"));
     assert!(monitored.contains("Decision command:"));
-    assert!(monitored.contains("Commands"));
+    assert!(monitored.contains("ACTIONS"));
+    assert!(monitored.contains(&accept_command));
 
     kill_daemon(home.path())?;
     kd_ok(&bin, home.path(), &["daemon", "start"])?;
@@ -4641,8 +4640,8 @@ fn parallel_layer_failure_joins_records_and_cancels_siblings_black_box() -> Test
     )?;
     let monitored = String::from_utf8(monitored.stdout)?;
     assert!(
-        monitored.contains("parallel_worker_layer"),
-        "monitor should show parallel phase; output:\n{monitored}"
+        monitored.contains("WORKERS"),
+        "monitor should show the typed worker projection; output:\n{monitored}"
     );
     assert!(
         monitored.contains("active parallel slice-001, slice-002"),
@@ -4741,8 +4740,9 @@ fn monitor_specific_run_returns_error_for_failed_terminal_status() -> TestResult
     let stdout = String::from_utf8_lossy(&monitored.stdout);
     let stderr = String::from_utf8_lossy(&monitored.stderr);
     assert!(stdout.contains(&run_id));
-    assert!(stdout.contains("Run ✗ failed"));
-    assert!(stdout.contains("Terminal reason: kind=failed"));
+    assert!(stdout.contains("✕ FAILED"));
+    assert!(stdout.contains("WHAT STOPPED IT"));
+    assert!(stdout.contains("failed · retryable · resolution owner: daemon"));
     assert!(stderr.contains("run ended with status failed"));
 
     let failed = kd_ok(&bin, home.path(), &["status", "--run", &run_id])?;
@@ -4798,7 +4798,7 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
         ],
     )?;
     let empty_monitor = String::from_utf8(empty_monitor.stdout)?;
-    assert!(empty_monitor.contains("Run waiting"));
+    assert!(empty_monitor.contains("Khazad-Doom Monitor"));
     assert!(empty_monitor.contains("waiting for the latest active daemon-owned run"));
 
     kd_ok(&bin, home.path(), &["init", "--repo", path(repo_a.path())])?;
@@ -4872,10 +4872,9 @@ fn status_latest_returns_active_run_for_repo_or_null() -> TestResult {
         ],
     )?;
     let latest_monitor = String::from_utf8(latest_monitor.stdout)?;
-    assert!(latest_monitor.contains("Khazad-Doom Monitor"));
+    assert!(latest_monitor.contains("● RUNNING"));
     assert!(latest_monitor.contains(&run_a));
-    assert!(latest_monitor.contains("Run ● running"));
-    assert!(latest_monitor.contains("Workers"));
+    assert!(latest_monitor.contains("WORKERS"));
 
     let started_b = kd_ok(
         &bin,

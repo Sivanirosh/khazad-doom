@@ -181,32 +181,41 @@ The default cockpit mode is `auto`: if a usable `herdr` binary is on `PATH`, run
 
 To focus Herdr after a run already exists, use `khazad-doom cockpit open --run <run-id>` or `khazad-doom cockpit open --latest --repo .`. The command reads daemon status to identify the run, opens or focuses the Herdr workspace, and returns JSON with a clear `fallback`, `remediation`, and `operator_commands` list when Herdr is unavailable; headless `status`, `watch`, `monitor`, `answer`, and `handoff` flows do not require Herdr.
 
-Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI or Herdr cockpit is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, Herdr dashboard/status panes, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and exact `operator_commands`. The shared compact feed has a first-class `Attention` section for pending worker questions and replan decisions; renderers must show those full lines, including options, exact commands, and deadlines, without truncation. The canonical terminal/dashboard sections are `Run`, `Mission`, `Workers`, `Attention`, optional `Commands`, `Checks`, and `Economics`; renderers should not resurrect older ad-hoc blocks such as `Todos`, `Activity`, `Tail`, `Terminal`, `Replan`, or `Shell`.
+Use `watch --run <run-id>` as the plain text fallback when a dashboard TUI or Herdr cockpit is not suitable. Daemon `status` responses include a versioned `feed` projection; `watch`, terminal `monitor`, Herdr dashboard/status panes, and the optional Pi `/khazad-attach <run-id>` widget paint that projection instead of independently interpreting run events. The Dashboard's glance zone selects three display modes from typed feed fields: terminal lifecycle first, then non-terminal `attention_items`, otherwise nominal monitoring. It uses typed lifecycle, summary, worker activity, gate/repair, linked actions, and terminal reason; the remaining `feed.blocks` stay daemon-authored generic evidence, including unknown future block kinds. Rich question options, recommendation, rationale, and deadline remain verbatim Attention-block evidence because they are not fields of `StatusAttentionItem`.
+
+Blocked and failed status JSON also includes `primary_terminal_reason`, mirrored at `feed.terminal_reason`, with `kind`, `resolution_owner`, `retryable`, `operator_action_required`, `evidence_links`, `remediation`, `disposition`, and compatibility `operator_commands`. `NEEDS YOU` appears only when an attention item resolves to a typed action for that run; incident-only attention stays neutral. Linked action commands are emitted as exact, undecorated logical command lines; a Commands block or `operator_commands` is used only as a compatibility fallback. Header freshness comes only from `worker_activity.updated_at` and is neutral—age does not imply urgency or staleness, and a future timestamp is shown as clock skew. On short panes, lower-priority evidence collapses before a final bounded-frame elision; this is presentation only and never changes daemon state or evidence.
 
 Inside Pi, the shipped adapter is a thin bridge, not a second cockpit. `/khazad-attach <run-id>` attaches a compact read-only widget to one daemon run feed, `/khazad-explain <run-id>` (or explicit `/khazad-explain --latest`) paints one daemon `feed` snapshot, `/khazad-open <run-id>` (or explicit `/khazad-open --latest`) delegates Herdr open/focus to `khazad-doom cockpit open`, `/khazad-handoff <run-id>` summarizes daemon handoff JSON, `/khazad-answer <run-id> <question-id> <answer>` answers through daemon state, and `/khazad-detach` clears the widget. The adapter does not implicitly auto-discover runs, own workflow state, infer lifecycle from the Pi session, or replace `status`/`watch`/`monitor`; all live wording comes from `RunDetails.feed`, and session shutdown/reload only cleans up Pi UI resources.
 
-During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices:
+During `worker_running` and `integration_repair`, status/watch/monitor separate supervisor liveness from worker output activity. For parallel worker layers, they also label the layer and list active slices. Representative plain Dashboard modes are:
 
 ```text
-Run ● running • kd-20260627-090458-b91f6fbf
-└ phase parallel_worker_layer (worker_running) • elapsed 22m14s
-└ repo …/example/repo
-└ slice worker is running
+ ● RUNNING  kd-… · …/example/repo                         updated 8s ago
+implementing retry logic for slice-002
+phase worker_running · slice slice-002 · attempt 1
 
-Workers (parallel: slice-001, slice-002 • attempt 1 • now)
-└ Parallel layer: slice-001, slice-002
-└ Supervisor: alive, observed child 8s ago
-└ Process: running pid=12345
-└ Runtime: 22m14s
-└ Last worker event: none
-└ Timeout: disabled
+WORKERS  (2 active / 5 total) ─────────────────────────────────────────
+ ◐ slice-002  running • attempt 1
+```
 
-Checks
-└ tail .workflow/runs/<run>/outputs/slice-001.check.attempt-1.json
+```text
+ ● RUNNING  kd-… · …/example/repo                       updated 4m12s ago
+slice-002 blocked on operator question
 
-Attention
-└ worker is quiet for 15m00s; this may be normal; no timeout configured
-└ wait, inspect, or cancel explicitly
+! NEEDS YOU  1 item
+! q-42 · worker question: Deploy the preview environment now?
+
+ACTIONS  exact daemon commands ─────────────────────────────────────────
+   khazad-doom answer <run-id> q-42 <answer>
+```
+
+```text
+ ✕ FAILED  kd-… · …/example/repo
+integration gate failed twice; repair budget exhausted
+
+! WHAT STOPPED IT
+! gate_failure · retryable · resolution owner: operator
+! fix the failing tests, then resume
 ```
 
 A quiet worker is not considered failed by default. Khazad-Doom reports that the daemon is still supervising the process, shows when stdout/stderr/JSON events last arrived, and leaves the wait/inspect/cancel decision explicit unless a repo config opts into a worker-attempt timeout. The status JSON includes `progress.parallel_layer: true` and `progress.parallel_slices` while a parallel worker layer is active.

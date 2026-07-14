@@ -6,6 +6,7 @@ mod daemon;
 mod domain;
 mod gitutil;
 mod ipc;
+mod monitor;
 mod paths;
 mod pi_contract;
 mod state;
