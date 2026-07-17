@@ -2216,6 +2216,7 @@ mod tests {
         assert_eq!(defaults.poll_max_millis, 500);
         assert_eq!(defaults.economics_checkpoint_millis, 500);
         assert!(defaults.raw_output_spill);
+        assert_eq!(defaults.pi_event_journal_max_bytes, 64 * 1024 * 1024);
 
         super::write_json(
             store.config_path(),
@@ -2230,6 +2231,20 @@ mod tests {
             .read_config()
             .expect_err("hard maximum must reject accidental unbounded retention");
         assert!(format!("{error:#}").contains("retained_output_bytes"));
+
+        super::write_json(
+            store.config_path(),
+            &serde_json::json!({
+                "runtime": {
+                    "pi_event_journal_max_bytes": crate::domain::MAX_PI_EVENT_JOURNAL_BYTES + 1
+                }
+            }),
+        )
+        .unwrap();
+        let error = store
+            .read_config()
+            .expect_err("hard maximum must bound canonical Pi journal storage");
+        assert!(format!("{error:#}").contains("pi_event_journal_max_bytes"));
     }
 
     #[test]

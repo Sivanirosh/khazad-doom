@@ -9,6 +9,7 @@ mod ipc;
 mod monitor;
 mod paths;
 mod pi_contract;
+mod pi_event_journal;
 mod state;
 mod workflow;
 
@@ -46,6 +47,40 @@ fn main() {
                 std::process::exit(125);
             }
         }
+    }
+    if internal_command.as_deref() == Some(pi_event_journal::PI_EVENT_RELAY_ARG) {
+        let max_bytes = args.next().and_then(|value| value.parse::<u64>().ok());
+        let stats_path = args.next();
+        if max_bytes.is_none() || args.next().is_some() {
+            eprintln!("khazad-doom: Pi event relay requires a byte limit and optional stats path");
+            std::process::exit(125);
+        }
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        match pi_event_journal::relay(
+            stdin.lock(),
+            stdout.lock(),
+            max_bytes.expect("checked byte limit"),
+        ) {
+            Ok(stats) => {
+                if let Some(path) = stats_path
+                    && let Err(err) = artifact::write_json(path, &stats)
+                {
+                    eprintln!("khazad-doom: Pi event relay stats failed: {err:#}");
+                    std::process::exit(120);
+                }
+            }
+            Err(err) => {
+                if let Some(path) = stats_path
+                    && let Err(stats_err) = artifact::write_json(path, err.stats())
+                {
+                    eprintln!("khazad-doom: Pi event relay stats failed: {stats_err:#}");
+                }
+                eprintln!("khazad-doom: Pi event relay failed: {err}");
+                std::process::exit(120);
+            }
+        }
+        return;
     }
     if internal_command.as_deref() == Some(artifact::ATOMIC_JSON_WRITER_ARG) {
         let path = args.next();

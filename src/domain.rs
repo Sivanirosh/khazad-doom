@@ -188,6 +188,7 @@ fn split_slice_github_issue(value: &str) -> (&str, Option<SliceProvenance>) {
 
 pub const MAX_RETAINED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RETAINED_OUTPUT_LINES: usize = 100_000;
+pub const MAX_PI_EVENT_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_OBSERVATION_FLUSH_BYTES: usize = 1024 * 1024;
 pub const MAX_OBSERVATION_FLUSH_MILLIS: u64 = 5_000;
 pub const MAX_RUNTIME_POLL_MILLIS: u64 = 5_000;
@@ -216,9 +217,12 @@ pub struct RuntimeConfig {
     /// Minimum interval between growing economics artifact checkpoints. Zero
     /// deliberately persists every mutation.
     pub economics_checkpoint_millis: u64,
-    /// Stream complete raw command/worker bytes to append-only artifacts when
-    /// a caller supplies an attempt artifact path.
+    /// Stream command/worker output to append-only artifacts when a caller
+    /// supplies an attempt artifact path. Pi JSON stdout is stored as a
+    /// canonical delta journal rather than repeated cumulative snapshots.
     pub raw_output_spill: bool,
+    /// Hard per-attempt byte limit for the canonical Pi event journal.
+    pub pi_event_journal_max_bytes: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -232,6 +236,7 @@ impl Default for RuntimeConfig {
             poll_max_millis: 500,
             economics_checkpoint_millis: 500,
             raw_output_spill: true,
+            pi_event_journal_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -284,6 +289,15 @@ impl RuntimeConfig {
                 "runtime.economics_checkpoint_millis={} exceeds hard maximum {}",
                 self.economics_checkpoint_millis,
                 MAX_ECONOMICS_CHECKPOINT_MILLIS
+            );
+        }
+        if self.pi_event_journal_max_bytes == 0
+            || self.pi_event_journal_max_bytes > MAX_PI_EVENT_JOURNAL_BYTES
+        {
+            anyhow::bail!(
+                "runtime.pi_event_journal_max_bytes={} must be between 1 and hard maximum {}",
+                self.pi_event_journal_max_bytes,
+                MAX_PI_EVENT_JOURNAL_BYTES
             );
         }
         if (self.retained_output_bytes == 0 || self.retained_output_lines == 0)

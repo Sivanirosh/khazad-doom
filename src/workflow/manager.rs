@@ -6105,6 +6105,10 @@ impl Manager {
             Err(err) => {
                 let launch_failure =
                     self.classify_runner_launch_failure(err.as_ref(), request.runner_metadata);
+                let runner_failure_kind = err
+                    .downcast_ref::<RunnerError>()
+                    .map(RunnerError::failure_kind)
+                    .unwrap_or_default();
                 *request.last_failure = launch_failure
                     .as_ref()
                     .map(|failure| failure.summary.clone())
@@ -6157,8 +6161,10 @@ impl Manager {
                         secondary_failures: (*request.secondary_failures).clone(),
                         failure_kind: launch_failure
                             .as_ref()
-                            .map(|failure| failure.failure_kind.clone())
-                            .unwrap_or_default(),
+                            .map(|failure| failure.failure_kind.as_str())
+                            .filter(|kind| !kind.is_empty())
+                            .unwrap_or(runner_failure_kind)
+                            .to_string(),
                         retryable: launch_failure.as_ref().map(|failure| failure.retryable),
                         operator_action_required: launch_failure
                             .as_ref()

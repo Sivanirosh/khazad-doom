@@ -1,6 +1,7 @@
 use crate::artifact::{PiTuiWorkerArtifacts, PiWrapperArtifacts};
 use crate::domain::{Handoff, RuntimeConfig};
 use crate::pi_contract::{self, PiContractObservation, PiContractWarning, PiParser};
+use crate::pi_event_journal::{PiEventJournalWriter, WORKER_OUTPUT_LIMIT_FAILURE_KIND};
 use crate::{artifact, gitutil};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -191,6 +192,7 @@ pub struct RunnerLaunchFailure {
 pub struct RunnerError {
     message: String,
     transcript: RunnerTranscript,
+    failure_kind: String,
 }
 
 impl RunnerError {
@@ -198,11 +200,28 @@ impl RunnerError {
         Self {
             message: message.into(),
             transcript,
+            failure_kind: String::new(),
+        }
+    }
+
+    fn with_failure_kind(
+        message: impl Into<String>,
+        transcript: RunnerTranscript,
+        failure_kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            transcript,
+            failure_kind: failure_kind.into(),
         }
     }
 
     pub fn transcript(&self) -> &RunnerTranscript {
         &self.transcript
+    }
+
+    pub fn failure_kind(&self) -> &str {
+        &self.failure_kind
     }
 
     pub fn classify_launch_failure(
@@ -473,7 +492,7 @@ impl Runner for PiRunner {
         let stderr_bytes = job.runtime.retained_output_bytes;
         let stderr_lines = job.runtime.retained_output_lines;
         let stderr_thread = thread::spawn(move || {
-            let mut reader = TeeReader::new(stderr, stderr_spill, stderr_stats);
+            let mut reader = TeeReader::new_raw(stderr, stderr_spill, stderr_stats);
             let mut chunk = [0_u8; 8 * 1024];
             let mut tail = String::new();
             loop {
@@ -491,13 +510,20 @@ impl Runner for PiRunner {
 
         let stdout = child.stdout.take().context("pi stdout")?;
         let stdout_events = events.clone();
+        let stdout_stats_observer = stdout_stats.clone();
         let retained_output_bytes = job.runtime.retained_output_bytes;
         let retained_output_lines = job.runtime.retained_output_lines;
+        let pi_event_journal_max_bytes = job.runtime.pi_event_journal_max_bytes;
         let parser_thread = thread::spawn(move || {
             let mut parser =
                 PiParser::with_output_bounds(retained_output_bytes, retained_output_lines);
             parser.parse(
-                TeeReader::new(stdout, stdout_spill, stdout_stats),
+                TeeReader::new_pi_journal(
+                    stdout,
+                    stdout_spill,
+                    stdout_stats,
+                    pi_event_journal_max_bytes,
+                ),
                 stdout_events,
                 Some(pid),
             )?;
@@ -506,6 +532,16 @@ impl Runner for PiRunner {
 
         let mut next_observation = Instant::now();
         let status = loop {
+            if stdout_stats_observer
+                .lock()
+                .expect("Pi stdout stats mutex poisoned")
+                .output_limit_exceeded
+            {
+                terminate_child(
+                    &mut child,
+                    Duration::from_secs(job.termination_grace_seconds),
+                );
+            }
             if cancel.is_cancelled() {
                 terminate_child(
                     &mut child,
@@ -553,8 +589,30 @@ impl Runner for PiRunner {
             let stderr = join_stderr(stderr_thread)?;
             return Err(RunnerError::new("job cancelled", parser.transcript(&stderr)).into());
         }
-        let parser = join_parser(parser_thread)?;
         let stderr = join_stderr(stderr_thread)?;
+        let parser = match join_parser(parser_thread) {
+            Ok(parser) => parser,
+            Err(err) => {
+                let failure_kind = if stdout_stats_observer
+                    .lock()
+                    .expect("Pi stdout stats mutex poisoned")
+                    .output_limit_exceeded
+                {
+                    WORKER_OUTPUT_LIMIT_FAILURE_KIND
+                } else {
+                    ""
+                };
+                return Err(RunnerError::with_failure_kind(
+                    format!("parse Pi event stream failed: {err:#}"),
+                    RunnerTranscript {
+                        stderr_tail: stderr,
+                        ..RunnerTranscript::default()
+                    },
+                    failure_kind,
+                )
+                .into());
+            }
+        };
         if !status.success() {
             let msg = stderr.trim();
             let message = if msg.is_empty() {
@@ -624,51 +682,147 @@ fn join_stderr(stderr_thread: thread::JoinHandle<Result<String>>) -> Result<Stri
         .map_err(|_| anyhow::anyhow!("pi stderr capture panicked"))?
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct OutputSpillStats {
-    bytes: u64,
-    newline_count: usize,
-    ends_with_newline: bool,
+    source_bytes: u64,
+    source_lines: usize,
+    stored_bytes: u64,
+    stored_lines: usize,
+    compacted_events: usize,
+    storage_bytes_saved: u64,
+    source_sha256: String,
+    stored_sha256: String,
+    output_limit_bytes: u64,
+    output_limit_exceeded: bool,
+    raw_ends_with_newline: bool,
 }
 
 impl OutputSpillStats {
-    fn line_count(&self) -> usize {
-        self.newline_count
-            .saturating_add(usize::from(self.bytes > 0 && !self.ends_with_newline))
+    fn raw_ingest(&mut self, bytes: &[u8]) {
+        self.source_bytes = self.source_bytes.saturating_add(bytes.len() as u64);
+        self.stored_bytes = self.stored_bytes.saturating_add(bytes.len() as u64);
+        self.source_lines = self
+            .source_lines
+            .saturating_add(bytes.iter().filter(|byte| **byte == b'\n').count());
+        self.stored_lines = self.source_lines;
+        self.raw_ends_with_newline = bytes.last() == Some(&b'\n');
     }
+
+    fn finish_raw(&mut self) {
+        if self.source_bytes > 0 && !self.raw_ends_with_newline {
+            self.source_lines = self.source_lines.saturating_add(1);
+            self.stored_lines = self.source_lines;
+            self.raw_ends_with_newline = true;
+        }
+    }
+}
+
+enum SpillWriter {
+    Raw(File),
+    PiJournal(Box<PiEventJournalWriter<File>>),
 }
 
 struct TeeReader<R> {
     inner: R,
-    spill: Option<File>,
+    spill: Option<SpillWriter>,
     stats: Arc<Mutex<OutputSpillStats>>,
+    finished: bool,
 }
 
 impl<R> TeeReader<R> {
-    fn new(inner: R, spill: Option<File>, stats: Arc<Mutex<OutputSpillStats>>) -> Self {
+    fn new_raw(inner: R, spill: Option<File>, stats: Arc<Mutex<OutputSpillStats>>) -> Self {
         Self {
             inner,
-            spill,
+            spill: spill.map(SpillWriter::Raw),
             stats,
+            finished: false,
         }
+    }
+
+    fn new_pi_journal(
+        inner: R,
+        spill: Option<File>,
+        stats: Arc<Mutex<OutputSpillStats>>,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            inner,
+            spill: spill.map(|file| {
+                SpillWriter::PiJournal(Box::new(PiEventJournalWriter::new(file, max_bytes)))
+            }),
+            stats,
+            finished: false,
+        }
+    }
+
+    fn finish_spill(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        match self.spill.as_mut() {
+            Some(SpillWriter::PiJournal(journal)) => {
+                let journal_stats = journal.finish()?;
+                let mut stats = self.stats.lock().expect("Pi output stats mutex poisoned");
+                stats.source_bytes = journal_stats.source_bytes;
+                stats.source_lines = journal_stats.source_lines;
+                stats.stored_bytes = journal_stats.stored_bytes;
+                stats.stored_lines = journal_stats.stored_lines;
+                stats.compacted_events = journal_stats.compacted_events;
+                stats.storage_bytes_saved = journal_stats.storage_bytes_saved;
+                stats.source_sha256 = journal_stats.source_sha256;
+                stats.stored_sha256 = journal_stats.stored_sha256;
+                stats.output_limit_bytes = journal_stats.output_limit_bytes;
+                stats.output_limit_exceeded = journal_stats.output_limit_exceeded;
+            }
+            Some(SpillWriter::Raw(_)) | None => self
+                .stats
+                .lock()
+                .expect("Pi output stats mutex poisoned")
+                .finish_raw(),
+        }
+        Ok(())
     }
 }
 
 impl<R: Read> Read for TeeReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read(buf)?;
-        if read > 0 {
-            if let Some(spill) = self.spill.as_mut() {
+        if read == 0 {
+            self.finish_spill()?;
+            return Ok(0);
+        }
+        match self.spill.as_mut() {
+            Some(SpillWriter::Raw(spill)) => {
                 spill.write_all(&buf[..read]).map_err(|err| {
                     std::io::Error::new(err.kind(), format!("write Pi raw output spill: {err}"))
                 })?;
+                self.stats
+                    .lock()
+                    .expect("Pi output stats mutex poisoned")
+                    .raw_ingest(&buf[..read]);
             }
-            let mut stats = self.stats.lock().expect("Pi output stats mutex poisoned");
-            stats.bytes = stats.bytes.saturating_add(read as u64);
-            stats.newline_count = stats
-                .newline_count
-                .saturating_add(buf[..read].iter().filter(|byte| **byte == b'\n').count());
-            stats.ends_with_newline = buf[read - 1] == b'\n';
+            Some(SpillWriter::PiJournal(journal)) => {
+                let ingest_result = journal.ingest(&buf[..read]);
+                let journal_stats = journal.stats();
+                let mut stats = self.stats.lock().expect("Pi output stats mutex poisoned");
+                stats.source_bytes = journal_stats.source_bytes;
+                stats.source_lines = journal_stats.source_lines;
+                stats.stored_bytes = journal_stats.stored_bytes;
+                stats.stored_lines = journal_stats.stored_lines;
+                stats.compacted_events = journal_stats.compacted_events;
+                stats.storage_bytes_saved = journal_stats.storage_bytes_saved;
+                stats.source_sha256 = journal_stats.source_sha256;
+                stats.stored_sha256 = journal_stats.stored_sha256;
+                stats.output_limit_bytes = journal_stats.output_limit_bytes;
+                stats.output_limit_exceeded = journal_stats.output_limit_exceeded;
+                ingest_result?;
+            }
+            None => self
+                .stats
+                .lock()
+                .expect("Pi output stats mutex poisoned")
+                .raw_ingest(&buf[..read]),
         }
         Ok(read)
     }
@@ -708,32 +862,46 @@ impl Drop for WorkerOutputCaptureGuard {
         let stdout_bytes = fs::metadata(&stdout_path).map_or(0, |metadata| metadata.len());
         let stderr_bytes = fs::metadata(&stderr_path).map_or(0, |metadata| metadata.len());
         let total_bytes = stdout_bytes.saturating_add(stderr_bytes);
-        let stdout_lines = self
+        let stdout = self
             .stdout_stats
             .lock()
             .expect("Pi stdout stats mutex poisoned")
-            .line_count();
-        let stderr_lines = self
+            .clone();
+        let stderr = self
             .stderr_stats
             .lock()
             .expect("Pi stderr stats mutex poisoned")
-            .line_count();
+            .clone();
+        let source_total_bytes = stdout.source_bytes.saturating_add(stderr.source_bytes);
         let _ = artifact::write_json(
             stem.with_extension("runtime.json"),
             &json!({
-                "schema_version": 1,
-                "capture": "bounded_tail_with_append_only_raw_spill",
+                "schema_version": 2,
+                "capture": "bounded_tail_with_canonical_pi_event_journal_v1",
                 "total_bytes": total_bytes,
+                "source_total_bytes": source_total_bytes,
                 "stdout_bytes": stdout_bytes,
                 "stderr_bytes": stderr_bytes,
-                "stdout_lines": stdout_lines,
-                "stderr_lines": stderr_lines,
+                "stdout_source_bytes": stdout.source_bytes,
+                "stdout_stored_bytes": stdout.stored_bytes,
+                "stderr_source_bytes": stderr.source_bytes,
+                "stderr_stored_bytes": stderr.stored_bytes,
+                "stdout_lines": stdout.source_lines,
+                "stderr_lines": stderr.source_lines,
+                "stdout_stored_lines": stdout.stored_lines,
+                "stdout_compacted_events": stdout.compacted_events,
+                "stdout_storage_bytes_saved": stdout.storage_bytes_saved,
+                "stdout_source_sha256": stdout.source_sha256,
+                "stdout_stored_sha256": stdout.stored_sha256,
+                "pi_event_journal_compaction_version": 1,
+                "pi_event_journal_output_limit_bytes": stdout.output_limit_bytes,
+                "pi_event_journal_output_limit_exceeded": stdout.output_limit_exceeded,
                 "retained_output_bytes_per_stream": self.retained_output_bytes,
                 "retained_output_lines_per_stream": self.retained_output_lines,
-                "truncated": stdout_bytes > self.retained_output_bytes as u64
-                    || stderr_bytes > self.retained_output_bytes as u64
-                    || stdout_lines > self.retained_output_lines
-                    || stderr_lines > self.retained_output_lines,
+                "truncated": stdout.source_bytes > self.retained_output_bytes as u64
+                    || stderr.source_bytes > self.retained_output_bytes as u64
+                    || stdout.source_lines > self.retained_output_lines
+                    || stderr.source_lines > self.retained_output_lines,
                 "spill_paths": [stdout_path, stderr_path],
             }),
         );
@@ -827,8 +995,10 @@ pub(crate) fn prepare_pi_wrapper_artifacts(
     if let Some(parent) = artifacts.wrapper_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    let stdout_journal_path = artifacts.stdout_path.with_extension("journal.json");
     for path in [
         &artifacts.stdout_path,
+        &stdout_journal_path,
         &artifacts.stderr_path,
         &artifacts.exit_path,
         &artifacts.status_path,
@@ -854,13 +1024,16 @@ pub(crate) fn prepare_pi_wrapper_artifacts(
             "cwd": job.cwd,
             "prompt_path": artifacts.prompt_path,
             "stdout_path": artifacts.stdout_path,
+            "stdout_journal_path": stdout_journal_path,
             "stderr_path": artifacts.stderr_path,
             "exit_path": artifacts.exit_path,
             "status_path": artifacts.status_path,
             "result_path": artifacts.result_path,
             "atomic_json_writer": &atomic_json_writer,
             "env_keys": effective_env(&job.env).keys().cloned().collect::<Vec<_>>(),
-            "contract": "khazad-owned-herdr-pi-wrapper-v1",
+            "pi_event_journal_max_bytes": job.runtime.pi_event_journal_max_bytes,
+            "pi_event_journal_compaction_version": 1,
+            "contract": "khazad-owned-herdr-pi-wrapper-v2",
         }),
     )?;
     write_private(
@@ -1072,6 +1245,29 @@ pub(crate) fn collect_pi_wrapper_result(
     let data = parse_pi_artifact_result(job, artifacts, exit_code, Some(pid))?;
     let stdout_bytes = fs::metadata(&artifacts.stdout_path).map_or(0, |metadata| metadata.len());
     let stderr_bytes = fs::metadata(&artifacts.stderr_path).map_or(0, |metadata| metadata.len());
+    let journal_stats = read_pi_wrapper_journal_stats(artifacts).unwrap_or_else(|| {
+        json!({
+            "schema_version": 1,
+            "compaction_version": 1,
+            "source_bytes": stdout_bytes,
+            "source_lines": stdout_lines.total_lines,
+            "stored_bytes": stdout_bytes,
+            "stored_lines": stdout_lines.total_lines,
+            "compacted_events": 0,
+            "storage_bytes_saved": 0,
+            "source_sha256": "",
+            "stored_sha256": "",
+            "output_limit_bytes": job.runtime.pi_event_journal_max_bytes,
+            "output_limit_exceeded": false,
+        })
+    });
+    let stdout_source_bytes = journal_stats["source_bytes"]
+        .as_u64()
+        .unwrap_or(stdout_bytes);
+    let stdout_source_lines = journal_stats["source_lines"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(stdout_lines.total_lines);
     artifact::write_json(
         &artifacts.result_path,
         &json!({
@@ -1080,24 +1276,36 @@ pub(crate) fn collect_pi_wrapper_result(
             "contract_warnings": data.contract_warnings,
             "source": "khazad_owned_wrapper_artifacts",
             "output_capture": {
-                "schema_version": 1,
-                "capture": "bounded_tail_with_append_only_raw_spill",
+                "schema_version": 2,
+                "capture": "bounded_tail_with_canonical_pi_event_journal_v1",
                 "total_bytes": stdout_bytes.saturating_add(stderr_bytes),
+                "source_total_bytes": stdout_source_bytes.saturating_add(stderr_bytes),
                 "stdout_bytes": stdout_bytes,
                 "stderr_bytes": stderr_bytes,
-                "stdout_lines": stdout_lines.total_lines,
+                "stdout_lines": stdout_source_lines,
                 "stderr_lines": stderr_lines.total_lines,
+                "pi_event_journal": journal_stats,
                 "retained_output_bytes_per_stream": job.runtime.retained_output_bytes,
                 "retained_output_lines_per_stream": job.runtime.retained_output_lines,
-                "truncated": stdout_bytes > job.runtime.retained_output_bytes as u64
+                "truncated": stdout_source_bytes > job.runtime.retained_output_bytes as u64
                     || stderr_bytes > job.runtime.retained_output_bytes as u64
-                    || stdout_lines.total_lines > job.runtime.retained_output_lines
+                    || stdout_source_lines > job.runtime.retained_output_lines
                     || stderr_lines.total_lines > job.runtime.retained_output_lines,
                 "spill_paths": [artifacts.stdout_path.clone(), artifacts.stderr_path.clone()],
             },
         }),
     )?;
     Ok(data)
+}
+
+fn read_pi_wrapper_journal_stats(artifacts: &PiWrapperArtifacts) -> Option<Value> {
+    artifact::read_json(artifacts.stdout_path.with_extension("journal.json")).ok()
+}
+
+fn pi_wrapper_output_limit_exceeded(artifacts: &PiWrapperArtifacts) -> bool {
+    read_pi_wrapper_journal_stats(artifacts)
+        .and_then(|stats| stats["output_limit_exceeded"].as_bool())
+        .unwrap_or(false)
 }
 
 fn parse_pi_artifact_result(
@@ -1130,7 +1338,17 @@ fn parse_pi_artifact_result(
         } else {
             format!("pi exited with {status}: {msg}")
         };
-        return Err(RunnerError::new(message, parser.transcript(&stderr)).into());
+        let failure_kind = if pi_wrapper_output_limit_exceeded(artifacts) {
+            WORKER_OUTPUT_LIMIT_FAILURE_KIND
+        } else {
+            ""
+        };
+        return Err(RunnerError::with_failure_kind(
+            message,
+            parser.transcript(&stderr),
+            failure_kind,
+        )
+        .into());
     }
 
     let text = parser.final_text().trim().to_string();
@@ -1294,6 +1512,7 @@ umask 077
 STATUS={status}
 EXIT={exit}
 STDOUT={stdout}
+STDOUT_JOURNAL={stdout_journal}
 STDERR={stderr}
 PROMPT={prompt}
 ENV_FILE={env_file}
@@ -1330,12 +1549,47 @@ setsid /bin/sh -c '
   writer=$2
   writer_arg=$3
   shift 3
+  relay=$1
+  relay_arg=$2
+  relay_max=$3
+  relay_stats=$4
+  fifo=$5
+  prompt=$6
+  termination_grace=$7
+  shift 7
   pid=$$
   if ! printf "{{\"state\":\"launched\",\"pid\":%s}}\\n" "$pid" | "$writer" "$writer_arg" "$status"; then
     exit 125
   fi
-  exec "$@"
-' sh "$STATUS" "$ATOMIC_JSON_WRITER" {atomic_json_writer_arg} env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} < "$PROMPT" > "$STDOUT" 2> "$STDERR" &
+  trap '\''rm -f "$fifo"'\'' EXIT
+  rm -f "$fifo"
+  mkfifo "$fifo" || exit 125
+  "$relay" "$relay_arg" "$relay_max" "$relay_stats" < "$fifo" &
+  relay_pid=$!
+  "$@" < "$prompt" > "$fifo" &
+  command_pid=$!
+  wait "$relay_pid"
+  relay_code=$?
+  killer_pid=
+  if [ "$relay_code" -ne 0 ]; then
+    kill -TERM "$command_pid" 2>/dev/null || true
+    (
+      sleep "$termination_grace"
+      kill -KILL "$command_pid" 2>/dev/null || true
+    ) &
+    killer_pid=$!
+  fi
+  wait "$command_pid"
+  command_code=$?
+  if [ -n "$killer_pid" ]; then
+    kill "$killer_pid" 2>/dev/null || true
+    wait "$killer_pid" 2>/dev/null || true
+  fi
+  if [ "$relay_code" -ne 0 ]; then
+    exit "$relay_code"
+  fi
+  exit "$command_code"
+' sh "$STATUS" "$ATOMIC_JSON_WRITER" {atomic_json_writer_arg} "$ATOMIC_JSON_WRITER" {pi_event_relay_arg} {pi_event_journal_max_bytes} "$STDOUT_JOURNAL" "$STDOUT.relay.fifo" "$PROMPT" {termination_grace_seconds} env -i /bin/sh -c '. "$1"; shift; exec "$@"' sh "$ENV_FILE" {command} > "$STDOUT" 2> "$STDERR" &
 pid=$!
 wait "$pid"
 code=$?
@@ -1355,12 +1609,16 @@ exit "$code"
         status = shell_quote_path(&artifacts.status_path),
         exit = shell_quote_path(&artifacts.exit_path),
         stdout = shell_quote_path(&artifacts.stdout_path),
+        stdout_journal = shell_quote_path(&artifacts.stdout_path.with_extension("journal.json")),
         stderr = shell_quote_path(&artifacts.stderr_path),
         prompt = shell_quote_path(&artifacts.prompt_path),
         env_file = shell_quote_path(&artifacts.env_path),
         cwd = shell_quote_path(&job.cwd),
         atomic_json_writer = shell_quote_path(atomic_json_writer),
         atomic_json_writer_arg = artifact::ATOMIC_JSON_WRITER_ARG,
+        pi_event_relay_arg = crate::pi_event_journal::PI_EVENT_RELAY_ARG,
+        pi_event_journal_max_bytes = job.runtime.pi_event_journal_max_bytes,
+        termination_grace_seconds = job.termination_grace_seconds,
         command = command,
     )
 }
@@ -1852,6 +2110,59 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_relay_limit_is_classified_as_typed_worker_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = artifact::Store::new(temp.path());
+        let output_path = temp.path().join("worker-output.json");
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&output_path)
+            .unwrap();
+        fs::write(&artifacts.stdout_path, "").unwrap();
+        fs::write(
+            &artifacts.stderr_path,
+            format!(
+                "khazad-doom: Pi event relay failed: {}: budget exhausted\n",
+                crate::pi_event_journal::WORKER_OUTPUT_LIMIT_FAILURE_KIND
+            ),
+        )
+        .unwrap();
+        artifact::write_json(&artifacts.exit_path, &json!({"exit_code": 120})).unwrap();
+        artifact::write_json(
+            artifacts.stdout_path.with_extension("journal.json"),
+            &json!({"output_limit_exceeded": true}),
+        )
+        .unwrap();
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: "{}".to_string(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
+        };
+
+        let error = super::parse_pi_artifact_result(&job, &artifacts, 120, None).unwrap_err();
+        let runner_error = error.downcast_ref::<RunnerError>().unwrap();
+        assert_eq!(
+            runner_error.failure_kind(),
+            crate::pi_event_journal::WORKER_OUTPUT_LIMIT_FAILURE_KIND
+        );
+
+        artifact::write_json(
+            artifacts.stdout_path.with_extension("journal.json"),
+            &json!({"output_limit_exceeded": false}),
+        )
+        .unwrap();
+        let forged = super::parse_pi_artifact_result(&job, &artifacts, 120, None).unwrap_err();
+        assert_eq!(
+            forged.downcast_ref::<RunnerError>().unwrap().failure_kind(),
+            ""
+        );
+    }
+
+    #[test]
     fn wrapper_preserves_authoritative_result_larger_than_diagnostic_tail() {
         let temp = tempfile::tempdir().unwrap();
         let store = artifact::Store::new(temp.path());
@@ -1918,6 +2229,166 @@ mod tests {
         assert!(format!("{error:#}").contains("output spill"));
         assert!(!stem.with_extension("stdout.log").exists());
         assert!(!stem.with_extension("runtime.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_pi_event_journal_does_not_persist_cumulative_delta_snapshots() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi-events");
+        let cumulative = "x".repeat(4 * 1024);
+        let mut wire = String::from("#!/bin/sh\ncat <<'KHAZAD_PI_EVENTS'\n");
+        for index in 0..200 {
+            wire.push_str(
+                &serde_json::json!({
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "toolcall_delta",
+                        "contentIndex": 0,
+                        "delta": "x",
+                        "partial": {
+                            "role": "assistant",
+                            "content": [{"type": "toolCall", "partialJson": cumulative}]
+                        }
+                    },
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "toolCall", "partialJson": cumulative}],
+                        "sequence": index
+                    }
+                })
+                .to_string(),
+            );
+            wire.push('\n');
+        }
+        wire.push_str(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done"}]
+                }
+            })
+            .to_string(),
+        );
+        wire.push_str("\nKHAZAD_PI_EVENTS\n");
+        fs::write(&script, &wire).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let stem = temp.path().join("capture");
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        runner
+            .run(
+                Job {
+                    kind: "worker".to_string(),
+                    prompt: String::new(),
+                    cwd: temp.path().to_path_buf(),
+                    json_schema: String::new(),
+                    env: BTreeMap::new(),
+                    termination_grace_seconds: 0,
+                    runtime: RuntimeConfig::default(),
+                    raw_output_stem: Some(stem.clone()),
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .unwrap();
+
+        let journal = fs::read_to_string(stem.with_extension("stdout.log")).unwrap();
+        assert!(
+            journal.len() < 64 * 1024,
+            "journal was {} bytes",
+            journal.len()
+        );
+        let updates = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["type"] == "message_update")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 200);
+        assert!(updates.iter().all(|event| event.get("message").is_none()));
+        assert!(updates.iter().all(|event| {
+            event["assistantMessageEvent"]
+                .as_object()
+                .is_some_and(|assistant| !assistant.contains_key("partial"))
+        }));
+        let metadata: serde_json::Value =
+            artifact::read_json(stem.with_extension("runtime.json")).unwrap();
+        assert!(metadata["stdout_source_bytes"].as_u64().unwrap() > 1024 * 1024);
+        assert!(metadata["stdout_stored_bytes"].as_u64().unwrap() < 64 * 1024);
+        assert_eq!(metadata["stdout_compacted_events"], 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_pi_event_journal_reports_a_typed_output_limit_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi-large-terminal");
+        let event = serde_json::json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "content": "x".repeat(4096)}
+        });
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' {}\n",
+                super::shell_quote(&event.to_string())
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+        let stem = temp.path().join("capture");
+        let runner = PiRunner {
+            bin: script.to_string_lossy().into_owned(),
+            extra_args: Vec::new(),
+            metadata: RunnerMetadata::default(),
+        };
+        let error = runner
+            .run(
+                Job {
+                    kind: "worker".to_string(),
+                    prompt: String::new(),
+                    cwd: temp.path().to_path_buf(),
+                    json_schema: String::new(),
+                    env: BTreeMap::new(),
+                    termination_grace_seconds: 0,
+                    runtime: RuntimeConfig {
+                        pi_event_journal_max_bytes: 256,
+                        ..RuntimeConfig::default()
+                    },
+                    raw_output_stem: Some(stem.clone()),
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .unwrap_err();
+        let runner_error = error.downcast_ref::<RunnerError>().unwrap();
+        assert_eq!(
+            runner_error.failure_kind(),
+            crate::pi_event_journal::WORKER_OUTPUT_LIMIT_FAILURE_KIND
+        );
+        assert!(
+            fs::read(stem.with_extension("stdout.log"))
+                .unwrap()
+                .is_empty()
+        );
+        let metadata: serde_json::Value =
+            artifact::read_json(stem.with_extension("runtime.json")).unwrap();
+        assert_eq!(metadata["pi_event_journal_output_limit_exceeded"], true);
+        assert_eq!(metadata["pi_event_journal_output_limit_bytes"], 256);
+        assert_eq!(metadata["stdout_lines"], 1);
     }
 
     #[cfg(unix)]
@@ -2176,6 +2647,180 @@ mod tests {
         assert!(script.contains("setsid /bin/sh -c"));
         let command: serde_json::Value = artifact::read_json(&artifacts.command_path).unwrap();
         assert!(command["atomic_json_writer"].is_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_wrapper_routes_pi_stdout_through_the_canonical_event_relay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi-events");
+        let cumulative = "x".repeat(4 * 1024);
+        let mut wire = String::from("#!/bin/sh\ncat <<'KHAZAD_PI_EVENTS'\n");
+        for _ in 0..100 {
+            wire.push_str(
+                &serde_json::json!({
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "toolcall_delta",
+                        "delta": "x",
+                        "partial": {"content": cumulative}
+                    },
+                    "message": {"content": cumulative}
+                })
+                .to_string(),
+            );
+            wire.push('\n');
+        }
+        wire.push_str(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+            })
+            .to_string(),
+        );
+        wire.push_str("\nKHAZAD_PI_EVENTS\n");
+        fs::write(&script, wire).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&temp.path().join("worker.json"))
+            .unwrap();
+        let spec = PiCommandSpec {
+            bin: script.to_string_lossy().into_owned(),
+            args: Vec::new(),
+        };
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: String::new(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig::default(),
+            raw_output_stem: None,
+        };
+        let test_binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap()
+            .join("khazad-doom");
+        assert!(test_binary.exists(), "missing {}", test_binary.display());
+        fs::write(&artifacts.prompt_path, "").unwrap();
+        fs::write(&artifacts.env_path, super::env_file_text(&job.env)).unwrap();
+        fs::write(
+            &artifacts.wrapper_path,
+            super::wrapper_script(&spec, &job, &artifacts, &test_binary),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&artifacts.wrapper_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&artifacts.wrapper_path, permissions).unwrap();
+
+        let status = std::process::Command::new(&artifacts.wrapper_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "wrapper exited {status}");
+        let journal = fs::read_to_string(&artifacts.stdout_path).unwrap();
+        assert!(
+            journal.len() < 32 * 1024,
+            "journal was {} bytes",
+            journal.len()
+        );
+        let updates = journal
+            .lines()
+            .take(100)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(updates.iter().all(|event| event.get("message").is_none()));
+        assert!(updates.iter().all(|event| {
+            event["assistantMessageEvent"]
+                .as_object()
+                .is_some_and(|assistant| !assistant.contains_key("partial"))
+        }));
+        assert!(journal.contains("\"type\":\"message_end\""));
+        let stats: serde_json::Value =
+            artifact::read_json(artifacts.stdout_path.with_extension("journal.json")).unwrap();
+        assert!(stats["source_bytes"].as_u64().unwrap() > 512 * 1024);
+        assert!(stats["stored_bytes"].as_u64().unwrap() < 32 * 1024);
+        assert_eq!(stats["compacted_events"], 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_relay_limit_kills_a_term_ignoring_pi_without_hanging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-pi-term-ignoring");
+        let event = serde_json::json!({
+            "type": "message_end",
+            "message": {"content": "x".repeat(4096)}
+        });
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' {}\nsleep 30\n",
+                super::shell_quote(&event.to_string())
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+        let store = artifact::Store::new(temp.path());
+        let artifacts = store
+            .pi_wrapper_artifacts_for_output_path(&temp.path().join("worker.json"))
+            .unwrap();
+        let spec = PiCommandSpec {
+            bin: script.to_string_lossy().into_owned(),
+            args: Vec::new(),
+        };
+        let job = Job {
+            kind: "worker".to_string(),
+            prompt: String::new(),
+            cwd: temp.path().to_path_buf(),
+            json_schema: String::new(),
+            env: BTreeMap::new(),
+            termination_grace_seconds: 0,
+            runtime: RuntimeConfig {
+                pi_event_journal_max_bytes: 256,
+                ..RuntimeConfig::default()
+            },
+            raw_output_stem: None,
+        };
+        let test_binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap()
+            .join("khazad-doom");
+        fs::write(&artifacts.prompt_path, "").unwrap();
+        fs::write(&artifacts.env_path, super::env_file_text(&job.env)).unwrap();
+        fs::write(
+            &artifacts.wrapper_path,
+            super::wrapper_script(&spec, &job, &artifacts, &test_binary),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&artifacts.wrapper_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&artifacts.wrapper_path, permissions).unwrap();
+
+        let started = Instant::now();
+        let status = std::process::Command::new(&artifacts.wrapper_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(120));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let stats: serde_json::Value =
+            artifact::read_json(artifacts.stdout_path.with_extension("journal.json")).unwrap();
+        assert_eq!(stats["output_limit_exceeded"], true);
+        assert_eq!(stats["source_lines"], 1);
     }
 
     #[cfg(unix)]

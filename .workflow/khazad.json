@@ -14,7 +14,8 @@
     "poll_initial_millis": 25,
     "poll_max_millis": 500,
     "economics_checkpoint_millis": 500,
-    "raw_output_spill": true
+    "raw_output_spill": true,
+    "pi_event_journal_max_bytes": 67108864
   },
   "handoff": {
     "push": false,

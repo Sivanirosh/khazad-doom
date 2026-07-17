@@ -393,7 +393,7 @@ Retries preserve attempt history and should be treated as at-least-once executio
 | `.workflow/schema/slice.schema.json` | JSON Schema for editor/CI validation. |
 | `.workflow/plans/` | Optional planning artifacts. |
 | `.workflow/reports/` | Reports committed to integration branches. |
-| `.workflow/runs/` | Transient handoffs, optional `origin.json` feedback target artifacts, terminal run summaries, notification dedupe records, attempt diagnostics, and raw outputs; gitignored. |
+| `.workflow/runs/` | Transient handoffs, optional `origin.json` feedback target artifacts, terminal run summaries, notification dedupe records, attempt diagnostics, canonical Pi event journals, and stderr captures; gitignored. |
 | `~/.khazad-doom/socket` | Daemon IPC socket. |
 | `~/.khazad-doom/state.sqlite` | Run, slice, event, live progress, worker question, and replan proposal state. |
 | `~/.khazad-doom/worktrees/` | Daemon-managed temporary worktrees. |

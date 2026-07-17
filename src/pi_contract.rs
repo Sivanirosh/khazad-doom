@@ -88,6 +88,22 @@ pub fn launch_args(extra_args: &[String]) -> Vec<String> {
     args
 }
 
+pub(crate) fn canonical_event_journal_line(line: &[u8]) -> Option<Vec<u8>> {
+    let mut event = serde_json::from_slice::<Value>(line).ok()?;
+    let object = event.as_object_mut()?;
+    if object.get("type").and_then(Value::as_str) != Some("message_update") {
+        return None;
+    }
+    object.remove("message");
+    if let Some(assistant) = object
+        .get_mut("assistantMessageEvent")
+        .and_then(Value::as_object_mut)
+    {
+        assistant.remove("partial");
+    }
+    serde_json::to_vec(&event).ok()
+}
+
 pub fn remove_json_mode_flags(args: &[String]) -> Vec<String> {
     let mode_flag = PI_JSON_MODE_FLAGS[0];
     let mode_value = PI_JSON_MODE_FLAGS[1];
